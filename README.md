@@ -208,6 +208,16 @@ All `/api/*` routes require `Authorization: Bearer <API_TOKEN>`.
 | GET    | `/api/forecast?lat=&lon=`                         | 7-day forecast (Open-Meteo) |
 | POST   | `/ingest/custom/{INGEST_TOKEN}`                   | For relay / SDR ingest      |
 
+## Tests
+
+```sh
+pip install -r requirements-dev.txt
+pytest -q                  # backend tests
+pytest -q relay/tests/     # relay parser tests
+```
+
+CI runs both on every push (`.github/workflows/ci.yml`).
+
 ## License
 
 [MIT](LICENSE) — do whatever you want, no warranty.

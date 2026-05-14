@@ -1,0 +1,22 @@
+services:
+  zasder-weather:
+    build: .
+    container_name: zasder-weather
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/weather.db
+    volumes:
+      - weather-data:/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  weather-data:

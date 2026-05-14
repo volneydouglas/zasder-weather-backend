@@ -4,8 +4,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    aw_application_key: str
-    aw_api_key: str
+    # Optional — only required for AmbientWeather ingest. AcuRite-only
+    # deploys can leave both unset; the poller stays asleep and only the
+    # /ingest/custom path is active.
+    aw_application_key: str | None = None
+    aw_api_key: str | None = None
     api_token: str
     # Optional secondary bearer token accepted alongside `api_token`. Use cases:
     #   * App Store submission — give the reviewer a dedicated token in the
@@ -26,6 +29,10 @@ class Settings(BaseSettings):
     @property
     def valid_api_tokens(self) -> set[str]:
         return {t for t in [self.api_token, self.reviewer_api_token] if t}
+
+    @property
+    def aw_configured(self) -> bool:
+        return bool(self.aw_application_key and self.aw_api_key)
 
 
 settings = Settings()

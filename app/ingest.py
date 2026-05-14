@@ -35,7 +35,7 @@ import re
 import time
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Path, Request
+from fastapi import APIRouter, Header, HTTPException, Path, Request
 
 from . import db
 from .config import settings
@@ -119,15 +119,61 @@ def _device_label(normalized: dict[str, Any]) -> tuple[str, str | None]:
     return name, location
 
 
-def require_ingest_token(token: str) -> None:
+def _require_ingest_token(token: str) -> None:
     expected = settings.ingest_token
     if not expected or token != expected:
         raise HTTPException(status_code=401, detail="invalid ingest token")
 
 
+def _token_from_header(authorization: str | None,
+                       x_ingest_token: str | None) -> str:
+    """Pull the ingest token from either Authorization: Bearer or
+    X-Ingest-Token. Missing both = empty string (will fail validation)."""
+    if x_ingest_token: return x_ingest_token.strip()
+    if authorization and authorization.startswith("Bearer "):
+        return authorization.removeprefix("Bearer ").strip()
+    return ""
+
+
+async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
+    if not isinstance(payload_obj, dict):
+        raise HTTPException(status_code=400, detail="payload must be a JSON object")
+    dev = payload_obj.get("device") or {}
+    raw_id = dev.get("id") or ""
+    mac = _format_mac(str(raw_id))
+    if not mac:
+        raise HTTPException(status_code=400, detail="device.id required")
+    flat = _flatten(payload_obj)
+    if not flat:
+        raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
+    name, location = _device_label(payload_obj)
+    info = {
+        "name": name,
+        "info": {"name": name, "location": location, "source": payload_obj.get("source")},
+        "lastData": flat,
+    }
+    await db.upsert_device(mac, info)
+    inserted = await db.insert_observations(mac, [{**flat, "_source": payload_obj}])
+    return {"ok": True, "mac": mac, "inserted": inserted, "ts_ms": flat["dateutc"]}
+
+
+# Preferred: token in header so it never appears in proxy/access logs.
+@router.post("/ingest/custom")
+async def ingest_custom_header(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+    x_ingest_token: Annotated[str | None, Header(alias="X-Ingest-Token")] = None,
+) -> dict[str, Any]:
+    _require_ingest_token(_token_from_header(authorization, x_ingest_token))
+    return await _do_ingest(await request.json())
+
+
+# Backwards-compat: token in path. Still accepted for older relay deploys
+# but the token will leak into access logs. Migrate clients to the header
+# form when convenient.
 @router.post("/ingest/custom/{token}")
 async def ingest_custom(token: Annotated[str, Path()], request: Request) -> dict[str, Any]:
-    require_ingest_token(token)
+    _require_ingest_token(token)
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="payload must be a JSON object")

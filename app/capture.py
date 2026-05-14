@@ -4,7 +4,12 @@ without reading through fly logs.
 
 Mounted at /ingest/capture/{slug}/{path...}. The slug lets you tell different
 stations apart — e.g. /ingest/capture/acurite-atlas/... vs /ingest/capture/
-ecowitt-gw1100/... — without writing the parser yet."""
+ecowitt-gw1100/... — without writing the parser yet.
+
+Security: gated behind a token (CAPTURE_TOKEN env var) and bounds bodies at
+MAX_BODY_BYTES so a random POST flood can't exhaust disk or worker memory.
+When CAPTURE_TOKEN isn't set, the endpoint is disabled entirely (returns
+404), since reverse-engineering is normally a one-off task."""
 
 from __future__ import annotations
 
@@ -12,12 +17,16 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 router = APIRouter()
+
+# Hard limit on a captured payload. Real station POSTs are < 4 KB; 64 KB is
+# generous and keeps a single request from spiking memory.
+MAX_BODY_BYTES = 64 * 1024
 
 # JSON-lines log lives next to the SQLite db on the persistent volume so we
 # don't lose captures across redeploys. One file per slug; appended forever.
@@ -29,8 +38,33 @@ def _log_path(slug: str) -> Path:
     return base / f"{safe}.jsonl"
 
 
+def _require_capture_token(authorization: str | None, query_token: str | None) -> None:
+    expected = os.environ.get("CAPTURE_TOKEN", "").strip()
+    if not expected:
+        # Endpoint disabled entirely when no token is configured. We return
+        # 404 (not 401) so a port scan can't tell the route exists.
+        raise HTTPException(status_code=404, detail="not found")
+    presented: str | None = None
+    if authorization and authorization.startswith("Bearer "):
+        presented = authorization.removeprefix("Bearer ").strip()
+    elif query_token:
+        presented = query_token.strip()
+    if presented != expected:
+        raise HTTPException(status_code=404, detail="not found")
+
+
 async def _capture(request: Request, slug: str, full_path: str) -> dict[str, Any]:
-    body_bytes = await request.body()
+    # Refuse oversized payloads early — both via Content-Length and by
+    # enforcing the max during read. A misbehaving station can't fill the
+    # volume with one giant POST.
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail="payload too large")
+    body_bytes = b""
+    async for chunk in request.stream():
+        body_bytes += chunk
+        if len(body_bytes) > MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="payload too large")
     # Try to decode as text so a human can grep it; fall back to base64 marker.
     body_text: str | None
     try:
@@ -62,21 +96,34 @@ async def _capture(request: Request, slug: str, full_path: str) -> dict[str, Any
 
 
 # Catch-all routes for every method the station might use. Path can be empty
-# (root POST) or arbitrary depth.
+# (root POST) or arbitrary depth. ALL of them are token-gated — the operator
+# must explicitly opt into capture by setting CAPTURE_TOKEN. Token can be
+# supplied via Authorization: Bearer (preferred) or ?t= query param so a
+# script-less station can still hit the endpoint.
 @router.api_route("/ingest/capture/{slug}",
                   methods=["GET","POST","PUT","PATCH","DELETE","HEAD"])
 @router.api_route("/ingest/capture/{slug}/{full_path:path}",
                   methods=["GET","POST","PUT","PATCH","DELETE","HEAD"])
-async def capture_any(request: Request, slug: str, full_path: str = "") -> PlainTextResponse:
+async def capture_any(
+    request: Request,
+    slug: str,
+    full_path: str = "",
+    authorization: Annotated[str | None, Header()] = None,
+    t: str | None = None,
+) -> PlainTextResponse:
+    _require_capture_token(authorization, t)
     await _capture(request, slug, full_path)
-    # Most stations expect a 200 with an empty or terse body. Mimic that.
     return PlainTextResponse("OK", status_code=200)
 
 
-# Also serve the typical Acurite Atlas vhost root path with a 200 so the hub
-# considers the connection healthy even before we map specific paths.
 @router.api_route("/ingest/acurite/{full_path:path}",
                   methods=["GET","POST","PUT","PATCH","DELETE","HEAD"])
-async def capture_acurite(request: Request, full_path: str = "") -> PlainTextResponse:
+async def capture_acurite(
+    request: Request,
+    full_path: str = "",
+    authorization: Annotated[str | None, Header()] = None,
+    t: str | None = None,
+) -> PlainTextResponse:
+    _require_capture_token(authorization, t)
     await _capture(request, "acurite-atlas", full_path)
     return PlainTextResponse("OK", status_code=200)

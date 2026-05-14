@@ -224,10 +224,15 @@ def _forward(observation: dict) -> None:
     def _send():
         try:
             import urllib.request
+            # Token via Authorization header (not URL path) so it doesn't
+            # land in proxy / access logs.
             req = urllib.request.Request(
-                f"{BACKEND_URL}/ingest/custom/{INGEST_TOKEN}",
+                f"{BACKEND_URL}/ingest/custom",
                 data=json.dumps(observation).encode(),
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {INGEST_TOKEN}",
+                },
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=FORWARD_TIMEOUT) as resp:

@@ -1,3 +1,4 @@
+import html as _html
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -25,17 +26,27 @@ log = logging.getLogger("api")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db()
-    client = AmbientWeatherClient(settings.aw_application_key, settings.aw_api_key)
-    poller = Poller(client)
-    await poller.start()
+    app.state.started_at = time.time()
+    # AmbientWeather poller only starts when both keys are set. AcuRite-only
+    # deploys leave them unset and rely entirely on /ingest/custom.
+    client = None
+    poller = None
+    if settings.aw_configured:
+        client = AmbientWeatherClient(settings.aw_application_key,  # type: ignore[arg-type]
+                                      settings.aw_api_key)          # type: ignore[arg-type]
+        poller = Poller(client)
+        await poller.start()
+        log.info("AmbientWeather poller started")
+    else:
+        log.info("AmbientWeather keys not set — poller disabled "
+                 "(custom ingest endpoints are still active)")
     app.state.client = client
     app.state.poller = poller
-    app.state.started_at = time.time()
     try:
         yield
     finally:
-        await poller.stop()
-        await client.aclose()
+        if poller is not None: await poller.stop()
+        if client is not None: await client.aclose()
 
 
 app = FastAPI(title="zasder weather", lifespan=lifespan)
@@ -98,10 +109,16 @@ def _humanize_age(seconds: float) -> str:
 
 def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float) -> str:
     started = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    # Escape every operator/source-supplied value before interpolating.
+    # device.name and device.location flow in through /ingest/custom from
+    # whoever is running the relay; the page is public so we can't trust them.
+    # last_seen_class is internally-controlled (whitelisted strings) so it
+    # doesn't need escaping.
+    def esc(s: object) -> str: return _html.escape(str(s), quote=True)
     rows_html = "\n".join(
-        f'<tr><td>{r["name"]}</td><td class="muted">{r["location"]}</td>'
-        f'<td class="mono">{r["mac"]}</td><td class="num">{r["count"]:,}</td>'
-        f'<td class="age {r["last_seen_class"]}">{r["last_seen"]}</td></tr>'
+        f'<tr><td>{esc(r["name"])}</td><td class="muted">{esc(r["location"])}</td>'
+        f'<td class="mono">{esc(r["mac"])}</td><td class="num">{r["count"]:,}</td>'
+        f'<td class="age {r["last_seen_class"]}">{esc(r["last_seen"])}</td></tr>'
         for r in rows
     ) or '<tr><td colspan="5" class="muted">No devices yet — waiting for first poll.</td></tr>'
     days = int(uptime_s // 86400)

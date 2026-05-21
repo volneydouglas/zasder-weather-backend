@@ -46,6 +46,23 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_obs_mac_date
     ON observations (mac, dateutc_ms DESC);
+
+-- "discoveries" = the long-tail of RF devices the SDR happens to hear that
+-- aren't our configured sensors: neighbors' weather stations, TPMS from
+-- passing cars, garage remotes, utility meters, etc. Useful for "what's
+-- around me?" surveys without polluting the main observations table.
+CREATE TABLE IF NOT EXISTS discoveries (
+    model         TEXT NOT NULL,
+    sensor_id     TEXT NOT NULL,
+    first_seen_ms INTEGER NOT NULL,
+    last_seen_ms  INTEGER NOT NULL,
+    seen_count    INTEGER NOT NULL DEFAULT 1,
+    sample_json   TEXT,
+    PRIMARY KEY (model, sensor_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discoveries_last_seen
+    ON discoveries (last_seen_ms DESC);
 """
 
 
@@ -184,20 +201,209 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
     return json.loads(row["data_json"]) if row else None
 
 
+def _auto_bucket_ms(window_ms: int) -> int:
+    """Pick a bucket size so a chart of `window_ms` returns a tractable
+    number of points (~200-2000) without being capped by a row LIMIT.
+    Returns 0 = no bucketing (return raw rows)."""
+    span_h = window_ms / 3_600_000
+    if span_h <= 6:    return 0                  # raw — typical SDR rate gives ~1.3K/6h
+    if span_h <= 24:   return 60_000             # 1-min buckets → ≤1440 points
+    if span_h <= 72:   return 5 * 60_000         # 5-min  → ≤864 points
+    if span_h <= 168:  return 15 * 60_000        # 15-min → ≤672 points
+    return 60 * 60_000                           # 1-hour → ≤720 points for 30d
+
+
 async def history(
     mac: str, start_ms: int, end_ms: int, limit: int = 5000
 ) -> list[dict[str, Any]]:
+    """Time-series for a device. Auto-downsamples for windows > 6h so the
+    iOS app's 3d/7d charts don't get truncated by the row LIMIT.
+
+    For raw windows: returns the parsed data_json (full source) so the
+    Charts tab + Dashboard's recent-history both see identical shape.
+
+    For bucketed windows: returns synthesized rows with AVG()-aggregated
+    numeric fields and the bucket-midpoint timestamp. Same dict shape
+    the iOS app already reads — just no `_source` (not needed for charts).
+    """
+    bucket_ms = _auto_bucket_ms(end_ms - start_ms)
+    if bucket_ms == 0:
+        async with connect() as db:
+            rows = await (await db.execute(
+                """
+                SELECT data_json FROM observations
+                WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?
+                ORDER BY dateutc_ms ASC
+                LIMIT ?
+                """,
+                (mac, start_ms, end_ms, limit),
+            )).fetchall()
+        return [json.loads(r["data_json"]) for r in rows]
+
+    # Bucketed: GROUP BY (dateutc_ms / bucket_ms), AVG every numeric column.
+    # bucket_ms is computed by us (not user input) so f-string interpolation
+    # is safe here. The midpoint timestamp puts the point in the middle of
+    # the bucket, which is what most chart libraries expect.
+    half = bucket_ms // 2
+    sql = f"""
+        SELECT
+          (dateutc_ms / {bucket_ms}) * {bucket_ms} + {half} AS dateutc,
+          AVG(tempf)          AS tempf,
+          AVG(feels_like)     AS feelsLike,
+          AVG(dew_point)      AS dewPoint,
+          AVG(humidity)       AS humidity,
+          AVG(tempinf)        AS tempinf,
+          AVG(humidityin)     AS humidityin,
+          AVG(baromrelin)     AS baromrelin,
+          AVG(baromabsin)     AS baromabsin,
+          AVG(windspeedmph)   AS windspeedmph,
+          AVG(windgustmph)    AS windgustmph,
+          MAX(maxdailygust)   AS maxdailygust,
+          AVG(winddir)        AS winddir,
+          AVG(hourlyrainin)   AS hourlyrainin,
+          AVG(eventrainin)    AS eventrainin,
+          AVG(dailyrainin)    AS dailyrainin,
+          AVG(weeklyrainin)   AS weeklyrainin,
+          AVG(monthlyrainin)  AS monthlyrainin,
+          AVG(yearlyrainin)   AS yearlyrainin,
+          AVG(uv)             AS uv,
+          AVG(solarradiation) AS solarradiation
+        FROM observations
+        WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?
+        GROUP BY dateutc_ms / {bucket_ms}
+        ORDER BY dateutc ASC
+        LIMIT ?
+    """
+    async with connect() as db:
+        rows = await (await db.execute(sql,
+            (mac, start_ms, end_ms, limit))).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def upsert_discovery(model: str, sensor_id: str,
+                           now_ms: int, sample: dict[str, Any]) -> None:
+    """Bump the seen-count + last_seen for a (model, sensor_id) we've heard
+    on the airwaves. Inserts a new row on first sighting with the full
+    payload as `sample_json` (for "what does this device look like?"
+    inspection). Subsequent sightings only update counters; the sample
+    stays as captured the first time."""
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO discoveries (model, sensor_id, first_seen_ms,
+                                     last_seen_ms, seen_count, sample_json)
+            VALUES (?, ?, ?, ?, 1, ?)
+            ON CONFLICT(model, sensor_id) DO UPDATE SET
+                last_seen_ms = excluded.last_seen_ms,
+                seen_count   = seen_count + 1
+            """,
+            (model, sensor_id, now_ms, now_ms, json.dumps(sample)),
+        )
+        await db.commit()
+
+
+async def list_discoveries(since_ms: int | None = None,
+                           limit: int = 500) -> list[dict[str, Any]]:
+    """Latest-seen-first list of distinct RF devices we've decoded."""
+    where = "WHERE last_seen_ms >= ? " if since_ms else ""
+    params: tuple = (since_ms, limit) if since_ms else (limit,)
     async with connect() as db:
         rows = await (await db.execute(
-            """
-            SELECT data_json FROM observations
-            WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?
-            ORDER BY dateutc_ms ASC
+            f"""
+            SELECT model, sensor_id, first_seen_ms, last_seen_ms,
+                   seen_count, sample_json
+            FROM discoveries
+            {where}
+            ORDER BY last_seen_ms DESC
             LIMIT ?
             """,
-            (mac, start_ms, end_ms, limit),
+            params,
         )).fetchall()
-    return [json.loads(r["data_json"]) for r in rows]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        sample = None
+        if r["sample_json"]:
+            try: sample = json.loads(r["sample_json"])
+            except json.JSONDecodeError: pass
+        out.append({
+            "model": r["model"],
+            "id": r["sensor_id"],
+            "first_seen_ms": r["first_seen_ms"],
+            "last_seen_ms": r["last_seen_ms"],
+            "seen_count": r["seen_count"],
+            "sample": sample,
+        })
+    return out
+
+
+async def yearly_rain_at_or_before(mac: str, cutoff_ms: int) -> float | None:
+    """Most recent yearlyrainin value for `mac` at or before `cutoff_ms`.
+    Falls back to the earliest yearlyrainin we have on file if no row sits
+    before the cutoff — so a freshly-deployed SDR sensor still gets sensible
+    daily/weekly/monthly rollups (treated as "rain since start of monitoring"
+    until our data span covers the full period). Returns None only if the
+    device has zero yearlyrainin observations at all."""
+    async with connect() as db:
+        row = await (await db.execute(
+            """
+            SELECT yearlyrainin FROM observations
+            WHERE mac = ? AND dateutc_ms <= ? AND yearlyrainin IS NOT NULL
+            ORDER BY dateutc_ms DESC LIMIT 1
+            """,
+            (mac, cutoff_ms),
+        )).fetchone()
+        if row:
+            return row["yearlyrainin"]
+        # Fallback — first-ever value for the device.
+        row = await (await db.execute(
+            """
+            SELECT yearlyrainin FROM observations
+            WHERE mac = ? AND yearlyrainin IS NOT NULL
+            ORDER BY dateutc_ms ASC LIMIT 1
+            """,
+            (mac,),
+        )).fetchone()
+    return row["yearlyrainin"] if row else None
+
+
+async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None]:
+    """Compute hourly/daily/weekly/monthly rain by differencing the current
+    yearlyrainin against historical yearlyrainin at the start of each period
+    boundary (in local time per `tz_name`). Returns None for any period we
+    can't compute (no qualifying row before the boundary). Clamps negatives
+    to 0 to handle counter resets / calibration changes."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT yearlyrainin FROM observations WHERE mac = ? "
+            "AND yearlyrainin IS NOT NULL ORDER BY dateutc_ms DESC LIMIT 1",
+            (mac,),
+        )).fetchone()
+    if not row or row["yearlyrainin"] is None:
+        return {"hourly_in": None, "daily_in": None,
+                "weekly_in": None, "monthly_in": None}
+    current = float(row["yearlyrainin"])
+    now_local = datetime.now(tz=tz)
+    top_of_hour    = now_local.replace(minute=0, second=0, microsecond=0)
+    start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    # US-meteorology convention: weeks start Sunday. Python's weekday():
+    # Mon=0..Sun=6 → days since Sunday = (weekday + 1) % 7.
+    start_of_week  = start_of_today - timedelta(days=(now_local.weekday() + 1) % 7)
+    start_of_month = start_of_today.replace(day=1)
+    out: dict[str, float | None] = {}
+    for name, boundary in (("hourly_in", top_of_hour),
+                            ("daily_in", start_of_today),
+                            ("weekly_in", start_of_week),
+                            ("monthly_in", start_of_month)):
+        boundary_ms = int(boundary.timestamp() * 1000)
+        prior = await yearly_rain_at_or_before(mac, boundary_ms)
+        out[name] = None if prior is None else round(max(0.0, current - prior), 3)
+    return out
 
 
 async def aggregate(

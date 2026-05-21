@@ -48,6 +48,7 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     expects (same keys as AmbientWeather's REST response)."""
     dev = normalized.get("device") or {}
     out = normalized.get("outdoor") or {}
+    ind = normalized.get("indoor") or {}
     wind = normalized.get("wind") or {}
     rain = normalized.get("rain") or {}
     press = normalized.get("pressure") or {}
@@ -66,26 +67,33 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     except (ValueError, TypeError):
         return None
 
+    # Indoor block is optional — historically the AcuRite hub-relay never
+    # had access to indoor data (the hub sensor was elsewhere). The SDR path
+    # using a paired indoor sensor (Fineoffset-WH32B, etc.) sends it here.
+    # Pressure is unusual — it physically comes from indoors (the console)
+    # but is logically reported as "outdoor barometric"; accept it from
+    # either place.
+    rel_inhg = press.get("relative_inhg") or ind.get("pressure_inhg")
     return {
         "dateutc":        dateutc_ms,
         "tempf":          out.get("tempf"),
         "feelsLike":      out.get("feels_like"),
         "dewPoint":       out.get("dew_point_f"),
         "humidity":       out.get("humidity"),
-        "tempinf":        None,
-        "humidityin":     None,
-        "baromrelin":     press.get("relative_inhg"),
-        "baromabsin":     press.get("relative_inhg"),  # ingest sources rarely split
+        "tempinf":        ind.get("tempf"),
+        "humidityin":     ind.get("humidity"),
+        "baromrelin":     rel_inhg,
+        "baromabsin":     rel_inhg,  # ingest sources rarely split
         "windspeedmph":   wind.get("speed_mph"),
         "windgustmph":    wind.get("gust_mph"),
         "maxdailygust":   wind.get("gust_mph"),  # best-effort; relays don't track daily peak
         "winddir":        wind.get("direction"),
         "hourlyrainin":   rain.get("hourly_in"),
-        "eventrainin":    None,
+        "eventrainin":    rain.get("event_in"),
         "dailyrainin":    rain.get("daily_in"),
-        "weeklyrainin":   None,
-        "monthlyrainin":  None,
-        "yearlyrainin":   None,
+        "weeklyrainin":   rain.get("weekly_in"),
+        "monthlyrainin":  rain.get("monthly_in"),
+        "yearlyrainin":   rain.get("yearly_in"),
         "uv":             out.get("uv"),
         "solarradiation": out.get("solar_wm2"),
     }

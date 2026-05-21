@@ -1,0 +1,73 @@
+services:
+  sdr-relay:
+    build: .
+    container_name: sdr-relay
+    restart: unless-stopped
+    # USB pass-through. The two RTL-SDR dongles are reached via the
+    # bus directory; both ends of each USB ID need to be available so
+    # rtl_433 can claim them. --device=/dev/bus/usb is the standard
+    # approach for SDR containers and works on the Pi.
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    volumes:
+      # Persists rain calibration state (sensor counter offsets) across
+      # container restarts so we don't re-baseline on every redeploy.
+      - ./data:/data
+    environment:
+      BACKEND_URL: ${BACKEND_URL:-}
+      INGEST_TOKEN: ${INGEST_TOKEN:-}
+      # AcuRite Atlas (433 MHz). Set ATLAS_ID=0 to disable.
+      ATLAS_ID: ${ATLAS_ID:-0}
+      ATLAS_NAME: ${ATLAS_NAME:-AcuRite Atlas (SDR)}
+      ATLAS_LOCATION: ${ATLAS_LOCATION:-}
+      ATLAS_SERIAL: ${ATLAS_SERIAL:-acurite433}
+      ATLAS_POST_INTERVAL: ${ATLAS_POST_INTERVAL:-60}
+      # Set to 1 if your Atlas's UV/lux sensor is reporting stuck values
+      # (common AcuRite hardware failure — sensor reports a constant
+      # value forever even at night). Masks both fields as None.
+      ATLAS_UV_LUX_BROKEN: ${ATLAS_UV_LUX_BROKEN:-0}
+      # Optional LaCrosse-TH2 sensor (433 MHz, temp+humidity only).
+      # rtl_433 calls it "LaCrosse-TH2". Set LACROSSE_ID=0 to skip.
+      LACROSSE_ID: ${LACROSSE_ID:-0}
+      LACROSSE_NAME: ${LACROSSE_NAME:-LaCrosse (SDR)}
+      LACROSSE_LOCATION: ${LACROSSE_LOCATION:-}
+      # Atlas yearly-rain calibration baseline (inches). Set to the value
+      # your prior data source (AWN, hub, etc.) reports for yearlyrainin
+      # at deploy time. Leave at 0 to skip yearly rain posting.
+      ATLAS_RAIN_YEARLY_BASELINE_IN: ${ATLAS_RAIN_YEARLY_BASELINE_IN:-0}
+      # Fine Offset / WS-2000 family on 915 MHz. WH24_ID=0 disables outdoor.
+      WH24_ID: ${WH24_ID:-0}
+      WH32B_ID: ${WH32B_ID:-0}
+      WS2000_NAME: ${WS2000_NAME:-WS-2000 (SDR)}
+      WS2000_LOCATION: ${WS2000_LOCATION:-}
+      WS2000_SERIAL: ${WS2000_SERIAL:-ws2000}
+      # WS-2000 yearly-rain calibration baseline (inches). Same idea as
+      # ATLAS_RAIN_YEARLY_BASELINE_IN. Leave at 0 to skip.
+      WS2000_RAIN_YEARLY_BASELINE_IN: ${WS2000_RAIN_YEARLY_BASELINE_IN:-0}
+      # Reject any single-packet rain delta exceeding this many inches as
+      # spurious. See .env.example for details. Set to 0 to disable.
+      MAX_RAIN_DELTA_IN: ${MAX_RAIN_DELTA_IN:-5.0}
+      # Discovery survey of nearby RF devices. State lives locally at
+      # /data/discoveries.json (privacy-respecting default — neighbors'
+      # RF traffic doesn't leave the LAN). Set DISCOVERY_FORWARD_TO_BACKEND=1
+      # to ALSO post sightings to the backend (rate-limited) if you want
+      # the survey queryable from anywhere on a single-tenant deployment.
+      DISCOVERY_ENABLED: ${DISCOVERY_ENABLED:-1}
+      DISCOVERY_FORWARD_TO_BACKEND: ${DISCOVERY_FORWARD_TO_BACKEND:-0}
+      DISCOVERY_RATE_LIMIT_S: ${DISCOVERY_RATE_LIMIT_S:-60}
+      # Water meter visualization moved to the sibling water-meter-watch/
+      # project — see ../water-meter-watch/ for the dashboard and
+      # display calibration env vars.
+      # Neptune R900 water meters. Empty = forward every R900 we hear
+      # (useful for first-time identification: see which one's consumption
+      # counter jumps when you run a hose). Set to a comma-separated list
+      # of IDs once you know which is yours.
+      WATER_METER_IDS: ${WATER_METER_IDS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      # Lightweight liveness: the wrapper process must be alive.
+      test: ["CMD", "pgrep", "-f", "sdr_relay.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

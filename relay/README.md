@@ -1,4 +1,12 @@
-# Acurite (and friends) relay
+# AcuRite hub relay (legacy)
+
+> [!WARNING]
+> **Prefer the [SDR relay](../sdr-relay/) instead of this one for new
+> deployments.** AcuRite has been progressively shutting down their
+> cloud services. This relay depends on the hub still uploading to
+> `atlasapi.myacurite.com` and on AcuRite firmware behavior, both of
+> which can change without notice. The SDR path captures the sensor's
+> RF broadcasts directly and is independent of any vendor cloud.
 
 A tiny Docker container that lets a local-network weather station with
 firmware that can't reach a modern cloud (TLS 1.1, hardcoded hostnames,

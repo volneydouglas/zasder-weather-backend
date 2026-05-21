@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     database_path: str = "./data/weather.db"
     forecast_lat: float | None = None
     forecast_lon: float | None = None
+    # IANA timezone for daily/hourly/weekly/monthly rain rollups. Defaults to
+    # UTC so the public template works anywhere; personal deploys set it to
+    # their actual local zone (e.g., "America/Phoenix") so "today's rain"
+    # means today in the user's wall-clock sense, not UTC's.
+    timezone: str = "UTC"
 
     @property
     def valid_api_tokens(self) -> set[str]:

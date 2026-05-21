@@ -8,12 +8,16 @@ from typing import Annotated
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 from . import db
 from .ambient_client import AmbientWeatherClient
 from .capture import router as capture_router
 from .config import settings
+from .discovery import router as discovery_router
 from .ingest import router as ingest_router
+from .meter import router as meter_router
 from .poller import Poller
 
 logging.basicConfig(
@@ -51,7 +55,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="zasder weather", lifespan=lifespan)
 app.include_router(capture_router)
+app.include_router(discovery_router)
 app.include_router(ingest_router)
+app.include_router(meter_router)
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 
 def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
@@ -77,6 +84,11 @@ async def status_page() -> HTMLResponse:
     now_ms = int(time.time() * 1000)
     rows = []
     total_obs = 0
+    # Find the freshest non-null tempf across all devices for the sanity-check
+    # tile. "Freshest" = highest dateutc_ms in the observations table, scoped
+    # to rows that actually have a tempf value (a few SDR-coalesced posts can
+    # land without it if the message-type cycle hasn't seen temp yet).
+    latest_temp: dict | None = None
     for d in devices:
         n = await db.observation_count(d["mac"])
         total_obs += n
@@ -87,6 +99,16 @@ async def status_page() -> HTMLResponse:
             age = (now_ms - last_seen_ms) / 1000
             last_seen_label = _humanize_age(age)
             last_seen_class = "fresh" if age < 600 else ("warm" if age < 3600 else "stale")
+        # Latest observation may or may not include tempf — pick best.
+        obs = await db.latest_observation(d["mac"])
+        if obs and obs.get("tempf") is not None:
+            obs_ms = obs.get("dateutc")
+            if obs_ms and (latest_temp is None or obs_ms > latest_temp["ts_ms"]):
+                latest_temp = {
+                    "tempf": float(obs["tempf"]),
+                    "ts_ms": obs_ms,
+                    "device": d.get("name") or d["mac"],
+                }
         rows.append({
             "name": d.get("name") or d["mac"],
             "location": d.get("location") or "—",
@@ -97,7 +119,7 @@ async def status_page() -> HTMLResponse:
         })
 
     uptime = time.time() - getattr(app.state, "started_at", time.time())
-    return HTMLResponse(_render_status_html(rows, total_obs, uptime))
+    return HTMLResponse(_render_status_html(rows, total_obs, uptime, latest_temp, now_ms))
 
 
 def _humanize_age(seconds: float) -> str:
@@ -107,7 +129,9 @@ def _humanize_age(seconds: float) -> str:
     return f"{int(seconds // 86400)}d ago"
 
 
-def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float) -> str:
+def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
+                        latest_temp: dict | None = None,
+                        now_ms: int | None = None) -> str:
     started = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
     # Escape every operator/source-supplied value before interpolating.
     # device.name and device.location flow in through /ingest/custom from
@@ -125,6 +149,16 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float) -> st
     hours = int((uptime_s % 86400) // 3600)
     mins = int((uptime_s % 3600) // 60)
     uptime_label = f"{days}d {hours}h {mins}m" if days else f"{hours}h {mins}m"
+    # Latest-temp tile contents. Renders "—" if no device has reported a
+    # tempf yet (fresh deploy, AcuRite-only with hub silent, etc.).
+    if latest_temp and now_ms:
+        temp_val_html = f'{latest_temp["tempf"]:.1f}°F'
+        age_s = max(0, (now_ms - latest_temp["ts_ms"]) / 1000)
+        temp_sub_html = (f'<div class="stat-sub">{esc(latest_temp["device"])} · '
+                        f'{esc(_humanize_age(age_s))}</div>')
+    else:
+        temp_val_html = "—"
+        temp_sub_html = '<div class="stat-sub muted">no readings yet</div>'
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -138,13 +172,18 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float) -> st
     .wrap {{ max-width: 720px; margin: 0 auto; }}
     h1 {{ font-size: 18px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.2px; }}
     .sub {{ font-size: 12px; color: rgba(255,255,255,0.55); margin-bottom: 24px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 24px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 24px; }}
     .stat {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
               border-radius: 10px; padding: 12px; }}
     .stat .k {{ font-size: 9px; font-weight: 800; letter-spacing: 1.2px;
                  color: rgba(255,255,255,0.55); text-transform: uppercase; }}
     .stat .v {{ font-size: 22px; font-weight: 300; margin-top: 4px;
                  font-variant-numeric: tabular-nums; }}
+    .stat-sub {{ font-size: 9px; color: rgba(255,255,255,0.45); margin-top: 4px;
+                  letter-spacing: 0.3px; }}
+    @media (max-width: 540px) {{
+      .grid {{ grid-template-columns: repeat(2, 1fr); }}
+    }}
     table {{ width: 100%; border-collapse: collapse; background: rgba(255,255,255,0.03);
               border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; overflow: hidden; }}
     th, td {{ text-align: left; padding: 10px 12px; font-size: 12px;
@@ -158,6 +197,19 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float) -> st
     .fresh {{ color: oklch(78% 0.14 145); }}
     .warm  {{ color: oklch(78% 0.14 70); }}
     .stale {{ color: oklch(70% 0.20 28); }}
+    .hero {{ margin-bottom: 24px; }}
+    .hero-shots {{ display: flex; gap: 16px; justify-content: center; margin-bottom: 16px; }}
+    .hero-shot {{ flex: 0 0 220px; }}
+    .hero-shot img {{ width: 100%; height: auto; display: block;
+                       border-radius: 28px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }}
+    .hero-shot .cap {{ font-size: 10px; color: rgba(255,255,255,0.45); margin-top: 8px;
+                        text-align: center; letter-spacing: 0.3px; }}
+    .hero-copy p {{ font-size: 13px; color: rgba(255,255,255,0.75); margin: 0 0 10px;
+                     max-width: 560px; margin-left: auto; margin-right: auto; text-align: center; }}
+    @media (max-width: 540px) {{
+      .hero-shots {{ flex-wrap: wrap; }}
+      .hero-shot {{ flex: 0 0 calc(50% - 8px); max-width: calc(50% - 8px); }}
+    }}
     footer {{ margin-top: 24px; font-size: 10px; color: rgba(255,255,255,0.35); }}
     a {{ color: oklch(70% 0.14 245); text-decoration: none; }}
   </style>
@@ -166,10 +218,27 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float) -> st
   <div class="wrap">
     <h1>Zasder Weather</h1>
     <div class="sub">Read-only status — no auth required. The iOS app reads protected endpoints under <code>/api</code>.</div>
+    <div class="hero">
+      <div class="hero-shots">
+        <div class="hero-shot">
+          <img src="/static/dashboard.png" alt="Zasder Weather iOS app — Dashboard tab showing current conditions, 24h temperature chart, and stat tiles" loading="lazy">
+          <div class="cap">Dashboard</div>
+        </div>
+        <div class="hero-shot">
+          <img src="/static/charts.png" alt="Zasder Weather iOS app — Charts tab showing temperature time series with selectable field and time-range pickers" loading="lazy">
+          <div class="cap">Charts</div>
+        </div>
+      </div>
+      <div class="hero-copy">
+        <p>A clean, dark, fast iOS app for personal weather stations. Bring your own backend (this one) and your station data is yours, end to end. No ads, no tracking, no subscriptions.</p>
+        <p>Supports AmbientWeather and AcuRite Atlas out of the box. Multi-device dashboard, history charts across six fields, threshold-based local alerts, and a 7-day Open-Meteo forecast.</p>
+      </div>
+    </div>
     <div class="grid">
       <div class="stat"><div class="k">Status</div><div class="v">Up</div></div>
       <div class="stat"><div class="k">Devices</div><div class="v">{len(rows)}</div></div>
       <div class="stat"><div class="k">Observations</div><div class="v">{total_obs:,}</div></div>
+      <div class="stat"><div class="k">Latest temp</div><div class="v">{temp_val_html}</div>{temp_sub_html}</div>
     </div>
     <table>
       <thead><tr><th>Device</th><th>Location</th><th>MAC</th><th>Rows</th><th>Last seen</th></tr></thead>
@@ -196,6 +265,26 @@ async def get_current(mac: str) -> JSONResponse:
     obs = await db.latest_observation(mac)
     if not obs:
         raise HTTPException(status_code=404, detail="no data for device")
+    # Rain rollup enrichment: if the source posts yearlyrainin (SDR path)
+    # but not the bucketed values (daily/hourly/etc.), compute them from
+    # historical yearlyrainin deltas at local-time period boundaries.
+    # AWN-sourced rows ship pre-computed rollups already and the conditional
+    # leaves those untouched.
+    if obs.get("yearlyrainin") is not None and any(
+        obs.get(k) is None for k in
+        ("dailyrainin", "hourlyrainin", "weeklyrainin", "monthlyrainin")
+    ):
+        try:
+            rollups = await db.rain_rollups(mac, settings.timezone)
+        except Exception as e:
+            log.warning("rain_rollups failed for %s: %s", mac, e)
+            rollups = {}
+        for k, v in (("dailyrainin",   rollups.get("daily_in")),
+                      ("hourlyrainin",  rollups.get("hourly_in")),
+                      ("weeklyrainin",  rollups.get("weekly_in")),
+                      ("monthlyrainin", rollups.get("monthly_in"))):
+            if obs.get(k) is None and v is not None:
+                obs[k] = v
     return JSONResponse(obs)
 
 

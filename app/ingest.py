@@ -31,11 +31,12 @@ don't lose source-specific bonus fields (lightning, hub battery, etc).
 from __future__ import annotations
 
 import json as _json
+import math
 import re
 import time
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Header, HTTPException, Path, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 
 from . import db
 from .config import settings
@@ -43,15 +44,40 @@ from .config import settings
 router = APIRouter()
 
 
+def _finite(v: Any) -> Any:
+    """Return v if it's a finite number, None if it's NaN/inf, pass-through
+    for anything that isn't a number. Stops upstream decoders from poisoning
+    stored observations with non-finite floats that crash JSONResponse on
+    the read path (`/api/devices/{mac}/current` raises ValueError otherwise)."""
+    if isinstance(v, bool):  # bools are int subclass — leave alone
+        return v
+    if isinstance(v, (int, float)):
+        try:
+            return v if math.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+    return v
+
+
+def _scrub_numbers(block: dict[str, Any] | None) -> dict[str, Any]:
+    """Filter all numeric values in a sub-block (outdoor/wind/etc.) through
+    _finite so non-finite values never reach the DB."""
+    if not block:
+        return {}
+    return {k: _finite(v) for k, v in block.items()}
+
+
 def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     """Map a normalized observation → the flat-field shape db.insert_observations
     expects (same keys as AmbientWeather's REST response)."""
     dev = normalized.get("device") or {}
-    out = normalized.get("outdoor") or {}
-    ind = normalized.get("indoor") or {}
-    wind = normalized.get("wind") or {}
-    rain = normalized.get("rain") or {}
-    press = normalized.get("pressure") or {}
+    # Filter NaN/inf out of every numeric sub-block at the boundary so non-
+    # finite values never reach the DB or downstream JSON serialization.
+    out = _scrub_numbers(normalized.get("outdoor"))
+    ind = _scrub_numbers(normalized.get("indoor"))
+    wind = _scrub_numbers(normalized.get("wind"))
+    rain = _scrub_numbers(normalized.get("rain"))
+    press = _scrub_numbers(normalized.get("pressure"))
 
     ts_iso = normalized.get("timestamp_utc")
     if not ts_iso:
@@ -165,7 +191,21 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     return {"ok": True, "mac": mac, "inserted": inserted, "ts_ms": flat["dateutc"]}
 
 
-# Preferred: token in header so it never appears in proxy/access logs.
+async def _parse_json_body(request: Request) -> Any:
+    """Parse a request body as JSON, returning a 400 on malformed input
+    instead of letting FastAPI surface it as a 500. Also rejects Python's
+    non-standard NaN/Infinity literals that some decoders emit, since
+    they'd serialize back to non-JSON-compliant numbers downstream."""
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty body")
+    try:
+        return _json.loads(body, parse_constant=lambda _: None)
+    except _json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {e.msg}")
+
+
+# Token in header so it never appears in proxy/access logs.
 @router.post("/ingest/custom")
 async def ingest_custom_header(
     request: Request,
@@ -173,40 +213,8 @@ async def ingest_custom_header(
     x_ingest_token: Annotated[str | None, Header(alias="X-Ingest-Token")] = None,
 ) -> dict[str, Any]:
     _require_ingest_token(_token_from_header(authorization, x_ingest_token))
-    return await _do_ingest(await request.json())
+    return await _do_ingest(await _parse_json_body(request))
 
-
-# Backwards-compat: token in path. Still accepted for older relay deploys
-# but the token will leak into access logs. Migrate clients to the header
-# form when convenient.
-@router.post("/ingest/custom/{token}")
-async def ingest_custom(token: Annotated[str, Path()], request: Request) -> dict[str, Any]:
-    _require_ingest_token(token)
-    payload = await request.json()
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="payload must be a JSON object")
-
-    dev = payload.get("device") or {}
-    raw_id = dev.get("id") or ""
-    mac = _format_mac(str(raw_id))
-    if not mac:
-        raise HTTPException(status_code=400, detail="device.id required")
-
-    flat = _flatten(payload)
-    if not flat:
-        raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
-
-    # Upsert the device row so /api/devices includes this source.
-    name, location = _device_label(payload)
-    info = {
-        "name": name,
-        "info": {"name": name, "location": location, "source": payload.get("source")},
-        "lastData": flat,
-    }
-    await db.upsert_device(mac, info)
-
-    # Insert the observation. Stash the full normalized payload as data_json
-    # so we don't lose source-specific bonus fields (lightning, hub battery).
-    inserted = await db.insert_observations(mac, [{**flat, "_source": payload}])
-
-    return {"ok": True, "mac": mac, "inserted": inserted, "ts_ms": flat["dateutc"]}
+# (Legacy path-form `/ingest/custom/{token}` was removed 2026-05-21. The
+# only consumer was the retired hub-relay container; tokens in URLs leak
+# to proxy/access logs. Use the header form above for all new ingest.)

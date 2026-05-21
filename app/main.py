@@ -1,15 +1,17 @@
 import html as _html
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import db
 from .ambient_client import AmbientWeatherClient
@@ -53,12 +55,78 @@ async def lifespan(app: FastAPI):
         if client is not None: await client.aclose()
 
 
-app = FastAPI(title="zasder weather", lifespan=lifespan)
+# /docs, /redoc, /openapi.json are exposed by default in FastAPI and
+# advertise the shapes of every route — including /ingest/* and
+# /ingest/capture/* — to anyone who can hit the URL. They also load
+# CDN scripts (Swagger UI), which exacerbates the missing CSP. Disable
+# in production; set DEBUG=1 (or any truthy value) to re-enable for
+# local development.
+_DEBUG = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes")
+app = FastAPI(
+    title="zasder weather",
+    lifespan=lifespan,
+    docs_url="/docs" if _DEBUG else None,
+    redoc_url="/redoc" if _DEBUG else None,
+    openapi_url="/openapi.json" if _DEBUG else None,
+)
 app.include_router(capture_router)
 app.include_router(discovery_router)
 app.include_router(ingest_router)
 app.include_router(meter_router)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+
+
+# ───────────────────────── security middleware ─────────────────────────
+# Two layers of hardening recommended by an external code review:
+#   1. TrustedHostMiddleware — reject requests whose Host header doesn't
+#      match an allow-list. Defends against Host-header poisoning if we
+#      ever generate absolute URLs from request.url (we don't today; this
+#      is belt-and-suspenders). Allow list is configurable via
+#      ALLOWED_HOSTS env var (comma-separated). Defaults to "*" (accept
+#      anything) so the public template works out-of-box; set this in
+#      Fly secrets for production deploys (e.g.
+#      ALLOWED_HOSTS="weather.example.com,*.fly.dev").
+#   2. Browser security headers — CSP, HSTS, X-Content-Type-Options,
+#      X-Frame-Options, Referrer-Policy. Especially important on the
+#      public HTML status page; documents loading CDN scripts (Swagger UI
+#      in DEBUG mode) need a CSP that allows them.
+
+_allowed_raw = os.environ.get("ALLOWED_HOSTS", "*").strip()
+_ALLOWED_HOSTS = [h.strip() for h in _allowed_raw.split(",") if h.strip()] or ["*"]
+if _ALLOWED_HOSTS != ["*"]:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Add a baseline set of browser security headers to every response.
+    These mostly matter for HTML responses (the /status page and FastAPI's
+    /docs when DEBUG=1) but cost nothing to set on JSON responses too."""
+    response = await call_next(request)
+    # Conservative CSP — page renders inline styles + same-origin images.
+    # When DEBUG=1 and /docs is enabled, Swagger UI also needs cdn.jsdelivr.net
+    # for its script and style assets; we allow that selectively.
+    if _DEBUG:
+        csp = ("default-src 'self'; "
+               "img-src 'self' data:; "
+               "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+               "script-src 'self' https://cdn.jsdelivr.net; "
+               "connect-src 'self'; frame-ancestors 'none'")
+    else:
+        csp = ("default-src 'self'; "
+               "img-src 'self' data:; "
+               "style-src 'self' 'unsafe-inline'; "
+               "script-src 'self'; "
+               "connect-src 'self'; frame-ancestors 'none'")
+    response.headers.setdefault("Content-Security-Policy", csp)
+    response.headers.setdefault("Strict-Transport-Security",
+                                 "max-age=63072000; includeSubDomains")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy",
+                                 "geolocation=(), microphone=(), camera=()")
+    return response
 
 
 def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
@@ -315,6 +383,8 @@ async def get_summary(
     return JSONResponse(agg)
 
 
+from typing import Any  # noqa: E402
+
 @app.get("/api/captures/{slug}", dependencies=[Depends(require_token)])
 async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSONResponse:
     """Read recent capture-endpoint hits for a slug. Token-gated so random
@@ -326,8 +396,17 @@ async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSO
     import json as _json
     with path.open("r", encoding="utf-8") as f:
         lines = f.readlines()
-    rows = [_json.loads(l) for l in lines[-tail:]]
-    return JSONResponse({"slug": slug, "count": len(rows), "rows": rows})
+    # Tolerate corrupt/partial JSONL — older log lines from a crashed
+    # write can have a truncated trailing line. Skip rather than 500.
+    rows: list[dict] = []
+    skipped = 0
+    for line in lines[-tail:]:
+        try: rows.append(_json.loads(line))
+        except _json.JSONDecodeError: skipped += 1
+    out: dict[str, Any] = {"slug": slug, "count": len(rows), "rows": rows}
+    if skipped:
+        out["skipped_malformed"] = skipped
+    return JSONResponse(out)
 
 
 @app.get("/api/forecast", dependencies=[Depends(require_token)])

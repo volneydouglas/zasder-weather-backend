@@ -53,6 +53,19 @@ def _require_capture_token(authorization: str | None, query_token: str | None) -
         raise HTTPException(status_code=404, detail="not found")
 
 
+# Headers + query-params we redact before writing to the JSONL log so the
+# capture token doesn't end up in plaintext where anyone with the API token
+# could read it back via /api/captures/{slug}.
+_REDACT_HEADERS = {"authorization", "cookie", "x-capture-token", "proxy-authorization"}
+_REDACT_QUERY   = {"t", "token", "api_key", "apikey", "auth"}
+
+
+def _redact_dict(d: dict[str, Any], drop_keys: set[str]) -> dict[str, Any]:
+    """Return a copy of `d` with any keys in drop_keys (case-insensitive)
+    replaced by the literal string "<redacted>"."""
+    return {k: ("<redacted>" if k.lower() in drop_keys else v) for k, v in d.items()}
+
+
 async def _capture(request: Request, slug: str, full_path: str) -> dict[str, Any]:
     # Refuse oversized payloads early — both via Content-Length and by
     # enforcing the max during read. A misbehaving station can't fill the
@@ -78,8 +91,10 @@ async def _capture(request: Request, slug: str, full_path: str) -> dict[str, Any
         "slug":   slug,
         "method": request.method,
         "path":   "/" + full_path,
-        "query":  dict(request.query_params),
-        "headers": dict(request.headers),
+        # Redact bearer tokens / capture-token query params so the JSONL log
+        # doesn't store secrets that would be re-emitted by /api/captures.
+        "query":  _redact_dict(dict(request.query_params), _REDACT_QUERY),
+        "headers": _redact_dict(dict(request.headers), _REDACT_HEADERS),
         "remote": request.client.host if request.client else None,
         "body":   body_text,
         "body_len": len(body_bytes),

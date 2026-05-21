@@ -62,20 +62,66 @@ def test_ingest_header_no_auth_rejected(client):
     r = client.post("/ingest/custom", json=_good_obs())
     assert r.status_code == 401
 
-def test_ingest_path_form_still_works(client):
-    """Backwards compat: token-in-URL form remains accepted for older relays."""
+def test_ingest_path_form_removed(client):
+    """The legacy /ingest/custom/{token} URL form was removed 2026-05-21
+    (tokens in URLs leak into proxy logs). The route should 404 now,
+    NOT auth-check against the token in the path."""
     r = client.post("/ingest/custom/test-ingest-token", json=_good_obs())
-    assert r.status_code == 200
-
-def test_ingest_path_form_rejects_bad_token(client):
-    r = client.post("/ingest/custom/wrong", json=_good_obs())
-    assert r.status_code == 401
+    assert r.status_code == 404
+    r = client.post("/ingest/custom/anything-at-all", json=_good_obs())
+    assert r.status_code == 404
 
 def test_ingest_rejects_missing_timestamp(client):
     bad = _good_obs(); bad.pop("timestamp_utc")
     r = client.post("/ingest/custom",
                     headers={"Authorization": "Bearer test-ingest-token"},
                     json=bad)
+    assert r.status_code == 400
+
+
+# ───────────────── P1: non-finite floats must not poison observations ─────────────────
+
+def test_ingest_strips_nan_floats_to_none(client):
+    """A flaky decoder occasionally emits NaN/inf. If we store those, the
+    /current read path 500s on JSON serialization. Backend must coerce
+    non-finite values to None at the boundary."""
+    # Python's json.dumps with allow_nan=True (the default) emits literal
+    # NaN, which TestClient happily sends. We send NaN via a raw JSON body
+    # to bypass any client-side validation.
+    raw_body = (
+        '{"device":{"id":"AABBCCDDEEFF"},'
+        '"timestamp_utc":"2026-05-21T12:00:00Z",'
+        '"outdoor":{"tempf":NaN,"humidity":50,"feels_like":Infinity},'
+        '"source":"test"}'
+    )
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token",
+                             "Content-Type": "application/json"},
+                    content=raw_body)
+    assert r.status_code == 200, r.text
+    # Read path must succeed (NOT 500) — values stored as None, not NaN
+    cur = client.get("/api/devices/AA:BB:CC:DD:EE:FF/current",
+                     headers={"Authorization": "Bearer test-api-token"})
+    assert cur.status_code == 200
+    obs = cur.json()
+    assert obs["tempf"] is None  # NaN was coerced
+    assert obs["feelsLike"] is None  # Infinity was coerced
+    assert obs["humidity"] == 50  # well-formed numbers pass through
+
+def test_ingest_rejects_malformed_json(client):
+    """Bad JSON should 400, not 500. Reproduces the reviewer's case."""
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token",
+                             "Content-Type": "application/json"},
+                    content='{bad')
+    assert r.status_code == 400
+    assert "invalid JSON" in r.json()["detail"].lower() or "invalid" in r.json()["detail"].lower()
+
+def test_ingest_rejects_empty_body(client):
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token",
+                             "Content-Type": "application/json"},
+                    content="")
     assert r.status_code == 400
 
 
@@ -133,6 +179,81 @@ def test_meter_requires_ingest_token(client):
 def test_meter_recent_requires_api_token(client):
     r = client.get("/api/meters/123/recent")
     assert r.status_code == 401
+
+
+# ───────────────── PR2: security headers + malformed input handling ─────────────────
+
+def test_security_headers_present_on_status(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    for h in ("Content-Security-Policy", "Strict-Transport-Security",
+              "X-Content-Type-Options", "X-Frame-Options",
+              "Referrer-Policy", "Permissions-Policy"):
+        assert h in r.headers, f"missing security header: {h}"
+    assert r.headers["X-Content-Type-Options"] == "nosniff"
+    assert r.headers["X-Frame-Options"] == "DENY"
+
+def test_security_headers_present_on_api(client):
+    """Security headers apply to JSON responses too, not just HTML."""
+    r = client.get("/api/devices",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert "Content-Security-Policy" in r.headers
+    assert "X-Content-Type-Options" in r.headers
+
+def test_docs_disabled_in_production(client):
+    """/docs, /redoc, and /openapi.json should 404 unless DEBUG=1 is set
+    (test env doesn't set DEBUG, so they should be off)."""
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        r = client.get(path)
+        assert r.status_code == 404, f"{path} should be disabled in prod"
+
+def test_discovery_rejects_malformed_json(client):
+    r = client.post("/ingest/discovery",
+                    headers={"Authorization": "Bearer test-ingest-token",
+                             "Content-Type": "application/json"},
+                    content='{bad')
+    assert r.status_code == 400
+
+def test_meter_rejects_malformed_json(client):
+    r = client.post("/ingest/meter",
+                    headers={"Authorization": "Bearer test-ingest-token",
+                             "Content-Type": "application/json"},
+                    content='not json')
+    assert r.status_code == 400
+
+def test_aw_configured_rejects_placeholder_values(monkeypatch, temp_env):
+    """`aw_configured` should be False for the literal placeholder string
+    from .env.example. Otherwise a fresh deploy with the unedited template
+    would start the AWN poller against bogus creds."""
+    monkeypatch.setenv("AW_APPLICATION_KEY", "replace-with-application-key")
+    monkeypatch.setenv("AW_API_KEY", "replace-with-api-key")
+    # Re-import config so it picks up the env we just set
+    import importlib
+    from app import config as cfg_mod
+    importlib.reload(cfg_mod)
+    assert cfg_mod.settings.aw_configured is False
+
+def test_captures_tolerates_malformed_jsonl(client, temp_env):
+    """A truncated trailing line in the capture log should be skipped,
+    not crash the read endpoint."""
+    # Post a real capture so the file exists
+    client.post("/ingest/capture/malformed-test",
+                headers={"Authorization": "Bearer test-capture-token"},
+                data="real-capture")
+    # Now append a malformed line directly to the JSONL
+    from app.capture import _log_path
+    p = _log_path("malformed-test")
+    with p.open("a") as f:
+        f.write("{this is not valid json\n")
+        f.write('{"valid": "yes"}\n')
+    r = client.get("/api/captures/malformed-test",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    body = r.json()
+    # Got 2 valid rows (the original capture + the synthetic valid one);
+    # 1 malformed row was reported as skipped.
+    assert body["count"] == 2
+    assert body.get("skipped_malformed") == 1
 
 
 # ─────────────────── discoveries (long-tail RF survey) ───────────────────
@@ -366,6 +487,29 @@ def test_capture_with_bearer_accepted(client):
                     headers={"Authorization": "Bearer test-capture-token"},
                     data="hello")
     assert r.status_code == 200
+
+def test_capture_redacts_token_from_logs(client):
+    """The capture token (both Authorization header and ?t= query param)
+    must NOT end up in the JSONL log readable via /api/captures."""
+    # Post via Authorization header
+    client.post("/ingest/capture/redact-test",
+                headers={"Authorization": "Bearer test-capture-token",
+                         "X-Capture-Token": "should-also-be-redacted",
+                         "Cookie": "session=secret-value"},
+                data="hello-header")
+    # Post via ?t= query
+    client.post("/ingest/capture/redact-test?t=test-capture-token&token=also-secret",
+                data="hello-query")
+    r = client.get("/api/captures/redact-test",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    body = r.text  # raw string scan so we catch ANY occurrence
+    # The token MUST NOT be present anywhere in the captured records
+    assert "test-capture-token" not in body, "capture token leaked in /api/captures output"
+    assert "secret-value" not in body, "cookie value leaked"
+    assert "also-secret" not in body, "token query param leaked"
+    # The literal "<redacted>" marker should be there
+    assert "<redacted>" in body
 
 def test_capture_with_query_token_accepted(client):
     """For stations that can't set headers, ?t=<token> works too."""

@@ -13,6 +13,7 @@ GET  /api/discoveries    — survey of nearby RF traffic, latest first
 """
 from __future__ import annotations
 
+import json as _json
 import time
 from typing import Annotated, Any
 
@@ -22,6 +23,18 @@ from . import db
 from .config import settings
 
 router = APIRouter()
+
+
+async def _parse_json_body(request: Request) -> Any:
+    """Parse a JSON body and 400 (not 500) on malformed input. Also
+    rejects Python's NaN/Infinity literals via parse_constant."""
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty body")
+    try:
+        return _json.loads(body, parse_constant=lambda _: None)
+    except _json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {e.msg}")
 
 
 def _require_ingest_token(authorization: str | None,
@@ -53,7 +66,7 @@ async def ingest_discovery(
     record — we store the first one verbatim as a sample for inspection
     and bump counters on subsequent sightings."""
     _require_ingest_token(authorization, x_ingest_token)
-    payload = await request.json()
+    payload = await _parse_json_body(request)
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="payload must be a JSON object")
     model = str(payload.get("model") or "").strip()

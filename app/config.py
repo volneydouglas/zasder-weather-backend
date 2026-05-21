@@ -37,7 +37,16 @@ class Settings(BaseSettings):
 
     @property
     def aw_configured(self) -> bool:
-        return bool(self.aw_application_key and self.aw_api_key)
+        """True only when BOTH AWN keys are set to real-looking values.
+        Defensive: also rejects placeholder strings like 'replace-with-*'
+        so a half-edited .env.example doesn't start the AWN poller with
+        garbage credentials (which hammers the AWN API with 401s and
+        eventually gets rate-limited)."""
+        def _real(v: str | None) -> bool:
+            if not v: return False
+            s = v.strip().lower()
+            return bool(s) and "replace-with" not in s and s != "replace_me"
+        return _real(self.aw_application_key) and _real(self.aw_api_key)
 
 
 settings = Settings()

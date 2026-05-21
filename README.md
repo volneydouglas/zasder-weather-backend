@@ -301,9 +301,9 @@ All `/api/*` routes require `Authorization: Bearer <API_TOKEN>`.
 | POST   | `/ingest/discovery`                               | Source posts a `(model, id)` RF sighting. Same auth. Used by the SDR relay to populate the long-tail survey of nearby devices |
 | GET    | `/api/discoveries?since_hours=24`                 | Survey of distinct RF devices the SDR has decoded — neighbors' weather stations, TPMS, garage remotes, utility meters, etc. Latest-seen first |
 
-The path-form `/ingest/custom/{INGEST_TOKEN}` is also accepted for
-backwards compatibility with older relays. New deployments should use
-the header form so the token doesn't end up in proxy/access logs.
+The legacy path-form `/ingest/custom/{INGEST_TOKEN}` was removed
+2026-05-21 because tokens in URLs leak into proxy and access logs.
+The header form is the only supported way to authenticate ingest now.
 
 ## Tests
 

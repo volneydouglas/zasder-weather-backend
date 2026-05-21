@@ -74,7 +74,13 @@ async def ingest_meter(
     rtl_433-style record (whatever fields the decoder produced) plus an
     `id` we use for filename routing."""
     _require_ingest_token(authorization, x_ingest_token)
-    payload = await request.json()
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="empty body")
+    try:
+        payload = json.loads(body, parse_constant=lambda _: None)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {e.msg}")
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="payload must be a JSON object")
     meter_id = str(payload.get("id") or "")

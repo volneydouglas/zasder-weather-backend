@@ -152,23 +152,38 @@ log = logging.getLogger("sdr-relay")
 
 # ───────────────────────── unit conversions ─────────────────────────
 
+def _finite(v: float | int | None) -> float | None:
+    """Coerce to a finite float or None. Rejects NaN/inf — rtl_433
+    decoders occasionally emit these on partial frames, and they brick
+    the backend's JSON serialization downstream."""
+    if v is None: return None
+    try: f = float(v)
+    except (TypeError, ValueError): return None
+    return f if math.isfinite(f) else None
+
 def c_to_f(c: float | None) -> float | None:
+    c = _finite(c)
     return round(c * 9 / 5 + 32, 1) if c is not None else None
 
 def f_round(f: float | None) -> float | None:
+    f = _finite(f)
     return round(f, 1) if f is not None else None
 
 def mm_to_in(mm: float | None) -> float | None:
+    mm = _finite(mm)
     return round(mm * 0.0393701, 3) if mm is not None else None
 
 def ms_to_mph(ms: float | None) -> float | None:
+    ms = _finite(ms)
     return round(ms * 2.23694, 1) if ms is not None else None
 
 def hpa_to_inhg(hpa: float | None) -> float | None:
+    hpa = _finite(hpa)
     return round(hpa * 0.02953, 2) if hpa is not None else None
 
 def lux_to_wm2(lux: float | None) -> float | None:
     # AcuRite-community accepted conversion for outdoor light: ~126 lux/W/m².
+    lux = _finite(lux)
     return round(lux / 126.0, 1) if lux is not None else None
 
 

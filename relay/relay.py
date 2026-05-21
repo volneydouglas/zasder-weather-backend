@@ -63,10 +63,15 @@ STATION_LOCATION = os.environ.get("STATION_LOCATION", "")
 # ──────────────────────────────────────────────────────────────────────────
 
 # Numeric fields where empty-string means "no reading", not zero.
+# NaN/inf are explicitly rejected — Python's float() accepts "NaN" / "inf"
+# strings, but JSON serialization downstream chokes on non-finite values,
+# which would brick /api/devices/{mac}/current on the backend.
 def _f(s: str | None) -> float | None:
     if s is None or s == "": return None
-    try: return float(s)
+    try: v = float(s)
     except ValueError: return None
+    import math
+    return v if math.isfinite(v) else None
 
 def _i(s: str | None) -> int | None:
     v = _f(s)

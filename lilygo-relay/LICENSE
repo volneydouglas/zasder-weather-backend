@@ -1,0 +1,28 @@
+                    GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+This sub-project (lilygo-relay/) is licensed under the GNU General
+Public License v3.0, distinct from the MIT license that covers the
+rest of the Zasder Weather repository.
+
+The reason: lilygo-relay depends on rtl_433_ESP
+(https://github.com/NorthernMan54/rtl_433_ESP), which is GPL-3.0.
+Code that links against GPL-3.0 libraries must itself be GPL-3.0
+when distributed. Keeping this directory under GPL-3.0 makes that
+inheritance explicit and contained — the backend, sdr-relay, and iOS
+app remain MIT.
+
+For the full GPL-3.0 license text, see:
+https://www.gnu.org/licenses/gpl-3.0.txt
+
+Copyright (C) 2026 Volney Douglas / Zasder LLC
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+General Public License for more details.

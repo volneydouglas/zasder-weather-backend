@@ -24,6 +24,7 @@ direct-RF SDR), and **where you host the backend** (Fly.io or LAN).
 |--------------------------|------------------------------------|---------|-------------------------------|
 | **AmbientWeather API**   | AWN-registered stations            | 60 s    | None — cloud-to-cloud         |
 | **SDR direct** *(rec.)*  | AcuRite Atlas, Fine Offset (WS-2000, WH-31, WS-5000, WH-65) | 16–30 s | ~$30 RTL-SDR dongle + Pi (or any always-on Linux box) |
+| **LilyGO ESP32** *(budget)* | AcuRite Atlas, Fine Offset (WS-2000, WH-31, WS-5000, WH-65) | 16–30 s | ~$25/band [LilyGO T3 LoRa32 V1.6.1](lilygo-relay/README.md), no Pi |
 | **DNS-hijack relay** *(legacy)* | AcuRite Atlas via the AcuRite hub          | sensor-dependent | Pi running a small Docker container |
 
 **Recommended for most people**: SDR direct + Fly hosting. Sensor data
@@ -36,6 +37,7 @@ theirs).
 |---|---|---|
 | **AWN API only** | Path A (easiest start) | Path B |
 | **SDR direct** | Path C (recommended) | Path D |
+| **LilyGO ESP32** | Path F (budget, no Pi) — see [lilygo-relay/](lilygo-relay/README.md) | same |
 | **AWN + SDR mixed** | Path A + add SDR | Path B + add SDR |
 | **AcuRite legacy** | Path E (deprecated, but works while AcuRite cloud is alive) | same |
 

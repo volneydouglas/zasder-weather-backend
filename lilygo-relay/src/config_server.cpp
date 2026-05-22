@@ -31,7 +31,11 @@ static constexpr unsigned long DIAG_CYCLE_MS = 5000;
 static unsigned long _lastDiagMs = 0;
 static int _diagIndex = 0;
 
-static const char *MDNS_NAME = "zasder-lilygo";
+// mDNS name is computed per-board in begin() — `zasder-lilygo-XXXX`
+// where XXXX is the last two bytes of the chip MAC (lowercase, no
+// colons). Multiple LilyGOs on the same LAN otherwise collide on
+// `zasder-lilygo.local` and the resolver picks one at random.
+static String mdnsName;
 
 void loadFromNvs() {
   prefs.begin("zasder", /*readOnly=*/false);
@@ -79,7 +83,7 @@ static void handleStatus() {
   body  = "{\n";
   body += "  \"mac\": \""        + escapeJson(mac) + "\",\n";
   body += "  \"ip\": \""         + escapeJson(ip)  + "\",\n";
-  body += "  \"mdns\": \""       + String(MDNS_NAME) + ".local\",\n";
+  body += "  \"mdns\": \""       + mdnsName + ".local\",\n";
   body += "  \"uptime_s\": "     + String(uptimeS) + ",\n";
   body += "  \"freq_mhz\": "     + String((double) RF_MODULE_FREQUENCY, 2) + ",\n";
   body += "  \"source\": \""     + String(ZASDER_SOURCE_TAG) + "\",\n";
@@ -177,9 +181,16 @@ static void handleRoot() {
 
 void begin() {
   bootMs = millis();
-  if (MDNS.begin(MDNS_NAME)) {
+  // Build per-board mDNS name from last 2 MAC bytes.
+  String mac = WiFi.macAddress();           // "F0:24:F9:AF:22:E4"
+  String suffix = mac.substring(12);        // "22:E4"
+  suffix.replace(":", "");
+  suffix.toLowerCase();
+  mdnsName = String("zasder-lilygo-") + suffix;
+
+  if (MDNS.begin(mdnsName.c_str())) {
     MDNS.addService("http", "tcp", 80);
-    Serial.printf("mDNS up: %s.local\n", MDNS_NAME);
+    Serial.printf("mDNS up: %s.local\n", mdnsName.c_str());
   } else {
     Serial.println("mDNS begin failed (board still reachable by IP)");
   }
@@ -190,7 +201,7 @@ void begin() {
   server.on("/reset",     HTTP_POST, handleReset);
   server.begin();
   Serial.printf("config server: http://%s/ (or http://%s.local/)\n",
-                WiFi.localIP().toString().c_str(), MDNS_NAME);
+                WiFi.localIP().toString().c_str(), mdnsName.c_str());
 }
 
 static void cycleDiagLine() {
@@ -202,7 +213,9 @@ static void cycleDiagLine() {
                WiFi.localIP().toString().c_str());
       break;
     case 1:
-      snprintf(buf, sizeof(buf), "mDNS: %s", MDNS_NAME);
+      // Trim "zasder-lilygo-" prefix on the OLED line — saves space.
+      snprintf(buf, sizeof(buf), "mDNS: ...-%s",
+               mdnsName.length() > 14 ? mdnsName.c_str() + 14 : "?");
       break;
     case 2: {
       unsigned long upS = (now - bootMs) / 1000;

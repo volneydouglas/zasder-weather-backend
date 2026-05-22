@@ -31,6 +31,16 @@ services:
       LACROSSE_ID: ${LACROSSE_ID:-0}
       LACROSSE_NAME: ${LACROSSE_NAME:-LaCrosse (SDR)}
       LACROSSE_LOCATION: ${LACROSSE_LOCATION:-}
+      # Optional Davis Vantage Pro2 ISS (915 MHz FHSS). DAVIS_ID is
+      # the transmitter id from the ISS DIP switches (1-8). DAVIS_ID=0
+      # to skip. With the default rtl_433 sample rate at 915 MHz we
+      # catch roughly 2% of Davis packets (one of 51 hop channels);
+      # the in-firmware coalescer makes that usable but for better
+      # coverage you can widen the 915 stream's sample rate.
+      DAVIS_ID: ${DAVIS_ID:-0}
+      DAVIS_NAME: ${DAVIS_NAME:-Davis Vantage Pro2 (SDR)}
+      DAVIS_LOCATION: ${DAVIS_LOCATION:-}
+      DAVIS_RAIN_YEARLY_BASELINE_IN: ${DAVIS_RAIN_YEARLY_BASELINE_IN:-0}
       # Atlas yearly-rain calibration baseline (inches). Set to the value
       # your prior data source (AWN, hub, etc.) reports for yearlyrainin
       # at deploy time. Leave at 0 to skip yearly rain posting.

@@ -85,6 +85,23 @@ LACROSSE_ID = int(os.environ.get("LACROSSE_ID", "0") or 0)
 LACROSSE_NAME = os.environ.get("LACROSSE_NAME", "LaCrosse (SDR)")
 LACROSSE_LOCATION = os.environ.get("LACROSSE_LOCATION", "")
 
+# Optional Davis Vantage Pro2 ISS (Integrated Sensor Suite) — 915 MHz
+# in NA, FHSS across 51 channels. The SDR captures whatever channels
+# fall inside the rtl_433 sample-rate window centered at 915 MHz (set
+# RTL433_915_SAMPLE_RATE to widen — default 250 ksps catches ~2% of
+# packets; 2400k catches ~12%; 6 packets/min ≈ enough to track every
+# minute even with FHSS losses). Set DAVIS_ID to the transmitter id
+# from rtl_433 -R 113 output (1-8 typically, set on the ISS DIP
+# switches). DAVIS_ID=0 to skip.
+DAVIS_ID = int(os.environ.get("DAVIS_ID", "0") or 0)
+DAVIS_NAME = os.environ.get("DAVIS_NAME", "Davis Vantage Pro2 (SDR)")
+DAVIS_LOCATION = os.environ.get("DAVIS_LOCATION", "")
+# Yearly-rain baseline for Davis (inches). Same idea as
+# ATLAS_RAIN_YEARLY_BASELINE_IN — Davis emits a tipping-bucket counter
+# that increments by 0.01" per click (or 0.2mm/0.254mm depending on
+# bucket size); we baseline against whatever your prior source reports.
+DAVIS_RAIN_YEARLY_BASELINE_IN = float(os.environ.get("DAVIS_RAIN_YEARLY_BASELINE_IN", "0") or 0)
+
 FORWARD_TIMEOUT = float(os.environ.get("FORWARD_TIMEOUT", "5") or 5)
 
 
@@ -720,6 +737,79 @@ def handle_lacrosse(pkt: dict[str, Any]) -> None:
                      "lacrosse-th2-sdr", ts, fields)
 
 
+# ───────────────────────── Davis Vantage Pro2 ISS ─────────────────────────
+# Davis broadcasts every ~2.5s, rotating ~10 message types. Each packet
+# carries wind (always) plus ONE rotating field (temp/humidity/rain/uv/
+# solar). With FHSS losses + rotation, any given field updates every
+# 25-60s depending on luck. We accumulate the latest value of each
+# field in a state dict and POST on every received packet — gives the
+# backend stable fields instead of one-field-at-a-time flickering.
+
+_davis_state: dict[str, Any] = {}
+_davis_baseline_rain_mm: float | None = None
+
+def handle_davis(pkt: dict[str, Any]) -> None:
+    if pkt.get("id") != DAVIS_ID:
+        return
+    s = _davis_state
+
+    # Wind is in every packet — refresh both speed (km/h → mph) and
+    # direction (degrees) unconditionally when present.
+    if pkt.get("wind_avg_km_h") is not None:
+        s["wind_avg_mph"] = float(pkt["wind_avg_km_h"]) * 0.621371
+    if pkt.get("wind_dir_deg") is not None:
+        s["wind_dir"] = float(pkt["wind_dir_deg"])
+
+    # Rotating fields — only update if present in this packet.
+    if pkt.get("temperature_F") is not None:
+        s["tempf"] = float(pkt["temperature_F"])
+    if pkt.get("humidity") is not None:
+        s["humidity"] = int(pkt["humidity"])
+    if pkt.get("uv_index") is not None:
+        s["uv"] = float(pkt["uv_index"])
+    if pkt.get("light_intensity") is not None:
+        s["solarradiation"] = float(pkt["light_intensity"])
+    # rtl_433 emits rain as a tipping-bucket lifetime click counter.
+    # Davis VP2 standard bucket = 0.01" per click; rtl_433 normalises
+    # to rain_mm so we get a steadily increasing mm counter that we
+    # baseline + delta-track the same way as Atlas / WH24.
+    if pkt.get("rain_mm") is not None:
+        s["rain_mm_total"] = float(pkt["rain_mm"])
+
+    # Need at least wind + one rotating field before the post is useful.
+    if not s.get("wind_avg_mph") or not (s.get("tempf") or s.get("humidity")):
+        return
+
+    fields: dict[str, dict] = {
+        "outdoor": {
+            "tempf":         s.get("tempf"),
+            "humidity":      s.get("humidity"),
+            "dew_point_f":   dew_point_f(s.get("tempf"), s.get("humidity")),
+            "feels_like":    heat_index_f(s.get("tempf"), s.get("humidity")),
+            "uv":            s.get("uv"),
+            "solarradiation": s.get("solarradiation"),
+        },
+        "wind": {
+            "windspeedmph":  s.get("wind_avg_mph"),
+            "winddir":       s.get("wind_dir"),
+        },
+    }
+    # Yearly rain calibration — same pattern as Atlas/WH24. Baseline
+    # snapshots the rtl_433 counter on first sight; subsequent posts
+    # report (current - baseline) + DAVIS_RAIN_YEARLY_BASELINE_IN.
+    rain_total = s.get("rain_mm_total")
+    if rain_total is not None:
+        yearly = compute_yearly_rain("davis", DAVIS_RAIN_YEARLY_BASELINE_IN,
+                                     mm_to_in(rain_total))
+        if yearly is not None:
+            fields["rain"] = {"yearly_in": yearly}
+
+    ts = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    mac = sensor_mac(0x05, DAVIS_ID)
+    post_observation(mac, DAVIS_NAME, DAVIS_LOCATION,
+                     "davis-vp2-sdr", ts, fields)
+
+
 # ───────────────────────── packet router ─────────────────────────
 
 def route(pkt: dict[str, Any]) -> None:
@@ -738,6 +828,8 @@ def route(pkt: dict[str, Any]) -> None:
         update_wh32b(pkt)
     elif model == "LaCrosse-TH2" and LACROSSE_ID:
         handle_lacrosse(pkt)
+    elif model == "Davis-ISS" and DAVIS_ID:
+        handle_davis(pkt)
     # Other models are passed only through post_discovery above.
 
 

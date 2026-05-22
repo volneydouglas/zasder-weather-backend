@@ -2,9 +2,18 @@
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <WiFiClientSecure.h>
 
 #include <time.h>
+
+#include "config_server.h"
+
+// 5 consecutive 401s = the token is wrong. Wipe it from NVS and reboot
+// so the firmware's "ingest_token empty → AP portal" path takes over,
+// letting the user re-enter it without a reflash.
+static constexpr int MAX_CONSECUTIVE_401 = 5;
+static int consecutive401 = 0;
 
 // Map an rtl_433 model + id to the synthetic MAC scheme the backend
 // expects ("5D:5D:TT:HH:HH:HH" — see sdr-relay/README.md). Same
@@ -68,6 +77,7 @@ void zasder_post(const char *rtl433Json,
                  const String &ingestToken) {
   if (backendUrl.isEmpty() || ingestToken.isEmpty()) {
     Serial.printf("[skip] %s\n", rtl433Json);
+    // OLED disabled — would have shown "post: no config" here
     return;
   }
 
@@ -148,10 +158,19 @@ void zasder_post(const char *rtl433Json,
   String body;
   serializeJson(out, body);
 
-  WiFiClientSecure tls;
-  tls.setInsecure();  // public template default; users on private CAs
-                      // can drop in setCACert() during build.
-  HTTPClient http;
+  // Static TLS client + HTTP client: reused across POSTs so we don't
+  // allocate fresh mbedTLS contexts every packet. Each fresh context
+  // is ~16 KB and the heap fragments fast; we saw "SSL - Memory
+  // allocation failed" → StoreProhibited panic within ~5 minutes of
+  // per-call alloc.
+  static WiFiClientSecure tls;
+  static bool tlsConfigured = false;
+  if (!tlsConfigured) {
+    tls.setInsecure();  // public template default; pin a CA in build
+                        // flags via setCACert() if you have one.
+    tlsConfigured = true;
+  }
+  static HTTPClient http;
   String url = backendUrl + "/ingest/custom";
   if (!http.begin(tls, url)) {
     Serial.printf("[http-begin-fail] %s\n", url.c_str());
@@ -162,8 +181,22 @@ void zasder_post(const char *rtl433Json,
   int rc = http.POST(body);
   if (rc >= 200 && rc < 300) {
     Serial.printf("[posted %d] %s %u\n", rc, model, (unsigned) id);
+    consecutive401 = 0;
+  } else if (rc == 401) {
+    consecutive401++;
+    Serial.printf("[post-fail 401] (consecutive=%d)\n", consecutive401);
+    if (consecutive401 >= MAX_CONSECUTIVE_401) {
+      Serial.println("Token rejected repeatedly — wiping NVS token. "
+                     "Re-provision via POST /provision over HTTP.");
+      http.end();
+      ZasderConfigServer::wipeIngestToken();
+      consecutive401 = 0;
+      ZasderConfigServer::notePostResult(rc);
+      return;
+    }
   } else {
     Serial.printf("[post-fail %d] %s\n", rc, http.errorToString(rc).c_str());
   }
+  ZasderConfigServer::notePostResult(rc);
   http.end();
 }

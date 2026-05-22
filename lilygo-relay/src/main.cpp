@@ -4,37 +4,34 @@
 // Pipeline: sensor → 433/915 MHz OOK → SX1276 → rtl_433_ESP decoder →
 // rtl_433_Callback() → zasder_post() → HTTPS POST → backend → SQLite.
 //
-// First-boot provisioning is via WiFiManager: the board comes up as an
-// access point named "ZasderLilyGO". Joining it opens a captive portal
-// where the user enters their Wi-Fi creds + BACKEND_URL + INGEST_TOKEN.
-// Saved to NVS so subsequent boots connect directly. To re-provision
-// (e.g. changed Wi-Fi password), hold BOOT for 5s while plugging in
-// power — the AP comes back up.
+// Provisioning flow:
+//   1. First boot: WiFiManager comes up as AP "ZasderLilyGO". User
+//      joins from a phone, captive portal asks for Wi-Fi creds only
+//      (NOT backend URL / token — those are configured later over the
+//      LAN, which is way more forgiving than a one-shot captive form).
+//   2. Once on the home Wi-Fi, the board exposes an HTTP config server
+//      at http://zasder-lilygo.local/ (and at its DHCP'd IP). curl/
+//      browser-POST backend_url + ingest_token there.
+//   3. POSTs to the backend start immediately once both are set.
+// To re-provision Wi-Fi, hit POST /reset (clears NVS + Wi-Fi creds).
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
-#include <Preferences.h>
 #include <rtl_433_ESP.h>
 
+#include "config_server.h"
+#include "display.h"
 #include "zasder_post.h"
 
-rtl_433_ESP rtl_433(RECEIVER_GPIO);
-Preferences prefs;
+// Per-packet JSON buffer handed to rtl_433_ESP's decoder. 512 B is the
+// upstream example default and covers every weather-station packet we
+// care about (the longest, Atlas multi-field, is ~280 B).
+#define JSON_MSG_BUFFER 512
+static char messageBuffer[JSON_MSG_BUFFER];
 
-// Provisioned values, kept in NVS under namespace "zasder".
-String backendUrl;
-String ingestToken;
-
-// Captive-portal custom fields. Exposed in the WiFiManager web UI
-// alongside the standard Wi-Fi SSID/password pickers so the user can
-// enter everything at once.
-WiFiManagerParameter pBackendUrl("backend_url", "Backend URL",
-                                 "https://weather.example.com", 96);
-WiFiManagerParameter pIngestToken("ingest_token", "Ingest token", "", 96);
-
-static volatile bool saveRequested = false;
-static void onSave() { saveRequested = true; }
+rtl_433_ESP rtl_433;
 
 void rtl_433_Callback(char *message) {
   // rtl_433_ESP hands us one JSON object per decoded packet. We don't
@@ -43,7 +40,19 @@ void rtl_433_Callback(char *message) {
   // UPSERT). v1 behavior: post every packet, accept the small window
   // of partial observations between cycles.
   digitalWrite(LED_BUILTIN_RX, HIGH);
-  zasder_post(message, backendUrl, ingestToken);
+  // Note the packet on the status server so /status reflects what we
+  // just heard even if the POST is about to fail.
+  {
+    JsonDocument pkt;
+    if (deserializeJson(pkt, message) == DeserializationError::Ok) {
+      const char *m = pkt["model"] | "?";
+      uint32_t pid  = pkt["id"]    | 0u;
+      ZasderConfigServer::noteIncomingPacket(m, pid);
+    }
+  }
+  zasder_post(message,
+              ZasderConfigServer::backendUrl,
+              ZasderConfigServer::ingestToken);
   digitalWrite(LED_BUILTIN_RX, LOW);
 }
 
@@ -57,47 +66,53 @@ void setup() {
 
   pinMode(LED_BUILTIN_RX, OUTPUT);
 
-  prefs.begin("zasder", /*readOnly=*/false);
-  backendUrl  = prefs.getString("backend_url",  "");
-  ingestToken = prefs.getString("ingest_token", "");
+  ZasderDisplay::begin();
+  {
+    char hdr[24];
+    snprintf(hdr, sizeof(hdr), "Zasder %.0fMHz",
+             (double) RF_MODULE_FREQUENCY);
+    ZasderDisplay::update(hdr, ZASDER_SOURCE_TAG,
+                          "WiFi: connecting", "", "");
+  }
 
-  pBackendUrl.setValue(backendUrl.c_str(), 96);
-  pIngestToken.setValue(ingestToken.c_str(), 96);
-
+  // WiFiManager now handles ONLY Wi-Fi creds. Backend URL + ingest
+  // token are deferred to the LAN-side HTTP config server below —
+  // editing fields on the captive portal turned out to be unreliable
+  // (Save button doesn't always persist params).
   WiFiManager wm;
-  wm.addParameter(&pBackendUrl);
-  wm.addParameter(&pIngestToken);
-  wm.setSaveConfigCallback(onSave);
-  // 5 min portal timeout — if no one connects, reboot and retry. Keeps
-  // a misconfigured board from sitting in AP mode forever after a
-  // power blip.
   wm.setConfigPortalTimeout(300);
-
+  Serial.println("Wi-Fi: trying saved creds, AP=ZasderLilyGO if none");
   if (!wm.autoConnect("ZasderLilyGO")) {
-    Serial.println("WiFiManager timed out — restarting");
+    Serial.println("WiFi setup timed out — restarting");
+    delay(500);
     ESP.restart();
   }
-
-  if (saveRequested) {
-    backendUrl  = pBackendUrl.getValue();
-    ingestToken = pIngestToken.getValue();
-    prefs.putString("backend_url",  backendUrl);
-    prefs.putString("ingest_token", ingestToken);
-    Serial.println("Saved provisioning to NVS");
-  }
-
   Serial.printf("Wi-Fi OK  IP=%s\n", WiFi.localIP().toString().c_str());
-  if (backendUrl.isEmpty() || ingestToken.isEmpty()) {
-    Serial.println("WARN: backend_url or ingest_token empty — packets "
-                   "will decode but POSTs will be skipped");
+  {
+    char ipLine[32];
+    snprintf(ipLine, sizeof(ipLine), "IP: %s",
+             WiFi.localIP().toString().c_str());
+    ZasderDisplay::update(nullptr, nullptr, ipLine,
+                          "config: /provision", "");
   }
 
-  rtl_433.initReceiver(RECEIVER_GPIO, RF_MODULE_FREQUENCY);
-  rtl_433.setCallback(rtl_433_Callback);
+  // Load backend creds from NVS (may be empty; POSTs just skip until
+  // someone provisions them via /provision over HTTP).
+  ZasderConfigServer::loadFromNvs();
+  ZasderConfigServer::begin();
+  Serial.printf("provision with: curl -X POST "
+                "http://%s/provision -d 'backend_url=...&ingest_token=...'\n",
+                WiFi.localIP().toString().c_str());
+
+  rtl_433.initReceiver(RF_MODULE_RECEIVER_GPIO, RF_MODULE_FREQUENCY);
+  rtl_433.setCallback(rtl_433_Callback, messageBuffer, JSON_MSG_BUFFER);
   rtl_433.enableReceiver();
-  Serial.println("Receiver enabled");
+  Serial.printf("ready — receiver up, has_token=%d has_url=%d\n",
+                (int) (ZasderConfigServer::ingestToken.length() > 0),
+                (int) (ZasderConfigServer::backendUrl.length()  > 0));
 }
 
 void loop() {
   rtl_433.loop();
+  ZasderConfigServer::loop();
 }

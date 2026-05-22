@@ -15,20 +15,27 @@
 static constexpr int MAX_CONSECUTIVE_401 = 5;
 static int consecutive401 = 0;
 
-// Map an rtl_433 model + id to the synthetic MAC scheme the backend
-// expects ("5D:5D:TT:HH:HH:HH" — see sdr-relay/README.md). Same
-// type-tag bytes so a LilyGO-sourced Atlas lands on the same device
-// row as an SDR-sourced one would.
-static String synthMac(const char *model, uint32_t id) {
-  uint8_t typeTag = 0xFF;
-  String  m       = String(model);
-  if (m == "Acurite-Atlas")          typeTag = 0x01;
-  else if (m == "Fineoffset-WH24")   typeTag = 0x02;
-  else if (m == "Fineoffset-WH65B")  typeTag = 0x02;
-  else if (m == "Fineoffset-WS80")   typeTag = 0x02;
-  else if (m == "Fineoffset-WH32B")  typeTag = 0x03;
-  else                                typeTag = 0xFE;  // unknown — still POST
+// Whitelist of rtl_433 models we POST to the backend. The 433 dongle
+// hears everything in the band — TPMS, garage openers, neighbor weather
+// stations, etc. — and POSTing all of it spams the backend with random
+// device rows (e.g. "Secplus-v1" garage doors). Only the actual weather
+// sensors are useful; everything else is dropped at the source.
+//
+// Returns the synthetic-MAC type tag for `model`, or 0 if the model is
+// not on the whitelist (caller skips the POST). Type tags match
+// sdr-relay so a LilyGO-sourced sensor lands on the same device row
+// as a Pi/SDR-sourced one (last-write-wins UPSERT).
+static uint8_t modelTypeTag(const char *model) {
+  if (!model) return 0;
+  if (strcmp(model, "Acurite-Atlas")   == 0) return 0x01;
+  if (strcmp(model, "Fineoffset-WH24") == 0) return 0x02;
+  if (strcmp(model, "Fineoffset-WH65B")== 0) return 0x02;
+  if (strcmp(model, "Fineoffset-WS80") == 0) return 0x02;
+  if (strcmp(model, "Fineoffset-WH32B")== 0) return 0x03;
+  return 0;
+}
 
+static String synthMac(uint8_t typeTag, uint32_t id) {
   char buf[13];
   snprintf(buf, sizeof(buf), "5D5D%02X%02X%02X%02X",
            typeTag,
@@ -38,16 +45,18 @@ static String synthMac(const char *model, uint32_t id) {
   return String(buf);
 }
 
-// ISO-8601 UTC string for the timestamp_utc field. rtl_433_ESP doesn't
-// stamp packets itself; we use the ESP32's clock (kept fresh by SNTP
-// after Wi-Fi connect — see configTzTime() in main if needed).
+// Lowest plausible "real time" UNIX epoch — anything below this means
+// SNTP hasn't synced yet and we should NOT POST (backend would record
+// "1970-01-01" timestamps which show up as "56 years ago" everywhere).
+// 1700000000 = 2023-11-14, comfortably before any real boot time.
+static constexpr time_t MIN_VALID_EPOCH = 1700000000;
+
+static bool clockSynced() {
+  return time(nullptr) >= MIN_VALID_EPOCH;
+}
+
 static String nowIsoUtc() {
   time_t now = time(nullptr);
-  if (now < 1700000000) {
-    // SNTP hasn't synced yet; fall back to a placeholder the backend
-    // will replace with received_at if it sees this exact value.
-    return "1970-01-01T00:00:00Z";
-  }
   struct tm tm;
   gmtime_r(&now, &tm);
   char buf[32];
@@ -94,6 +103,23 @@ void zasder_post(const char *rtl433Json,
   if (!model) return;
   uint32_t id = in["id"].as<uint32_t>();
 
+  // Whitelist: drop anything that isn't one of the known weather
+  // sensors before we POST. Otherwise the 433 dongle's broad RX
+  // creates a "Secplus-v1" device row for the neighbor's garage door,
+  // and similar junk for TPMS, smoke detectors, etc.
+  uint8_t typeTag = modelTypeTag(model);
+  if (typeTag == 0) {
+    return;
+  }
+
+  // Don't POST until NTP has synced. The backend would otherwise store
+  // 1970-01-01 timestamps for early-boot packets and they'd show up as
+  // "56 years ago" in the iOS app.
+  if (!clockSynced()) {
+    Serial.printf("[skip-no-clock] %s %u\n", model, (unsigned) id);
+    return;
+  }
+
   // Build the outgoing observation. /ingest/custom accepts:
   //   {device:{id,name,location}, timestamp_utc, source,
   //    outdoor:{tempf, humidity},
@@ -101,10 +127,14 @@ void zasder_post(const char *rtl433Json,
   //    rain:{yearly_in, hourly_in},
   //    pressure:{baromrelin},
   //    indoor:{tempf,humidity,pressure_inhg}}
+  // Intentionally omitting device.name — the Pi's sdr-relay already
+  // POSTs a friendly "AcuRite Atlas (SDR)" / "WS-2000 (SDR)" name on
+  // first sight; leaving name unset here means the backend keeps that
+  // friendly name on UPSERT instead of being overwritten with the raw
+  // rtl_433 model string ("Acurite-Atlas", etc.).
   JsonDocument out;
   auto device       = out["device"].to<JsonObject>();
-  device["id"]      = synthMac(model, id);
-  device["name"]    = model;            // backend keeps the first-seen name; can be edited via /api
+  device["id"]      = synthMac(typeTag, id);
   out["timestamp_utc"] = nowIsoUtc();
   out["source"]        = ZASDER_SOURCE_TAG;
 

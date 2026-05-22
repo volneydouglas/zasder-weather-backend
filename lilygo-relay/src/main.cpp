@@ -88,6 +88,15 @@ void setup() {
     ESP.restart();
   }
   Serial.printf("Wi-Fi OK  IP=%s\n", WiFi.localIP().toString().c_str());
+
+  // Start NTP. Without this, time() returns 0 and every POST goes in
+  // with timestamp 1970-01-01 — the backend stores it as "56y ago".
+  // We use UTC (offset 0) because the backend's /ingest/custom expects
+  // ISO timestamps in UTC. Two SNTP servers for redundancy. Sync runs
+  // asynchronously; first packets after boot may still POST before the
+  // clock catches up — zasder_post() drops those (skipPost path).
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  Serial.println("NTP sync started (UTC)");
   {
     char ipLine[32];
     snprintf(ipLine, sizeof(ipLine), "IP: %s",

@@ -125,7 +125,7 @@ def test_ingest_rejects_empty_body(client):
     assert r.status_code == 400
 
 
-# ───────────────── indoor block + meter (SDR pipeline) ─────────────────
+# ───────────────── indoor block (SDR pipeline) ─────────────────
 
 def test_ingest_indoor_block_flows_through(client):
     """The SDR relay sends temp/humidity/pressure for the indoor sensor
@@ -150,35 +150,6 @@ def test_ingest_indoor_block_flows_through(client):
     assert obs["tempinf"] == 72.4
     assert obs["humidityin"] == 41
     assert obs["baromrelin"] == 28.47
-
-def test_meter_ingest_and_recent_roundtrip(client):
-    """POST a meter reading then read it back from /api/meters/{id}/recent."""
-    reading = {"model": "Neptune-R900", "id": 1583287502,
-               "consumption": 257328, "leak": 5}
-    r = client.post("/ingest/meter",
-                    headers={"Authorization": "Bearer test-ingest-token"},
-                    json=reading)
-    assert r.status_code == 200, r.text
-    # List should now include this meter
-    listing = client.get("/api/meters",
-                         headers={"Authorization": "Bearer test-api-token"})
-    assert listing.status_code == 200
-    assert any(m["id"] == "1583287502" for m in listing.json()["meters"])
-    # Recent should return the reading
-    recent = client.get("/api/meters/1583287502/recent",
-                        headers={"Authorization": "Bearer test-api-token"})
-    assert recent.status_code == 200
-    rows = recent.json()["rows"]
-    assert len(rows) == 1
-    assert rows[0]["consumption"] == 257328
-
-def test_meter_requires_ingest_token(client):
-    r = client.post("/ingest/meter", json={"id": 1, "consumption": 1})
-    assert r.status_code == 401
-
-def test_meter_recent_requires_api_token(client):
-    r = client.get("/api/meters/123/recent")
-    assert r.status_code == 401
 
 
 # ───────────────── PR2: security headers + malformed input handling ─────────────────
@@ -214,12 +185,6 @@ def test_discovery_rejects_malformed_json(client):
                     content='{bad')
     assert r.status_code == 400
 
-def test_meter_rejects_malformed_json(client):
-    r = client.post("/ingest/meter",
-                    headers={"Authorization": "Bearer test-ingest-token",
-                             "Content-Type": "application/json"},
-                    content='not json')
-    assert r.status_code == 400
 
 def test_aw_configured_rejects_placeholder_values(monkeypatch, temp_env):
     """`aw_configured` should be False for the literal placeholder string

@@ -23,7 +23,7 @@ direct-RF SDR), and **where you host the backend** (Fly.io or LAN).
 | Ingest method            | Works for                          | Cadence | LAN hardware?                 |
 |--------------------------|------------------------------------|---------|-------------------------------|
 | **AmbientWeather API**   | AWN-registered stations            | 60 s    | None — cloud-to-cloud         |
-| **SDR direct** *(rec.)*  | AcuRite Atlas, Fine Offset (WS-2000, WH-31, WS-5000, WH-65), neighbour utility meters | 16–30 s | ~$30 RTL-SDR dongle + Pi (or any always-on Linux box) |
+| **SDR direct** *(rec.)*  | AcuRite Atlas, Fine Offset (WS-2000, WH-31, WS-5000, WH-65) | 16–30 s | ~$30 RTL-SDR dongle + Pi (or any always-on Linux box) |
 | **DNS-hijack relay** *(legacy)* | AcuRite Atlas via the AcuRite hub          | sensor-dependent | Pi running a small Docker container |
 
 **Recommended for most people**: SDR direct + Fly hosting. Sensor data
@@ -161,22 +161,6 @@ this path exists).
 4. **Open the iOS app.** Within a minute or two new device rows appear
    for each configured sensor.
 
-### Bonus: utility meters
-
-If you're at 915 MHz, the SDR also hears nearby Neptune R900 water
-meters (and many gas/electric meters). The relay captures these to
-local `/data/meters/<id>.jsonl` files on the LAN host. Optionally,
-specific meters listed in `WATER_METER_IDS` are also forwarded to the
-backend's `/ingest/meter` endpoint and queryable via
-`/api/meters/{id}/recent`.
-
-For a visual local-only dashboard of every meter the SDR hears —
-yours plus neighbors' — see the companion project
-[water-meter-watch](https://github.com/volneydouglas/water-meter-watch).
-It mounts the same `/data/meters/` directory and serves a dashboard
-on port 8080 of your LAN host. Local-only by design; neighbors'
-meter data doesn't leave your network.
-
 ### Bonus: long-tail RF discovery survey
 
 The SDR also hears a lot of other 433/915 MHz traffic — TPMS from
@@ -294,10 +278,7 @@ All `/api/*` routes require `Authorization: Bearer <API_TOKEN>`.
 | GET    | `/api/devices/{mac}/history?hours=24`             | Time series                 |
 | GET    | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg + when          |
 | GET    | `/api/forecast?lat=&lon=`                         | 7-day forecast (Open-Meteo) |
-| GET    | `/api/meters`                                     | List utility meters captured by SDR |
-| GET    | `/api/meters/{id}/recent?tail=50`                 | Recent meter readings       |
 | POST   | `/ingest/custom`                                  | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
-| POST   | `/ingest/meter`                                   | Source posts a raw meter reading. Same auth |
 | POST   | `/ingest/discovery`                               | Source posts a `(model, id)` RF sighting. Same auth. Used by the SDR relay to populate the long-tail survey of nearby devices |
 | GET    | `/api/discoveries?since_hours=24`                 | Survey of distinct RF devices the SDR has decoded — neighbors' weather stations, TPMS, garage remotes, utility meters, etc. Latest-seen first |
 

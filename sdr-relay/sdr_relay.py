@@ -1,8 +1,8 @@
-"""SDR weather/meter relay.
+"""SDR weather relay.
 
 Listens on two RTL-SDR Blog V4 dongles via rtl_433 subprocesses (one on
 433 MHz for AcuRite Atlas, one on 915 MHz for Fine Offset / WS-2000 family
-sensors + neighborhood utility meters), normalizes each decoded packet
+sensors), normalizes each decoded packet
 into the backend's /ingest/custom schema, and POSTs.
 
 Replaces the network-level acurite-relay (DNS-hijack of
@@ -21,10 +21,6 @@ Architecture:
   - Optional indoor pairing: if WH32B_ID is set, its temp/humidity/pressure
     are merged into the outdoor station's posts under the schema's
     `indoor` block (a small backend extension supports this).
-  - Neptune R900 (water) and similar utility meters: forwarded to
-    /ingest/meter on the backend, which appends per-meter JSONL — useful
-    for the "is this my meter?" identification step (toggle hose, watch
-    consumption counter jump).
 
 Config (env vars; .env.example documents defaults):
   BACKEND_URL          required, e.g. https://weather.zasder.com
@@ -38,7 +34,6 @@ Config (env vars; .env.example documents defaults):
   WS2000_NAME          friendly name for the WS-2000 family station
   WS2000_LOCATION      friendly location
   WS2000_SERIAL        RTL-SDR EEPROM serial (default "ws2000")
-  WATER_METER_IDS      comma-separated R900 ids to forward (empty = forward all)
   ATLAS_POST_INTERVAL  seconds between coalesced Atlas posts (default 60)
   RTL433_BIN           rtl_433 binary path (default "rtl_433")
 """
@@ -83,8 +78,6 @@ WS2000_NAME = os.environ.get("WS2000_NAME", "WS-2000 (SDR)")
 WS2000_LOCATION = os.environ.get("WS2000_LOCATION", "")
 WS2000_SERIAL = os.environ.get("WS2000_SERIAL", "ws2000")
 
-_water_raw = os.environ.get("WATER_METER_IDS", "").strip()
-WATER_METER_IDS: set[str] = set(x.strip() for x in _water_raw.split(",") if x.strip()) if _water_raw else set()
 
 # Optional LaCrosse-TH2 temp/humidity sensor (433 MHz). Single-packet
 # protocol — no coalescing needed. Set LACROSSE_ID=0 to skip.
@@ -94,15 +87,6 @@ LACROSSE_LOCATION = os.environ.get("LACROSSE_LOCATION", "")
 
 FORWARD_TIMEOUT = float(os.environ.get("FORWARD_TIMEOUT", "5") or 5)
 
-# Local-only water-meter dashboard. Always captures every R900 sighting
-# to /data/meters/{id}.jsonl on the Pi (regardless of WATER_METER_IDS
-# which only controls cloud forwarding). A tiny HTTP server on this port
-# serves a dashboard so you can view yours + neighbors' meters without
-# any of that data leaving the LAN.
-LOCAL_METERS_DIR = os.environ.get("LOCAL_METERS_DIR", "/data/meters")
-# Dashboard / visualization for these files lives in the sibling
-# `water-meter-watch/` project, which runs as a separate container and
-# reads /data/meters/ via a shared volume mount.
 
 # Rain baselining. rtl_433 emits the sensor's lifetime cumulative rain
 # counter — which has no relation to "rain this year". To get a useful
@@ -460,36 +444,6 @@ def post_observation(mac: str, name: str, location: str, source: str,
         log.info("posted %s (%s)", name, source)
 
 
-def _record_meter_local(packet: dict[str, Any]) -> None:
-    """Append a meter packet to a per-meter JSONL file on the Pi. Local
-    only — used by the dashboard at http://<pi>:8080/ to show usage
-    without sending neighbors' data to the cloud."""
-    mid = str(packet.get("id") or "")
-    if not mid: return
-    safe = "".join(c for c in mid if c.isalnum() or c in "_-")[:64]
-    if not safe: return
-    try:
-        os.makedirs(LOCAL_METERS_DIR, exist_ok=True)
-        record = {"received_ms": int(time.time() * 1000), **packet}
-        with open(os.path.join(LOCAL_METERS_DIR, f"{safe}.jsonl"), "a",
-                  encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except OSError as e:
-        log.warning("could not append meter %s locally: %s", mid, e)
-
-
-def post_meter(packet: dict[str, Any]) -> None:
-    """Capture every R900 packet locally. Optionally forward to backend
-    if the meter is in WATER_METER_IDS — for personal-deployment cloud
-    queryability via /api/meters."""
-    mid = str(packet.get("id") or "")
-    if not mid: return
-    _record_meter_local(packet)  # always — for the local dashboard
-    if WATER_METER_IDS and mid not in WATER_METER_IDS:
-        return  # neighbor meter, keep out of cloud
-    if _post("/ingest/meter", packet):
-        log.info("meter %s: %s", mid, packet.get("consumption", "?"))
-
 
 # Discovery state — keyed by "<model>:<id>" so the JSON file is easy to
 # eyeball with `jq`. Each entry tracks first_seen / last_seen / count and
@@ -784,8 +738,6 @@ def route(pkt: dict[str, Any]) -> None:
         update_wh32b(pkt)
     elif model == "LaCrosse-TH2" and LACROSSE_ID:
         handle_lacrosse(pkt)
-    elif model == "Neptune-R900":
-        post_meter(pkt)
     # Other models are passed only through post_discovery above.
 
 
@@ -905,17 +857,14 @@ def main() -> int:
     else:
         log.info("Atlas disabled (ATLAS_ID unset)")
 
-    if WH24_ID or WH32B_ID or WATER_METER_IDS or not WATER_METER_IDS:
-        # 915 MHz stream is useful even without WH24 — it carries WH32B
-        # and meters. Always start it if anything's enabled at 915.
+    if WH24_ID or WH32B_ID:
+        # 915 MHz stream — WH24 outdoor and/or WH32B indoor.
         threads.append(threading.Thread(
             target=stream_rtl433,
-            # No -R filter on 915: we want Fine Offset AND R900 simultaneously.
             args=(WS2000_SERIAL, "915M", None, "ws2000-915", stop),
             daemon=True, name="ws2000-915"))
-        log.info("915 MHz enabled: serial=%s wh24=%d wh32b=%d water_filter=%s",
-                 WS2000_SERIAL, WH24_ID, WH32B_ID,
-                 ",".join(WATER_METER_IDS) or "all")
+        log.info("915 MHz enabled: serial=%s wh24=%d wh32b=%d",
+                 WS2000_SERIAL, WH24_ID, WH32B_ID)
 
     for t in threads:
         t.start()

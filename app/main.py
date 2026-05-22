@@ -19,7 +19,6 @@ from .capture import router as capture_router
 from .config import settings
 from .discovery import router as discovery_router
 from .ingest import router as ingest_router
-from .meter import router as meter_router
 from .poller import Poller
 
 logging.basicConfig(
@@ -72,7 +71,6 @@ app = FastAPI(
 app.include_router(capture_router)
 app.include_router(discovery_router)
 app.include_router(ingest_router)
-app.include_router(meter_router)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
 

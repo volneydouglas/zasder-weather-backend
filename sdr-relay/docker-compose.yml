@@ -55,14 +55,6 @@ services:
       DISCOVERY_ENABLED: ${DISCOVERY_ENABLED:-1}
       DISCOVERY_FORWARD_TO_BACKEND: ${DISCOVERY_FORWARD_TO_BACKEND:-0}
       DISCOVERY_RATE_LIMIT_S: ${DISCOVERY_RATE_LIMIT_S:-60}
-      # Water meter visualization moved to the sibling water-meter-watch/
-      # project — see ../water-meter-watch/ for the dashboard and
-      # display calibration env vars.
-      # Neptune R900 water meters. Empty = forward every R900 we hear
-      # (useful for first-time identification: see which one's consumption
-      # counter jumps when you run a hose). Set to a comma-separated list
-      # of IDs once you know which is yours.
-      WATER_METER_IDS: ${WATER_METER_IDS:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     healthcheck:
       # Lightweight liveness: the wrapper process must be alive.

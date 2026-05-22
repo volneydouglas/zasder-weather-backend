@@ -20,7 +20,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     """Set the env vars the app needs and point DATABASE_PATH at a temp file
     inside a per-test directory that's torn down at the end of the test.
     Per-test directory isolation matters for siblings of the DB file like
-    /meters (water-meter JSONL) and /captures (capture logs) — they're
+    /captures (capture logs) — they're
     derived from DATABASE_PATH's parent."""
     import shutil
     tmpdir = tempfile.mkdtemp(prefix="zw-test-")
@@ -43,7 +43,7 @@ def client(temp_env: str):
     """FastAPI TestClient with a freshly-imported app + isolated DB."""
     # Force re-import so settings + app pick up the env we just set.
     for mod in ["app.config", "app.db", "app.capture", "app.ingest",
-                "app.meter", "app.discovery", "app.main"]:
+                "app.discovery", "app.main"]:
         if mod in importlib.sys.modules: importlib.reload(importlib.sys.modules[mod])
     from fastapi.testclient import TestClient
     from app.main import app

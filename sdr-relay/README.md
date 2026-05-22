@@ -24,13 +24,7 @@ survives any future cloud shutdown.
 - **Optional indoor pairing**: if a `Fineoffset-WH32B` indoor sensor is
   configured, its temp/humidity/pressure are merged into the outdoor
   observation's `indoor` block.
-- **Neptune R900 water meters** (915 MHz): captured to
-  `/data/meters/<id>.jsonl` on the LAN host for every R900 sighting
-  (local-only). Optionally forwarded to the backend's `/ingest/meter`
-  endpoint for the IDs listed in `WATER_METER_IDS`. The companion
-  [water-meter-watch](../water-meter-watch/) project reads the local
-  JSONL files via a shared volume mount and serves a dashboard for
-  inspection at `http://<lan-ip>:8080/`.
+
 
 The 915 MHz dongle also hears stray traffic from neighbours' AcuRite,
 LaCrosse, and ERT meters; those packets are quietly ignored.
@@ -116,14 +110,12 @@ Within 30–60 seconds you should see lines like:
 ```
 INFO sdr-relay: posted AcuRite Atlas (SDR) (acurite-atlas-sdr)
 INFO sdr-relay: posted WS-2000 (SDR) (fineoffset-wh24-sdr)
-INFO sdr-relay: meter 1583287502: 257328
 ```
 
 Verify on the backend:
 
 ```sh
 curl -H "Authorization: Bearer $API_TOKEN" $BACKEND_URL/api/devices
-curl -H "Authorization: Bearer $API_TOKEN" $BACKEND_URL/api/meters
 ```
 
 ## Finding sensor IDs
@@ -140,7 +132,6 @@ rtl_433 -d "serial=acurite433" -R 40 -F json
 rtl_433 -d "serial=ws2000" -f 915M -F json
 # → look for Fineoffset-WH24/WH65B/WS80 (outdoor, set WH24_ID)
 # → look for Fineoffset-WH32B (indoor, set WH32B_ID)
-# → look for Neptune-R900 (water meters — note the ids for filtering later)
 ```
 
 Ctrl-C after you've identified each. The IDs are stable per physical
@@ -155,7 +146,7 @@ service synthesises one per sensor using a deterministic format:
 5D:5D:TT:HH:HH:HH
        ^  ^─ low 3 bytes of the RF sensor id
        └──── sensor type tag (01=Atlas, 02=Fine Offset outdoor,
-                              03=Fine Offset indoor, 09=R900)
+                              03=Fine Offset indoor)
 ```
 
 The `5D:5D` prefix is in the locally-administered MAC range (won't

@@ -312,54 +312,6 @@ def test_lacrosse_ignores_other_sensor_ids(monkeypatch):
     assert cap.calls == []
 
 
-# ───────────────────────── meter routing ─────────────────────────
-
-def test_meter_post_unfiltered(monkeypatch):
-    _reset_state()
-    cap = _patch(monkeypatch)
-    # No WATER_METER_IDS filter → forward all
-    monkeypatch.setattr(sdr_relay, "WATER_METER_IDS", set())
-    sdr_relay.post_meter({"model": "Neptune-R900", "id": 12345, "consumption": 100})
-    assert len(cap.calls) == 1
-    assert cap.calls[0]["url"] == "/ingest/meter"
-    assert cap.calls[0]["payload"]["id"] == 12345
-
-
-def test_meter_post_filtered_out(monkeypatch):
-    _reset_state()
-    cap = _patch(monkeypatch)
-    monkeypatch.setattr(sdr_relay, "WATER_METER_IDS", {"12345"})
-    # Not in the filter list
-    sdr_relay.post_meter({"model": "Neptune-R900", "id": 99999, "consumption": 100})
-    assert cap.calls == []
-    # In the filter list
-    sdr_relay.post_meter({"model": "Neptune-R900", "id": 12345, "consumption": 100})
-    assert len(cap.calls) == 1
-
-
-def test_meter_local_capture_always_writes(monkeypatch, tmp_path):
-    """Local capture writes every R900 to its per-meter JSONL regardless
-    of WATER_METER_IDS — the dashboard needs neighbors' data too."""
-    _reset_state()
-    cap = _patch(monkeypatch)
-    monkeypatch.setattr(sdr_relay, "WATER_METER_IDS", {"12345"})
-    monkeypatch.setattr(sdr_relay, "LOCAL_METERS_DIR", str(tmp_path))
-    # Mine (in cloud filter)
-    sdr_relay.post_meter({"model": "Neptune-R900", "id": 12345, "consumption": 100})
-    # Neighbor (NOT in cloud filter)
-    sdr_relay.post_meter({"model": "Neptune-R900", "id": 99999, "consumption": 500})
-    # Both should have local files even though only mine went to the cloud
-    assert (tmp_path / "12345.jsonl").exists()
-    assert (tmp_path / "99999.jsonl").exists()
-    assert len(cap.calls) == 1  # only the in-filter one was forwarded
-
-
-# _meter_summary lived in this module historically; moved to the
-# sibling water-meter-watch project on 2026-05-19 when we split the
-# dashboard out. Tests for that logic now live in
-# water-meter-watch/tests/test_dashboard.py.
-
-
 # ───────────────────────── rain accumulator ─────────────────────────
 
 def test_rain_returns_none_without_baseline():
@@ -640,11 +592,9 @@ def test_route_dispatches_by_model(monkeypatch):
     cap = _patch(monkeypatch)
     sdr_relay.route({"model": "Acurite-Atlas", "id": 711, "temperature_F": 90.0})
     sdr_relay.route({"model": "Fineoffset-WH24", "id": 125, "temperature_C": 30.0})
-    sdr_relay.route({"model": "Neptune-R900", "id": 100, "consumption": 1})
     sdr_relay.route({"model": "LaCrosse-TH2", "id": 1})  # neighbour noise, ignored
     sources = [c["payload"].get("source") or c["url"] for c in cap.calls]
     assert "acurite-atlas-sdr" in sources
     assert "fineoffset-wh24-sdr" in sources
-    assert "/ingest/meter" in sources
     # LaCrosse-TH2 should NOT appear
     assert not any("lacrosse" in str(s).lower() for s in sources)

@@ -22,3 +22,6 @@ jobs:
       - name: Run relay tests
         run: pytest -q tests/
         working-directory: ./relay
+      - name: Run sdr-relay tests
+        run: pytest -q tests/
+        working-directory: ./sdr-relay

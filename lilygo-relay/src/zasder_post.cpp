@@ -167,16 +167,14 @@ void zasder_post(const char *rtl433Json,
     copyIf(in, "wind_dir_deg", wind, "winddir");
   }
 
-  // ── rain block ── rtl_433 emits a lifetime cumulative counter
-  // ("rain_mm" or "rain_in"). Server-side rain calibration takes a
-  // baseline once and tracks deltas from there — see backend docs.
-  if (in["rain_mm"].is<float>() || in["rain_in"].is<float>()) {
-    auto rain = out["rain"].to<JsonObject>();
-    if (in["rain_in"].is<float>())
-      rain["yearly_in"] = in["rain_in"].as<float>();
-    else
-      rain["yearly_in"] = mm_to_in(in["rain_mm"].as<float>());
-  }
+  // Rain block intentionally NOT sent. rtl_433 emits a lifetime
+  // cumulative rain counter; turning that into a useful yearly_in
+  // requires a baseline + delta tracker (the Pi's sdr-relay has one,
+  // calibrated against AWN's yearlyrainin at deploy time). The LilyGO
+  // doesn't, and posting the raw counter as "yearly_in" overwrites the
+  // Pi's correct value via last-write-wins UPSERT. If you're running
+  // LilyGO-only (no Pi), wire up baselining here; otherwise let the Pi
+  // own rain reporting for that device row.
 
   // ── pressure block ── (typically only WH32B indoor; outdoor sensors
   // rarely include it). Convert hPa → inHg.

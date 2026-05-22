@@ -115,23 +115,34 @@ async def connect() -> AsyncIterator[aiosqlite.Connection]:
 
 async def upsert_device(mac: str, info: dict[str, Any]) -> None:
     inner = info.get("info") or {}
-    name = inner.get("name") or info.get("name")
+    # Explicit name = operator-supplied device.name from the POST. Auto-name
+    # is the source-derived fallback used only on first INSERT — see
+    # ingest._device_label() / _auto_device_name() for the split.
+    explicit_name = info.get("name")
+    auto_name = info.get("auto_name")
     coords = inner.get("coords") or {}
     location = coords.get("location") or coords.get("address") or inner.get("location")
     last = info.get("lastData") or {}
     last_seen_ms = last.get("dateutc")
+    # Effective name for the INSERT path: prefer explicit, fall back to
+    # auto. On UPDATE, COALESCE preserves the existing row name when no
+    # explicit name was provided — so a secondary source POSTing without
+    # device.name doesn't flip the friendly name the operator (or first
+    # source) set.
+    insert_name = explicit_name or auto_name
     async with connect() as db:
         await db.execute(
             """
             INSERT INTO devices (mac, name, location, info_json, last_seen_ms)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(mac) DO UPDATE SET
-                name = excluded.name,
+                name = COALESCE(?, devices.name, excluded.name),
                 location = excluded.location,
                 info_json = excluded.info_json,
                 last_seen_ms = excluded.last_seen_ms
             """,
-            (mac, name, location, json.dumps(info), last_seen_ms),
+            (mac, insert_name, location, json.dumps(info), last_seen_ms,
+             explicit_name),
         )
         await db.commit()
 

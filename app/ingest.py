@@ -133,11 +133,26 @@ def _format_mac(raw: str) -> str:
     return raw or ""
 
 
-def _device_label(normalized: dict[str, Any]) -> tuple[str, str | None]:
-    """Pick a friendly name + location for the devices table from the source.
-    Operator-set device.name / device.location override the auto-generated
-    pretty name so a "STATION_LOCATION=Chandler" env var on the relay flows
-    through to the iOS app."""
+def _device_label(normalized: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Pick a friendly name + location for the devices table.
+
+    Returns (name, location) where `name` is:
+      - the operator-supplied `device.name` if present (explicit POST field), OR
+      - None — meaning "I have no explicit name; preserve whatever the row
+        already has, and only fall back to an auto-derived name on first INSERT".
+
+    The auto-derived fallback ("AcuRite Atlas" etc.) is built in upsert_device
+    when row is brand new, NOT here, so a secondary source posting to an
+    existing row (e.g. LilyGO posting to a row the Pi already named
+    "AcuRite Atlas (SDR)") doesn't flip the name on every UPSERT."""
+    dev = normalized.get("device") or {}
+    explicit_name = dev.get("name")
+    location = dev.get("location")
+    return explicit_name, location
+
+
+def _auto_device_name(normalized: dict[str, Any]) -> str:
+    """Auto-generated name used ONLY on first INSERT of a device row."""
     dev = normalized.get("device") or {}
     src = normalized.get("source") or "custom"
     model = dev.get("model")
@@ -147,10 +162,7 @@ def _device_label(normalized: dict[str, Any]) -> tuple[str, str | None]:
         "ecowitt": "Ecowitt",
         "tempest": "Tempest",
     }.get(src, src.replace("-", " ").title())
-    auto_name = f"{pretty}{f' ({model})' if model and model.lower() not in pretty.lower() else ''}"
-    name = dev.get("name") or auto_name
-    location = dev.get("location")
-    return name, location
+    return f"{pretty}{f' ({model})' if model and model.lower() not in pretty.lower() else ''}"
 
 
 def _require_ingest_token(token: str) -> None:
@@ -180,10 +192,16 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     flat = _flatten(payload_obj)
     if not flat:
         raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
-    name, location = _device_label(payload_obj)
+    explicit_name, location = _device_label(payload_obj)
+    auto_name = _auto_device_name(payload_obj)
     info = {
-        "name": name,
-        "info": {"name": name, "location": location, "source": payload_obj.get("source")},
+        # `name` here is the operator-explicit value (None if not provided).
+        # `info.auto_name` is the fallback used only on first INSERT.
+        "name": explicit_name,
+        "auto_name": auto_name,
+        "info": {"name": explicit_name or auto_name,
+                 "location": location,
+                 "source": payload_obj.get("source")},
         "lastData": flat,
     }
     await db.upsert_device(mac, info)

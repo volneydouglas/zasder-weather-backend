@@ -10,6 +10,7 @@ namespace ZasderDisplay {
 
 void begin();
 bool isPresent();  // false if I2C probe failed; renders are no-ops
+void loop();       // call from main loop() — runs the 4h invert timer
 
 void update(const char *header,
             const char *line1,

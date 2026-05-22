@@ -14,12 +14,22 @@ String ingestToken;
 
 static WebServer server(80);
 static Preferences prefs;
-static String   lastPacket    = "(none)";
-static String   lastPostText  = "(none)";
-static uint32_t pktsDecoded   = 0;
-static uint32_t pktsPostedOk  = 0;
-static uint32_t pkts401       = 0;
-static uint32_t bootMs        = 0;
+static String        lastPacket    = "(none)";
+static String        lastPostText  = "(none)";
+static uint32_t      pktsDecoded   = 0;
+static uint32_t      pktsPostedOk  = 0;
+static uint32_t      pkts401       = 0;
+static uint32_t      bootMs        = 0;
+static unsigned long lastPacketMs  = 0;
+
+// Cycling diagnostic line on the OLED — rotates IP / mDNS / uptime /
+// RSSI / rx-age every 5 s so the most useful operator-debug fields all
+// surface without us needing a dedicated 6-line OLED. Total cycle is
+// 25 s; if the board's dead you'll see the rx-age slot tick up which
+// is the loudest indicator that the radio went quiet.
+static constexpr unsigned long DIAG_CYCLE_MS = 5000;
+static unsigned long _lastDiagMs = 0;
+static int _diagIndex = 0;
 
 static const char *MDNS_NAME = "zasder-lilygo";
 
@@ -183,19 +193,66 @@ void begin() {
                 WiFi.localIP().toString().c_str(), MDNS_NAME);
 }
 
+static void cycleDiagLine() {
+  unsigned long now = millis();
+  char buf[24];
+  switch (_diagIndex) {
+    case 0:
+      snprintf(buf, sizeof(buf), "IP: %s",
+               WiFi.localIP().toString().c_str());
+      break;
+    case 1:
+      snprintf(buf, sizeof(buf), "mDNS: %s", MDNS_NAME);
+      break;
+    case 2: {
+      unsigned long upS = (now - bootMs) / 1000;
+      if (upS < 60)        snprintf(buf, sizeof(buf), "up: %lus", upS);
+      else if (upS < 3600) snprintf(buf, sizeof(buf), "up: %lum%lus",
+                                    upS / 60, upS % 60);
+      else if (upS < 86400) snprintf(buf, sizeof(buf), "up: %luh%lum",
+                                    upS / 3600, (upS % 3600) / 60);
+      else                 snprintf(buf, sizeof(buf), "up: %lud%luh",
+                                    upS / 86400, (upS % 86400) / 3600);
+      break;
+    }
+    case 3:
+      snprintf(buf, sizeof(buf), "WiFi: %d dBm", (int) WiFi.RSSI());
+      break;
+    case 4:
+      if (lastPacketMs == 0) {
+        snprintf(buf, sizeof(buf), "rx age: never");
+      } else {
+        unsigned long ago = (now - lastPacketMs) / 1000;
+        if (ago < 60)        snprintf(buf, sizeof(buf), "rx age: %lus", ago);
+        else if (ago < 3600) snprintf(buf, sizeof(buf), "rx age: %lum", ago / 60);
+        else                 snprintf(buf, sizeof(buf), "rx age: %luh", ago / 3600);
+      }
+      break;
+  }
+  _diagIndex = (_diagIndex + 1) % 5;
+  ZasderDisplay::update(nullptr, nullptr, buf, nullptr, nullptr);
+}
+
 void loop() {
   server.handleClient();
+  unsigned long now = millis();
+  if (now - _lastDiagMs >= DIAG_CYCLE_MS) {
+    _lastDiagMs = now;
+    cycleDiagLine();
+  }
 }
 
 void noteIncomingPacket(const char *model, uint32_t id) {
   pktsDecoded++;
+  lastPacketMs = millis();
   char buf[48];
   snprintf(buf, sizeof(buf), "%.32s #%u", model, (unsigned) id);
   lastPacket = buf;
   char dispLine[24];
   snprintf(dispLine, sizeof(dispLine), "rx: %.14s#%u",
            model, (unsigned) id);
-  ZasderDisplay::update(nullptr, nullptr, dispLine, nullptr, nullptr);
+  // Updates line 3 only — line 2 is owned by the cycling diag below.
+  ZasderDisplay::update(nullptr, nullptr, nullptr, dispLine, nullptr);
 }
 
 void notePostResult(int httpCode) {
@@ -211,11 +268,13 @@ void notePostResult(int httpCode) {
   char dispLine[24];
   snprintf(dispLine, sizeof(dispLine), "post: %s",
            lastPostText.c_str());
-  // Update line 4 (POST status) and refresh counters on header.
+  // Counters in the header, last POST result on line 4. Line 1
+  // (source tag), line 2 (cycling diag), and line 3 (last rx) are
+  // each owned by other callers.
   char hdrLine[24];
   snprintf(hdrLine, sizeof(hdrLine), "ok=%lu 401=%lu",
            (unsigned long) pktsPostedOk, (unsigned long) pkts401);
-  ZasderDisplay::update(nullptr, hdrLine, nullptr, nullptr, dispLine);
+  ZasderDisplay::update(hdrLine, nullptr, nullptr, nullptr, dispLine);
 }
 
 }  // namespace ZasderConfigServer

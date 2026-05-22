@@ -115,4 +115,5 @@ void setup() {
 void loop() {
   rtl_433.loop();
   ZasderConfigServer::loop();
+  ZasderDisplay::loop();
 }

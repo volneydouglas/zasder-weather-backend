@@ -16,6 +16,18 @@ static U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(
     U8G2_R0, /*reset=*/U8X8_PIN_NONE);
 
 static bool _displayPresent = false;
+
+// Burn-in mitigation: SSD1306 OLEDs degrade with 24/7 use, mostly as a
+// function of brightness × time-pixel-lit. Two cheap defenses:
+//   1. Run at ~30% contrast — biggest single-factor lifetime win.
+//   2. Flip the display polarity (normal ↔ inverted) every 4h so the
+//      pixels that were "lit white" become "lit dark" and vice versa,
+//      evening out the wear across the panel.
+static constexpr uint8_t        OLED_CONTRAST       = 80;
+static constexpr unsigned long  INVERT_INTERVAL_MS  = 4UL * 60UL * 60UL * 1000UL;
+static unsigned long            _lastInvertMs       = 0;
+static bool                     _inverted           = false;
+
 static String _header;
 static String _line1;
 static String _line2;
@@ -59,7 +71,8 @@ void begin() {
       u8g2.setI2CAddress(addr << 1);
       u8g2.begin();
       Wire.setClock(400000);
-      u8g2.setContrast(255);
+      u8g2.setContrast(OLED_CONTRAST);
+      _lastInvertMs = millis();
       _displayPresent = true;
       _header = "Zasder LilyGO";
       _line1  = "booting...";
@@ -76,6 +89,19 @@ void begin() {
 }
 
 bool isPresent() { return _displayPresent; }
+
+void loop() {
+  if (!_displayPresent) return;
+  unsigned long now = millis();
+  // millis() wraps every ~49 days — using unsigned subtraction means
+  // the comparison stays correct across wrap.
+  if (now - _lastInvertMs >= INVERT_INTERVAL_MS) {
+    _inverted = !_inverted;
+    // SSD1306 raw commands: 0xA6 = normal, 0xA7 = inverted.
+    u8g2.sendF("c", _inverted ? 0xA7 : 0xA6);
+    _lastInvertMs = now;
+  }
+}
 
 void update(const char *header,
             const char *line1,

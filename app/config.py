@@ -31,6 +31,24 @@ class Settings(BaseSettings):
     # means today in the user's wall-clock sense, not UTC's.
     timezone: str = "UTC"
 
+    # WeatherLink v2 cloud poller (Davis Vantage Pro 2 + 6313 console).
+    # All four must be set together to enable the poller; any unset and
+    # the poller stays asleep (similar to aw_configured).
+    weatherlink_api_key: str | None = None
+    weatherlink_api_secret: str | None = None
+    weatherlink_station_id: int | None = None
+    weatherlink_poll_interval_seconds: int = 60
+    # Friendly name + location used on the synthetic device row; if
+    # unset, falls back to the WeatherLink station's own name / city.
+    weatherlink_name: str | None = None
+    weatherlink_location: str | None = None
+
+    @property
+    def weatherlink_configured(self) -> bool:
+        return bool(self.weatherlink_api_key
+                    and self.weatherlink_api_secret
+                    and self.weatherlink_station_id)
+
     @property
     def valid_api_tokens(self) -> set[str]:
         return {t for t in [self.api_token, self.reviewer_api_token] if t}

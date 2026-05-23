@@ -836,12 +836,20 @@ def route(pkt: dict[str, Any]) -> None:
 # ───────────────────────── rtl_433 subprocess wrappers ─────────────────────────
 
 def stream_rtl433(serial: str, freq_hz: str, decoders: list[str] | None,
-                  label: str, stop_event: threading.Event) -> None:
+                  label: str, stop_event: threading.Event,
+                  sample_rate: str | None = None) -> None:
     """Run one rtl_433 subprocess, parse JSON lines, route to handlers.
-    Auto-restarts on exit with backoff so a USB blip doesn't kill us."""
+    Auto-restarts on exit with backoff so a USB blip doesn't kill us.
+
+    `sample_rate` widens the receive bandwidth — e.g. "2400k" gives a
+    ~2.4 MHz window so a single 915 MHz stream catches a meaningful
+    chunk of Davis FHSS's 26 MHz hop spread (default 250k = ~1%
+    capture). Leave None for the rtl_433 default."""
     backoff = 1
     while not stop_event.is_set():
         cmd = [RTL433_BIN, "-d", f"serial={serial}", "-f", freq_hz, "-F", "json"]
+        if sample_rate:
+            cmd.extend(["-s", sample_rate])
         for d in (decoders or []):
             cmd.extend(["-R", d])
         log.info("[%s] starting: %s", label, " ".join(cmd))
@@ -949,14 +957,24 @@ def main() -> int:
     else:
         log.info("Atlas disabled (ATLAS_ID unset)")
 
-    if WH24_ID or WH32B_ID:
-        # 915 MHz stream — WH24 outdoor and/or WH32B indoor.
+    # 915 MHz stream — only starts if there's an actual configured
+    # sensor at 915. WH24_ID and WH32B_ID are Fine Offset outdoor /
+    # indoor; WATER_METER_IDS is a non-empty set of R900 meter IDs to
+    # forward. If everything's zero/empty, the dongle is left free
+    # for another process to claim (e.g. rtldavis for Davis-ISS FHSS,
+    # which can't share an SDR with rtl_433).
+    if WH24_ID or WH32B_ID or WATER_METER_IDS:
         threads.append(threading.Thread(
             target=stream_rtl433,
+            # No -R filter on 915: open-mode so all 915 protocols decode.
             args=(WS2000_SERIAL, "915M", None, "ws2000-915", stop),
             daemon=True, name="ws2000-915"))
         log.info("915 MHz enabled: serial=%s wh24=%d wh32b=%d",
                  WS2000_SERIAL, WH24_ID, WH32B_ID)
+    else:
+        log.info("915 MHz stream disabled (no WH24/WH32B/water meters "
+                 "configured) — dongle %s is free for another process",
+                 WS2000_SERIAL)
 
     for t in threads:
         t.start()

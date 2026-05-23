@@ -20,6 +20,8 @@ from .config import settings
 from .discovery import router as discovery_router
 from .ingest import router as ingest_router
 from .poller import Poller
+from .weatherlink_client import WeatherLinkClient
+from .weatherlink_poller import WeatherlinkPoller
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,11 +49,33 @@ async def lifespan(app: FastAPI):
                  "(custom ingest endpoints are still active)")
     app.state.client = client
     app.state.poller = poller
+
+    # WeatherLink v2 cloud poller — independent from AWN. Same lifespan
+    # gating (start only if all 3 creds set; explicit log if disabled
+    # so it's obvious in deploy logs whether the secrets landed).
+    wl_client = None
+    wl_poller = None
+    if settings.weatherlink_configured:
+        wl_client = WeatherLinkClient(settings.weatherlink_api_key,  # type: ignore[arg-type]
+                                      settings.weatherlink_api_secret)  # type: ignore[arg-type]
+        wl_poller = WeatherlinkPoller(wl_client,
+                                      settings.weatherlink_station_id,  # type: ignore[arg-type]
+                                      settings.weatherlink_poll_interval_seconds)
+        await wl_poller.start()
+        log.info("WeatherLink poller started (station_id=%s)",
+                 settings.weatherlink_station_id)
+    else:
+        log.info("WeatherLink not configured — skipping Davis cloud poller")
+    app.state.wl_client = wl_client
+    app.state.wl_poller = wl_poller
+
     try:
         yield
     finally:
         if poller is not None: await poller.stop()
         if client is not None: await client.aclose()
+        if wl_poller is not None: await wl_poller.stop()
+        if wl_client is not None: await wl_client.aclose()
 
 
 # /docs, /redoc, /openapi.json are exposed by default in FastAPI and

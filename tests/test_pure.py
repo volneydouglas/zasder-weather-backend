@@ -61,18 +61,28 @@ def test_flatten_returns_none_on_garbage_timestamp():
     assert ingest._flatten(p) is None
 
 
-# ───────────────────────── _device_label ─────────────────────────
+# ───────────────────── _device_label / _auto_device_name ─────────────────────
 
-def test_device_label_uses_payload_overrides():
+def test_device_label_returns_explicit_name():
+    """When device.name is in the POST, _device_label echoes it as the
+    explicit name (overrides any auto-derived fallback in upsert)."""
     name, loc = ingest._device_label({"device": {"name": "Backyard", "location": "Phoenix"}})
     assert name == "Backyard"
     assert loc == "Phoenix"
 
-def test_device_label_pretty_for_known_source():
+def test_device_label_returns_none_when_name_absent():
+    """No explicit device.name → _device_label returns None so the
+    UPSERT preserves whatever name's already in the row (a secondary
+    source shouldn't flip the friendly name set by the primary)."""
     name, loc = ingest._device_label({"device": {}, "source": "acurite-atlas"})
-    assert name == "AcuRite Atlas"
+    assert name is None
     assert loc is None
 
-def test_device_label_includes_model_when_distinct():
-    name, _ = ingest._device_label({"device": {"model": "Iris"}, "source": "acurite-atlas"})
+def test_auto_device_name_pretty_for_known_source():
+    """The auto-derived name is the fallback used only on first INSERT."""
+    name = ingest._auto_device_name({"device": {}, "source": "acurite-atlas"})
+    assert name == "AcuRite Atlas"
+
+def test_auto_device_name_includes_model_when_distinct():
+    name = ingest._auto_device_name({"device": {"model": "Iris"}, "source": "acurite-atlas"})
     assert name == "AcuRite Atlas (Iris)"

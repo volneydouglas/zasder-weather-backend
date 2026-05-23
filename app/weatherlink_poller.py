@@ -87,6 +87,14 @@ def build_payload(station: dict[str, Any],
     ts_iso = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc) \
         .isoformat(timespec="seconds")
 
+    # Field names MUST match the backend ingest._flatten() schema:
+    #   outdoor: tempf, feels_like, dew_point_f, humidity, uv, solar_wm2
+    #   wind:    speed_mph, gust_mph, direction
+    #   rain:    hourly_in, daily_in, monthly_in, yearly_in
+    #   indoor:  tempf, humidity, pressure_inhg
+    #   pressure: relative_inhg
+    # Mis-naming silently drops the field — the iOS app then shows the
+    # tile as missing even though the cloud had the data.
     outdoor: dict[str, Any] = {}
     if iss_data.get("temp") is not None:
         outdoor["tempf"] = float(iss_data["temp"])
@@ -100,21 +108,37 @@ def build_payload(station: dict[str, Any],
     if iss_data.get("uv_index") is not None:
         outdoor["uv"] = float(iss_data["uv_index"])
     if iss_data.get("solar_rad") is not None:
-        outdoor["solarradiation"] = float(iss_data["solar_rad"])
+        outdoor["solar_wm2"] = float(iss_data["solar_rad"])
 
     wind: dict[str, Any] = {}
     if iss_data.get("wind_speed_last") is not None:
-        wind["windspeedmph"] = float(iss_data["wind_speed_last"])
+        wind["speed_mph"] = float(iss_data["wind_speed_last"])
     if iss_data.get("wind_speed_hi_last_2_min") is not None:
-        wind["windgustmph"] = float(iss_data["wind_speed_hi_last_2_min"])
+        wind["gust_mph"] = float(iss_data["wind_speed_hi_last_2_min"])
     if iss_data.get("wind_dir_last") is not None:
-        wind["winddir"] = round(float(iss_data["wind_dir_last"]))
+        wind["direction"] = round(float(iss_data["wind_dir_last"]))
 
     rain: dict[str, Any] = {}
     if iss_data.get("rainfall_year_in") is not None:
-        rain["yearly_in"] = float(iss_data["rainfall_year_in"])
+        # Add the operator-supplied baseline so a mid-year-installed
+        # ISS reports the actual year-to-date total, not just rain
+        # since pairing. (Davis cloud's rainfall_year_in resets to 0
+        # at install + only counts new tips from then on.)
+        rain["yearly_in"] = (float(iss_data["rainfall_year_in"])
+                              + settings.weatherlink_yearly_rain_baseline_in)
+    # Davis cloud reports daily + hourly directly. Setting them here
+    # explicitly stops backend/app/main.py:get_current() from invoking
+    # its rain-rollup enrichment (which would otherwise compute
+    # daily/weekly/monthly from yearlyrainin DELTAS — broken for a
+    # baselined value since the "yesterday" yearlyrainin is fictional).
+    if iss_data.get("rainfall_day_in") is not None:
+        rain["daily_in"] = float(iss_data["rainfall_day_in"])
     if iss_data.get("rainfall_last_60_min_in") is not None:
         rain["hourly_in"] = float(iss_data["rainfall_last_60_min_in"])
+    # Davis cloud doesn't expose weekly_in / monthly_in inches; the
+    # backend's rollup will still compute them from now-baselined
+    # yearly history (which is correct as soon as all stored rows
+    # carry the baseline value).
 
     indoor: dict[str, Any] = {}
     if indoor_data.get("temp_in") is not None:
@@ -126,9 +150,7 @@ def build_payload(station: dict[str, Any],
 
     pressure: dict[str, Any] = {}
     if barom_data.get("bar_sea_level") is not None:
-        pressure["baromrelin"] = float(barom_data["bar_sea_level"])
-    if barom_data.get("bar_absolute") is not None:
-        pressure["baromabsin"] = float(barom_data["bar_absolute"])
+        pressure["relative_inhg"] = float(barom_data["bar_sea_level"])
 
     payload: dict[str, Any] = {
         "device": {

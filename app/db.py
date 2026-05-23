@@ -204,12 +204,44 @@ async def observation_count(mac: str) -> int:
 
 
 async def latest_observation(mac: str) -> dict[str, Any] | None:
+    """Composite "latest" — for each AWN field, return the most recent
+    NON-NULL value across the last ~5 minutes of observations. Fixes
+    the partial-poster problem where a device has multiple producers
+    posting different field subsets at different cadences (e.g.,
+    LilyGO 433 posts every Atlas RF packet ~16-30s with rotating
+    partial fields, while the Pi's sdr-relay coalesces every 60s with
+    all fields). Using strict "latest row" loses fields between
+    coalesced posts; this composite preserves them.
+
+    Returns the dateutc of the freshest contributing row so the iOS
+    app's "last update" indicator still moves forward in real time."""
+    LOOKBACK_MS = 5 * 60 * 1000
     async with connect() as db:
-        row = await (await db.execute(
-            "SELECT data_json FROM observations WHERE mac = ? ORDER BY dateutc_ms DESC LIMIT 1",
+        # Fetch the freshest row first to seed dateutc + any always-
+        # present keys (helps with rows that have an unusual shape).
+        freshest_row = await (await db.execute(
+            "SELECT data_json, dateutc_ms FROM observations "
+            "WHERE mac = ? ORDER BY dateutc_ms DESC LIMIT 1",
             (mac,),
         )).fetchone()
-    return json.loads(row["data_json"]) if row else None
+        if not freshest_row:
+            return None
+        cutoff_ms = freshest_row["dateutc_ms"] - LOOKBACK_MS
+        recent_rows = await (await db.execute(
+            "SELECT data_json FROM observations "
+            "WHERE mac = ? AND dateutc_ms >= ? "
+            "ORDER BY dateutc_ms DESC",
+            (mac, cutoff_ms),
+        )).fetchall()
+    # Start from freshest row (preserves dateutc + any fields it has),
+    # then fill in nulls from older rows in the lookback window.
+    out: dict[str, Any] = dict(json.loads(freshest_row["data_json"]))
+    for r in recent_rows[1:]:
+        older = json.loads(r["data_json"])
+        for k, v in older.items():
+            if v is not None and out.get(k) is None:
+                out[k] = v
+    return out
 
 
 def _auto_bucket_ms(window_ms: int) -> int:

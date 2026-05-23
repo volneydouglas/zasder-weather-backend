@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     # unset, falls back to the WeatherLink station's own name / city.
     weatherlink_name: str | None = None
     weatherlink_location: str | None = None
+    # Inches to ADD to whatever the WeatherLink API reports as
+    # rainfall_year_in. Use case: the Davis ISS was installed
+    # mid-year, so its own yearly counter started at 0 even though
+    # actual cumulative rainfall was already higher. Other receivers
+    # (AWN, Atlas) have the right total; we baseline Davis here.
+    weatherlink_yearly_rain_baseline_in: float = 0.0
 
     @property
     def weatherlink_configured(self) -> bool:

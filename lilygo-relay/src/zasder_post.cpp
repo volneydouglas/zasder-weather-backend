@@ -21,6 +21,13 @@ static int consecutive401 = 0;
 // device rows (e.g. "Secplus-v1" garage doors). Only the actual weather
 // sensors are useful; everything else is dropped at the source.
 //
+// Fineoffset-WH32B (indoor temp/humidity/pressure monitor) is
+// intentionally NOT in the whitelist — it shows up as its own device
+// row that the operator typically doesn't want as a top-level station.
+// If you need indoor stats, run an outdoor station (WH24/WH65/WS80)
+// that supports the optional WH32B pairing, and let the *outdoor*
+// post carry the indoor block.
+//
 // Returns the synthetic-MAC type tag for `model`, or 0 if the model is
 // not on the whitelist (caller skips the POST). Type tags match
 // sdr-relay so a LilyGO-sourced sensor lands on the same device row
@@ -31,7 +38,6 @@ static uint8_t modelTypeTag(const char *model) {
   if (strcmp(model, "Fineoffset-WH24") == 0) return 0x02;
   if (strcmp(model, "Fineoffset-WH65B")== 0) return 0x02;
   if (strcmp(model, "Fineoffset-WS80") == 0) return 0x02;
-  if (strcmp(model, "Fineoffset-WH32B")== 0) return 0x03;
   return 0;
 }
 
@@ -80,6 +86,20 @@ static inline float c_to_f(float c)     { return c * 9.0f / 5.0f + 32.0f; }
 static inline float ms_to_mph(float ms) { return ms * 2.23694f; }
 static inline float mm_to_in(float mm)  { return mm / 25.4f; }
 static inline float hpa_to_inhg(float h){ return h * 0.0295299830714f; }
+
+// Magnus-Tetens dew point in °F from tempf + humidity %. Matches the
+// formula sdr-relay uses so two sources posting to the same device
+// row don't disagree on dew point by a fraction. Returns NaN if
+// humidity is non-positive (rare sensor glitch) — caller must check
+// isnan() before using.
+static float dew_point_f(float temp_f, float humidity_pct) {
+  if (humidity_pct <= 0.0f) return NAN;
+  float t_c = (temp_f - 32.0f) * 5.0f / 9.0f;
+  const float a = 17.625f, b = 243.04f;
+  float gamma = logf(humidity_pct / 100.0f) + (a * t_c) / (b + t_c);
+  float dp_c = (b * gamma) / (a - gamma);
+  return dp_c * 9.0f / 5.0f + 32.0f;
+}
 
 void zasder_post(const char *rtl433Json,
                  const String &backendUrl,
@@ -145,11 +165,25 @@ void zasder_post(const char *rtl433Json,
       outdoor["tempf"] = c_to_f(in["temperature_C"].as<float>());
     else if (in["temperature_F"].is<float>())
       outdoor["tempf"] = in["temperature_F"].as<float>();
+    // Field names MUST match backend/app/ingest._flatten() schema:
+    //   outdoor: tempf, feels_like, dew_point_f, humidity, uv, solar_wm2
+    //   wind:    speed_mph, gust_mph, direction
+    //   indoor:  tempf, humidity, pressure_inhg
+    //   pressure: relative_inhg
+    // Mis-naming silently drops the field; the iOS card then renders
+    // without that tile.
     copyIf(in, "humidity",         outdoor, "humidity");
     copyIf(in, "uv",               outdoor, "uv");
     copyIf(in, "uvi",              outdoor, "uv");
     copyIf(in, "light_lux",        outdoor, "lux");
-    copyIf(in, "solar_radiation",  outdoor, "solarradiation");
+    copyIf(in, "solar_radiation",  outdoor, "solar_wm2");
+    // Computed dew point when we have both temp + humidity. Backend
+    // accepts dew_point_f directly (no further derivation needed).
+    if (outdoor["tempf"].is<float>() && outdoor["humidity"].is<float>()) {
+      float dp = dew_point_f(outdoor["tempf"].as<float>(),
+                             outdoor["humidity"].as<float>());
+      if (!isnan(dp)) outdoor["dew_point_f"] = dp;
+    }
   }
 
   // ── wind block ──
@@ -157,14 +191,14 @@ void zasder_post(const char *rtl433Json,
       in["wind_avg_mi_h"].is<float>() || in["wind_dir_deg"].is<int>()) {
     auto wind = out["wind"].to<JsonObject>();
     if (in["wind_avg_m_s"].is<float>())
-      wind["windspeedmph"] = ms_to_mph(in["wind_avg_m_s"].as<float>());
+      wind["speed_mph"] = ms_to_mph(in["wind_avg_m_s"].as<float>());
     else if (in["wind_avg_mi_h"].is<float>())
-      wind["windspeedmph"] = in["wind_avg_mi_h"].as<float>();
+      wind["speed_mph"] = in["wind_avg_mi_h"].as<float>();
     if (in["wind_max_m_s"].is<float>())
-      wind["windgustmph"] = ms_to_mph(in["wind_max_m_s"].as<float>());
+      wind["gust_mph"] = ms_to_mph(in["wind_max_m_s"].as<float>());
     else if (in["wind_max_mi_h"].is<float>())
-      wind["windgustmph"] = in["wind_max_mi_h"].as<float>();
-    copyIf(in, "wind_dir_deg", wind, "winddir");
+      wind["gust_mph"] = in["wind_max_mi_h"].as<float>();
+    copyIf(in, "wind_dir_deg", wind, "direction");
   }
 
   // Rain block intentionally NOT sent. rtl_433 emits a lifetime
@@ -176,11 +210,12 @@ void zasder_post(const char *rtl433Json,
   // LilyGO-only (no Pi), wire up baselining here; otherwise let the Pi
   // own rain reporting for that device row.
 
-  // ── pressure block ── (typically only WH32B indoor; outdoor sensors
-  // rarely include it). Convert hPa → inHg.
+  // ── pressure block ── (only relevant if a paired indoor sensor
+  // forwards barometer; outdoor stations don't have one). Convert
+  // hPa → inHg.
   if (in["pressure_hPa"].is<float>()) {
     auto p = out["pressure"].to<JsonObject>();
-    p["baromrelin"] = hpa_to_inhg(in["pressure_hPa"].as<float>());
+    p["relative_inhg"] = hpa_to_inhg(in["pressure_hPa"].as<float>());
   }
 
   String body;

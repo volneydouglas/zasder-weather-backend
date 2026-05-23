@@ -1,310 +1,186 @@
-# Zasder Weather — Backend
+# Zasder Weather (backend)
 
-Self-hosted backend for the **Zasder Weather** iOS app. Ingests
-observations from supported weather stations, stores them in SQLite,
-and serves a small HTTP API the iOS app reads. Pairs Open-Meteo for
-the 7-day forecast.
+Self-hosted weather-station backend. Pulls data from any combination of
+**AmbientWeather cloud**, **Davis WeatherLink cloud**, or direct **433/915 MHz
+RF capture** (LilyGO ESP32+SX1276), stores it in SQLite, and exposes a small
+HTTP API that a [companion iOS app](https://apps.apple.com/) reads.
 
-The iOS app is on the App Store. This repo is the server-side piece —
-get it running somewhere your phone can reach (Fly.io, your home
-network, a VPS) and point the app at it.
+Built because [MyAcurite](https://www.acurite.com/) was killed by AcuRite in
+2026 and Davis's WeatherLink Console is a paid cloud lock-in. Owning your
+own backend means the data is yours, the dashboard is yours, the app keeps
+working when vendors change their minds.
 
-> [!IMPORTANT]
-> **You need to run your own backend.** The official instance at
-> `weather.zasder.com` is the developer's personal deployment and is
-> **not** shared. Don't point your app at it — you'll get an
-> `invalid token` error. Pick one of the paths below.
+If you also want LLM-assisted setup (Claude Code, Cursor, Aider, etc.),
+read **[AGENTS.md](AGENTS.md)** — it's the same setup story but written
+for an AI agent.
 
-## Pick your path
+## What you need
 
-Two independent decisions: **how you ingest data** (cloud API or
-direct-RF SDR), and **where you host the backend** (Fly.io or LAN).
+Pick **one or more** of these ingest paths. They all coexist — data shows up
+as separate device rows in the iOS app.
 
-| Ingest method            | Works for                          | Cadence | LAN hardware?                 |
-|--------------------------|------------------------------------|---------|-------------------------------|
-| **AmbientWeather API**   | AWN-registered stations            | 60 s    | None — cloud-to-cloud         |
-| **SDR direct** *(rec.)*  | AcuRite Atlas, Fine Offset (WS-2000, WH-31, WS-5000, WH-65) | 16–30 s | ~$30 RTL-SDR dongle + Pi (or any always-on Linux box) |
-| **LilyGO ESP32** *(budget)* | AcuRite Atlas, Fine Offset (WS-2000, WH-31, WS-5000, WH-65) | 16–30 s | ~$25/band [LilyGO T3 LoRa32 V1.6.1](lilygo-relay/README.md), no Pi |
-| **DNS-hijack relay** *(legacy)* | AcuRite Atlas via the AcuRite hub          | sensor-dependent | Pi running a small Docker container |
+| Path | Hardware needed | Data quality | Notes |
+|---|---|---|---|
+| **A. AmbientWeather cloud** | An AmbientWeather-registered station (WS-2000, WS-2902, etc.) | 60s cadence | Easiest if you already have one. Cloud-only — at the mercy of AWN's API. |
+| **B. Davis WeatherLink cloud** | Davis Vantage Vue / Pro 2 + WeatherLink Console (any) | 1–5 min cadence (subscription-tier dependent) | Davis VP2 + 6313 Console works only via cloud — the new console doesn't broadcast in the legacy unencrypted protocol. |
+| **C. LilyGO 433 MHz** | LilyGO T3 LoRa32 V1.6.1 board (~$25), AcuRite Atlas | ~16s real-time | Captures AcuRite Atlas via RTL433-style decode on ESP32. |
+| **D. LilyGO 915 MHz** | Second LilyGO board, Fine Offset / AmbientWeather WS-2000 outdoor + WH32B indoor | ~16s real-time | Captures Fineoffset family (FSK). Merges WH32B indoor data into the outdoor station's tile grid. |
 
-**Recommended for most people**: SDR direct + Fly hosting. Sensor data
-flows: outdoor sensor → 433/915 MHz RF → SDR on your Pi → backend on
-Fly.io → iOS app. No vendor cloud anywhere; survives any future cloud
-shutdown by sensor manufacturers (AcuRite has been gradually killing
-theirs).
+Two deployment modes for the backend itself:
 
-| | **Backend on Fly.io** | **Backend on your LAN** |
-|---|---|---|
-| **AWN API only** | Path A (easiest start) | Path B |
-| **SDR direct** | Path C (recommended) | Path D |
-| **LilyGO ESP32** | Path F (budget, no Pi) — see [lilygo-relay/](lilygo-relay/README.md) | same |
-| **AWN + SDR mixed** | Path A + add SDR | Path B + add SDR |
-| **AcuRite legacy** | Path E (deprecated, but works while AcuRite cloud is alive) | same |
+- **Cloud (Fly.io)** — recommended. ~$0–5/month. Single command setup. Custom domain optional.
+- **Local Docker** — runs on any Linux/macOS box with Docker. Good for "I want all my data on-premise."
 
-You can run multiple ingest methods at once — they all post into the
-same backend and surface as separate devices in the iOS app.
+The iOS app is published separately on the App Store and connects to whichever backend URL you give it.
 
-## What you need (every path)
-
-- An **AmbientWeather** station that's reporting to ambientweather.net,
-  and an [Application Key + API Key](https://ambientweather.net/account)
-  → **only if you're ingesting via AWN API**.
-- An **AcuRite Atlas / Fine Offset / WS-2000 / Ecowitt** outdoor station
-  → **only if you're using SDR direct**.
-- The Zasder Weather iOS app from the App Store, plus a way to give it
-  a backend URL + bearer token (you'll generate that during setup).
-
-For paths involving Fly.io: a free Fly.io account.
-For LAN hosting: a machine that can run Docker (Raspberry Pi 3+ with
-wired ethernet is plenty).
-
----
-
-## Path A — Fly.io + AmbientWeather API (easiest)
+## Quickstart: Fly.io + AmbientWeather (5 minutes)
 
 ```sh
-brew install flyctl                      # macOS; otherwise see fly.io/docs/install/
-fly auth signup                          # or `fly auth login` if you have an account
-./bin/setup-fly.sh                       # interactive — prompts for AWN keys
+# 1. Install Fly CLI
+brew install flyctl
+fly auth signup     # or `fly auth login`
+
+# 2. Clone + run interactive setup
+git clone https://github.com/volneydouglas/zasder-weather-backend.git
+cd zasder-weather-backend
+./bin/setup-fly.sh  # prompts for app name, region, AWN keys, TZ
+                    # outputs an API_TOKEN — save it for the iOS app
 ```
 
-When it finishes the script prints:
+When `setup-fly.sh` finishes you'll have a live backend at
+`https://<app>.fly.dev/`. The status page at `/` proves it's running. Point
+the iOS app at that URL + the printed `API_TOKEN` and you're done.
 
-```
-Backend URL:   https://your-app-name.fly.dev
-Bearer Token:  <a long random string>
-```
+To add Davis cloud or a LilyGO SDR later: see the per-path sections below.
 
-Open the iOS app → **Settings** → paste both → **Test connection**. Done.
-
-### Optional: custom domain
+## Quickstart: local Docker
 
 ```sh
-fly certs add your-domain.example.com
-fly certs show your-domain.example.com    # add the A + AAAA records it prints to your DNS
-```
-
----
-
-## Path B — Local backend + AmbientWeather API
-
-For people who'd rather run everything on their own machine. Requires
-a Pi/NAS/always-on box on your LAN running Docker.
-
-```sh
+git clone https://github.com/volneydouglas/zasder-weather-backend.git
+cd zasder-weather-backend
 cp .env.example .env
-# Edit .env — set AW_APPLICATION_KEY, AW_API_KEY, and a fresh API_TOKEN
-#   (generate with:  openssl rand -hex 32)
+$EDITOR .env        # at minimum, fill API_TOKEN + INGEST_TOKEN
 docker compose up -d
 ```
 
-Find the host's LAN IP, then in the iOS app → **Settings**:
+The backend listens on `http://localhost:8080/`. The iOS app needs to reach
+it on your LAN — point the app at `http://<your-mac-ip>:8080` and the same
+`API_TOKEN` from `.env`.
 
-- **Backend URL**: `http://<that-lan-ip>:8080`
-- **Bearer Token**: the `API_TOKEN` you set in `.env`
+## Path A — AmbientWeather cloud poller
 
-**Heads-up:** your phone needs to be on the same Wi-Fi as the host. For
-remote access without exposing the port to the internet, look at
-[Tailscale](https://tailscale.com) or WireGuard.
+Add to `.env` (or as Fly secrets):
 
----
+```sh
+AW_APPLICATION_KEY=<from https://ambientweather.net/account>
+AW_API_KEY=<same page>
+POLL_INTERVAL_SECONDS=60
+```
 
-## Path C — Fly.io backend + SDR direct (recommended)
+Restart. The backend polls every 60s and stores each station's most recent
+reading as a device row.
 
-Skip any vendor's cloud entirely. A tiny container on a LAN host runs
-[rtl_433](https://github.com/merbanan/rtl_433) against an RTL-SDR
-dongle, decodes packets from your outdoor sensor's 433/915 MHz
-broadcasts, and forwards them as normalized JSON to your Fly backend.
+## Path B — Davis WeatherLink cloud poller
 
-The sensor data path becomes: **sensor → RF → SDR → relay → Fly → app**.
-Works even if AcuRite, AmbientWeather, or any other manufacturer kills
-their cloud tomorrow (which has been a recurring story — that's why
-this path exists).
-
-### Hardware needed
-
-- 1× **[RTL-SDR Blog V4](https://www.rtl-sdr.com/v4/)** USB dongle (~$25)
-  with its bundled dipole antenna kit
-- Optionally a 2nd V4 for dual-band capture (433 MHz for AcuRite +
-  915 MHz for Fine Offset / WS-2000 simultaneously)
-- A **powered USB hub** (V4 has TCXO+LDO that benefit from clean power)
-- Any always-on Linux box on your LAN to host it (Pi 3+ works fine)
-
-### Steps
-
-1. **Set up the Fly backend** (Path A above). When it finishes, you'll
-   have a `BACKEND_URL` and an `INGEST_TOKEN`.
-
-2. **Deploy the SDR relay** on your LAN host:
-
+1. Sign in at https://www.weatherlink.com/account
+2. **Scroll to the bottom-left** of the Account page — there's a section
+   labeled **"API Key v2"** (Davis tucks it below the fold; that's why most
+   people can't find it). Click **Generate v2 Key**.
+3. Copy the **API Key** and **API Secret** (Secret is shown ONCE).
+4. Find your station ID:
    ```sh
-   cd sdr-relay
-   cp .env.example .env
-   # Edit .env — set BACKEND_URL + INGEST_TOKEN, plus the sensor IDs
-   # for your station (see sdr-relay/README.md for how to find them).
-   docker compose up -d
-   docker logs -f sdr-relay
+   curl -H "X-Api-Secret: <SECRET>" \
+     "https://api.weatherlink.com/v2/stations?api-key=<KEY>"
+   ```
+   `station_id` is in the response.
+5. Add to `.env`:
+   ```sh
+   WEATHERLINK_API_KEY=...
+   WEATHERLINK_API_SECRET=...
+   WEATHERLINK_STATION_ID=...
+   WEATHERLINK_NAME=Davis Vantage Pro2 (Cloud)
+   WEATHERLINK_LOCATION=Your City
+   # If your ISS was installed mid-year and the cloud's yearly_rainin starts at 0:
+   WEATHERLINK_YEARLY_RAIN_BASELINE_IN=0
    ```
 
-3. **First-time sensor discovery** — before configuring, run rtl_433
-   directly to identify the sensor IDs in range:
+Restart. Free WeatherLink tier exposes 5-minute current-conditions; Pro+
+gives 1-minute. Both work; adjust `WEATHERLINK_POLL_INTERVAL_SECONDS`
+(default 60) to match your tier.
 
-   ```sh
-   rtl_433 -d "serial=acurite433" -R 40 -F json      # AcuRite Atlas (433 MHz)
-   rtl_433 -d "serial=ws2000" -f 915M -F json        # Fine Offset / WS-2000 (915 MHz)
-   ```
+## Paths C + D — LilyGO ESP32 SDR direct
 
-   Look for `"id": <integer>` in the output and put those values in
-   `.env` as `ATLAS_ID` / `WH24_ID` / `WH32B_ID`. See
-   [`sdr-relay/README.md`](sdr-relay/README.md) for the full guide
-   including kernel-driver blacklisting, dongle-EEPROM marking,
-   and per-device field maps.
+These give real-time RF capture without going through any vendor cloud. One
+LilyGO board per band (one for 433 MHz Atlas, one for 915 MHz Fineoffset).
 
-4. **Open the iOS app.** Within a minute or two new device rows appear
-   for each configured sensor.
-
-### Bonus: long-tail RF discovery survey
-
-The SDR also hears a lot of other 433/915 MHz traffic — TPMS from
-passing cars, garage remotes, security sensors, smoke detectors, etc.
-Every decoded packet is recorded locally in `/data/discoveries.json`
-on the LAN host (deduped by `(model, id)` with first/last-seen and a
-sample payload). View any time with:
+See **[lilygo-relay/README.md](lilygo-relay/README.md)** for hardware, flashing,
+provisioning, and field-tested gotchas. Short version:
 
 ```sh
-docker exec sdr-relay cat /data/discoveries.json | jq .
+brew install platformio
+cd lilygo-relay
+pio run -e t3_v161_433 -t upload    # for the 433 board
+# or
+pio run -e t3_v161_915 -t upload    # for the 915 board
 ```
 
-Set `DISCOVERY_FORWARD_TO_BACKEND=1` to also POST sightings to the
-backend (queryable via `/api/discoveries`) — useful for single-tenant
-personal deployments. Leave at `0` for shared or multi-tenant
-deployments since neighbors' RF traffic doesn't belong in a cloud DB.
-
----
-
-## Path D — Local backend + SDR direct
-
-Same as Path C but everything lives on one LAN box. The SDR relay
-just points at `http://localhost:8080`:
-
+After flashing, the board comes up as a `ZasderLilyGO` Wi-Fi access point.
+Join it from a phone, fill in your home Wi-Fi creds, save. Then point it at
+your backend via:
 ```sh
-# Backend
-cp .env.example .env
-# Edit: AW_* optional, API_TOKEN + INGEST_TOKEN required
-docker compose up -d
-
-# SDR relay (same host or another LAN host)
-cd sdr-relay
-cp .env.example .env
-# BACKEND_URL=http://<backend-host-ip>:8080
-# INGEST_TOKEN=<same as backend's>
-docker compose up -d
+curl -X POST http://<board-ip>/provision \
+  -d "backend_url=https://your-backend.fly.dev" \
+  -d "ingest_token=$INGEST_TOKEN"
 ```
+Data starts flowing in within seconds.
 
----
+## What's in this repo
 
-## Path E — AcuRite via legacy DNS-hijack relay
-
-> [!WARNING]
-> AcuRite has been progressively shutting down their cloud services.
-> This path depends on the hub still uploading to
-> `atlasapi.myacurite.com` and on AcuRite's firmware behavior, both of
-> which can change without notice. **Prefer Path C/D (SDR direct).**
-> This path is documented for users with existing hub setups they
-> haven't migrated yet.
-
-The AcuRite Atlas hub speaks **TLS 1.1** and posts to a hardcoded
-hostname. Fly's edge enforces TLS 1.2+ so the hub can't reach Fly
-directly. A LAN-side container terminates TLS 1.1, parses the
-Wunderground-format POST, and forwards JSON to your backend.
-
-See [`relay/README.md`](relay/README.md) for the full DNS-hijack setup,
-self-signed cert handling, and troubleshooting. Briefly:
-
-```sh
-cd relay
-cp .env.example .env
-# Edit BACKEND_URL + INGEST_TOKEN
-docker compose up -d
 ```
-
-Then override `atlasapi.myacurite.com → <relay-lan-ip>` in your
-router's DNS and power-cycle the hub.
-
----
-
-## Configuration reference
-
-All configuration via environment variables (or a `.env` file). See
-`.env.example` for the annotated backend list, `sdr-relay/.env.example`
-for the SDR relay, and `relay/.env.example` for the legacy hub relay.
-
-### Backend
-
-| Var                       | Required | Notes                                           |
-|---------------------------|----------|-------------------------------------------------|
-| `API_TOKEN`               | yes      | Long random string. iOS sends as Bearer token   |
-| `INGEST_TOKEN`            | for SDR / legacy relay | Long random string. Sources POST with this as Bearer |
-| `AW_APPLICATION_KEY`      | for AWN  | From AmbientWeather account → API keys          |
-| `AW_API_KEY`              | for AWN  | Same place                                      |
-| `REVIEWER_API_TOKEN`      | no       | Optional secondary read token (App Store demos) |
-| `POLL_INTERVAL_SECONDS`   | no (60)  | AWN rate-limits at 1 req/s; don't go below 30   |
-| `DATABASE_PATH`           | no       | SQLite file path. Fly default `/data/weather.db`|
-| `FORECAST_LAT`/`_LON`     | no       | Open-Meteo forecast coords. Defaults to your station's |
-| `TIMEZONE`                | no (UTC) | IANA TZ (e.g. `America/Phoenix`) for local-time rain rollup bucketing |
-
-### SDR relay
-
-See [`sdr-relay/.env.example`](sdr-relay/.env.example) — the major
-ones are `ATLAS_ID`, `WH24_ID`, `WH32B_ID` (sensor IDs you discover
-via rtl_433), `*_RAIN_YEARLY_BASELINE_IN` (calibrate cumulative rain
-counter to a known value), and `MAX_RAIN_DELTA_IN` (sanity ceiling
-to reject decoder glitches).
-
-### Legacy hub relay
-
-See [`relay/.env.example`](relay/.env.example) — minimal: just
-`BACKEND_URL` + `INGEST_TOKEN`, plus optional Wunderground
-rebroadcast and human-readable station labels.
+backend/             FastAPI app — pollers, /ingest/custom, /api/*, status page
+lilygo-relay/        ESP32+SX1276 firmware (PlatformIO project)
+bin/setup-fly.sh     Interactive Fly.io setup (creates app, volume, secrets)
+docker-compose.yml   Local-deployment compose file
+README.md            (this file — human-oriented)
+AGENTS.md            LLM-friendly deployment guide
+.env.example         Annotated environment template
+```
 
 ## API
 
-All `/api/*` routes require `Authorization: Bearer <API_TOKEN>`.
+All `/api/*` routes require `Authorization: Bearer <API_TOKEN>`. iOS app
+calls these. Public-readable status page at `/`.
 
-| Method | Path                                              | Notes                       |
-|--------|---------------------------------------------------|-----------------------------|
-| GET    | `/`                                               | Public read-only status page (HTML) |
-| GET    | `/healthz`                                        | Liveness, no auth           |
-| GET    | `/api/devices`                                    | Devices + latest reading    |
-| GET    | `/api/devices/{mac}/current`                      | Most recent observation (with on-the-fly rain rollups for sources that post only `yearly_in`) |
-| GET    | `/api/devices/{mac}/history?hours=24`             | Time series                 |
-| GET    | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg + when          |
-| GET    | `/api/forecast?lat=&lon=`                         | 7-day forecast (Open-Meteo) |
-| POST   | `/ingest/custom`                                  | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
-| POST   | `/ingest/discovery`                               | Source posts a `(model, id)` RF sighting. Same auth. Used by the SDR relay to populate the long-tail survey of nearby devices |
-| GET    | `/api/discoveries?since_hours=24`                 | Survey of distinct RF devices the SDR has decoded — neighbors' weather stations, TPMS, garage remotes, utility meters, etc. Latest-seen first |
-
-The legacy path-form `/ingest/custom/{INGEST_TOKEN}` was removed
-2026-05-21 because tokens in URLs leak into proxy and access logs.
-The header form is the only supported way to authenticate ingest now.
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/` | HTML status page (no auth) |
+| GET | `/healthz` | Liveness, no auth |
+| GET | `/api/devices` | All devices + latest reading |
+| GET | `/api/devices/{mac}/current` | Composite latest-non-null per field |
+| GET | `/api/devices/{mac}/history?hours=24` | Time series, auto-bucketed for 3d/7d/30d |
+| GET | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg/median + when |
+| GET | `/api/forecast?lat=&lon=` | 7-day forecast (Open-Meteo) |
+| POST | `/ingest/custom` | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
+| POST | `/ingest/discovery` | Source posts a `(model, id)` RF sighting |
+| GET | `/api/discoveries?since_hours=24` | Long-tail RF device survey |
 
 ## Tests
 
 ```sh
-pip install -r requirements-dev.txt
-pytest -q                       # backend tests
-pytest -q relay/tests/          # legacy relay parser tests
-pytest -q sdr-relay/tests/      # SDR relay normalization + rain accumulator tests
+pytest -q                    # backend (auto-discovered)
+cd lilygo-relay && pio test  # firmware unit tests (small)
 ```
-
-CI runs all three on every push (`.github/workflows/ci.yml`).
 
 ## License
 
-[MIT](LICENSE) — do whatever you want, no warranty.
+MIT for backend + setup scripts. `lilygo-relay/` ships under GPL-3.0
+because it links against
+[rtl_433_ESP](https://github.com/NorthernMan54/rtl_433_ESP) which is GPL.
+The GPL is contained to that subdirectory; everything else stays MIT.
 
-## Contributing
+## Acknowledgments
 
-This is a hobby project mirrored from a private monorepo. Issues + PRs
-welcome but don't expect rapid turnaround. For larger ideas, open an
-issue first to chat about scope before sinking time into a PR.
+- [rtl_433](https://github.com/merbanan/rtl_433) — the canonical RF-decode reference
+- [rtl_433_ESP](https://github.com/NorthernMan54/rtl_433_ESP) — ports the decoders to ESP32
+- [Open-Meteo](https://open-meteo.com/) — free forecast API
+- [Fly.io](https://fly.io/) — backend hosting

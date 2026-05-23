@@ -32,9 +32,13 @@ from .weatherlink_client import WeatherLinkClient
 log = logging.getLogger("wl-poller")
 
 
-# Davis WeatherLink sensor_type → handler. From observation against a
-# 6313 + VP2 6163 ISS in May 2026; types stable across firmwares.
-SENSOR_TYPE_ISS     = 43       # Vantage ISS — outdoor temp/hum/wind/rain/UV/solar
+# Davis WeatherLink sensor_type → handler. Davis cloud rotates between
+# 43 and 46 for the VP2 ISS depending on firmware/console state — both
+# carry the same field set (temp/hum/wind/rain/uv/solar). Either one
+# is treated as ISS data. Drop-of-the-other was a silent data-loss
+# bug pre-2026-05-22 — confirmed live when sensor_type flipped from
+# 43 → 46 mid-day and 700+ observations vanished.
+SENSOR_TYPES_ISS    = {43, 46}
 SENSOR_TYPE_INDOOR  = 365      # 6313 built-in indoor temp+hum
 SENSOR_TYPE_BAROM   = 242      # 6313 built-in barometer
 
@@ -65,7 +69,7 @@ def build_payload(station: dict[str, Any],
         if not rows:
             continue
         r = rows[0]
-        if stype == SENSOR_TYPE_ISS:
+        if stype in SENSOR_TYPES_ISS:
             iss_data = r
             if r.get("tx_id"):
                 tx_id = int(r["tx_id"])
@@ -111,12 +115,26 @@ def build_payload(station: dict[str, Any],
         outdoor["solar_wm2"] = float(iss_data["solar_rad"])
 
     wind: dict[str, Any] = {}
-    if iss_data.get("wind_speed_last") is not None:
-        wind["speed_mph"] = float(iss_data["wind_speed_last"])
+    # Prefer the 2-min rolling average over wind_speed_last (single 2.5s
+    # sample, often 0 between gusts) — gives the iOS tile a steadier
+    # value that actually represents conditions. wind_speed_hi_last_2_min
+    # is the 2-min peak (= the gust tile).
+    speed = (iss_data.get("wind_speed_avg_last_2_min")
+             if iss_data.get("wind_speed_avg_last_2_min") is not None
+             else iss_data.get("wind_speed_last"))
+    if speed is not None:
+        wind["speed_mph"] = float(speed)
     if iss_data.get("wind_speed_hi_last_2_min") is not None:
         wind["gust_mph"] = float(iss_data["wind_speed_hi_last_2_min"])
-    if iss_data.get("wind_dir_last") is not None:
-        wind["direction"] = round(float(iss_data["wind_dir_last"]))
+    # Use the scalar-averaged direction from the same 2-min window when
+    # available — single-sample wind_dir_last reports the vane's resting
+    # direction during calms (gives the wind rose spurious dominant
+    # directions). The scalar avg respects speed weighting.
+    direction = (iss_data.get("wind_dir_scalar_avg_last_2_min")
+                 if iss_data.get("wind_dir_scalar_avg_last_2_min") is not None
+                 else iss_data.get("wind_dir_last"))
+    if direction is not None:
+        wind["direction"] = round(float(direction))
 
     rain: dict[str, Any] = {}
     if iss_data.get("rainfall_year_in") is not None:

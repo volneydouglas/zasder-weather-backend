@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     # (AWN, Atlas) have the right total; we baseline Davis here.
     weatherlink_yearly_rain_baseline_in: float = 0.0
 
+    # When set, every /current response for a device WITHOUT pressure
+    # falls back to the freshest pressure (+ indoor temp/humidity) from
+    # this source MAC. Use case: Atlas (no barometer) + co-located
+    # WH32B-paired Crestview (or Davis) on the same property — operator
+    # gets a pressure tile on the Atlas card by pointing this env at
+    # whichever device actually has a barometer.
+    # Set to e.g. "5D:5D:02:00:00:7D" (Crestview SDR with WH32B paired).
+    shared_barometer_source_mac: str | None = None
+
     @property
     def weatherlink_configured(self) -> bool:
         return bool(self.weatherlink_api_key

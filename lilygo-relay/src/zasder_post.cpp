@@ -21,12 +21,12 @@ static int consecutive401 = 0;
 // device rows (e.g. "Secplus-v1" garage doors). Only the actual weather
 // sensors are useful; everything else is dropped at the source.
 //
-// Fineoffset-WH32B (indoor temp/humidity/pressure monitor) is
-// intentionally NOT in the whitelist — it shows up as its own device
-// row that the operator typically doesn't want as a top-level station.
-// If you need indoor stats, run an outdoor station (WH24/WH65/WS80)
-// that supports the optional WH32B pairing, and let the *outdoor*
-// post carry the indoor block.
+// Fineoffset-WH32B is handled separately (NOT in this whitelist): its
+// temp/humid/pressure are cached and merged into the outdoor WH24/WH65/
+// WS80 post's `indoor` + `pressure` blocks instead of being POSTed as
+// its own device row. Same trick the Pi's sdr-relay uses — gives the
+// outdoor card pressure + indoor tiles without spawning a duplicate
+// indoor-only device row in the iOS app.
 //
 // Returns the synthetic-MAC type tag for `model`, or 0 if the model is
 // not on the whitelist (caller skips the POST). Type tags match
@@ -40,6 +40,18 @@ static uint8_t modelTypeTag(const char *model) {
   if (strcmp(model, "Fineoffset-WS80") == 0) return 0x02;
   return 0;
 }
+
+// Cached WH32B reading — populated whenever the 915 dongle hears a
+// WH32B packet, merged into every outdoor (WH24/WH65/WS80) post.
+// `valid` flips true on first capture; outdoor posts include the
+// indoor + pressure blocks only when this is true.
+struct WH32BCache {
+  bool   valid = false;
+  float  tempf = NAN;
+  float  humidity = NAN;
+  float  pressure_inhg = NAN;
+};
+static WH32BCache wh32b;
 
 static String synthMac(uint8_t typeTag, uint32_t id) {
   char buf[13];
@@ -122,6 +134,23 @@ void zasder_post(const char *rtl433Json,
   const char *model = in["model"].as<const char *>();
   if (!model) return;
   uint32_t id = in["id"].as<uint32_t>();
+
+  // Fineoffset-WH32B: cache + return. We never POST the WH32B as its
+  // own device (operator doesn't want an indoor-only station row);
+  // instead, the next WH24/WH65/WS80 outdoor post merges these values
+  // into its `indoor` + `pressure` blocks.
+  if (strcmp(model, "Fineoffset-WH32B") == 0) {
+    if (in["temperature_C"].is<float>())
+      wh32b.tempf = c_to_f(in["temperature_C"].as<float>());
+    if (in["humidity"].is<float>())
+      wh32b.humidity = in["humidity"].as<float>();
+    if (in["pressure_hPa"].is<float>())
+      wh32b.pressure_inhg = hpa_to_inhg(in["pressure_hPa"].as<float>());
+    wh32b.valid = true;
+    Serial.printf("[wh32b-cache] tempf=%.1f hum=%.1f press_inhg=%.2f\n",
+                  wh32b.tempf, wh32b.humidity, wh32b.pressure_inhg);
+    return;
+  }
 
   // Whitelist: drop anything that isn't one of the known weather
   // sensors before we POST. Otherwise the 433 dongle's broad RX
@@ -216,6 +245,27 @@ void zasder_post(const char *rtl433Json,
   if (in["pressure_hPa"].is<float>()) {
     auto p = out["pressure"].to<JsonObject>();
     p["relative_inhg"] = hpa_to_inhg(in["pressure_hPa"].as<float>());
+  }
+
+  // ── WH32B merge ── Fineoffset outdoor stations don't carry indoor
+  // temp/humidity or pressure on their own, but a paired WH32B does.
+  // We cache the latest WH32B reading globally and attach it to each
+  // outdoor post here — same pattern as sdr-relay/sdr_relay.py's
+  // handle_wh24() does with WH32B_ID. typeTag 0x02 = Fineoffset
+  // outdoor (WH24/WH65/WS80); Atlas (0x01) doesn't get the merge
+  // because Atlas + WH32B aren't typically deployed together.
+  if (typeTag == 0x02 && wh32b.valid) {
+    auto indoor = out["indoor"].to<JsonObject>();
+    if (!isnan(wh32b.tempf))         indoor["tempf"]         = wh32b.tempf;
+    if (!isnan(wh32b.humidity))      indoor["humidity"]      = wh32b.humidity;
+    if (!isnan(wh32b.pressure_inhg)) indoor["pressure_inhg"] = wh32b.pressure_inhg;
+    // Also expose pressure at top-level so the iOS Pressure tile
+    // renders. Backend stores both indoor.pressure_inhg and
+    // pressure.relative_inhg into the same baromrelin column.
+    if (!isnan(wh32b.pressure_inhg)) {
+      auto p = out["pressure"].to<JsonObject>();
+      p["relative_inhg"] = wh32b.pressure_inhg;
+    }
   }
 
   String body;

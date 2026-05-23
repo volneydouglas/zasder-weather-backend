@@ -241,6 +241,32 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
         for k, v in older.items():
             if v is not None and out.get(k) is None:
                 out[k] = v
+
+    # Cross-device pressure/indoor fallback: if this device still has
+    # no barometer reading and the operator has named a shared source
+    # MAC, pull pressure (and indoor temp/humidity) from that source's
+    # most recent observation. Use case: Atlas + WS-2000 outdoor
+    # stations don't include a barometer; a co-located WH32B-paired
+    # device (Crestview SDR) or Davis cloud does. Single env var lets
+    # one source share its barometer with all the others.
+    src_mac = settings.shared_barometer_source_mac
+    needs_pressure = out.get("baromrelin") is None
+    if src_mac and needs_pressure and src_mac != mac:
+        from . import config  # avoid circular at module import
+        async with connect() as db:
+            src_row = await (await db.execute(
+                "SELECT data_json FROM observations WHERE mac = ? "
+                "AND baromrelin IS NOT NULL ORDER BY dateutc_ms DESC LIMIT 1",
+                (src_mac,),
+            )).fetchone()
+        if src_row:
+            src = json.loads(src_row["data_json"])
+            for k in ("baromrelin", "baromabsin"):
+                if out.get(k) is None and src.get(k) is not None:
+                    out[k] = src[k]
+            for k in ("tempinf", "humidityin"):
+                if out.get(k) is None and src.get(k) is not None:
+                    out[k] = src[k]
     return out
 
 

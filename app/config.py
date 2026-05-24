@@ -1,3 +1,6 @@
+import json as _json
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,6 +51,28 @@ class Settings(BaseSettings):
     # actual cumulative rainfall was already higher. Other receivers
     # (AWN, Atlas) have the right total; we baseline Davis here.
     weatherlink_yearly_rain_baseline_in: float = 0.0
+
+    # Per-MAC yearly-rain offset applied at ingest. Use case: LilyGO
+    # firmware posts the sensor's raw lifetime cumulative counter as
+    # rain.yearly_in (no firmware-side baselining), so each receiver
+    # needs an offset that calibrates the stored value to actual YTD
+    # rain. Env format is JSON: {"MAC1":offset1,"MAC2":offset2}.
+    # Stored yearly_in = max(0, posted_yearly_in - offset[mac]).
+    # MACs use the colonized AA:BB:CC:DD:EE:FF form.
+    ingest_yearly_rain_offsets: dict[str, float] = {}
+
+    @field_validator("ingest_yearly_rain_offsets", mode="before")
+    @classmethod
+    def _parse_offsets(cls, v):
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return {}
+            try:
+                return {k.upper(): float(val) for k, val in _json.loads(s).items()}
+            except (ValueError, TypeError):
+                return {}
+        return v or {}
 
     # When set, every /current response for a device WITHOUT pressure
     # falls back to the freshest pressure (+ indoor temp/humidity) from

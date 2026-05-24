@@ -100,6 +100,19 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # but is logically reported as "outdoor barometric"; accept it from
     # either place.
     rel_inhg = press.get("relative_inhg") or ind.get("pressure_inhg")
+
+    # Per-MAC yearly-rain calibration. Cumulative sensor counters (Atlas
+    # rain_in, Fineoffset rain_mm) report lifetime totals, so we subtract
+    # an operator-configured offset to get actual YTD inches. Clamp to
+    # zero so a decoder glitch posting below the offset doesn't yield
+    # a negative stored value.
+    yearly_in = rain.get("yearly_in")
+    if yearly_in is not None:
+        mac_for_offset = _format_mac(dev.get("id") or "").upper()
+        offset = settings.ingest_yearly_rain_offsets.get(mac_for_offset)
+        if offset is not None:
+            yearly_in = max(0.0, float(yearly_in) - offset)
+
     return {
         "dateutc":        dateutc_ms,
         "tempf":          out.get("tempf"),
@@ -119,7 +132,7 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "dailyrainin":    rain.get("daily_in"),
         "weeklyrainin":   rain.get("weekly_in"),
         "monthlyrainin":  rain.get("monthly_in"),
-        "yearlyrainin":   rain.get("yearly_in"),
+        "yearlyrainin":   yearly_in,
         "uv":             out.get("uv"),
         "solarradiation": out.get("solar_wm2"),
     }

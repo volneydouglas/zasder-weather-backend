@@ -204,8 +204,21 @@ void zasder_post(const char *rtl433Json,
     copyIf(in, "humidity",         outdoor, "humidity");
     copyIf(in, "uv",               outdoor, "uv");
     copyIf(in, "uvi",              outdoor, "uv");
-    copyIf(in, "light_lux",        outdoor, "lux");
-    copyIf(in, "solar_radiation",  outdoor, "solar_wm2");
+    // Solar irradiance: backend schema only takes outdoor.solar_wm2. If
+    // the decoder emits W/m² directly (rare; some Ecowitt variants),
+    // use it; otherwise derive from lux via the standard 126.7 lux/(W·m⁻²)
+    // sunlight approximation. rtl_433 names differ by decoder:
+    //   Atlas emits "lux"; Fineoffset-WH65B/WH24 emits "light_lux".
+    if (in["solar_radiation"].is<float>()) {
+      outdoor["solar_wm2"] = in["solar_radiation"].as<float>();
+    } else {
+      float lux = NAN;
+      if (in["light_lux"].is<float>()) lux = in["light_lux"].as<float>();
+      else if (in["lux"].is<float>())  lux = in["lux"].as<float>();
+      if (!isnan(lux)) {
+        outdoor["solar_wm2"] = lux / 126.7f;
+      }
+    }
     // Computed dew point when we have both temp + humidity. Backend
     // accepts dew_point_f directly (no further derivation needed).
     if (outdoor["tempf"].is<float>() && outdoor["humidity"].is<float>()) {
@@ -230,14 +243,28 @@ void zasder_post(const char *rtl433Json,
     copyIf(in, "wind_dir_deg", wind, "direction");
   }
 
-  // Rain block intentionally NOT sent. rtl_433 emits a lifetime
-  // cumulative rain counter; turning that into a useful yearly_in
-  // requires a baseline + delta tracker (the Pi's sdr-relay has one,
-  // calibrated against AWN's yearlyrainin at deploy time). The LilyGO
-  // doesn't, and posting the raw counter as "yearly_in" overwrites the
-  // Pi's correct value via last-write-wins UPSERT. If you're running
-  // LilyGO-only (no Pi), wire up baselining here; otherwise let the Pi
-  // own rain reporting for that device row.
+  // ── rain block ── Send the raw cumulative counter as yearly_in.
+  // The backend's rain_rollups() differences yearlyrainin against
+  // historical values at local-time period boundaries, so daily /
+  // hourly / weekly / monthly come out correct after the first ~24h
+  // of history (the very first reading produces None for daily, which
+  // iOS handles by hiding the cell — subsequent readings populate
+  // properly). Atlas emits rain_in (inches); Fineoffset emits
+  // rain_mm (millimeters).
+  //
+  // CAVEAT: yearlyrainin will look big on first deploy because it's
+  // the sensor's lifetime cumulative, not 0-since-Jan-1. The rollups
+  // are still correct since they're differences.
+  float rain_in_total = NAN;
+  if (in["rain_in"].is<float>()) {
+    rain_in_total = in["rain_in"].as<float>();
+  } else if (in["rain_mm"].is<float>()) {
+    rain_in_total = in["rain_mm"].as<float>() * 0.0393701f;
+  }
+  if (!isnan(rain_in_total)) {
+    auto rain = out["rain"].to<JsonObject>();
+    rain["yearly_in"] = rain_in_total;
+  }
 
   // ── pressure block ── (only relevant if a paired indoor sensor
   // forwards barometer; outdoor stations don't have one). Convert

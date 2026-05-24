@@ -137,7 +137,8 @@ Data starts flowing in within seconds.
 ## What's in this repo
 
 ```
-backend/             FastAPI app — pollers, /ingest/custom, /api/*, status page
+app/                 FastAPI app — pollers, /ingest/custom, /api/*, status page
+tests/               pytest suite (run `pytest -q`)
 lilygo-relay/        ESP32+SX1276 firmware (PlatformIO project)
 bin/setup-fly.sh     Interactive Fly.io setup (creates app, volume, secrets)
 docker-compose.yml   Local-deployment compose file

@@ -218,22 +218,67 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
         "lastData": flat,
     }
     await db.upsert_device(mac, info)
-    inserted = await db.insert_observations(mac, [{**flat, "_source": payload_obj}])
+    inserted = await db.insert_observations(
+        mac, [{**flat, "_source": _truncate_source(payload_obj)}])
     return {"ok": True, "mac": mac, "inserted": inserted, "ts_ms": flat["dateutc"]}
+
+
+# Per-request body size cap. A normal observation is ~500 bytes; even a
+# rich Atlas message with lightning + battery + RSSI tops out around 2 KB.
+# 64 KiB is generous headroom while making it impossible for a misbehaving
+# source to OOM the worker by streaming megabytes into a single ingest.
+INGEST_BODY_MAX_BYTES = 64 * 1024
+# Trim the persisted source-object copy to this so a single fat _source
+# can't bloat the observations table indefinitely. Loses bonus diagnostic
+# fields but never drops the flat data we actually render in iOS.
+INGEST_SOURCE_MAX_BYTES = 16 * 1024
 
 
 async def _parse_json_body(request: Request) -> Any:
     """Parse a request body as JSON, returning a 400 on malformed input
     instead of letting FastAPI surface it as a 500. Also rejects Python's
     non-standard NaN/Infinity literals that some decoders emit, since
-    they'd serialize back to non-JSON-compliant numbers downstream."""
+    they'd serialize back to non-JSON-compliant numbers downstream.
+    Enforces a size cap to bound worker memory."""
+    # Cheap early-reject via Content-Length so we don't read the body at
+    # all when a misbehaving client claims an absurd size.
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > INGEST_BODY_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"body too large; max {INGEST_BODY_MAX_BYTES} bytes")
+        except ValueError:
+            pass  # Malformed Content-Length — fall through to the read check.
     body = await request.body()
+    if len(body) > INGEST_BODY_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"body too large; max {INGEST_BODY_MAX_BYTES} bytes")
     if not body:
         raise HTTPException(status_code=400, detail="empty body")
     try:
         return _json.loads(body, parse_constant=lambda _: None)
     except _json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {e.msg}")
+
+
+def _truncate_source(payload_obj: dict[str, Any]) -> dict[str, Any]:
+    """Drop the _source copy down to INGEST_SOURCE_MAX_BYTES of JSON.
+    Strategy: serialize once, check size; if over, replace with a small
+    marker dict that retains key identifying fields (source tag, device
+    block, timestamp) so we can still trace the row's provenance."""
+    raw = _json.dumps(payload_obj, separators=(",", ":"))
+    if len(raw) <= INGEST_SOURCE_MAX_BYTES:
+        return payload_obj
+    return {
+        "_truncated": True,
+        "_original_bytes": len(raw),
+        "source": payload_obj.get("source"),
+        "device": payload_obj.get("device"),
+        "timestamp_utc": payload_obj.get("timestamp_utc"),
+    }
 
 
 # Token in header so it never appears in proxy/access logs.

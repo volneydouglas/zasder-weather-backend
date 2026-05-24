@@ -14,6 +14,20 @@ String ingestToken;
 
 static WebServer server(80);
 static Preferences prefs;
+// Set to true on first successful /provision that lands both
+// backend_url AND ingest_token. From that point on, /provision and
+// /reset require the caller to prove they know the current
+// ingest_token (Authorization: Bearer header OR `current_token` form
+// field). Prevents LAN hijack: a malicious page on the same network
+// can't repoint the board and silently capture the token.
+//
+// Recovery if the token is lost: hold RST and re-plug while pressing
+// reset, then reflash the firmware over USB — that re-flashes NVS
+// only optionally (depending on partition); the NVS-clear path is
+// the dedicated /reset route which itself requires auth. The board
+// can be physically reset by holding RST + power cycle and reflashing
+// with NVS erase via `pio run -t erase`.
+static bool provisioned = false;
 static String        lastPacket    = "(none)";
 static String        lastPostText  = "(none)";
 static uint32_t      pktsDecoded   = 0;
@@ -41,6 +55,15 @@ void loadFromNvs() {
   prefs.begin("zasder", /*readOnly=*/false);
   backendUrl  = prefs.getString("backend_url",  "");
   ingestToken = prefs.getString("ingest_token", "");
+  provisioned = prefs.getBool("provisioned", false);
+  // Self-heal: if NVS lost the flag but both creds are present (e.g.
+  // upgrading from a firmware build that predates the lock), treat the
+  // board as already provisioned so the lock takes effect immediately
+  // rather than after the next provisioning event.
+  if (!provisioned && backendUrl.length() > 0 && ingestToken.length() > 0) {
+    provisioned = true;
+    prefs.putBool("provisioned", true);
+  }
 }
 
 void wipeIngestToken() {
@@ -90,6 +113,7 @@ static void handleStatus() {
   body += "  \"backend_url\": \""+ escapeJson(backendUrl) + "\",\n";
   body += "  \"has_token\": "    + String(ingestToken.length() > 0 ? "true" : "false") + ",\n";
   body += "  \"token_len\": "    + String((unsigned) ingestToken.length()) + ",\n";
+  body += "  \"provisioned\": "  + String(provisioned ? "true" : "false") + ",\n";
   body += "  \"pkts_decoded\": " + String(pktsDecoded) + ",\n";
   body += "  \"pkts_posted_ok\": "+ String(pktsPostedOk) + ",\n";
   body += "  \"pkts_401\": "     + String(pkts401) + ",\n";
@@ -99,7 +123,44 @@ static void handleStatus() {
   server.send(200, "application/json", body);
 }
 
+// Constant-time string compare. Avoids leaking the token length /
+// prefix via timing analysis from a LAN attacker spraying guesses.
+static bool secureEquals(const String &a, const String &b) {
+  if (a.length() != b.length()) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < a.length(); i++) {
+    diff |= ((uint8_t) a[i]) ^ ((uint8_t) b[i]);
+  }
+  return diff == 0;
+}
+
+// Returns true if the caller proved they know the current
+// ingest_token. Two delivery channels accepted:
+//   * Authorization: Bearer <token>   (preferred — curl friendly)
+//   * current_token form field        (browser-form friendly)
+// On an unprovisioned board, every request is treated as authorized
+// so the first /provision works without a chicken-and-egg loop.
+static bool checkAuth() {
+  if (!provisioned) return true;
+  String supplied;
+  if (server.hasHeader("Authorization")) {
+    String h = server.header("Authorization");
+    if (h.startsWith("Bearer ")) supplied = h.substring(7);
+  }
+  if (supplied.length() == 0 && server.hasArg("current_token")) {
+    supplied = server.arg("current_token");
+  }
+  return supplied.length() > 0 && secureEquals(supplied, ingestToken);
+}
+
 static void handleProvision() {
+  if (!checkAuth()) {
+    server.send(403, "text/plain",
+                "forbidden: this board is already provisioned. Re-send "
+                "with Authorization: Bearer <current_ingest_token> or "
+                "include current_token=<...> as a form field.\n");
+    return;
+  }
   // Accept both form-encoded and ?query=string. backend_url is
   // required; ingest_token can be set independently (handy for token
   // rotation without re-entering the URL).
@@ -128,14 +189,26 @@ static void handleProvision() {
                 "as form/query args");
     return;
   }
+  // First successful provision flips the lock; from now on changes
+  // require Bearer auth with the current token.
+  if (!provisioned && backendUrl.length() > 0 && ingestToken.length() > 0) {
+    provisioned = true;
+    prefs.putBool("provisioned", true);
+    Serial.println("provisioning lock engaged — future changes require Bearer auth");
+  }
   Serial.printf("provisioned: backend_url=%s ingest_token_len=%u\n",
                 backendUrl.c_str(), (unsigned) ingestToken.length());
   handleStatus();  // reply with the fresh status
 }
 
 static void handleIdentify() {
+  if (!checkAuth()) {
+    server.send(403, "text/plain", "forbidden\n");
+    return;
+  }
   // Blink the on-board LED for 3 s. Lets the user pick this specific
   // board out of a stack of identical-looking ones — `curl -X POST
+  // -H "Authorization: Bearer $INGEST_TOKEN"
   // http://zasder-lilygo.local/identify` and watch which LED dances.
   server.send(200, "text/plain", "blinking 3s\n");
   for (int i = 0; i < 12; i++) {
@@ -146,6 +219,10 @@ static void handleIdentify() {
 }
 
 static void handleReset() {
+  if (!checkAuth()) {
+    server.send(403, "text/plain", "forbidden\n");
+    return;
+  }
   server.send(200, "text/plain",
               "wiping NVS + rebooting in 1s — board will return to "
               "Wi-Fi AP portal on next boot\n");
@@ -159,22 +236,42 @@ static void handleReset() {
 
 static void handleRoot() {
   // Tiny HTML page so a browser visit also works — pulls the JSON from
-  // /status under the hood.
-  server.send(200, "text/html",
+  // /status under the hood. When the board is already provisioned, the
+  // form requires the operator to re-enter the current ingest token as
+  // proof-of-ownership (mirrors the API's Bearer auth requirement).
+  String body =
     "<!doctype html><html><body style='font-family:sans-serif'>"
     "<h2>Zasder LilyGO relay</h2>"
-    "<p>JSON: <code><a href='/status'>/status</a></code></p>"
-    "<form method='POST' action='/provision'>"
-    "Backend URL: <input name='backend_url' size='40'><br>"
-    "Ingest token: <input name='ingest_token' size='40'><br>"
-    "<button>Provision</button>"
-    "</form>"
-    "<p><form method='POST' action='/identify' style='display:inline'>"
-    "<button>Identify (blink LED)</button></form> "
-    "<form method='POST' action='/reset' style='display:inline'>"
-    "<button onclick=\"return confirm('Wipe NVS + reboot?')\">Wipe + reboot</button>"
-    "</form></p>"
-    "</body></html>");
+    "<p>JSON: <code><a href='/status'>/status</a></code></p>";
+
+  if (provisioned) {
+    body +=
+      "<p><b>Locked.</b> Changes require the current ingest token.</p>"
+      "<form method='POST' action='/provision'>"
+      "Current ingest token (proof-of-ownership): "
+      "<input name='current_token' size='40' type='password'><br>"
+      "New backend URL (leave blank to keep): "
+      "<input name='backend_url' size='40'><br>"
+      "New ingest token (leave blank to keep): "
+      "<input name='ingest_token' size='40'><br>"
+      "<button>Update</button>"
+      "</form>";
+  } else {
+    body +=
+      "<p><b>Unprovisioned.</b> First provisioning locks the board.</p>"
+      "<form method='POST' action='/provision'>"
+      "Backend URL: <input name='backend_url' size='40'><br>"
+      "Ingest token: <input name='ingest_token' size='40'><br>"
+      "<button>Provision</button>"
+      "</form>";
+  }
+
+  body +=
+    "<p>Identify / reset require the current ingest token via "
+    "<code>Authorization: Bearer ...</code>. Use <code>curl</code> "
+    "for those.</p>"
+    "</body></html>";
+  server.send(200, "text/html", body);
 }
 
 // ── public glue ───────────────────────────────────────────────────────
@@ -199,6 +296,11 @@ void begin() {
   server.on("/provision", HTTP_POST, handleProvision);
   server.on("/identify",  HTTP_POST, handleIdentify);
   server.on("/reset",     HTTP_POST, handleReset);
+  // ESP32 WebServer ignores headers by default; whitelist Authorization
+  // so checkAuth() can read it.
+  const char *wantedHeaders[] = {"Authorization"};
+  server.collectHeaders(wantedHeaders,
+                        sizeof(wantedHeaders) / sizeof(wantedHeaders[0]));
   server.begin();
   Serial.printf("config server: http://%s/ (or http://%s.local/)\n",
                 WiFi.localIP().toString().c_str(), mdnsName.c_str());

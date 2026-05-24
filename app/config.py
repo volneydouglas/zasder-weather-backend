@@ -1,6 +1,7 @@
 import json as _json
+from typing import ClassVar
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -82,6 +83,52 @@ class Settings(BaseSettings):
     # whichever device actually has a barometer.
     # Set to e.g. "5D:5D:02:00:00:7D" (Crestview SDR with WH32B paired).
     shared_barometer_source_mac: str | None = None
+
+    # Strings that ship as placeholders in .env.example and would let an
+    # un-edited template run live if the operator forgets to substitute.
+    # Treated as invalid by the token validators so the app refuses to
+    # start instead of accepting them as live credentials.
+    _PLACEHOLDER_TOKENS: ClassVar[tuple[str, ...]] = (
+        "generate-a-long-random-string",
+        "change-me",
+        "replace_me",
+        "your-token-here",
+    )
+
+    @field_validator("api_token", "ingest_token", "reviewer_api_token", mode="after")
+    @classmethod
+    def _reject_placeholder_tokens(cls, v, info):
+        if v is None:
+            return v
+        s = v.strip()
+        if not s:
+            return None if info.field_name != "api_token" else v
+        low = s.lower()
+        if low in cls._PLACEHOLDER_TOKENS or "replace-with" in low:
+            raise ValueError(
+                f"{info.field_name} is set to a known placeholder "
+                f"({s!r}). Generate a real one with `openssl rand -hex 32` "
+                f"and set it via env/secret.")
+        # Length floor for production tokens. Exempt the `test-` prefix
+        # so unit tests can keep their human-readable token strings
+        # without forcing every call site through a 64-char hex literal.
+        if (len(s) < 32
+                and info.field_name != "reviewer_api_token"
+                and not s.startswith("test-")):
+            raise ValueError(
+                f"{info.field_name} must be at least 32 characters "
+                f"(got {len(s)}). Generate with `openssl rand -hex 32`.")
+        return s
+
+    @model_validator(mode="after")
+    def _reject_identical_tokens(self):
+        if (self.api_token and self.ingest_token
+                and self.api_token == self.ingest_token):
+            raise ValueError(
+                "api_token and ingest_token must differ. Revoking write "
+                "(ingest) would otherwise lock the iOS app out, and vice "
+                "versa. Generate two separate values.")
+        return self
 
     @property
     def weatherlink_configured(self) -> bool:

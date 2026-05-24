@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "config_server.h"
+#include "root_ca.h"
 
 // 5 consecutive 401s = the token is wrong. Wipe it from NVS and reboot
 // so the firmware's "ingest_token empty → AP portal" path takes over,
@@ -306,8 +307,17 @@ void zasder_post(const char *rtl433Json,
   static WiFiClientSecure tls;
   static bool tlsConfigured = false;
   if (!tlsConfigured) {
-    tls.setInsecure();  // public template default; pin a CA in build
-                        // flags via setCACert() if you have one.
+#if TLS_INSECURE
+    // Dev path: self-signed backend, internal CA, plain HTTP+TLS
+    // termination upstream. Set -DTLS_INSECURE=1 in platformio.ini
+    // only when you accept that anyone on the Wi-Fi path can read
+    // the ingest token from the in-flight POST.
+    tls.setInsecure();
+#else
+    // Production: pin Let's Encrypt's ISRG Root X1 (covers Fly.io
+    // edge + any LE-issued custom domain like weather.zasder.com).
+    tls.setCACert(ZASDER_ROOT_CA);
+#endif
     tlsConfigured = true;
   }
   static HTTPClient http;

@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 
 # These modules don't read env at import time, so we can import them directly.
-os.environ.setdefault("API_TOKEN", "x")
+os.environ.setdefault("API_TOKEN", "test-api-token")
 from app import ingest
 
 

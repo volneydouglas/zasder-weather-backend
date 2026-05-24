@@ -16,7 +16,7 @@ If you are an agent, before doing anything else:
 
 ## Glossary
 
-- **Backend** — FastAPI app in `backend/`. Stores observations in
+- **Backend** — FastAPI app in `app/`. Stores observations in
   SQLite, exposes `/api/*` (auth via `API_TOKEN`) for the iOS app, and
   `/ingest/custom` (auth via `INGEST_TOKEN`) for receivers.
 - **Receiver / source** — anything that POSTs observations to
@@ -33,23 +33,22 @@ If you are an agent, before doing anything else:
 ## Repo layout
 
 ```
-backend/
-  app/                       FastAPI source
-    main.py                  Lifespan, security middleware, routes
-    config.py                Pydantic Settings — reads env vars
-    db.py                    aiosqlite — schema, latest_observation, history
-    ingest.py                /ingest/custom + flatten()
-    poller.py                AmbientWeather cloud poller
-    weatherlink_*.py         Davis WeatherLink cloud poller
-    discovery.py             /ingest/discovery + /api/discoveries
-    capture.py               Optional raw-POST capture for debugging
-    static/                  Status page HTML
-  tests/                     pytest suite — run with `pytest -q`
-  Dockerfile                 python:3.12-slim → uvicorn
-  fly.toml                   Fly.io app + volume + secrets configuration
-  requirements.txt           Runtime deps (FastAPI, httpx, aiosqlite, pydantic)
-  requirements-dev.txt       Test deps (pytest, testclient, anyio)
-  pytest.ini
+app/                         FastAPI source (the Python package)
+  main.py                    Lifespan, security middleware, routes
+  config.py                  Pydantic Settings — reads env vars
+  db.py                      aiosqlite — schema, latest_observation, history
+  ingest.py                  /ingest/custom + flatten()
+  poller.py                  AmbientWeather cloud poller
+  weatherlink_*.py           Davis WeatherLink cloud poller
+  discovery.py               /ingest/discovery + /api/discoveries
+  capture.py                 Optional raw-POST capture for debugging
+  static/                    Status page HTML
+tests/                       pytest suite — run with `pytest -q`
+Dockerfile                   python:3.12-slim → uvicorn
+fly.toml                     Fly.io app + volume + secrets configuration
+requirements.txt             Runtime deps (FastAPI, httpx, aiosqlite, pydantic)
+requirements-dev.txt         Test deps (pytest, testclient, anyio)
+pytest.ini
 
 lilygo-relay/                ESP32 firmware (PlatformIO)
   src/
@@ -57,11 +56,11 @@ lilygo-relay/                ESP32 firmware (PlatformIO)
     zasder_post.cpp          rtl_433 JSON → /ingest/custom shape + HTTP POST
     config_server.cpp        LAN HTTP server (/status, /provision, /reset)
     display.cpp              OLED renderer (defensive — no-op if not detected)
+    root_ca.h                ISRG Root X1 pinned CA (Let's Encrypt anchor)
   platformio.ini             Two envs: t3_v161_433 + t3_v161_915
-  README.md                  Hardware + flashing + provisioning
+  README.md                  Hardware + flashing + provisioning + security
 
-bin/setup-fly.sh             Interactive Fly setup
-bin/setup.sh                 Optional local-Docker setup
+bin/setup-fly.sh             Interactive Fly setup (create | update | --rotate-tokens | --print-tokens)
 docker-compose.yml           Backend-only compose for local deploy
 .env.example                 Annotated environment template
 README.md                    Human-facing setup guide
@@ -240,7 +239,7 @@ The board also exposes mDNS as `zasder-lilygo-XXXX.local` (XXXX = last
 ## Tests
 
 ```sh
-pytest -q                       # backend, all of /backend/tests
+pytest -q                       # backend, all of /tests
 cd lilygo-relay && pio test     # firmware (small unit tests)
 ```
 
@@ -259,9 +258,9 @@ If the user asks for them, explain they're not part of the public template:
 
 ## Patterns to follow when modifying code
 
-- **Backend**: add new poller modules under `backend/app/`, register in
+- **Backend**: add new poller modules under `app/`, register in
   `main.py` lifespan with `if settings.x_configured` gating, write tests
-  in `backend/tests/`. Use existing `httpx.AsyncClient`, `aiosqlite`,
+  in `tests/`. Use existing `httpx.AsyncClient`, `aiosqlite`,
   `ingest._do_ingest()` for POST-shape ingest.
 - **LilyGO firmware**: stay within `lilygo-relay/src/`. New protocols
   go in `modelTypeTag()` (zasder_post.cpp) and the corresponding

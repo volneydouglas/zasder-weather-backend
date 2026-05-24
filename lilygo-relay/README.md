@@ -99,9 +99,30 @@ ships a browser-friendly form at `/` for non-curl users.
 
 ### Re-provisioning
 
-- Browse to `http://<board>/` (HTML form) → re-enter token or backend URL.
-- Or `POST /reset` — wipes NVS and reboots into clean AP mode for full re-pairing.
-- If you swapped Wi-Fi networks, hold the BOOT button at power-on to force the captive portal back up.
+The first successful `/provision` **locks** the board. Subsequent
+changes (rotate token, repoint backend URL, `/reset`, `/identify`)
+require proof-of-ownership by re-presenting the **current** ingest
+token. Two ways:
+
+```sh
+# Header form (curl / automation):
+curl -X POST http://<board>/provision \
+  -H "Authorization: Bearer $CURRENT_INGEST_TOKEN" \
+  --data-urlencode "backend_url=https://new-backend.example.com"
+
+# Form-field form (browser-friendly — the HTML form at / has a
+# 'Current ingest token' field that does the same thing):
+curl -X POST http://<board>/provision \
+  --data-urlencode "current_token=$CURRENT_INGEST_TOKEN" \
+  --data-urlencode "ingest_token=$NEW_TOKEN"
+```
+
+This blocks the LAN-hijack class of attack — anything on your Wi-Fi
+that doesn't know the current token can't repoint the board to a
+malicious backend and capture the next post. `/status` stays open
+(read-only diagnostic; reports `provisioned: true|false`).
+
+If you lost the current token: hold RST and power-cycle, then USB-reflash with `pio run -t erase` to wipe NVS, then re-flash and start fresh.
 
 ## Verify
 
@@ -141,18 +162,35 @@ default + automatic polarity invert every 4 hours.
   button (RST + a power slide switch — no BOOT button). Auto-reset via
   CP2104 DTR/RTS works for upload; manual bootloader entry isn't available.
 
+## Security
+
+- **TLS cert pinning** — ISRG Root X1 (Let's Encrypt's anchor) is
+  baked into `src/root_ca.h`. The firmware calls
+  `setCACert(ZASDER_ROOT_CA)`, so the backend's cert chain must
+  validate to that root. Fly.io edge + any custom domain provisioned
+  via `fly certs` qualifies (LE-issued). If you're running a
+  self-signed dev backend, set `-DTLS_INSECURE=1` in
+  `platformio.ini`'s `build_flags` — opt-in only; insecure TLS
+  exposes the ingest token to anyone on the Wi-Fi path.
+- **Provisioning lock** — first successful `/provision` flips an NVS
+  flag; from then on `/provision`, `/reset`, and `/identify` require
+  the current ingest token as Bearer auth (or `current_token=` form
+  field). `/status` stays open.
+- **Token in NVS, not flash** — secrets live in encrypted NVS
+  partition; a physical-access attacker who pulls the chip would need
+  to defeat NVS encryption to extract them.
+
 ## Limitations (v1)
 
 - **No long-tail RF discovery.** Firmware only decodes the configured
   protocol set. To survey what's else nearby, run rtl_433 on a separate
   RTL-SDR — they coexist fine.
-- **`setInsecure()` on TLS.** Backend cert isn't pinned. Pin via
-  `setCACert()` if you're security-paranoid (~2 KB more flash).
 - **Yearly-rain calibration**: rtl_433 emits a lifetime cumulative rain
-  counter; the firmware doesn't baseline against your prior data source.
-  If multiple receivers post to the same device row, the backend's
-  composite-latest handles it; standalone-LilyGO deploys see the raw
-  lifetime counter.
+  counter; the firmware posts it as `rain.yearly_in`. Use the backend's
+  `INGEST_YEARLY_RAIN_OFFSETS` env (per-MAC JSON map) to subtract the
+  sensor's lifetime baseline so iOS shows actual YTD inches.
+- **Single-band per board.** One LilyGO covers one band (433 OR 915,
+  build-time choice). Two-band coverage = two boards.
 
 ## License
 

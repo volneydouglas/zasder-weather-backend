@@ -25,16 +25,53 @@ from .config import settings
 router = APIRouter()
 
 
+# Same caps as /ingest/custom — discovery payloads are even smaller
+# (single rtl_433 packet ~300 bytes), so 64 KiB is far past anything
+# legitimate.
+DISCOVERY_BODY_MAX_BYTES   = 64 * 1024
+DISCOVERY_SAMPLE_MAX_BYTES = 16 * 1024
+
+
 async def _parse_json_body(request: Request) -> Any:
     """Parse a JSON body and 400 (not 500) on malformed input. Also
-    rejects Python's NaN/Infinity literals via parse_constant."""
+    rejects Python's NaN/Infinity literals via parse_constant. Enforces
+    a size cap to bound worker memory."""
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > DISCOVERY_BODY_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"body too large; max {DISCOVERY_BODY_MAX_BYTES} bytes")
+        except ValueError:
+            pass
     body = await request.body()
+    if len(body) > DISCOVERY_BODY_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"body too large; max {DISCOVERY_BODY_MAX_BYTES} bytes")
     if not body:
         raise HTTPException(status_code=400, detail="empty body")
     try:
         return _json.loads(body, parse_constant=lambda _: None)
     except _json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {e.msg}")
+
+
+def _truncate_sample(payload: dict[str, Any]) -> dict[str, Any]:
+    """Cap the stored sample so a pathological decoder spew can't bloat
+    the discoveries table. Falls back to model/id/time-only marker when
+    the original is over the limit."""
+    raw = _json.dumps(payload, separators=(",", ":"))
+    if len(raw) <= DISCOVERY_SAMPLE_MAX_BYTES:
+        return payload
+    return {
+        "_truncated": True,
+        "_original_bytes": len(raw),
+        "model": payload.get("model"),
+        "id": payload.get("id"),
+        "time": payload.get("time"),
+    }
 
 
 def _require_ingest_token(authorization: str | None,
@@ -75,7 +112,7 @@ async def ingest_discovery(
     # rtl_433 sometimes emits id as int, sometimes str, sometimes missing.
     sensor_id = str(payload.get("id") if payload.get("id") is not None else "?")
     now_ms = int(time.time() * 1000)
-    await db.upsert_discovery(model, sensor_id, now_ms, payload)
+    await db.upsert_discovery(model, sensor_id, now_ms, _truncate_sample(payload))
     return {"ok": True, "model": model, "id": sensor_id}
 
 

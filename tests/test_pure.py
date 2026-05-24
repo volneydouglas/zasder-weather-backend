@@ -86,3 +86,58 @@ def test_auto_device_name_pretty_for_known_source():
 def test_auto_device_name_includes_model_when_distinct():
     name = ingest._auto_device_name({"device": {"model": "Iris"}, "source": "acurite-atlas"})
     assert name == "AcuRite Atlas (Iris)"
+
+
+# ───────────────────── ingest_yearly_rain_offsets parsing ─────────────────────
+# Reviewer-noted edge cases on the offset env: lowercase MAC keys parsed as
+# dict (not JSON string), compact 12-hex form, and bad numeric values.
+
+def test_offset_validator_uppercases_dict_input():
+    from app.config import Settings
+    s = Settings(ingest_yearly_rain_offsets={"5d:5d:01:00:02:c7": 2.85})
+    assert s.ingest_yearly_rain_offsets == {"5D:5D:01:00:02:C7": 2.85}
+
+def test_offset_validator_uppercases_json_string_input():
+    from app.config import Settings
+    s = Settings(ingest_yearly_rain_offsets='{"5d:5d:01:00:02:c7":2.85}')
+    assert s.ingest_yearly_rain_offsets == {"5D:5D:01:00:02:C7": 2.85}
+
+def test_offset_validator_colonizes_compact_mac():
+    from app.config import Settings
+    s = Settings(ingest_yearly_rain_offsets={"5D5D010002C7": 2.85})
+    assert s.ingest_yearly_rain_offsets == {"5D:5D:01:00:02:C7": 2.85}
+
+def test_offset_validator_drops_nonnumeric_offset():
+    from app.config import Settings
+    s = Settings(ingest_yearly_rain_offsets={"5D:5D:01:00:02:C7": "not-a-number"})
+    assert s.ingest_yearly_rain_offsets == {}
+
+def test_offset_validator_empty_string_is_empty_dict():
+    from app.config import Settings
+    s = Settings(ingest_yearly_rain_offsets="")
+    assert s.ingest_yearly_rain_offsets == {}
+
+
+# ───────────────────── _flatten yearly_in coercion ─────────────────────
+# Reviewer-noted: float(yearly_in) on "abc" raised an unhandled exception
+# when an offset was configured. Must coerce to None instead.
+
+def test_flatten_yearly_in_nonnumeric_string_becomes_none():
+    payload = {
+        "device":        {"id": "5D5D010002C7"},
+        "timestamp_utc": "2026-05-24T07:40:15Z",
+        "rain":          {"yearly_in": "abc"},
+    }
+    out = ingest._flatten(payload)
+    assert out is not None
+    assert out["yearlyrainin"] is None
+
+def test_flatten_yearly_in_numeric_string_parsed():
+    payload = {
+        "device":        {"id": "5D5D010002C7"},
+        "timestamp_utc": "2026-05-24T07:40:15Z",
+        "rain":          {"yearly_in": "3.58"},
+    }
+    out = ingest._flatten(payload)
+    assert out is not None
+    assert out["yearlyrainin"] == 3.58

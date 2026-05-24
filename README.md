@@ -3,16 +3,22 @@
 Self-hosted weather-station backend. Pulls data from any combination of
 **AmbientWeather cloud**, **Davis WeatherLink cloud**, or direct **433/915 MHz
 RF capture** (LilyGO ESP32+SX1276), stores it in SQLite, and exposes a small
-HTTP API that a [companion iOS app](https://apps.apple.com/) reads.
+HTTP API that a [companion iOS app](https://zasder.com/weather) reads.
 
 Built because [MyAcurite](https://www.acurite.com/) was killed by AcuRite in
 2026 and Davis's WeatherLink Console is a paid cloud lock-in. Owning your
 own backend means the data is yours, the dashboard is yours, the app keeps
 working when vendors change their minds.
 
-If you also want LLM-assisted setup (Claude Code, Cursor, Aider, etc.),
-read **[AGENTS.md](AGENTS.md)** — it's the same setup story but written
-for an AI agent.
+**Not sure what you need?** The
+**[install planner](https://zasder.com/weather-helper)** asks what hardware
+you have and what you want, then prints a tailored, difficulty-tagged
+checklist — which LilyGO board(s) to buy, the exact commands to run, and a
+ready-to-paste `setup-fly.sh` one-liner. It runs entirely in your browser
+(no login, nothing stored on a server).
+
+If you want LLM-assisted setup (Claude Code, Cursor, Aider, etc.), read
+**[AGENTS.md](AGENTS.md)** — the same setup story written for an AI agent.
 
 ## What you need
 
@@ -28,43 +34,59 @@ as separate device rows in the iOS app.
 
 Two deployment modes for the backend itself:
 
-- **Cloud (Fly.io)** — recommended. ~$0–5/month. Single command setup. Custom domain optional.
-- **Local Docker** — runs on any Linux/macOS box with Docker. Good for "I want all my data on-premise."
+- **Cloud (Fly.io)** — recommended, and the only *supported* way to reach
+  your data off your LAN. ~$2/month, works anywhere you have internet.
+- **Local Docker** — runs on any always-on Linux/macOS box. LAN-only:
+  exposing it to the internet (port-forward, tunnel, reverse proxy) is on
+  you. Good for "I want all my data on-premise."
 
 The iOS app is published separately on the App Store and connects to whichever backend URL you give it.
 
-## Quickstart: Fly.io + AmbientWeather (5 minutes)
+## Quickstart: Fly.io (5 minutes)
 
 ```sh
 # 1. Install Fly CLI
 brew install flyctl
 fly auth signup     # or `fly auth login`
 
-# 2. Clone + run interactive setup
+# 2. Clone + run the path-based setup
 git clone https://github.com/volneydouglas/zasder-weather-backend.git
 cd zasder-weather-backend
-./bin/setup-fly.sh  # prompts for app name, region, AWN keys, TZ
-                    # outputs an API_TOKEN — save it for the iOS app
+./bin/setup-fly.sh
 ```
 
-When `setup-fly.sh` finishes you'll have a live backend at
-`https://<app>.fly.dev/`. The status page at `/` proves it's running. Point
-the iOS app at that URL + the printed `API_TOKEN` and you're done.
+`setup-fly.sh` asks **which sources you want first** (AmbientWeather / Davis
+/ LilyGO), then only prompts for what those paths need. It generates your
+tokens, creates the app + volume + secrets, deploys, and at the end prints —
+**and saves to `zasder-install-summary.txt`** — the exact next steps for
+each path you chose (iOS token, LilyGO provision commands, verify curls).
+Terminal scrollback gets lost; the summary file doesn't.
 
-To add Davis cloud or a LilyGO SDR later: see the per-path sections below.
+When it finishes you'll have a live backend at `https://<app>.fly.dev/`. The
+status page at `/` proves it's running. Point the iOS app at that URL + the
+printed `API_TOKEN` and you're done.
+
+Stuck? Run the health checklist:
+
+```sh
+./bin/doctor.sh        # fly auth, /healthz, both tokens, volume, pollers, recent data
+```
 
 ## Quickstart: local Docker
 
 ```sh
 git clone https://github.com/volneydouglas/zasder-weather-backend.git
 cd zasder-weather-backend
-cp .env.example .env
-$EDITOR .env        # at minimum, fill API_TOKEN + INGEST_TOKEN
-docker compose up -d
+./bin/setup-local.sh   # generates tokens, asks sources + TZ, writes .env, starts the stack
 ```
 
+`setup-local.sh` is the LAN counterpart to `setup-fly.sh` — same source
+checklist, but it writes `.env` and runs `docker compose up -d` for you.
+(Prefer to do it by hand? `cp .env.example .env`, fill `API_TOKEN` +
+`INGEST_TOKEN`, then `docker compose up -d`.)
+
 The backend listens on `http://localhost:8080/`. The iOS app needs to reach
-it on your LAN — point the app at `http://<your-mac-ip>:8080` and the same
+it on your LAN — point the app at `http://<your-host-ip>:8080` and the same
 `API_TOKEN` from `.env`.
 
 ## Path A — AmbientWeather cloud poller
@@ -126,25 +148,57 @@ pio run -e t3_v161_915 -t upload    # for the 915 board
 
 After flashing, the board comes up as a `ZasderLilyGO` Wi-Fi access point.
 Join it from a phone, fill in your home Wi-Fi creds, save. Then point it at
-your backend via:
+your backend. Set the two values once and reuse them so you don't fat-finger
+the token (the board also advertises mDNS as `zasder-lilygo-XXXX.local`,
+where `XXXX` is the last 2 bytes of its MAC):
+
 ```sh
-curl -X POST http://<board-ip>/provision \
-  -d "backend_url=https://your-backend.fly.dev" \
-  -d "ingest_token=$INGEST_TOKEN"
+export BACKEND_URL="https://your-app.fly.dev"
+export INGEST_TOKEN="paste-token-here"      # from zasder-install-summary.txt
+
+curl -X POST "http://zasder-lilygo-1234.local/provision" \
+  --data-urlencode "backend_url=$BACKEND_URL" \
+  --data-urlencode "ingest_token=$INGEST_TOKEN"
 ```
-Data starts flowing in within seconds.
+
+Data starts flowing in within seconds. `--data-urlencode` is safer than
+plain `-d` because tokens and URLs can contain characters `-d` would mangle.
+
+### Calibrating yearly rain (LilyGO only)
+
+LilyGO boards POST the sensor's **raw lifetime rain counter** (an Atlas that's
+been running for years might report 30+ inches). Without calibration the iOS
+app shows that lifetime total as "yearly rain." Fix it with a per-MAC offset
+so the stored value = `lifetime − offset`:
+
+```sh
+# 1. Read what the board is currently posting:
+curl -H "Authorization: Bearer $API_TOKEN" \
+  "$BACKEND_URL/api/devices/5D:5D:01:00:02:C7/current" | grep -i yearlyrain
+
+# 2. Set the offset (subtracts the sensor's lifetime so YTD starts ~real).
+#    --ytd is your true year-to-date inches (default 0 = "count from zero now"):
+./bin/set-rain-offset.sh 5D:5D:01:00:02:C7 3.58 --ytd=0.73     # offset → 2.85
+```
+
+The helper merges into the `INGEST_YEARLY_RAIN_OFFSETS` Fly secret without
+disturbing other MACs. Local Docker users: set the same JSON map in `.env`
+(see `.env.example`).
 
 ## What's in this repo
 
 ```
-app/                 FastAPI app — pollers, /ingest/custom, /api/*, status page
-tests/               pytest suite (run `pytest -q`)
-lilygo-relay/        ESP32+SX1276 firmware (PlatformIO project)
-bin/setup-fly.sh     Interactive Fly.io setup (creates app, volume, secrets)
-docker-compose.yml   Local-deployment compose file
-README.md            (this file — human-oriented)
-AGENTS.md            LLM-friendly deployment guide
-.env.example         Annotated environment template
+app/                    FastAPI app — pollers, /ingest/custom, /api/*, status page
+tests/                  pytest suite (run `pytest -q`)
+lilygo-relay/           ESP32+SX1276 firmware (PlatformIO project)
+bin/setup-fly.sh        Path-based Fly.io setup (sources → app, volume, secrets, summary)
+bin/setup-local.sh      Guided local Docker setup (tokens, .env, docker compose up)
+bin/doctor.sh           Health checklist (auth, /healthz, tokens, volume, pollers, data)
+bin/set-rain-offset.sh  Calibrate a LilyGO device's yearly rain (lifetime → real YTD)
+docker-compose.yml      Local-deployment compose file
+README.md               (this file — human-oriented)
+AGENTS.md               LLM-friendly deployment guide
+.env.example            Annotated environment template
 ```
 
 ## API

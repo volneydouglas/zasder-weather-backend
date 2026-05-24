@@ -105,13 +105,20 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # rain_in, Fineoffset rain_mm) report lifetime totals, so we subtract
     # an operator-configured offset to get actual YTD inches. Clamp to
     # zero so a decoder glitch posting below the offset doesn't yield
-    # a negative stored value.
+    # a negative stored value. Non-numeric input (e.g. decoder posted
+    # the literal string "abc") coerces to None — same defensive pattern
+    # as _scrub_numbers; never 500 the request.
     yearly_in = rain.get("yearly_in")
+    if yearly_in is not None:
+        try:
+            yearly_in = float(yearly_in)
+        except (TypeError, ValueError):
+            yearly_in = None
     if yearly_in is not None:
         mac_for_offset = _format_mac(dev.get("id") or "").upper()
         offset = settings.ingest_yearly_rain_offsets.get(mac_for_offset)
         if offset is not None:
-            yearly_in = max(0.0, float(yearly_in) - offset)
+            yearly_in = max(0.0, yearly_in - offset)
 
     return {
         "dateutc":        dateutc_ms,

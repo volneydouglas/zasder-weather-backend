@@ -1,6 +1,7 @@
 # Secrets
 .env
 *.env
+zasder-install-summary.txt
 
 # Python
 __pycache__/

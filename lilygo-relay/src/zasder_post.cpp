@@ -336,8 +336,10 @@ void zasder_post(const char *rtl433Json,
     consecutive401++;
     Serial.printf("[post-fail 401] (consecutive=%d)\n", consecutive401);
     if (consecutive401 >= MAX_CONSECUTIVE_401) {
-      Serial.println("Token rejected repeatedly — wiping NVS token. "
-                     "Re-provision via POST /provision over HTTP.");
+      Serial.println("Token rejected repeatedly — wiping NVS token "
+                     "AND clearing provisioned flag (so /provision "
+                     "is reachable again without prior-token proof). "
+                     "Re-pair via POST /provision over HTTP.");
       http.end();
       ZasderConfigServer::wipeIngestToken();
       consecutive401 = 0;

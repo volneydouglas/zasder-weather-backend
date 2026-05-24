@@ -59,21 +59,45 @@ class Settings(BaseSettings):
     # needs an offset that calibrates the stored value to actual YTD
     # rain. Env format is JSON: {"MAC1":offset1,"MAC2":offset2}.
     # Stored yearly_in = max(0, posted_yearly_in - offset[mac]).
-    # MACs use the colonized AA:BB:CC:DD:EE:FF form.
+    # Keys are case-insensitive and accept either colonized
+    # (AA:BB:CC:DD:EE:FF) or compact (AABBCCDDEEFF) form — the
+    # validator normalizes both.
     ingest_yearly_rain_offsets: dict[str, float] = {}
 
     @field_validator("ingest_yearly_rain_offsets", mode="before")
     @classmethod
     def _parse_offsets(cls, v):
+        # Accept three input shapes:
+        #   1. JSON string from env: '{"5d:5d:01:...":2.85}'
+        #   2. dict already parsed by pydantic-settings's json_mode env
+        #   3. None / empty string → {}
+        # Then normalize keys (uppercase + colonize) regardless of source
+        # so downstream lookups are consistent.
         if isinstance(v, str):
             s = v.strip()
             if not s:
                 return {}
             try:
-                return {k.upper(): float(val) for k, val in _json.loads(s).items()}
+                v = _json.loads(s)
             except (ValueError, TypeError):
                 return {}
-        return v or {}
+        if not isinstance(v, dict):
+            return {}
+        out: dict[str, float] = {}
+        for raw_key, raw_val in v.items():
+            try:
+                offset = float(raw_val)
+            except (TypeError, ValueError):
+                continue  # Drop the entry — better than 500ing later.
+            key = str(raw_key).upper().replace("-", "").replace(":", "")
+            # Re-colonize 12-hex MACs; pass anything else through
+            # unchanged so non-MAC keys (if anyone ever uses them) still
+            # work — though the ingest path only looks up MAC-formatted
+            # device IDs so non-MAC keys would never match.
+            if len(key) == 12 and all(c in "0123456789ABCDEF" for c in key):
+                key = ":".join(key[i:i+2] for i in range(0, 12, 2))
+            out[key] = offset
+        return out
 
     # When set, every /current response for a device WITHOUT pressure
     # falls back to the freshest pressure (+ indoor temp/humidity) from

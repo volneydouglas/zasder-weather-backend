@@ -176,9 +176,17 @@ default + automatic polarity invert every 4 hours.
   flag; from then on `/provision`, `/reset`, and `/identify` require
   the current ingest token as Bearer auth (or `current_token=` form
   field). `/status` stays open.
-- **Token in NVS, not flash** — secrets live in encrypted NVS
-  partition; a physical-access attacker who pulls the chip would need
-  to defeat NVS encryption to extract them.
+- **Token in NVS** — secrets live in the ESP32's NVS partition via
+  Arduino `Preferences`. NVS is **not encrypted by default** — this
+  build does not enable ESP-IDF flash encryption. A physical-access
+  attacker can desolder + read the flash and recover the token. If
+  that's in your threat model, enable flash encryption + secure boot
+  per Espressif's flash-encryption guide and rebuild; the firmware
+  doesn't depend on either being on or off.
+- **Auto-wipe on 5x 401** — if the backend rejects 5 consecutive
+  posts with 401, the firmware wipes both the stored token AND the
+  `provisioned` flag, returning to the unprovisioned bootstrap state
+  so `/provision` is reachable again without prior-token proof.
 
 ## Limitations (v1)
 

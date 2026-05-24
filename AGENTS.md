@@ -60,7 +60,10 @@ lilygo-relay/                ESP32 firmware (PlatformIO)
   platformio.ini             Two envs: t3_v161_433 + t3_v161_915
   README.md                  Hardware + flashing + provisioning + security
 
-bin/setup-fly.sh             Interactive Fly setup (create | update | --rotate-tokens | --print-tokens)
+bin/setup-fly.sh             Path-based Fly setup (asks sources first; create | update | --rotate-tokens | --print-tokens; non-interactive via --sources= --tz= --yes)
+bin/setup-local.sh           Guided local Docker setup (generates tokens, writes .env, docker compose up)
+bin/doctor.sh                Health checklist (fly auth, /healthz, both tokens, volume, pollers, recent data)
+bin/set-rain-offset.sh       Calibrate a LilyGO device's yearly rain (merges INGEST_YEARLY_RAIN_OFFSETS)
 docker-compose.yml           Backend-only compose for local deploy
 .env.example                 Annotated environment template
 README.md                    Human-facing setup guide
@@ -128,14 +131,19 @@ brew install flyctl                                  # macOS — adjust per OS
 fly auth signup     # or `fly auth login`
 fly status                                           # confirms you're authed
 
-# Setup (interactive)
+# Setup (path-based, interactive)
 ./bin/setup-fly.sh
-# Prompts for: app name, region, AWN keys (optional), timezone.
-# Generates and prints API_TOKEN + INGEST_TOKEN — capture these in
-# your secrets manager. They're set as Fly secrets automatically.
+# Asks WHICH SOURCES first (AmbientWeather / Davis / LilyGO), then only
+# prompts for what those need (app name, region, the chosen sources'
+# credentials, timezone). Generates API_TOKEN + INGEST_TOKEN, sets them
+# as Fly secrets, deploys, and writes the next steps (incl. LilyGO
+# provision commands) to zasder-install-summary.txt.
+#
+# Non-interactive (e.g. driven by the web planner):
+./bin/setup-fly.sh --sources=awn,davis,lilygo --tz=America/Phoenix --yes
 
-# Deploy
-fly deploy
+# Health checklist after deploy
+./bin/doctor.sh --app <app-name>
 
 # Add WeatherLink (Path B) later
 fly secrets set -a <app-name> \

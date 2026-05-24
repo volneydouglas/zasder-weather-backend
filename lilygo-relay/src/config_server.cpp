@@ -67,8 +67,17 @@ void loadFromNvs() {
 }
 
 void wipeIngestToken() {
+  // Also clear the provisioned flag: checkAuth() requires a non-empty
+  // current token to verify Bearer auth, so leaving provisioned=true
+  // after wiping the token would lock /provision out forever (only
+  // recovery would be USB-reflash + NVS-erase). Reverting to the
+  // unprovisioned state lets the operator re-pair from any LAN
+  // device with no proof-of-ownership required (matching the
+  // first-boot bootstrap path).
   prefs.remove("ingest_token");
+  prefs.remove("provisioned");
   ingestToken = "";
+  provisioned = false;
 }
 
 // ── handlers ──────────────────────────────────────────────────────────

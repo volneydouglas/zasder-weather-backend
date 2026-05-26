@@ -634,3 +634,10 @@ def test_rain_glitch_rejected(client):
     # that the 9.58 glitch never made it in (a stored glitch would pull any
     # bucket average far above the real ~3.6).
     assert ys and max(ys) < 5.0
+
+
+def test_alert_monitor_always_started(client):
+    # [P2] The monitor must start even with no env SMTP, so SMTP configured
+    # later from the app (PUT /api/alerts) is picked up without a redeploy.
+    from app.main import app
+    assert app.state.alert_monitor is not None

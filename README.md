@@ -40,7 +40,7 @@ Two deployment modes for the backend itself:
   exposing it to the internet (port-forward, tunnel, reverse proxy) is on
   you. Good for "I want all my data on-premise."
 
-The iOS app is published separately on the App Store and connects to whichever backend URL you give it.
+The iOS app ([app page](https://zasder.com/weather)) is distributed separately and connects to whichever backend URL you give it.
 
 ## Quickstart: Fly.io (5 minutes)
 
@@ -206,6 +206,12 @@ Tune how long offline counts as "down" per device (SDRs tight, cloud feeds
 looser) with `ALERT_STALE_MINUTES` + the per-MAC `ALERT_STALE_MINUTES_BY_MAC`
 map (set a MAC to `0` to stop watching it). See `.env.example` for all knobs.
 
+Everything except the SMTP password can also be managed from the **iOS app**
+(Settings → Notifications) via the `/api/alerts` endpoints — recipients,
+per-device on/off + thresholds, and even the SMTP server itself (the password
+is write-only: the app can set it, the API never returns it). DB settings
+override the env defaults and take effect within a minute, no redeploy.
+
 ## What's in this repo
 
 ```
@@ -236,6 +242,9 @@ calls these. Public-readable status page at `/`.
 | GET | `/api/devices/{mac}/history?hours=24` | Time series, auto-bucketed for 3d/7d/30d |
 | GET | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg/median + when |
 | GET | `/api/forecast?lat=&lon=` | 7-day forecast (Open-Meteo) |
+| GET/PUT | `/api/alerts` | Device-down alert prefs (app-managed; SMTP password write-only) |
+| PUT | `/api/devices/{mac}/alert` | Per-device monitor toggle + threshold |
+| POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
 | POST | `/ingest/custom` | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
 | POST | `/ingest/discovery` | Source posts a `(model, id)` RF sighting |
 | GET | `/api/discoveries?since_hours=24` | Long-tail RF device survey |

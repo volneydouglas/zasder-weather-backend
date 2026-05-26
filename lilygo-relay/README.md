@@ -148,8 +148,31 @@ If you're debugging a dead board, the cycling row gives every diagnostic
 you'd want without needing serial. Burn-in mitigated via 30%-contrast
 default + automatic polarity invert every 4 hours.
 
+## Reliability (self-healing)
+
+The board recovers from the common failure modes on its own — important when
+it lives somewhere you don't routinely check:
+
+- **Watchdog.** An independent task (pinned to the other core) resets the chip
+  if the main loop stops running for >60s — catches a hard hang even when the
+  network stack still answers pings. Boot logs `esp_reset_reason()` so a
+  watchdog reset is distinguishable from a power-on.
+- **Wi-Fi auto-reconnect + HTTP re-bind.** On a disconnect the board
+  reconnects; on reconnect it re-binds the HTTP listener and re-announces
+  mDNS. A dropped STA otherwise leaves the listener on a stale socket, which
+  is exactly what wedges the loop.
+- **Bounded POST.** The HTTPS POST has connect/read timeouts so a stalled TLS
+  handshake after a Wi-Fi flap can't freeze the loop.
+
 ## Field-tested gotchas
 
+- **Wi-Fi 6/7 APs (UniFi etc.) on 2.4 GHz**: simple ESP32 chips fail auth
+  (`reason 202 AUTH_FAIL`) against WPA3 / transition mode, PMF (802.11w), or
+  band-steering / 802.11r — symptom is repeated reconnects and occasional
+  wedges. Fix on the AP: a dedicated **2.4 GHz-only, WPA2, PMF-disabled** IoT
+  SSID with band steering + fast roaming off (and a long group-rekey
+  interval). The self-healing above makes a stray drop non-fatal, but fixing
+  the AP stops the drops at the source.
 - **OLED reset pin on V1.6.1**: PlatformIO's `ttgo-lora32-v21new` variant
   declares `OLED_RST=16`, but on V1.6.1 GPIO16 is **NOT** the OLED reset.
   LilyGO's own example marks it `UNUSED_PIN`. We pass `U8X8_PIN_NONE` to

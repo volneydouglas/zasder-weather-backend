@@ -71,19 +71,16 @@ async def lifespan(app: FastAPI):
     app.state.wl_client = wl_client
     app.state.wl_poller = wl_poller
 
-    # Device-staleness email alerts — independent of any poller; watches
-    # ALL devices (cloud + SDR) for going quiet. Started whenever an SMTP
-    # transport is present; recipients + on/off + thresholds come from
-    # app-managed DB prefs (over env defaults) and are re-read each tick,
-    # so changes from the app take effect without a redeploy.
-    alert_monitor = None
-    if settings.transport_configured:
-        alert_monitor = AlertMonitor()
-        await alert_monitor.start()
-        log.info("staleness alert monitor started (SMTP transport present)")
-    else:
-        log.info("SMTP_HOST not set — staleness alert monitor disabled")
+    # Device-staleness email alerts — independent of any poller; watches ALL
+    # devices (cloud + SDR) for going quiet. ALWAYS started: it re-reads the
+    # effective config each tick and no-ops unless alerts are enabled with a
+    # transport + recipients. Gating on env SMTP at boot would miss transport
+    # configured later from the app (PUT /api/alerts → DB), so the monitor
+    # must already be running to pick that up without a redeploy.
+    alert_monitor = AlertMonitor()
+    await alert_monitor.start()
     app.state.alert_monitor = alert_monitor
+    log.info("staleness alert monitor started (active once alerts are configured)")
 
     try:
         yield

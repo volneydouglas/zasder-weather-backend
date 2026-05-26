@@ -98,6 +98,15 @@ if source_enabled davis && [ "$NONINTERACTIVE" -eq 0 ]; then
   [ -n "$wl_station" ] || read -r -p "WEATHERLINK_STATION_ID: " wl_station
 fi
 
+# Fail before writing a broken .env if a selected cloud source is missing
+# credentials (easy to hit with e.g. --sources=davis --yes).
+if source_enabled awn && { [ -z "$aw_app_key" ] || [ -z "$aw_api_key" ]; }; then
+  err "AmbientWeather selected but AW_APPLICATION_KEY / AW_API_KEY missing"; exit 1
+fi
+if source_enabled davis && { [ -z "$wl_key" ] || [ -z "$wl_secret" ] || [ -z "$wl_station" ]; }; then
+  err "Davis selected but WEATHERLINK_API_KEY / _SECRET / _STATION_ID missing"; exit 1
+fi
+
 # Timezone
 tz="$TZ_FLAG"
 if [ -z "$tz" ] && [ "$NONINTERACTIVE" -eq 0 ]; then

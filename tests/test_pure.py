@@ -268,3 +268,12 @@ def test_rain_glitch_ignores_decrease():
 
 def test_rain_glitch_disabled_when_rate_zero():
     assert ingest._is_rain_glitch(99.0, 0.01, 0.0) is False
+
+
+def test_reviewer_token_must_meet_length_floor():
+    # [P3] reviewer_api_token is accepted on /api/*, so a short one is a
+    # guessable backdoor — it must meet the same 32-char floor.
+    import pytest
+    from app.config import Settings
+    with pytest.raises(Exception):
+        Settings(api_token="a" * 32, reviewer_api_token="123")

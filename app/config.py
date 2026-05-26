@@ -104,11 +104,13 @@ class Settings(BaseSettings):
         # See _normalize_mac_map for the accepted shapes + normalization.
         return _normalize_mac_map(v)
 
-    # Reject SDR rain-decode glitches: a single reading where the cumulative
-    # yearly rain jumps more than this rate (in/hr) × elapsed-time (+ a small
-    # floor for tip-counter jitter) is dropped, since real rain ramps
-    # gradually while a decode glitch spikes for one reading. The next real
-    # reading resumes from the last good value, so isolated spikes vanish.
+    # Rain-glitch guard for ALL /ingest/custom sources (SDR/LilyGO + any custom
+    # relay; the built-in AWN/WeatherLink pollers don't go through /ingest, so
+    # they're unaffected). A reading whose cumulative yearly rain jumps more
+    # than this rate (in/hr) × elapsed-time (+ a small tip-jitter floor) is
+    # dropped — all rain buckets nulled for that one reading — since real rain
+    # ramps gradually while a decode glitch spikes for one reading. The next
+    # real reading resumes from the last good value, so isolated spikes vanish.
     # 2 in/hr is well above any real rainfall rate. Set 0 to disable.
     ingest_max_rain_rate_in_per_hr: float = 2.0
 
@@ -178,12 +180,11 @@ class Settings(BaseSettings):
                 f"{info.field_name} is set to a known placeholder "
                 f"({s!r}). Generate a real one with `openssl rand -hex 32` "
                 f"and set it via env/secret.")
-        # Length floor for production tokens. Exempt the `test-` prefix
-        # so unit tests can keep their human-readable token strings
-        # without forcing every call site through a 64-char hex literal.
-        if (len(s) < 32
-                and info.field_name != "reviewer_api_token"
-                and not s.startswith("test-")):
+        # Length floor for production tokens — applies to reviewer_api_token
+        # too (it's accepted on /api/* just like api_token, so a short one is
+        # a guessable backdoor). Exempt the `test-` prefix so unit tests can
+        # keep human-readable token strings.
+        if len(s) < 32 and not s.startswith("test-"):
             raise ValueError(
                 f"{info.field_name} must be at least 32 characters "
                 f"(got {len(s)}). Generate with `openssl rand -hex 32`.")

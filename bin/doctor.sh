@@ -139,19 +139,26 @@ if not devs:
     print("  ! no devices yet — nothing has posted (check a source/board)"); sys.exit(2)
 now = time.time(); freshest = None
 def ts(d):
-    for k in ("dateutc","last_seen","timestamp","ts"):
-        v = (d.get("latest") or d).get(k) if isinstance(d.get("latest") or d, dict) else None
+    # /api/devices returns lastSeen (ms) + lastData.dateutc (ms).
+    cands = [d.get("lastSeen"), (d.get("lastData") or {}).get("dateutc")]
+    for v in cands:
         if isinstance(v,(int,float)): return v/1000 if v>1e12 else v
     return None
+stale = []
 for d in devs:
     t = ts(d)
     if t and (freshest is None or t>freshest): freshest=t
+    if t and (now-t)/60 >= 15:
+        stale.append((d.get("name") or d.get("mac") or "?", int((now-t)/60)))
 label = f"{len(devs)} device(s)"
 if freshest:
     mins=int((now-freshest)/60)
     label += f", freshest obs {mins} min ago"
-    print(f"  {'✓' if mins<15 else '!'} {label}")
-    sys.exit(0 if mins<15 else 2)
+if stale:
+    for name, m in stale:
+        print(f"  ! {name}: {m} min since last report")
+    print(f"  ! {label} — {len(stale)} stale (>15 min)")
+    sys.exit(2)
 print(f"  ✓ {label}"); sys.exit(0)
 PY
   case "${DATA_RC:-1}" in 0) PASS=$((PASS+1)) ;; *) WARN=$((WARN+1)) ;; esac

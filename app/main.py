@@ -4,16 +4,18 @@ import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import db
+from .alerts import AlertMonitor
 from .ambient_client import AmbientWeatherClient
 from .capture import router as capture_router
 from .config import settings
@@ -69,6 +71,20 @@ async def lifespan(app: FastAPI):
     app.state.wl_client = wl_client
     app.state.wl_poller = wl_poller
 
+    # Device-staleness email alerts — independent of any poller; watches
+    # ALL devices (cloud + SDR) for going quiet. Started whenever an SMTP
+    # transport is present; recipients + on/off + thresholds come from
+    # app-managed DB prefs (over env defaults) and are re-read each tick,
+    # so changes from the app take effect without a redeploy.
+    alert_monitor = None
+    if settings.transport_configured:
+        alert_monitor = AlertMonitor()
+        await alert_monitor.start()
+        log.info("staleness alert monitor started (SMTP transport present)")
+    else:
+        log.info("SMTP_HOST not set — staleness alert monitor disabled")
+    app.state.alert_monitor = alert_monitor
+
     try:
         yield
     finally:
@@ -76,6 +92,7 @@ async def lifespan(app: FastAPI):
         if client is not None: await client.aclose()
         if wl_poller is not None: await wl_poller.stop()
         if wl_client is not None: await wl_client.aclose()
+        if alert_monitor is not None: await alert_monitor.stop()
 
 
 # /docs, /redoc, /openapi.json are exposed by default in FastAPI and
@@ -348,6 +365,113 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
 @app.get("/api/devices", dependencies=[Depends(require_token)])
 async def get_devices() -> JSONResponse:
     return JSONResponse(await db.list_devices())
+
+
+# ───────────────────────── alert preferences (app-managed) ─────────────────────────
+# The iOS app reads/writes these to control device-down email alerts. The
+# SMTP transport itself stays a server secret (env); only PREFERENCES live
+# here. DB prefs override env defaults; the monitor re-reads each tick.
+
+class AlertPrefsIn(BaseModel):
+    enabled: bool | None = None
+    default_threshold_minutes: float | None = Field(default=None, ge=1, le=1440)
+    repeat_hours: float | None = Field(default=None, ge=0, le=168)
+    recipients: list[str] | None = None
+
+
+class DeviceAlertIn(BaseModel):
+    monitor: bool = True
+    threshold_minutes: float | None = Field(default=None, ge=1, le=1440)
+
+
+async def _alerts_state() -> dict[str, Any]:
+    """Full alert config + per-device status — the shape the iOS app renders."""
+    from .alerts import effective_config, _device_threshold
+    cfg = await effective_config()
+    prefs = await db.get_alert_prefs()
+    dev_prefs = await db.get_device_alert_prefs()
+    states = await db.get_alert_states()
+    devices = await db.list_devices()
+    dev_list = []
+    for d in devices:
+        mac = d["mac"]
+        dp = dev_prefs.get(mac, {})
+        thr = _device_threshold(mac, dev_prefs, cfg.default_threshold_min)
+        dev_list.append({
+            "mac": mac,
+            "name": d.get("name") or mac,
+            "monitor": thr is not None,
+            "threshold_minutes": thr,                       # effective; None if unmonitored
+            "threshold_override": dp.get("threshold_min"),  # raw per-device value or None
+            "last_seen_ms": d.get("lastSeen"),
+            "state": (states.get(mac) or {}).get("state"),  # 'ok'|'stale'|None
+        })
+    return {
+        "transport_configured": cfg.transport_configured,
+        "enabled": cfg.enabled,
+        "enabled_override": prefs["enabled"],               # raw 0/1/None
+        "default_threshold_minutes": cfg.default_threshold_min,
+        "repeat_hours": cfg.repeat_hours,
+        "recipients": cfg.recipients,
+        "recipients_source": "app" if prefs["recipients"] else "env",
+        "devices": dev_list,
+    }
+
+
+@app.get("/api/alerts", dependencies=[Depends(require_token)])
+async def get_alerts() -> JSONResponse:
+    return JSONResponse(await _alerts_state())
+
+
+@app.put("/api/alerts", dependencies=[Depends(require_token)])
+async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
+    fields: dict[str, Any] = {}
+    if body.enabled is not None:
+        fields["enabled"] = 1 if body.enabled else 0
+    if body.default_threshold_minutes is not None:
+        fields["default_threshold_min"] = body.default_threshold_minutes
+    if body.repeat_hours is not None:
+        fields["repeat_hours"] = body.repeat_hours
+    if body.recipients is not None:
+        clean = [r.strip() for r in body.recipients if r.strip()]
+        for r in clean:
+            if "@" not in r or " " in r:
+                raise HTTPException(status_code=400, detail=f"invalid recipient: {r!r}")
+        # Empty list clears the override → falls back to env recipients.
+        fields["recipients"] = ",".join(clean) if clean else None
+    await db.set_alert_prefs(**fields)
+    return JSONResponse(await _alerts_state())
+
+
+@app.put("/api/devices/{mac}/alert", dependencies=[Depends(require_token)])
+async def put_device_alert(mac: str, body: DeviceAlertIn) -> JSONResponse:
+    from .ingest import _format_mac
+    await db.upsert_device_alert_pref(_format_mac(mac), body.monitor, body.threshold_minutes)
+    return JSONResponse(await _alerts_state())
+
+
+@app.post("/api/alerts/test", dependencies=[Depends(require_token)])
+async def test_alert() -> JSONResponse:
+    """Send a one-off test email to the current recipients — lets the app's
+    setup screen verify delivery end to end."""
+    import asyncio as _asyncio
+    from .alerts import effective_config, _send_sync
+    cfg = await effective_config()
+    if not cfg.transport_configured:
+        raise HTTPException(status_code=400,
+                            detail="SMTP transport not configured (set SMTP_HOST + creds as secrets)")
+    if not cfg.recipients:
+        raise HTTPException(status_code=400, detail="no recipients configured")
+    from_addr = (settings.alert_email_from or settings.smtp_username
+                 or "zasder-weather@localhost")
+    try:
+        await _asyncio.to_thread(
+            _send_sync, "[Zasder Weather] Test alert",
+            "This is a test from your Zasder Weather backend — device-down "
+            "alerts are wired up correctly.", cfg.recipients, from_addr)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"send failed: {e}")
+    return JSONResponse({"ok": True, "sent_to": cfg.recipients})
 
 
 @app.get("/api/devices/{mac}/current", dependencies=[Depends(require_token)])

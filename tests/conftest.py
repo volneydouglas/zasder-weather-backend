@@ -43,7 +43,7 @@ def client(temp_env: str):
     """FastAPI TestClient with a freshly-imported app + isolated DB."""
     # Force re-import so settings + app pick up the env we just set.
     for mod in ["app.config", "app.db", "app.capture", "app.ingest",
-                "app.discovery", "app.main"]:
+                "app.discovery", "app.alerts", "app.main"]:
         if mod in importlib.sys.modules: importlib.reload(importlib.sys.modules[mod])
     from fastapi.testclient import TestClient
     from app.main import app

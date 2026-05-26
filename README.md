@@ -185,6 +185,27 @@ The helper merges into the `INGEST_YEARLY_RAIN_OFFSETS` Fly secret without
 disturbing other MACs. Local Docker users: set the same JSON map in `.env`
 (see `.env.example`).
 
+## Device-down email alerts (optional)
+
+The backend can email you when a device that was reporting goes quiet —
+an SDR board that hangs, a dead sensor battery, an expired cloud key. It
+watches every device, baselines each on first sight (so it won't nag about
+ones that were already gone), alerts on the OK→stale transition, and sends
+a recovery note when data resumes.
+
+Set the SMTP transport as secrets — easiest is a Gmail **App Password**:
+
+```sh
+fly secrets set -a <app> \
+  ALERT_EMAIL_TO=you@example.com \
+  SMTP_HOST=smtp.gmail.com SMTP_PORT=587 \
+  SMTP_USERNAME=you@gmail.com SMTP_PASSWORD=your-app-password
+```
+
+Tune how long offline counts as "down" per device (SDRs tight, cloud feeds
+looser) with `ALERT_STALE_MINUTES` + the per-MAC `ALERT_STALE_MINUTES_BY_MAC`
+map (set a MAC to `0` to stop watching it). See `.env.example` for all knobs.
+
 ## What's in this repo
 
 ```

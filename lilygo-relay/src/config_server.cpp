@@ -315,6 +315,21 @@ void begin() {
                 WiFi.localIP().toString().c_str(), mdnsName.c_str());
 }
 
+void onReconnect() {
+  // Route handlers registered in begin() persist on the server object;
+  // we only need to re-bind the listening socket and re-announce mDNS on
+  // the new IP. This clears the stale post-reconnect socket that would
+  // otherwise wedge handleClient().
+  server.stop();
+  server.begin();
+  MDNS.end();
+  if (MDNS.begin(mdnsName.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+  }
+  Serial.printf("[reconnect] HTTP server + mDNS re-bound on %s\n",
+                WiFi.localIP().toString().c_str());
+}
+
 static void cycleDiagLine() {
   unsigned long now = millis();
   char buf[24];

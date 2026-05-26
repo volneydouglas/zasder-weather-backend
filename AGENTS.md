@@ -118,6 +118,8 @@ Q: Where do they want the backend?
 | `WEATHERLINK_POLL_INTERVAL_SECONDS` | Optional | Default 60. Min 15. |
 | `WEATHERLINK_YEARLY_RAIN_BASELINE_IN` | Optional | Inches to add to Davis's reported yearly rain (mid-year install). |
 | `SHARED_BAROMETER_SOURCE_MAC` | Optional | For cross-device pressure tile fallback. |
+| `ALERT_EMAIL_TO` + `SMTP_HOST` | Optional | Both set = device-down email alerts on. SMTP_USERNAME/PASSWORD/PORT/SSL for transport (Gmail App Password works). |
+| `ALERT_STALE_MINUTES` (+ `_BY_MAC`) | Optional | Minutes offline before alerting; per-MAC override map, `0` disables a device. Default 15. |
 | `ALLOWED_HOSTS` | Recommended in prod | Comma-separated allow-list for Host header. Defaults `*`. |
 | `DEBUG` | Never set in prod | `1` re-enables `/docs` (off by default). |
 

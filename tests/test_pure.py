@@ -141,3 +141,107 @@ def test_flatten_yearly_in_numeric_string_parsed():
     out = ingest._flatten(payload)
     assert out is not None
     assert out["yearlyrainin"] == 3.58
+
+
+# ───────────────────── staleness-alert decision logic ─────────────────────
+# Pure transition logic in app.alerts.decide — no DB, no SMTP.
+
+from app import alerts  # noqa: E402
+
+_MIN = 60_000          # 1 minute in ms
+_THRESH = 10 * _MIN    # 10-minute staleness threshold
+
+def test_decide_baselines_on_first_sight_no_alert():
+    # First time we see a device (prior=None) we record state but never alert,
+    # so a device that was already dead at startup doesn't trigger.
+    d = alerts.decide(None, last_seen_ms=0, now_ms=100 * _MIN, threshold_ms=_THRESH, repeat_ms=0)
+    assert d.state == "stale" and d.event is None
+
+def test_decide_ok_to_stale_fires():
+    prior = {"state": "ok", "changed_ms": 0, "notified_ms": None}
+    now = 100 * _MIN
+    d = alerts.decide(prior, last_seen_ms=now - 11 * _MIN, now_ms=now, threshold_ms=_THRESH, repeat_ms=0)
+    assert d.state == "stale" and d.event == "stale" and d.changed_ms == now
+
+def test_decide_stale_to_ok_recovers():
+    prior = {"state": "stale", "changed_ms": 50 * _MIN, "notified_ms": 50 * _MIN}
+    now = 100 * _MIN
+    d = alerts.decide(prior, last_seen_ms=now - 1 * _MIN, now_ms=now, threshold_ms=_THRESH, repeat_ms=0)
+    assert d.state == "ok" and d.event == "recovered"
+
+def test_decide_stable_ok_no_event():
+    prior = {"state": "ok", "changed_ms": 0, "notified_ms": None}
+    now = 100 * _MIN
+    d = alerts.decide(prior, last_seen_ms=now - 2 * _MIN, now_ms=now, threshold_ms=_THRESH, repeat_ms=0)
+    assert d.state == "ok" and d.event is None
+
+def test_decide_no_repeat_when_disabled():
+    prior = {"state": "stale", "changed_ms": 0, "notified_ms": 0}
+    now = 100 * _MIN
+    d = alerts.decide(prior, last_seen_ms=0, now_ms=now, threshold_ms=_THRESH, repeat_ms=0)
+    assert d.event is None
+
+def test_decide_repeat_after_interval():
+    prior = {"state": "stale", "changed_ms": 0, "notified_ms": 0}
+    now = 100 * _MIN
+    d = alerts.decide(prior, last_seen_ms=0, now_ms=now, threshold_ms=_THRESH, repeat_ms=60 * _MIN)
+    assert d.event == "repeat" and d.state == "stale"
+
+def test_build_alert_stale_subject_and_body():
+    subj, body = alerts.build_alert("stale", "Crestview (SDR)", "5D:5D:02:00:00:7D",
+                                    last_seen_ms=0, now_ms=11 * _MIN, threshold_min=10,
+                                    tz_name="America/Phoenix")
+    assert "not reporting" in subj and "Crestview (SDR)" in subj
+    assert "5D:5D:02:00:00:7D" in body and "threshold 10 min" in body
+
+def test_build_alert_recovered_subject():
+    subj, _ = alerts.build_alert("recovered", "Crestview (SDR)", "5D:5D:02:00:00:7D",
+                                 last_seen_ms=11 * _MIN, now_ms=12 * _MIN, threshold_min=10,
+                                 tz_name="UTC")
+    assert "reporting again" in subj
+
+
+# ───────────────────── alert threshold env parsing ─────────────────────
+
+def test_alert_threshold_map_normalizes_and_drops_bad():
+    from app.config import Settings
+    s = Settings(alert_stale_minutes_by_mac={"5d5d0200007d": 10, "C8:C9:A3:55:85:62": "nope"})
+    assert s.alert_stale_minutes_by_mac == {"5D:5D:02:00:00:7D": 10.0}
+
+
+# ───────────────────── feels-like derivation ─────────────────────
+# SDR/custom sources post raw temp but no feels_like; the backend derives it.
+
+def test_feels_like_matches_awn_heat_index():
+    # AWN reported 95.09 for 99.3F / 15% RH — raw Rothfusz regression.
+    assert ingest._compute_feels_like(99.3, 15, 0.89) == 95.09
+
+def test_feels_like_wind_chill_when_cold_and_windy():
+    fl = ingest._compute_feels_like(20.0, 50, 15.0)
+    assert fl is not None and fl < 20.0          # wind chill below air temp
+
+def test_feels_like_neutral_returns_air_temp():
+    assert ingest._compute_feels_like(65.0, 40, 2.0) == 65.0
+
+def test_feels_like_none_when_temp_unknown():
+    assert ingest._compute_feels_like(None, 50, 5.0) is None
+
+def test_flatten_derives_feelslike_for_sdr_without_it():
+    # SDR-style payload: temp + humidity, no feels_like provided.
+    payload = {
+        "device": {"id": "5D5D020000 7D".replace(" ", "")},
+        "timestamp_utc": "2026-05-25T07:40:15Z",
+        "outdoor": {"tempf": 99.3, "humidity": 15},
+        "wind": {"speed_mph": 0.89},
+    }
+    out = ingest._flatten(payload)
+    assert out is not None and out["feelsLike"] == 95.09
+
+def test_flatten_passes_through_provided_feelslike():
+    payload = {
+        "device": {"id": "AABBCCDDEEFF"},
+        "timestamp_utc": "2026-05-25T07:40:15Z",
+        "outdoor": {"tempf": 99.3, "humidity": 15, "feels_like": 88.0},
+    }
+    out = ingest._flatten(payload)
+    assert out is not None and out["feelsLike"] == 88.0

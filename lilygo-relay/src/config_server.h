@@ -19,6 +19,11 @@ namespace ZasderConfigServer {
 
 void begin();        // call after WiFi is connected
 void loop();         // call from main loop()
+// Re-bind the HTTP listener + re-announce mDNS after a Wi-Fi reconnect.
+// A dropped/reconnected STA invalidates the old listening socket; without
+// this, handleClient() can wedge on the stale socket (loop freezes while
+// ping/mDNS still answer). Safe to call repeatedly from loop().
+void onReconnect();
 
 // Called by the rest of the firmware to feed the status page.
 void noteIncomingPacket(const char *model, uint32_t id);

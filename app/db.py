@@ -63,6 +63,35 @@ CREATE TABLE IF NOT EXISTS discoveries (
 
 CREATE INDEX IF NOT EXISTS idx_discoveries_last_seen
     ON discoveries (last_seen_ms DESC);
+
+-- Per-device staleness-alert state. Persisted (not in-memory) so a Fly
+-- restart / redeploy doesn't re-fire alerts for devices that are already
+-- known-stale. `state` is 'ok' | 'stale'; `changed_ms` is when it last
+-- flipped; `notified_ms` is when we last emailed about the current state.
+CREATE TABLE IF NOT EXISTS device_alert_state (
+    mac          TEXT PRIMARY KEY,
+    state        TEXT NOT NULL,
+    last_seen_ms INTEGER,
+    changed_ms   INTEGER NOT NULL,
+    notified_ms  INTEGER
+);
+
+-- App-managed alert PREFERENCES (distinct from secret SMTP transport, which
+-- stays in env). Singleton global row + per-device overrides. NULL columns
+-- mean "inherit the env default", so the app only stores what it changes.
+CREATE TABLE IF NOT EXISTS alert_prefs (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled               INTEGER,   -- 0/1, NULL = on (when transport configured)
+    default_threshold_min REAL,      -- NULL = env ALERT_STALE_MINUTES
+    repeat_hours          REAL,      -- NULL = env ALERT_REPEAT_HOURS
+    recipients            TEXT        -- comma-separated, NULL = env ALERT_EMAIL_TO
+);
+
+CREATE TABLE IF NOT EXISTS device_alert_prefs (
+    mac           TEXT PRIMARY KEY,
+    monitor       INTEGER NOT NULL DEFAULT 1,   -- 0 = don't watch this device
+    threshold_min REAL                          -- NULL = use default threshold
+);
 """
 
 
@@ -192,6 +221,97 @@ async def list_devices() -> list[dict[str, Any]]:
             "info": info.get("info"),
         })
     return out
+
+
+async def get_alert_states() -> dict[str, dict[str, Any]]:
+    """All persisted per-device alert states, keyed by MAC."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, state, last_seen_ms, changed_ms, notified_ms "
+            "FROM device_alert_state"
+        )).fetchall()
+    return {
+        r["mac"]: {
+            "state": r["state"],
+            "last_seen_ms": r["last_seen_ms"],
+            "changed_ms": r["changed_ms"],
+            "notified_ms": r["notified_ms"],
+        }
+        for r in rows
+    }
+
+
+async def upsert_alert_state(mac: str, state: str, last_seen_ms: int | None,
+                             changed_ms: int, notified_ms: int | None) -> None:
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO device_alert_state (mac, state, last_seen_ms, changed_ms, notified_ms)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(mac) DO UPDATE SET
+                state        = excluded.state,
+                last_seen_ms = excluded.last_seen_ms,
+                changed_ms   = excluded.changed_ms,
+                notified_ms  = excluded.notified_ms
+            """,
+            (mac, state, last_seen_ms, changed_ms, notified_ms),
+        )
+        await db.commit()
+
+
+_ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipients")
+
+
+async def get_alert_prefs() -> dict[str, Any]:
+    """Global alert preferences (singleton). NULLs mean 'inherit env default'."""
+    async with connect() as db:
+        row = await (await db.execute(
+            f"SELECT {', '.join(_ALERT_PREF_COLS)} FROM alert_prefs WHERE id = 1"
+        )).fetchone()
+    if not row:
+        return {c: None for c in _ALERT_PREF_COLS}
+    return {c: row[c] for c in _ALERT_PREF_COLS}
+
+
+async def set_alert_prefs(**fields: Any) -> None:
+    """Update only the provided global-pref columns on the singleton row."""
+    cols = [c for c in _ALERT_PREF_COLS if c in fields]
+    if not cols:
+        return
+    async with connect() as db:
+        await db.execute("INSERT OR IGNORE INTO alert_prefs (id) VALUES (1)")
+        await db.execute(
+            f"UPDATE alert_prefs SET {', '.join(f'{c} = ?' for c in cols)} WHERE id = 1",
+            [fields[c] for c in cols],
+        )
+        await db.commit()
+
+
+async def get_device_alert_prefs() -> dict[str, dict[str, Any]]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, monitor, threshold_min FROM device_alert_prefs"
+        )).fetchall()
+    return {
+        r["mac"]: {"monitor": bool(r["monitor"]), "threshold_min": r["threshold_min"]}
+        for r in rows
+    }
+
+
+async def upsert_device_alert_pref(mac: str, monitor: bool,
+                                   threshold_min: float | None) -> None:
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO device_alert_prefs (mac, monitor, threshold_min)
+            VALUES (?, ?, ?)
+            ON CONFLICT(mac) DO UPDATE SET
+                monitor = excluded.monitor,
+                threshold_min = excluded.threshold_min
+            """,
+            (mac, 1 if monitor else 0, threshold_min),
+        )
+        await db.commit()
 
 
 async def observation_count(mac: str) -> int:

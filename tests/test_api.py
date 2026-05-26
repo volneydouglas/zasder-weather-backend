@@ -517,3 +517,79 @@ def test_status_escapes_device_name(client):
     assert "<img src=x onerror=" not in page
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
     assert "&lt;img src=x onerror=alert(2)&gt;" in page
+
+
+# ───────────────────────── alert preferences API ─────────────────────────
+# SMTP_HOST is unset in the test env, so effective `enabled` is always False
+# (nothing to send through); these verify the prefs are stored + reflected.
+
+_H = {"Authorization": "Bearer test-api-token"}
+
+def _ingest_device(client, mac_compact="AABBCCDDEEFF"):
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": mac_compact, "model": "Atlas"},
+                      "timestamp_utc": "2026-05-25T06:00:00Z",
+                      "outdoor": {"tempf": 70}, "wind": {}, "rain": {}, "pressure": {},
+                      "source": "acurite-atlas"})
+
+def test_alerts_requires_bearer(client):
+    assert client.get("/api/alerts").status_code == 401
+    assert client.put("/api/alerts", json={}).status_code == 401
+
+def test_alerts_default_shape(client):
+    r = client.get("/api/alerts", headers=_H)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["transport_configured"] is False     # no SMTP_HOST in tests
+    assert body["enabled"] is False
+    assert body["default_threshold_minutes"] == 15.0  # env default
+    assert body["devices"] == []
+
+def test_alerts_put_updates_globals(client):
+    r = client.put("/api/alerts", headers=_H,
+                   json={"default_threshold_minutes": 8, "repeat_hours": 6,
+                         "recipients": ["a@example.com", "b@example.com"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["default_threshold_minutes"] == 8.0
+    assert body["repeat_hours"] == 6.0
+    assert body["recipients"] == ["a@example.com", "b@example.com"]
+    assert body["recipients_source"] == "app"
+    # persisted across a fresh GET
+    assert client.get("/api/alerts", headers=_H).json()["default_threshold_minutes"] == 8.0
+
+def test_alerts_put_rejects_bad_recipient(client):
+    r = client.put("/api/alerts", headers=_H, json={"recipients": ["not-an-email"]})
+    assert r.status_code == 400
+
+def test_alerts_put_validates_threshold_range(client):
+    assert client.put("/api/alerts", headers=_H,
+                      json={"default_threshold_minutes": 0}).status_code == 422
+
+def test_device_alert_pref_roundtrip(client):
+    _ingest_device(client)
+    mac = "AA:BB:CC:DD:EE:FF"
+    # turn monitoring on with a tight 10-min threshold
+    r = client.put(f"/api/devices/{mac}/alert", headers=_H,
+                   json={"monitor": True, "threshold_minutes": 10})
+    assert r.status_code == 200
+    dev = next(d for d in r.json()["devices"] if d["mac"] == mac)
+    assert dev["monitor"] is True and dev["threshold_minutes"] == 10.0
+    assert dev["threshold_override"] == 10.0
+    # turn it off → not monitored, effective threshold None
+    r = client.put(f"/api/devices/{mac}/alert", headers=_H, json={"monitor": False})
+    dev = next(d for d in r.json()["devices"] if d["mac"] == mac)
+    assert dev["monitor"] is False and dev["threshold_minutes"] is None
+
+def test_device_alert_accepts_compact_mac(client):
+    _ingest_device(client)
+    # compact form in the path normalizes to the stored colonized MAC
+    r = client.put("/api/devices/aabbccddeeff/alert", headers=_H,
+                   json={"monitor": True, "threshold_minutes": 12})
+    dev = next(d for d in r.json()["devices"] if d["mac"] == "AA:BB:CC:DD:EE:FF")
+    assert dev["threshold_minutes"] == 12.0
+
+def test_alerts_test_send_requires_transport(client):
+    # no SMTP_HOST configured → 400, not a 500
+    assert client.post("/api/alerts/test", headers=_H).status_code == 400

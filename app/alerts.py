@@ -1,0 +1,238 @@
+"""Device-staleness email alerting.
+
+A background task polls each device's last-report age and emails the operator
+when a device that was reporting goes quiet (e.g. an SDR/LilyGO board hangs, a
+sensor battery dies, a cloud API key expires). The decision logic is pure and
+unit-tested (`decide`); the task layer adds DB-persisted state + SMTP delivery.
+
+Off unless `alert_email_to` and `smtp_host` are configured (see Settings).
+"""
+import asyncio
+import logging
+import smtplib
+import ssl
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from email.message import EmailMessage
+from zoneinfo import ZoneInfo
+
+from . import db
+from .config import settings
+
+log = logging.getLogger("alerts")
+
+
+# ───────────────────────── pure decision logic ─────────────────────────
+@dataclass
+class AlertDecision:
+    state: str            # 'ok' | 'stale'  — the device's state this tick
+    event: str | None     # None | 'stale' | 'recovered' | 'repeat'
+    changed_ms: int       # when the state last flipped
+
+
+def decide(prior: dict | None, last_seen_ms: int | None, now_ms: int,
+           threshold_ms: int, repeat_ms: int) -> AlertDecision:
+    """Decide whether to alert for one device this tick.
+
+    `prior` is the persisted state (dict with 'state'/'changed_ms'/'notified_ms')
+    or None on first sight. Transition-based: a device is *baselined* on first
+    sight with no alert, so we never alert for devices that were already
+    dead/removed when monitoring started. Thereafter:
+      * OK→stale  → 'stale' event
+      * stale→OK  → 'recovered' event
+      * stays stale and repeat_ms>0 and that long since last notify → 'repeat'
+    """
+    is_stale = last_seen_ms is not None and (now_ms - last_seen_ms) > threshold_ms
+    cur = "stale" if is_stale else "ok"
+
+    if prior is None:
+        return AlertDecision(cur, None, now_ms)        # baseline, no alert
+
+    if cur != prior["state"]:
+        return AlertDecision(cur, "stale" if cur == "stale" else "recovered", now_ms)
+
+    # State unchanged. Optionally re-remind while still stale.
+    if cur == "stale" and repeat_ms > 0:
+        last_notified = prior.get("notified_ms") or prior.get("changed_ms") or 0
+        if now_ms - last_notified >= repeat_ms:
+            return AlertDecision("stale", "repeat", prior["changed_ms"])
+
+    return AlertDecision(cur, None, prior["changed_ms"])
+
+
+def _fmt_ts(ms: int | None, tz_name: str) -> str:
+    if not ms:
+        return "never"
+    try:
+        zi = ZoneInfo(tz_name)
+    except Exception:
+        zi = ZoneInfo("UTC")
+    return datetime.fromtimestamp(ms / 1000, zi).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def build_alert(event: str, name: str, mac: str, last_seen_ms: int | None,
+                now_ms: int, threshold_min: float, tz_name: str) -> tuple[str, str]:
+    """Build (subject, body) for an alert. Pure — unit-testable."""
+    last = _fmt_ts(last_seen_ms, tz_name)
+    if event in ("stale", "repeat"):
+        age_min = (now_ms - last_seen_ms) / 60000 if last_seen_ms else None
+        age_txt = f"{age_min:.0f} min" if age_min is not None else "an unknown time"
+        still = "still " if event == "repeat" else ""
+        subject = f"[Zasder Weather] {name} {still}not reporting"
+        body = (
+            f"Device '{name}' ({mac}) has not reported for {age_txt} "
+            f"(threshold {threshold_min:.0f} min).\n\n"
+            f"Last reading: {last}\n\n"
+            "If this is an SDR/LilyGO receiver it may have hung — power-cycle "
+            "or reset it. If it's a cloud feed, check the upstream service and "
+            "your API credentials. The status page lists every device's "
+            "last-seen time.\n"
+        )
+    else:  # recovered
+        subject = f"[Zasder Weather] {name} is reporting again"
+        body = (f"Device '{name}' ({mac}) is back online.\n\n"
+                f"Latest reading: {last}\n")
+    return subject, body
+
+
+# ───────────────────────── effective config ─────────────────────────
+@dataclass
+class EffectiveAlertConfig:
+    enabled: bool                 # transport + recipients + not turned off
+    transport_configured: bool    # SMTP server present (env secret)
+    recipients: list[str]         # DB prefs override env
+    default_threshold_min: float  # DB prefs override env
+    repeat_hours: float           # DB prefs override env
+
+
+def _parse_recipients(raw: str | None) -> list[str]:
+    return [e.strip() for e in (raw or "").split(",") if e.strip()]
+
+
+async def effective_config() -> EffectiveAlertConfig:
+    """Merge app-managed DB prefs over env defaults. DB value wins when set;
+    NULL falls back to env. The SMTP transport itself is always env-only."""
+    p = await db.get_alert_prefs()
+    transport = settings.transport_configured
+    recipients = (_parse_recipients(p["recipients"]) if p["recipients"]
+                  else settings.alert_recipients)
+    default_thr = (p["default_threshold_min"] if p["default_threshold_min"] is not None
+                   else settings.alert_stale_minutes)
+    repeat = (p["repeat_hours"] if p["repeat_hours"] is not None
+              else settings.alert_repeat_hours)
+    db_enabled = p["enabled"]            # 0 / 1 / None
+    enabled = transport and bool(recipients) and (db_enabled != 0)
+    return EffectiveAlertConfig(enabled, transport, recipients,
+                                float(default_thr), float(repeat))
+
+
+# ───────────────────────── SMTP delivery ─────────────────────────
+def _send_sync(subject: str, body: str, to_list: list[str], from_addr: str) -> None:
+    """Blocking SMTP send — run via asyncio.to_thread. Supports STARTTLS
+    (587), implicit SSL (465), or plain, with optional auth."""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = ", ".join(to_list)
+    msg.set_content(body)
+
+    host = settings.smtp_host
+    port = settings.smtp_port
+    user, pw = settings.smtp_username, settings.smtp_password
+    if settings.smtp_ssl:
+        with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(),
+                              timeout=30) as s:
+            if user:
+                s.login(user, pw or "")
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=30) as s:
+            s.ehlo()
+            if settings.smtp_tls:
+                s.starttls(context=ssl.create_default_context())
+                s.ehlo()
+            if user:
+                s.login(user, pw or "")
+            s.send_message(msg)
+
+
+# ───────────────────────── monitor task ─────────────────────────
+class AlertMonitor:
+    def __init__(self) -> None:
+        self._task: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._run(), name="alert-monitor")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            await self._task
+
+    async def _run(self) -> None:
+        interval = max(15, settings.alert_check_interval_seconds)
+        log.info("alert monitor running every %ds (transport configured=%s)",
+                 interval, settings.transport_configured)
+        while not self._stop.is_set():
+            try:
+                await self._tick()
+            except Exception as e:
+                log.exception("alert tick failed: %s", e)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _tick(self) -> None:
+        cfg = await effective_config()
+        if not cfg.enabled:
+            return  # turned off (via app), no transport, or no recipients
+        now_ms = int(time.time() * 1000)
+        repeat_ms = int(cfg.repeat_hours * 3600 * 1000)
+        from_addr = (settings.alert_email_from or settings.smtp_username
+                     or "zasder-weather@localhost")
+        devices = await db.list_devices()
+        states = await db.get_alert_states()
+        dev_prefs = await db.get_device_alert_prefs()
+        for d in devices:
+            mac = d["mac"]
+            name = d.get("name") or mac
+            thr_min = _device_threshold(mac, dev_prefs, cfg.default_threshold_min)
+            if thr_min is None or thr_min <= 0:    # monitoring disabled for device
+                continue
+            threshold_ms = int(thr_min * 60 * 1000)
+            prior = states.get(mac)
+            last_seen = d.get("lastSeen")
+            dec = decide(prior, last_seen, now_ms, threshold_ms, repeat_ms)
+
+            notified_ms = (prior or {}).get("notified_ms")
+            if dec.event:
+                subject, bodytext = build_alert(
+                    dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
+                try:
+                    await asyncio.to_thread(_send_sync, subject, bodytext,
+                                            cfg.recipients, from_addr)
+                    notified_ms = now_ms
+                    log.info("alert email sent: %s for %s (%s)", dec.event, name, mac)
+                except Exception as e:
+                    # Don't advance notified_ms on failure → retry next tick.
+                    log.exception("failed to email alert for %s (%s): %s", name, mac, e)
+
+            if prior is None or dec.state != prior["state"] or dec.event:
+                await db.upsert_alert_state(
+                    mac, dec.state, last_seen, dec.changed_ms, notified_ms)
+
+
+def _device_threshold(mac: str, dev_prefs: dict, default_min: float) -> float | None:
+    """Effective stale-threshold (minutes) for a device, or None if it's
+    explicitly not monitored. Precedence: app per-device pref > env per-MAC
+    override > global default."""
+    dp = dev_prefs.get(mac)
+    if dp is not None:
+        if not dp.get("monitor", True):
+            return None
+        if dp.get("threshold_min") is not None:
+            return float(dp["threshold_min"])
+    return float(settings.alert_stale_minutes_by_mac.get(mac, default_min))

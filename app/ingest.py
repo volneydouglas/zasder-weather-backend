@@ -120,10 +120,19 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         if offset is not None:
             yearly_in = max(0.0, yearly_in - offset)
 
+    # Feels-like: pass through the source's own value if present (AWN +
+    # Davis provide it); otherwise derive it so SDR/custom sources that only
+    # post raw temp/humidity still get the tile. Matches AWN's method.
+    tempf = out.get("tempf")
+    feels_like = out.get("feels_like")
+    if feels_like is None:
+        feels_like = _compute_feels_like(tempf, out.get("humidity"),
+                                         wind.get("speed_mph"))
+
     return {
         "dateutc":        dateutc_ms,
-        "tempf":          out.get("tempf"),
-        "feelsLike":      out.get("feels_like"),
+        "tempf":          tempf,
+        "feelsLike":      feels_like,
         "dewPoint":       out.get("dew_point_f"),
         "humidity":       out.get("humidity"),
         "tempinf":        ind.get("tempf"),
@@ -143,6 +152,36 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "uv":             out.get("uv"),
         "solarradiation": out.get("solar_wm2"),
     }
+
+
+def _compute_feels_like(tempf: Any, humidity: Any, wind_mph: Any) -> float | None:
+    """NWS 'feels like', matching what AmbientWeather reports: the Rothfusz
+    heat-index regression at ≥80°F (which legitimately dips below air temp in
+    dry heat — e.g. 99.3°F/15% → 95.09°F), wind chill at ≤50°F with wind
+    >3 mph, else the air temp. Returns None only when temperature is unknown.
+    Fallback for sources (SDR/custom) that don't post their own feels_like."""
+    try:
+        t = float(tempf)
+    except (TypeError, ValueError):
+        return None
+    try:
+        rh = float(humidity)
+    except (TypeError, ValueError):
+        rh = None
+    if rh is not None and t >= 80.0:
+        hi = (-42.379 + 2.04901523 * t + 10.14333127 * rh
+              - 0.22475541 * t * rh - 6.83783e-3 * t * t
+              - 5.481717e-2 * rh * rh + 1.22874e-3 * t * t * rh
+              + 8.5282e-4 * t * rh * rh - 1.99e-6 * t * t * rh * rh)
+        return round(hi, 2)
+    try:
+        v = float(wind_mph)
+    except (TypeError, ValueError):
+        v = None
+    if v is not None and t <= 50.0 and v > 3.0:
+        wc = 35.74 + 0.6215 * t - 35.75 * v**0.16 + 0.4275 * t * v**0.16
+        return round(wc, 2)
+    return round(t, 2)
 
 
 def _format_mac(raw: str) -> str:

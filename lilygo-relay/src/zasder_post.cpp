@@ -326,6 +326,10 @@ void zasder_post(const char *rtl433Json,
     Serial.printf("[http-begin-fail] %s\n", url.c_str());
     return;
   }
+  // Bound the POST so a stalled TLS connect/read (e.g. after a Wi-Fi flap)
+  // can't block loop() indefinitely. Well under the 60s loop watchdog.
+  http.setConnectTimeout(8000);
+  http.setTimeout(8000);
   http.addHeader("Content-Type",  "application/json");
   http.addHeader("Authorization", "Bearer " + ingestToken);
   int rc = http.POST(body);

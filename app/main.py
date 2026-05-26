@@ -523,6 +523,42 @@ async def push_test() -> JSONResponse:
     return JSONResponse({"ok": True, **res})
 
 
+# ───────────────────────── threshold alert rules ─────────────────────────
+
+class AlertRuleIn(BaseModel):
+    field: str
+    comparator: str
+    threshold: float
+    target_mac: str | None = None     # None = any device
+
+
+@app.get("/api/alerts/rules", dependencies=[Depends(require_token)])
+async def list_rules() -> JSONResponse:
+    return JSONResponse(await db.list_alert_rules())
+
+
+@app.post("/api/alerts/rules", dependencies=[Depends(require_token)])
+async def create_rule(body: AlertRuleIn) -> JSONResponse:
+    from .alerts import THRESHOLD_FIELDS, THRESHOLD_COMPARATORS
+    from .ingest import _format_mac
+    if body.field not in THRESHOLD_FIELDS:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown field {body.field!r}; allowed: {sorted(THRESHOLD_FIELDS)}")
+    if body.comparator not in THRESHOLD_COMPARATORS:
+        raise HTTPException(status_code=400,
+                            detail=f"comparator must be one of {sorted(THRESHOLD_COMPARATORS)}")
+    mac = _format_mac(body.target_mac) if body.target_mac else None
+    rule = await db.create_alert_rule(mac, body.field, body.comparator, body.threshold)
+    return JSONResponse(rule)
+
+
+@app.delete("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_token)])
+async def delete_rule(rule_id: int) -> JSONResponse:
+    if not await db.delete_alert_rule(rule_id):
+        raise HTTPException(status_code=404, detail="rule not found")
+    return JSONResponse({"ok": True, "deleted": rule_id})
+
+
 @app.get("/api/devices/{mac}/current", dependencies=[Depends(require_token)])
 async def get_current(mac: str) -> JSONResponse:
     obs = await db.latest_observation(mac)

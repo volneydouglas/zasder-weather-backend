@@ -114,6 +114,28 @@ CREATE TABLE IF NOT EXISTS push_tokens (
     created_ms   INTEGER NOT NULL,
     last_seen_ms INTEGER NOT NULL
 );
+
+-- Server-side threshold alert rules (e.g. tempf above 100). target_mac NULL =
+-- any device. comparator: above|below|equalTo. threshold is API-native units
+-- (°F, mph, in, inHg). Edge-triggered: alert_rule_state tracks per-(rule,device)
+-- triggered state so we fire once on crossing and re-arm when it clears.
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_mac  TEXT,
+    field       TEXT NOT NULL,
+    comparator  TEXT NOT NULL,
+    threshold   REAL NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    created_ms  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS alert_rule_state (
+    rule_id    INTEGER NOT NULL,
+    mac        TEXT NOT NULL,
+    triggered  INTEGER NOT NULL DEFAULT 0,
+    changed_ms INTEGER,
+    PRIMARY KEY (rule_id, mac)
+);
 """
 
 
@@ -346,6 +368,62 @@ async def upsert_device_alert_pref(mac: str, monitor: bool,
                 threshold_min = excluded.threshold_min
             """,
             (mac, 1 if monitor else 0, threshold_min),
+        )
+        await db.commit()
+
+
+async def create_alert_rule(target_mac: str | None, field: str,
+                            comparator: str, threshold: float) -> dict[str, Any]:
+    now = int(__import__("time").time() * 1000)
+    async with connect() as db:
+        cur = await db.execute(
+            "INSERT INTO alert_rules (target_mac, field, comparator, threshold, enabled, created_ms) "
+            "VALUES (?, ?, ?, ?, 1, ?)",
+            (target_mac, field, comparator, threshold, now),
+        )
+        await db.commit()
+        rid = cur.lastrowid
+    return {"id": rid, "target_mac": target_mac, "field": field,
+            "comparator": comparator, "threshold": threshold, "enabled": True}
+
+
+async def list_alert_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
+    sql = "SELECT id, target_mac, field, comparator, threshold, enabled FROM alert_rules"
+    if enabled_only:
+        sql += " WHERE enabled = 1"
+    sql += " ORDER BY id"
+    async with connect() as db:
+        rows = await (await db.execute(sql)).fetchall()
+    return [{"id": r["id"], "target_mac": r["target_mac"], "field": r["field"],
+             "comparator": r["comparator"], "threshold": r["threshold"],
+             "enabled": bool(r["enabled"])} for r in rows]
+
+
+async def delete_alert_rule(rule_id: int) -> int:
+    async with connect() as db:
+        cur = await db.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
+        await db.execute("DELETE FROM alert_rule_state WHERE rule_id = ?", (rule_id,))
+        await db.commit()
+        return cur.rowcount or 0
+
+
+async def get_rule_states() -> dict[tuple[int, str], int]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT rule_id, mac, triggered FROM alert_rule_state")).fetchall()
+    return {(r["rule_id"], r["mac"]): r["triggered"] for r in rows}
+
+
+async def upsert_rule_state(rule_id: int, mac: str, triggered: int, changed_ms: int) -> None:
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO alert_rule_state (rule_id, mac, triggered, changed_ms)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(rule_id, mac) DO UPDATE SET
+                triggered = excluded.triggered, changed_ms = excluded.changed_ms
+            """,
+            (rule_id, mac, triggered, changed_ms),
         )
         await db.commit()
 

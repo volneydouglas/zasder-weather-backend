@@ -304,3 +304,21 @@ def test_build_push_offline_and_recovered():
     assert "offline" in t and "No data" in b
     t2, _ = alerts.build_push("recovered", "Crestview (SDR)", now - 1 * 60_000, now, 10)
     assert "back online" in t2
+
+
+# ───────────────────── threshold rules ─────────────────────
+def test_evaluate_rule_above_fires_once_then_rearms():
+    assert alerts.evaluate_rule("above", 100.0, 102.0, 0) == (True, True)   # clear→trigger fires
+    assert alerts.evaluate_rule("above", 100.0, 103.0, 1) == (True, False)  # stays triggered, no re-fire
+    assert alerts.evaluate_rule("above", 100.0, 98.0, 1) == (False, False)  # clears → re-arms
+
+def test_evaluate_rule_below_and_equal():
+    assert alerts.evaluate_rule("below", 32.0, 30.0, 0) == (True, True)
+    assert alerts.evaluate_rule("below", 32.0, 40.0, 0) == (False, False)
+    assert alerts.evaluate_rule("equalTo", 50.0, 50.3, 0) == (True, True)   # within tolerance
+    assert alerts.evaluate_rule("equalTo", 50.0, 51.0, 0) == (False, False)
+
+def test_build_threshold_message():
+    title, body = alerts.build_threshold_message("Crestview", "tempf", 102.3, "above", 100)
+    assert "Crestview" in title and "Temperature" in title
+    assert "102.3°F" in body and "> 100°F" in body

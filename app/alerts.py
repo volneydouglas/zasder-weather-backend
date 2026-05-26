@@ -107,6 +107,53 @@ def build_push(event: str, name: str, last_seen_ms: int | None,
     return f"{name} is back online", "Reporting again"
 
 
+# ───────────────────────── threshold rules ─────────────────────────
+# Field keys match the iOS AlertRule / observation JSON keys.
+THRESHOLD_FIELDS = {
+    "tempf", "feelsLike", "humidity", "dewPoint", "windspeedmph",
+    "windgustmph", "dailyrainin", "hourlyrainin", "baromrelin", "uv",
+}
+THRESHOLD_COMPARATORS = {"above", "below", "equalTo"}
+_FIELD_LABELS = {
+    "tempf": "Temperature", "feelsLike": "Feels Like", "humidity": "Humidity",
+    "dewPoint": "Dew Point", "windspeedmph": "Wind Speed", "windgustmph": "Wind Gust",
+    "dailyrainin": "Rain Today", "hourlyrainin": "Rain Rate",
+    "baromrelin": "Pressure", "uv": "UV Index",
+}
+_FIELD_UNITS = {
+    "tempf": "°F", "feelsLike": "°F", "dewPoint": "°F", "humidity": "%",
+    "windspeedmph": " mph", "windgustmph": " mph", "dailyrainin": " in",
+    "hourlyrainin": " in/hr", "baromrelin": " inHg", "uv": "",
+}
+_COMPARATOR_SYM = {"above": ">", "below": "<", "equalTo": "="}
+
+
+def rule_triggered(comparator: str, threshold: float, value: float) -> bool:
+    if comparator == "above":
+        return value > threshold
+    if comparator == "below":
+        return value < threshold
+    return abs(value - threshold) < 0.5   # equalTo — tolerance for noisy sensors
+
+
+def evaluate_rule(comparator: str, threshold: float, value: float,
+                  prev_triggered: int) -> tuple[bool, bool]:
+    """(now_triggered, fire). Edge-triggered: fire only on clear→triggered."""
+    now = rule_triggered(comparator, threshold, value)
+    return now, (now and not prev_triggered)
+
+
+def build_threshold_message(device_name: str, field: str, value: float,
+                            comparator: str, threshold: float) -> tuple[str, str]:
+    """(title, body) for a tripped threshold rule. Pure — unit-testable."""
+    label = _FIELD_LABELS.get(field, field)
+    unit = _FIELD_UNITS.get(field, "")
+    sym = _COMPARATOR_SYM.get(comparator, comparator)
+    def fmt(v: float) -> str: return f"{v:g}{unit}"
+    return (f"{device_name}: {label} alert",
+            f"{label} is {fmt(value)} ({sym} {fmt(threshold)})")
+
+
 # ───────────────────────── effective config ─────────────────────────
 @dataclass
 class EffectiveAlertConfig:
@@ -190,6 +237,29 @@ def _send_sync(subject: str, body: str, to_list: list[str],
             s.send_message(msg)
 
 
+# ───────────────────────── delivery ─────────────────────────
+async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
+                   push_title: str, push_body: str) -> bool:
+    """Send an alert through every configured channel (email + push). Returns
+    True if at least one channel delivered. Shared by device-down + threshold."""
+    delivered = False
+    if cfg.enabled:
+        try:
+            await asyncio.to_thread(_send_sync, subject, body, cfg.recipients, cfg)
+            delivered = True
+        except Exception as e:
+            log.exception("alert email send failed: %s", e)
+    if settings.apns_configured:
+        try:
+            from . import apns
+            res = await apns.send_to_all(push_title, push_body)
+            if res.get("sent"):
+                delivered = True
+        except Exception as e:
+            log.exception("alert push send failed: %s", e)
+    return delivered
+
+
 # ───────────────────────── monitor task ─────────────────────────
 class AlertMonitor:
     def __init__(self) -> None:
@@ -241,36 +311,48 @@ class AlertMonitor:
 
             notified_ms = (prior or {}).get("notified_ms")
             if dec.event:
-                delivered = False
-                # Email channel (only if transport + recipients are set).
-                if cfg.enabled:
-                    subject, bodytext = build_alert(
-                        dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
-                    try:
-                        await asyncio.to_thread(_send_sync, subject, bodytext,
-                                                cfg.recipients, cfg)
-                        delivered = True
-                        log.info("alert email sent: %s for %s (%s)", dec.event, name, mac)
-                    except Exception as e:
-                        log.exception("failed to email alert for %s (%s): %s", name, mac, e)
-                # Push channel (independent of email).
-                if settings.apns_configured:
-                    title, pbody = build_push(dec.event, name, last_seen, now_ms, thr_min)
-                    try:
-                        from . import apns
-                        res = await apns.send_to_all(title, pbody)
-                        if res.get("sent"):
-                            delivered = True
-                        log.info("alert push: %s for %s → %s", dec.event, name, res)
-                    except Exception as e:
-                        log.exception("failed to push alert for %s (%s): %s", name, mac, e)
-                # Advance the re-notify clock only if a channel actually delivered.
-                if delivered:
-                    notified_ms = now_ms
+                subject, bodytext = build_alert(
+                    dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
+                ptitle, pbody = build_push(dec.event, name, last_seen, now_ms, thr_min)
+                if await _deliver(cfg, subject, bodytext, ptitle, pbody):
+                    notified_ms = now_ms     # advance re-notify clock only on delivery
+                log.info("device-down alert %s for %s (%s)", dec.event, name, mac)
 
             if prior is None or dec.state != prior["state"] or dec.event:
                 await db.upsert_alert_state(
                     mac, dec.state, last_seen, dec.changed_ms, notified_ms)
+
+        # ── threshold rules: fire when a device's latest reading crosses a rule
+        await self._check_threshold_rules(cfg, devices, now_ms)
+
+    async def _check_threshold_rules(self, cfg, devices, now_ms: int) -> None:
+        rules = await db.list_alert_rules(enabled_only=True)
+        if not rules:
+            return
+        rstates = await db.get_rule_states()
+        for d in devices:
+            last = d.get("lastData") or {}
+            for rule in rules:
+                if rule["target_mac"] and rule["target_mac"] != d["mac"]:
+                    continue
+                raw = last.get(rule["field"])
+                if raw is None:
+                    continue
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                prev = rstates.get((rule["id"], d["mac"]), 0)
+                now_trig, fire = evaluate_rule(rule["comparator"], rule["threshold"], val, prev)
+                if int(now_trig) != prev:
+                    await db.upsert_rule_state(rule["id"], d["mac"], int(now_trig), now_ms)
+                if fire:
+                    dname = d.get("name") or d["mac"]
+                    title, body = build_threshold_message(
+                        dname, rule["field"], val, rule["comparator"], rule["threshold"])
+                    await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body)
+                    log.info("threshold alert fired: rule %s (%s) on %s value=%.3f",
+                             rule["id"], rule["field"], dname, val)
 
 
 def _device_threshold(mac: str, dev_prefs: dict, default_min: float) -> float | None:

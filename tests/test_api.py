@@ -660,3 +660,25 @@ def test_push_test_requires_apns(client):
     # No APNs config in the test env → 400, not 500.
     assert client.post("/api/push/test",
                        headers={"Authorization": "Bearer test-api-token"}).status_code == 400
+
+
+def test_alert_rules_crud(client):
+    H = {"Authorization": "Bearer test-api-token"}
+    r = client.post("/api/alerts/rules", headers=H,
+                    json={"field": "tempf", "comparator": "above", "threshold": 100})
+    assert r.status_code == 200
+    rid = r.json()["id"]
+    assert r.json()["field"] == "tempf" and r.json()["threshold"] == 100
+    assert any(x["id"] == rid for x in client.get("/api/alerts/rules", headers=H).json())
+    assert client.delete(f"/api/alerts/rules/{rid}", headers=H).status_code == 200
+    assert all(x["id"] != rid for x in client.get("/api/alerts/rules", headers=H).json())
+
+def test_alert_rule_validation(client):
+    H = {"Authorization": "Bearer test-api-token"}
+    assert client.post("/api/alerts/rules", headers=H,
+                       json={"field": "bogus", "comparator": "above", "threshold": 1}).status_code == 400
+    assert client.post("/api/alerts/rules", headers=H,
+                       json={"field": "tempf", "comparator": "sideways", "threshold": 1}).status_code == 400
+
+def test_alert_rules_requires_token(client):
+    assert client.get("/api/alerts/rules").status_code == 401

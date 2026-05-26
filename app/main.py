@@ -377,6 +377,15 @@ class AlertPrefsIn(BaseModel):
     default_threshold_minutes: float | None = Field(default=None, ge=1, le=1440)
     repeat_hours: float | None = Field(default=None, ge=0, le=168)
     recipients: list[str] | None = None
+    # App-managed SMTP transport. Password is write-only (never returned).
+    # Send "" to clear a field back to the env default; omit to leave as-is.
+    smtp_host: str | None = None
+    smtp_port: int | None = Field(default=None, ge=1, le=65535)
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_from: str | None = None
+    smtp_tls: bool | None = None
+    smtp_ssl: bool | None = None
 
 
 class DeviceAlertIn(BaseModel):
@@ -414,6 +423,15 @@ async def _alerts_state() -> dict[str, Any]:
         "repeat_hours": cfg.repeat_hours,
         "recipients": cfg.recipients,
         "recipients_source": "app" if prefs["recipients"] else "env",
+        # SMTP transport — everything EXCEPT the password (write-only).
+        "smtp_host": cfg.smtp_host,
+        "smtp_port": cfg.smtp_port,
+        "smtp_username": cfg.smtp_username,
+        "smtp_from": cfg.smtp_from,
+        "smtp_tls": cfg.smtp_tls,
+        "smtp_ssl": cfg.smtp_ssl,
+        "smtp_password_set": bool(cfg.smtp_password),
+        "smtp_source": "app" if prefs["smtp_host"] else ("env" if cfg.smtp_host else "none"),
         "devices": dev_list,
     }
 
@@ -439,6 +457,14 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
                 raise HTTPException(status_code=400, detail=f"invalid recipient: {r!r}")
         # Empty list clears the override → falls back to env recipients.
         fields["recipients"] = ",".join(clean) if clean else None
+    # SMTP transport (DB over env). Empty string clears → env fallback.
+    if body.smtp_host is not None:     fields["smtp_host"] = body.smtp_host.strip() or None
+    if body.smtp_port is not None:     fields["smtp_port"] = body.smtp_port
+    if body.smtp_username is not None: fields["smtp_username"] = body.smtp_username.strip() or None
+    if body.smtp_password is not None: fields["smtp_password"] = body.smtp_password or None
+    if body.smtp_from is not None:     fields["smtp_from"] = body.smtp_from.strip() or None
+    if body.smtp_tls is not None:      fields["smtp_tls"] = 1 if body.smtp_tls else 0
+    if body.smtp_ssl is not None:      fields["smtp_ssl"] = 1 if body.smtp_ssl else 0
     await db.set_alert_prefs(**fields)
     return JSONResponse(await _alerts_state())
 
@@ -462,13 +488,11 @@ async def test_alert() -> JSONResponse:
                             detail="SMTP transport not configured (set SMTP_HOST + creds as secrets)")
     if not cfg.recipients:
         raise HTTPException(status_code=400, detail="no recipients configured")
-    from_addr = (settings.alert_email_from or settings.smtp_username
-                 or "zasder-weather@localhost")
     try:
         await _asyncio.to_thread(
             _send_sync, "[Zasder Weather] Test alert",
             "This is a test from your Zasder Weather backend — device-down "
-            "alerts are wired up correctly.", cfg.recipients, from_addr)
+            "alerts are wired up correctly.", cfg.recipients, cfg)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"send failed: {e}")
     return JSONResponse({"ok": True, "sent_to": cfg.recipients})

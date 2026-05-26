@@ -84,7 +84,18 @@ CREATE TABLE IF NOT EXISTS alert_prefs (
     enabled               INTEGER,   -- 0/1, NULL = on (when transport configured)
     default_threshold_min REAL,      -- NULL = env ALERT_STALE_MINUTES
     repeat_hours          REAL,      -- NULL = env ALERT_REPEAT_HOURS
-    recipients            TEXT        -- comma-separated, NULL = env ALERT_EMAIL_TO
+    recipients            TEXT,       -- comma-separated, NULL = env ALERT_EMAIL_TO
+    -- App-managed SMTP transport (NULL = fall back to the env secret). The
+    -- password is write-only over the API. Stored in the DB on the Fly
+    -- volume rather than Fly's secret store — fine for a revocable,
+    -- single-tenant Gmail App Password; never returned by GET /api/alerts.
+    smtp_host             TEXT,
+    smtp_port             INTEGER,
+    smtp_username         TEXT,
+    smtp_password         TEXT,
+    smtp_from             TEXT,
+    smtp_tls              INTEGER,
+    smtp_ssl              INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS device_alert_prefs (
@@ -132,6 +143,18 @@ async def init_db() -> None:
     _ensure_dir()
     async with aiosqlite.connect(settings.database_path) as db:
         await db.executescript(SCHEMA)
+        # Migrate older DBs: add any alert_prefs columns the schema gained
+        # after the table was first created (SQLite CREATE IF NOT EXISTS
+        # won't add columns to an existing table).
+        cur = await db.execute("PRAGMA table_info(alert_prefs)")
+        existing = {r[1] for r in await cur.fetchall()}
+        for col, decl in (
+            ("smtp_host", "TEXT"), ("smtp_port", "INTEGER"),
+            ("smtp_username", "TEXT"), ("smtp_password", "TEXT"),
+            ("smtp_from", "TEXT"), ("smtp_tls", "INTEGER"), ("smtp_ssl", "INTEGER"),
+        ):
+            if col not in existing:
+                await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
         await db.commit()
 
 
@@ -259,7 +282,9 @@ async def upsert_alert_state(mac: str, state: str, last_seen_ms: int | None,
         await db.commit()
 
 
-_ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipients")
+_ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipients",
+                    "smtp_host", "smtp_port", "smtp_username", "smtp_password",
+                    "smtp_from", "smtp_tls", "smtp_ssl")
 
 
 async def get_alert_prefs() -> dict[str, Any]:

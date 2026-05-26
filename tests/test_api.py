@@ -593,3 +593,22 @@ def test_device_alert_accepts_compact_mac(client):
 def test_alerts_test_send_requires_transport(client):
     # no SMTP_HOST configured → 400, not a 500
     assert client.post("/api/alerts/test", headers=_H).status_code == 400
+
+
+def test_alerts_smtp_write_only(client):
+    # App sets SMTP transport; GET echoes everything EXCEPT the password.
+    r = client.put("/api/alerts", headers=_H, json={
+        "smtp_host": "smtp.gmail.com", "smtp_port": 587,
+        "smtp_username": "me@gmail.com", "smtp_password": "secret-app-pw",
+        "smtp_from": "me@gmail.com", "smtp_tls": True})
+    assert r.status_code == 200
+    b = r.json()
+    assert b["transport_configured"] is True
+    assert b["smtp_host"] == "smtp.gmail.com" and b["smtp_username"] == "me@gmail.com"
+    assert b["smtp_port"] == 587 and b["smtp_password_set"] is True
+    assert "smtp_password" not in b              # never returned
+    assert b["smtp_source"] == "app"
+    # Password persists when other fields are edited without re-sending it.
+    r2 = client.put("/api/alerts", headers=_H, json={"smtp_port": 465, "smtp_ssl": True})
+    b2 = r2.json()
+    assert b2["smtp_password_set"] is True and b2["smtp_port"] == 465

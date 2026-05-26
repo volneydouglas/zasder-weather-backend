@@ -100,47 +100,69 @@ def build_alert(event: str, name: str, mac: str, last_seen_ms: int | None,
 @dataclass
 class EffectiveAlertConfig:
     enabled: bool                 # transport + recipients + not turned off
-    transport_configured: bool    # SMTP server present (env secret)
+    transport_configured: bool    # an SMTP host is set (DB or env)
     recipients: list[str]         # DB prefs override env
     default_threshold_min: float  # DB prefs override env
     repeat_hours: float           # DB prefs override env
+    # Resolved SMTP transport (app-managed DB value over env secret).
+    smtp_host: str | None
+    smtp_port: int
+    smtp_username: str | None
+    smtp_password: str | None
+    smtp_from: str | None
+    smtp_tls: bool
+    smtp_ssl: bool
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
     return [e.strip() for e in (raw or "").split(",") if e.strip()]
 
 
+def _pick(dbv, envv):
+    """DB value wins unless it's NULL/empty, then fall back to env."""
+    return dbv if dbv not in (None, "") else envv
+
+
 async def effective_config() -> EffectiveAlertConfig:
     """Merge app-managed DB prefs over env defaults. DB value wins when set;
-    NULL falls back to env. The SMTP transport itself is always env-only."""
+    NULL falls back to env — including the SMTP transport, so the app can
+    configure mail end-to-end without touching server env/secrets."""
     p = await db.get_alert_prefs()
-    transport = settings.transport_configured
+    smtp_host = _pick(p["smtp_host"], settings.smtp_host)
+    smtp_port = int(p["smtp_port"]) if p["smtp_port"] is not None else settings.smtp_port
+    smtp_username = _pick(p["smtp_username"], settings.smtp_username)
+    smtp_password = _pick(p["smtp_password"], settings.smtp_password)
+    smtp_from = _pick(p["smtp_from"], settings.alert_email_from)
+    smtp_tls = bool(p["smtp_tls"]) if p["smtp_tls"] is not None else settings.smtp_tls
+    smtp_ssl = bool(p["smtp_ssl"]) if p["smtp_ssl"] is not None else settings.smtp_ssl
+    transport = bool(smtp_host)
     recipients = (_parse_recipients(p["recipients"]) if p["recipients"]
                   else settings.alert_recipients)
     default_thr = (p["default_threshold_min"] if p["default_threshold_min"] is not None
                    else settings.alert_stale_minutes)
     repeat = (p["repeat_hours"] if p["repeat_hours"] is not None
               else settings.alert_repeat_hours)
-    db_enabled = p["enabled"]            # 0 / 1 / None
-    enabled = transport and bool(recipients) and (db_enabled != 0)
-    return EffectiveAlertConfig(enabled, transport, recipients,
-                                float(default_thr), float(repeat))
+    enabled = transport and bool(recipients) and (p["enabled"] != 0)
+    return EffectiveAlertConfig(
+        enabled, transport, recipients, float(default_thr), float(repeat),
+        smtp_host, smtp_port, smtp_username, smtp_password, smtp_from,
+        smtp_tls, smtp_ssl)
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
-def _send_sync(subject: str, body: str, to_list: list[str], from_addr: str) -> None:
-    """Blocking SMTP send — run via asyncio.to_thread. Supports STARTTLS
-    (587), implicit SSL (465), or plain, with optional auth."""
+def _send_sync(subject: str, body: str, to_list: list[str],
+               cfg: EffectiveAlertConfig) -> None:
+    """Blocking SMTP send — run via asyncio.to_thread. Uses the resolved
+    transport (DB over env). STARTTLS (587), implicit SSL (465), or plain."""
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = from_addr
+    msg["From"] = cfg.smtp_from or cfg.smtp_username or "zasder-weather@localhost"
     msg["To"] = ", ".join(to_list)
     msg.set_content(body)
 
-    host = settings.smtp_host
-    port = settings.smtp_port
-    user, pw = settings.smtp_username, settings.smtp_password
-    if settings.smtp_ssl:
+    host, port = cfg.smtp_host, cfg.smtp_port
+    user, pw = cfg.smtp_username, cfg.smtp_password
+    if cfg.smtp_ssl:
         with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(),
                               timeout=30) as s:
             if user:
@@ -149,7 +171,7 @@ def _send_sync(subject: str, body: str, to_list: list[str], from_addr: str) -> N
     else:
         with smtplib.SMTP(host, port, timeout=30) as s:
             s.ehlo()
-            if settings.smtp_tls:
+            if cfg.smtp_tls:
                 s.starttls(context=ssl.create_default_context())
                 s.ehlo()
             if user:
@@ -191,8 +213,6 @@ class AlertMonitor:
             return  # turned off (via app), no transport, or no recipients
         now_ms = int(time.time() * 1000)
         repeat_ms = int(cfg.repeat_hours * 3600 * 1000)
-        from_addr = (settings.alert_email_from or settings.smtp_username
-                     or "zasder-weather@localhost")
         devices = await db.list_devices()
         states = await db.get_alert_states()
         dev_prefs = await db.get_device_alert_prefs()
@@ -213,7 +233,7 @@ class AlertMonitor:
                     dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
                 try:
                     await asyncio.to_thread(_send_sync, subject, bodytext,
-                                            cfg.recipients, from_addr)
+                                            cfg.recipients, cfg)
                     notified_ms = now_ms
                     log.info("alert email sent: %s for %s (%s)", dec.event, name, mac)
                 except Exception as e:

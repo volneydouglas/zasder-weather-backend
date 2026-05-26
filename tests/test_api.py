@@ -612,3 +612,25 @@ def test_alerts_smtp_write_only(client):
     r2 = client.put("/api/alerts", headers=_H, json={"smtp_port": 465, "smtp_ssl": True})
     b2 = r2.json()
     assert b2["smtp_password_set"] is True and b2["smtp_port"] == 465
+
+
+def test_rain_glitch_rejected(client):
+    ih = {"Authorization": "Bearer test-ingest-token"}
+    ah = {"Authorization": "Bearer test-api-token"}
+    def post(ts, yearly):
+        return client.post("/ingest/custom", headers=ih, json={
+            "device": {"id": "5D5D0200007D"}, "timestamp_utc": ts,
+            "outdoor": {"tempf": 70, "humidity": 50}, "wind": {}, "pressure": {},
+            "rain": {"yearly_in": yearly}, "source": "fineoffset-wh24"})
+    assert post("2026-05-25T10:00:00Z", 3.58).status_code == 200
+    # +6 inches in one minute is physically impossible → dropped as a glitch
+    assert post("2026-05-25T10:01:00Z", 9.58).status_code == 200
+    # a small, plausible increase a minute later is kept
+    assert post("2026-05-25T10:02:00Z", 3.60).status_code == 200
+    hist = client.get("/api/devices/5D:5D:02:00:00:7D/history?hours=720",
+                      headers=ah).json()["rows"]
+    ys = [r["yearlyrainin"] for r in hist if r.get("yearlyrainin") is not None]
+    # /history auto-buckets a wide window, so don't assert exact values — just
+    # that the 9.58 glitch never made it in (a stored glitch would pull any
+    # bucket average far above the real ~3.6).
+    assert ys and max(ys) < 5.0

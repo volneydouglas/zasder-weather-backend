@@ -339,6 +339,21 @@ async def upsert_device_alert_pref(mac: str, monitor: bool,
         await db.commit()
 
 
+async def last_yearly_rain(mac: str) -> tuple[float, int] | None:
+    """Most recent NON-NULL cumulative yearly-rain reading + its timestamp
+    (ms) for a device. Used by the ingest glitch guard as the 'before' value
+    (a dropped glitch leaves NULL, so this returns the last *good* reading)."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT yearlyrainin, dateutc_ms FROM observations "
+            "WHERE mac = ? AND yearlyrainin IS NOT NULL "
+            "ORDER BY dateutc_ms DESC LIMIT 1", (mac,)
+        )).fetchone()
+    if not row or row["yearlyrainin"] is None:
+        return None
+    return (float(row["yearlyrainin"]), int(row["dateutc_ms"]))
+
+
 async def observation_count(mac: str) -> int:
     """Total stored rows for a device. Used by the public /status page."""
     async with connect() as db:

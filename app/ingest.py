@@ -31,6 +31,7 @@ don't lose source-specific bonus fields (lightning, hub battery, etc).
 from __future__ import annotations
 
 import json as _json
+import logging
 import math
 import re
 import time
@@ -40,6 +41,8 @@ from fastapi import APIRouter, Header, HTTPException, Request
 
 from . import db
 from .config import settings
+
+log = logging.getLogger("ingest")
 
 router = APIRouter()
 
@@ -184,6 +187,18 @@ def _compute_feels_like(tempf: Any, humidity: Any, wind_mph: Any) -> float | Non
     return round(t, 2)
 
 
+def _is_rain_glitch(jump_in: float, elapsed_h: float,
+                    max_rate_in_per_hr: float) -> bool:
+    """True if a positive jump in cumulative yearly rain is implausible for the
+    elapsed time (an SDR decode glitch). Allowance = max-rate × hours + a 0.25"
+    floor for tip-counter jitter. Only positive spikes are flagged (counter
+    resets / negative deltas are handled by the offset/clamp path)."""
+    if max_rate_in_per_hr <= 0 or jump_in <= 0:
+        return False
+    allowance = max_rate_in_per_hr * max(elapsed_h, 1.0 / 3600.0) + 0.25
+    return jump_in > allowance
+
+
 def _format_mac(raw: str) -> str:
     """Normalize a hub identifier to AA:BB:CC:DD:EE:FF if it looks like a
     12-hex MAC. Pass through anything else unchanged."""
@@ -251,6 +266,29 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     flat = _flatten(payload_obj)
     if not flat:
         raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
+
+    # Reject SDR rain-decode glitches: a sudden spike in cumulative yearly
+    # rain that's physically impossible for the elapsed time. Real rain ramps
+    # gradually; a glitch jumps for one reading then the counter returns to its
+    # true value. We compare to the last *good* reading ("before" corroboration)
+    # — since a dropped glitch is stored NULL, the next real reading resumes from
+    # the good value, so isolated spikes drop cleanly without an "after" lookup.
+    max_rate = settings.ingest_max_rain_rate_in_per_hr
+    if flat.get("yearlyrainin") is not None and max_rate > 0:
+        prev = await db.last_yearly_rain(mac)
+        if prev is not None:
+            last_val, last_ts = prev
+            jump = flat["yearlyrainin"] - last_val
+            elapsed_h = (flat["dateutc"] - last_ts) / 3_600_000.0
+            if _is_rain_glitch(jump, elapsed_h, max_rate):
+                log.warning(
+                    "rain glitch dropped for %s: +%.2f in over %.3f h "
+                    "— %.2f→%.2f", mac, jump, elapsed_h, last_val,
+                    flat["yearlyrainin"])
+                for k in ("yearlyrainin", "hourlyrainin", "eventrainin",
+                          "dailyrainin", "weeklyrainin", "monthlyrainin"):
+                    flat[k] = None
+
     explicit_name, location = _device_label(payload_obj)
     auto_name = _auto_device_name(payload_obj)
     info = {

@@ -104,6 +104,14 @@ class Settings(BaseSettings):
         # See _normalize_mac_map for the accepted shapes + normalization.
         return _normalize_mac_map(v)
 
+    # Reject SDR rain-decode glitches: a single reading where the cumulative
+    # yearly rain jumps more than this rate (in/hr) × elapsed-time (+ a small
+    # floor for tip-counter jitter) is dropped, since real rain ramps
+    # gradually while a decode glitch spikes for one reading. The next real
+    # reading resumes from the last good value, so isolated spikes vanish.
+    # 2 in/hr is well above any real rainfall rate. Set 0 to disable.
+    ingest_max_rain_rate_in_per_hr: float = 2.0
+
     # ── Staleness alerting (email) ───────────────────────────────────────
     # Email an operator when a device that was reporting goes quiet for
     # longer than its threshold (e.g. an SDR board hangs, a sensor battery

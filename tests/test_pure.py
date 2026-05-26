@@ -245,3 +245,26 @@ def test_flatten_passes_through_provided_feelslike():
     }
     out = ingest._flatten(payload)
     assert out is not None and out["feelsLike"] == 88.0
+
+
+# ───────────────────── rain-glitch detection ─────────────────────
+# Cumulative yearly-rain spikes from SDR decode errors get rejected.
+
+def test_rain_glitch_flags_impossible_spike():
+    # +6 in over 1 minute — no real rain does that.
+    assert ingest._is_rain_glitch(6.0, 60 / 3600, 2.0) is True
+
+def test_rain_glitch_allows_normal_increase():
+    # +0.05 in over a minute — plausible heavy rain.
+    assert ingest._is_rain_glitch(0.05, 60 / 3600, 2.0) is False
+
+def test_rain_glitch_allows_accumulation_over_a_gap():
+    # 1.5 in over a 1-hour data gap is within 2 in/hr + floor.
+    assert ingest._is_rain_glitch(1.5, 1.0, 2.0) is False
+
+def test_rain_glitch_ignores_decrease():
+    # Counter reset / negative delta isn't a "spike".
+    assert ingest._is_rain_glitch(-3.0, 0.02, 2.0) is False
+
+def test_rain_glitch_disabled_when_rate_zero():
+    assert ingest._is_rain_glitch(99.0, 0.01, 0.0) is False

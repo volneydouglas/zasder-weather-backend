@@ -103,6 +103,17 @@ CREATE TABLE IF NOT EXISTS device_alert_prefs (
     monitor       INTEGER NOT NULL DEFAULT 1,   -- 0 = don't watch this device
     threshold_min REAL                          -- NULL = use default threshold
 );
+
+-- APNs device tokens registered by the iOS app. `env` records whether the
+-- token came from a sandbox (dev) or production (App Store) build, since each
+-- only works against the matching APNs host.
+CREATE TABLE IF NOT EXISTS push_tokens (
+    token        TEXT PRIMARY KEY,
+    platform     TEXT NOT NULL DEFAULT 'ios',
+    env          TEXT,
+    created_ms   INTEGER NOT NULL,
+    last_seen_ms INTEGER NOT NULL
+);
 """
 
 
@@ -336,6 +347,36 @@ async def upsert_device_alert_pref(mac: str, monitor: bool,
             """,
             (mac, 1 if monitor else 0, threshold_min),
         )
+        await db.commit()
+
+
+async def register_push_token(token: str, platform: str, env: str | None) -> None:
+    now = int(__import__("time").time() * 1000)
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO push_tokens (token, platform, env, created_ms, last_seen_ms)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(token) DO UPDATE SET
+                platform = excluded.platform, env = excluded.env,
+                last_seen_ms = excluded.last_seen_ms
+            """,
+            (token, platform, env, now, now),
+        )
+        await db.commit()
+
+
+async def list_push_tokens() -> list[dict[str, Any]]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT token, platform, env FROM push_tokens")).fetchall()
+    return [{"token": r["token"], "platform": r["platform"], "env": r["env"]} for r in rows]
+
+
+async def remove_push_token(token: str) -> None:
+    """Prune a token APNs rejected as dead (410 Unregistered / BadDeviceToken)."""
+    async with connect() as db:
+        await db.execute("DELETE FROM push_tokens WHERE token = ?", (token,))
         await db.commit()
 
 

@@ -641,3 +641,22 @@ def test_alert_monitor_always_started(client):
     # later from the app (PUT /api/alerts) is picked up without a redeploy.
     from app.main import app
     assert app.state.alert_monitor is not None
+
+
+def test_push_register_roundtrip(client):
+    H = {"Authorization": "Bearer test-api-token"}
+    assert client.post("/api/push/register", headers=H,
+                       json={"token": "abcd1234efgh", "env": "sandbox"}).json()["ok"] is True
+    # upsert (same token again) is fine
+    assert client.post("/api/push/register", headers=H,
+                       json={"token": "abcd1234efgh"}).status_code == 200
+    # too-short token rejected
+    assert client.post("/api/push/register", headers=H, json={"token": "x"}).status_code == 422
+
+def test_push_register_requires_token(client):
+    assert client.post("/api/push/register", json={"token": "abcd1234efgh"}).status_code == 401
+
+def test_push_test_requires_apns(client):
+    # No APNs config in the test env → 400, not 500.
+    assert client.post("/api/push/test",
+                       headers={"Authorization": "Bearer test-api-token"}).status_code == 400

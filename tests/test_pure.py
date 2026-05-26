@@ -277,3 +277,30 @@ def test_reviewer_token_must_meet_length_floor():
     from app.config import Settings
     with pytest.raises(Exception):
         Settings(api_token="a" * 32, reviewer_api_token="123")
+
+
+# ───────────────────── APNs push helpers ─────────────────────
+from app import apns  # noqa: E402
+
+def test_apns_build_payload_shape():
+    assert apns.build_payload("Title", "Body") == {
+        "aps": {"alert": {"title": "Title", "body": "Body"}, "sound": "default"}}
+
+def test_apns_make_jwt_structure():
+    import jwt as _jwt
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+    pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()).decode()
+    tok = apns.make_jwt("TEAMID1234", "KEYID5678", pem, now=1000)
+    assert _jwt.get_unverified_header(tok)["kid"] == "KEYID5678"
+    claims = _jwt.decode(tok, options={"verify_signature": False})
+    assert claims["iss"] == "TEAMID1234" and claims["iat"] == 1000
+
+def test_build_push_offline_and_recovered():
+    now = 100 * 60_000
+    t, b = alerts.build_push("stale", "Crestview (SDR)", now - 11 * 60_000, now, 10)
+    assert "offline" in t and "No data" in b
+    t2, _ = alerts.build_push("recovered", "Crestview (SDR)", now - 1 * 60_000, now, 10)
+    assert "back online" in t2

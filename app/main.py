@@ -495,6 +495,34 @@ async def test_alert() -> JSONResponse:
     return JSONResponse({"ok": True, "sent_to": cfg.recipients})
 
 
+# ───────────────────────── push notifications (APNs) ─────────────────────────
+
+class PushRegisterIn(BaseModel):
+    token: str = Field(min_length=8)
+    env: str | None = None            # "sandbox" (dev build) | "production"
+    platform: str = "ios"
+
+
+@app.post("/api/push/register", dependencies=[Depends(require_token)])
+async def push_register(body: PushRegisterIn) -> JSONResponse:
+    """The iOS app posts its APNs device token here after the user grants
+    notification permission. Idempotent (upsert)."""
+    env = body.env if body.env in ("sandbox", "production") else None
+    await db.register_push_token(body.token, body.platform, env)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/push/test", dependencies=[Depends(require_token)])
+async def push_test() -> JSONResponse:
+    """Send a test push to every registered device — verifies APNs setup."""
+    from .apns import send_to_all
+    if not settings.apns_configured:
+        raise HTTPException(status_code=400,
+                            detail="APNs not configured (set APNS_KEY_ID / APNS_TEAM_ID / APNS_KEY_P8)")
+    res = await send_to_all("Zasder Weather", "Test push — alerts are wired up.")
+    return JSONResponse({"ok": True, **res})
+
+
 @app.get("/api/devices/{mac}/current", dependencies=[Depends(require_token)])
 async def get_current(mac: str) -> JSONResponse:
     obs = await db.latest_observation(mac)

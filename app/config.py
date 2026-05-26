@@ -114,6 +114,23 @@ class Settings(BaseSettings):
     # 2 in/hr is well above any real rainfall rate. Set 0 to disable.
     ingest_max_rain_rate_in_per_hr: float = 2.0
 
+    # ── APNs push (token-based) ──────────────────────────────────────────
+    # Server-side push for alerts, alongside email. Enabled when key_id +
+    # team_id + key_p8 are set (set them as Fly secrets). Create an "Apple
+    # Push Notifications service (APNs)" Auth Key in the Developer portal →
+    # Keys; key_p8 is the .p8 file's full contents, key_id is its Key ID,
+    # team_id is the Apple Team ID (36HL89286N). topic = app bundle id.
+    # env: "sandbox" for dev/devicectl builds, "production" for App Store.
+    apns_key_id: str | None = None
+    apns_team_id: str | None = None
+    apns_key_p8: str | None = None
+    apns_topic: str = "com.zasder.weather"
+    apns_env: str = "sandbox"
+
+    @property
+    def apns_configured(self) -> bool:
+        return bool(self.apns_key_id and self.apns_team_id and self.apns_key_p8)
+
     # ── Staleness alerting (email) ───────────────────────────────────────
     # Email an operator when a device that was reporting goes quiet for
     # longer than its threshold (e.g. an SDR board hangs, a sensor battery

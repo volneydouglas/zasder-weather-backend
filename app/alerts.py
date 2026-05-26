@@ -96,6 +96,17 @@ def build_alert(event: str, name: str, mac: str, last_seen_ms: int | None,
     return subject, body
 
 
+def build_push(event: str, name: str, last_seen_ms: int | None,
+               now_ms: int, threshold_min: float) -> tuple[str, str]:
+    """Short (title, body) for an APNs alert push. Pure — unit-testable."""
+    if event in ("stale", "repeat"):
+        age = (now_ms - last_seen_ms) / 60000 if last_seen_ms else None
+        body = f"No data for {age:.0f} min (threshold {threshold_min:.0f})" if age is not None \
+            else "Not reporting"
+        return f"{name} is offline", body
+    return f"{name} is back online", "Reporting again"
+
+
 # ───────────────────────── effective config ─────────────────────────
 @dataclass
 class EffectiveAlertConfig:
@@ -209,8 +220,9 @@ class AlertMonitor:
 
     async def _tick(self) -> None:
         cfg = await effective_config()
-        if not cfg.enabled:
-            return  # turned off (via app), no transport, or no recipients
+        # Run if EITHER channel can deliver — email (cfg.enabled) or push.
+        if not cfg.enabled and not settings.apns_configured:
+            return
         now_ms = int(time.time() * 1000)
         repeat_ms = int(cfg.repeat_hours * 3600 * 1000)
         devices = await db.list_devices()
@@ -229,16 +241,32 @@ class AlertMonitor:
 
             notified_ms = (prior or {}).get("notified_ms")
             if dec.event:
-                subject, bodytext = build_alert(
-                    dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
-                try:
-                    await asyncio.to_thread(_send_sync, subject, bodytext,
-                                            cfg.recipients, cfg)
+                delivered = False
+                # Email channel (only if transport + recipients are set).
+                if cfg.enabled:
+                    subject, bodytext = build_alert(
+                        dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
+                    try:
+                        await asyncio.to_thread(_send_sync, subject, bodytext,
+                                                cfg.recipients, cfg)
+                        delivered = True
+                        log.info("alert email sent: %s for %s (%s)", dec.event, name, mac)
+                    except Exception as e:
+                        log.exception("failed to email alert for %s (%s): %s", name, mac, e)
+                # Push channel (independent of email).
+                if settings.apns_configured:
+                    title, pbody = build_push(dec.event, name, last_seen, now_ms, thr_min)
+                    try:
+                        from . import apns
+                        res = await apns.send_to_all(title, pbody)
+                        if res.get("sent"):
+                            delivered = True
+                        log.info("alert push: %s for %s → %s", dec.event, name, res)
+                    except Exception as e:
+                        log.exception("failed to push alert for %s (%s): %s", name, mac, e)
+                # Advance the re-notify clock only if a channel actually delivered.
+                if delivered:
                     notified_ms = now_ms
-                    log.info("alert email sent: %s for %s (%s)", dec.event, name, mac)
-                except Exception as e:
-                    # Don't advance notified_ms on failure → retry next tick.
-                    log.exception("failed to email alert for %s (%s): %s", name, mac, e)
 
             if prior is None or dec.state != prior["state"] or dec.event:
                 await db.upsert_alert_state(

@@ -51,14 +51,11 @@ def build_payload(title: str, body: str) -> dict:
     return {"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}
 
 
-async def send_to_all(title: str, body: str) -> dict:
-    """Push to every registered token (each to the host matching its build env).
-    Prunes dead tokens. Returns a summary dict. No-op if APNs isn't configured."""
-    if not settings.apns_configured:
-        return {"sent": 0, "skipped": "apns not configured"}
-    tokens = await db.list_push_tokens()
-    if not tokens:
-        return {"sent": 0, "pruned": 0, "total": 0}
+async def _push_tokens(tokens: list[dict], title: str, body: str) -> dict:
+    """Sign with the local APNs key and POST to Apple for each token. `tokens`
+    is a list of {token, env?} dicts. Returns {sent, dead, failed} where `dead`
+    lists tokens Apple says are gone (caller prunes). Does NOT touch the DB —
+    shared by send_to_all (own-key path) and the hosted relay."""
     payload = build_payload(title, body)
     headers = {
         "authorization": f"bearer {_provider_jwt()}",
@@ -66,7 +63,8 @@ async def send_to_all(title: str, body: str) -> dict:
         "apns-push-type": "alert",
         "apns-priority": "10",
     }
-    sent = pruned = failed = 0
+    sent = failed = 0
+    dead: list[str] = []
     async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
         for t in tokens:
             tok = t["token"]
@@ -87,10 +85,52 @@ async def send_to_all(title: str, body: str) -> dict:
                 pass
             if r.status_code == 410 or reason in (
                     "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"):
-                await db.remove_push_token(tok)
-                pruned += 1
-                log.info("pruned dead token %s… (%s %s)", tok[:8], r.status_code, reason)
+                dead.append(tok)
+                log.info("dead token %s… (%s %s)", tok[:8], r.status_code, reason)
             else:
                 failed += 1
                 log.warning("apns %s for %s…: %s", r.status_code, tok[:8], reason or r.text[:120])
-    return {"sent": sent, "pruned": pruned, "failed": failed, "total": len(tokens)}
+    return {"sent": sent, "dead": dead, "failed": failed}
+
+
+async def _push_via_relay(tokens: list[str], title: str, body: str) -> dict:
+    """Send through a shared relay instead of signing locally. For self-hosters
+    who don't run their own APNs key: the relay holds the key, fans out to
+    Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
+    body, env} — the relay enforces that shape."""
+    env = settings.apns_env if settings.apns_env in ("sandbox", "production") else "production"
+    payload = {"tokens": tokens, "title": title, "body": body, "env": env}
+    headers = {"authorization": f"Bearer {settings.apns_relay_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(settings.apns_relay_url, headers=headers, json=payload)  # type: ignore[arg-type]
+    except Exception as e:
+        log.warning("relay push failed: %s", e)
+        return {"sent": 0, "dead": [], "failed": len(tokens)}
+    if r.status_code != 200:
+        log.warning("relay push %s: %s", r.status_code, r.text[:200])
+        return {"sent": 0, "dead": [], "failed": len(tokens)}
+    data = r.json()
+    return {"sent": data.get("sent", 0), "dead": data.get("dead", []),
+            "failed": data.get("failed", 0)}
+
+
+async def send_to_all(title: str, body: str) -> dict:
+    """Push to every registered token. Routes through the hosted relay if one
+    is configured, else signs locally with the APNs key. Prunes dead tokens.
+    No-op if neither push path is configured."""
+    if not (settings.apns_configured or settings.apns_relay_configured):
+        return {"sent": 0, "skipped": "apns not configured"}
+    tokens = await db.list_push_tokens()
+    if not tokens:
+        return {"sent": 0, "pruned": 0, "total": 0}
+    if settings.apns_relay_configured:
+        res = await _push_via_relay([t["token"] for t in tokens], title, body)
+    else:
+        res = await _push_tokens(tokens, title, body)
+    pruned = 0
+    for tok in res.get("dead", []):
+        await db.remove_push_token(tok)
+        pruned += 1
+    return {"sent": res.get("sent", 0), "pruned": pruned,
+            "failed": res.get("failed", 0), "total": len(tokens)}

@@ -131,6 +131,21 @@ class Settings(BaseSettings):
     def apns_configured(self) -> bool:
         return bool(self.apns_key_id and self.apns_team_id and self.apns_key_p8)
 
+    # ── APNs relay client (for self-hosters without their own APNs key) ──
+    # A self-hosted backend can deliver background push to the official iOS
+    # app by routing through a shared relay instead of holding its own .p8.
+    # Set BOTH to enable: send_to_all then POSTs {tokens,title,body} to the
+    # relay, which holds the APNs key and fans out to Apple. The token is
+    # issued by the relay operator (App Attest gated). Leave unset to push
+    # with a local key (apns_* above) or to use email only. See the README
+    # "Push notifications" section for the three modes.
+    apns_relay_url: str | None = None      # e.g. https://weather.zasder.com/api/relay/push
+    apns_relay_token: str | None = None
+
+    @property
+    def apns_relay_configured(self) -> bool:
+        return bool(self.apns_relay_url and self.apns_relay_token)
+
     # ── Staleness alerting (email) ───────────────────────────────────────
     # Email an operator when a device that was reporting goes quiet for
     # longer than its threshold (e.g. an SDR board hangs, a sensor battery

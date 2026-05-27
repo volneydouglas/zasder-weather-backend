@@ -212,6 +212,29 @@ per-device on/off + thresholds, and even the SMTP server itself (the password
 is write-only: the app can set it, the API never returns it). DB settings
 override the env defaults and take effect within a minute, no redeploy.
 
+**Threshold alerts** (e.g. "temp above 100°F", "any rain") are stored
+server-side too, via `/api/alerts/rules`, and evaluated against incoming data
+so they fire even when the app is closed.
+
+## Push notifications (optional)
+
+Alerts can also arrive as iOS push, not just email. Email needs no Apple
+account and is the simplest default — push is an optional upgrade with two
+ways to enable it:
+
+- **Your own APNs key** — if you build and ship your own iOS app under your
+  own Apple Developer account, set `APNS_KEY_ID` / `APNS_TEAM_ID` /
+  `APNS_KEY_P8` / `APNS_TOPIC` / `APNS_ENV` (as secrets). The backend then
+  signs and sends push directly to Apple.
+- **A hosted relay** — if you run the official Zasder Weather app with your
+  own backend, you can't hold Apple's key for that app. Instead this backend
+  forwards alerts to a relay that does: set `APNS_RELAY_URL` +
+  `APNS_RELAY_TOKEN`. Enable push in the app (Settings → Notifications) and it
+  obtains the token and configures the backend for you — no Apple account
+  needed on your side.
+
+See `.env.example` for both blocks. Leave all of it unset to use email only.
+
 ## What's in this repo
 
 ```
@@ -244,7 +267,9 @@ calls these. Public-readable status page at `/`.
 | GET | `/api/forecast?lat=&lon=` | 7-day forecast (Open-Meteo) |
 | GET/PUT | `/api/alerts` | Device-down alert prefs (app-managed; SMTP password write-only) |
 | PUT | `/api/devices/{mac}/alert` | Per-device monitor toggle + threshold |
+| GET/POST/DELETE | `/api/alerts/rules` | Threshold alert rules (e.g. tempf above 100), evaluated server-side |
 | POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
+| POST | `/api/push/register` | Register an iOS APNs device token for push alerts |
 | POST | `/ingest/custom` | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
 | POST | `/ingest/discovery` | Source posts a `(model, id)` RF sighting |
 | GET | `/api/discoveries?since_hours=24` | Long-tail RF device survey |

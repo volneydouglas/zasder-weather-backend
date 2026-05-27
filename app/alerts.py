@@ -249,7 +249,7 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
             delivered = True
         except Exception as e:
             log.exception("alert email send failed: %s", e)
-    if settings.apns_configured:
+    if settings.apns_configured or settings.apns_relay_configured:
         try:
             from . import apns
             res = await apns.send_to_all(push_title, push_body)
@@ -290,8 +290,9 @@ class AlertMonitor:
 
     async def _tick(self) -> None:
         cfg = await effective_config()
-        # Run if EITHER channel can deliver — email (cfg.enabled) or push.
-        if not cfg.enabled and not settings.apns_configured:
+        # Run if EITHER channel can deliver — email (cfg.enabled) or push
+        # (local APNs key or a configured relay).
+        if not cfg.enabled and not settings.apns_configured and not settings.apns_relay_configured:
             return
         now_ms = int(time.time() * 1000)
         repeat_ms = int(cfg.repeat_hours * 3600 * 1000)

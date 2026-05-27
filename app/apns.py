@@ -93,17 +93,18 @@ async def _push_tokens(tokens: list[dict], title: str, body: str) -> dict:
     return {"sent": sent, "dead": dead, "failed": failed}
 
 
-async def _push_via_relay(tokens: list[str], title: str, body: str) -> dict:
+async def _push_via_relay(tokens: list[str], title: str, body: str,
+                          url: str, token: str) -> dict:
     """Send through a shared relay instead of signing locally. For self-hosters
     who don't run their own APNs key: the relay holds the key, fans out to
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
     body, env} — the relay enforces that shape."""
     env = settings.apns_env if settings.apns_env in ("sandbox", "production") else "production"
     payload = {"tokens": tokens, "title": title, "body": body, "env": env}
-    headers = {"authorization": f"Bearer {settings.apns_relay_token}"}
+    headers = {"authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            r = await client.post(settings.apns_relay_url, headers=headers, json=payload)  # type: ignore[arg-type]
+            r = await client.post(url, headers=headers, json=payload)
     except Exception as e:
         log.warning("relay push failed: %s", e)
         return {"sent": 0, "dead": [], "failed": len(tokens)}
@@ -115,19 +116,40 @@ async def _push_via_relay(tokens: list[str], title: str, body: str) -> dict:
             "failed": data.get("failed", 0)}
 
 
+async def effective_relay() -> tuple[str | None, str | None]:
+    """Resolve the relay (url, token) DB-over-env — the app-managed config wins
+    over env defaults, mirroring how SMTP is resolved for email alerts."""
+    cfg = await db.get_push_relay() or {}
+    url = cfg.get("url") or settings.apns_relay_url
+    token = cfg.get("token") or settings.apns_relay_token
+    return url, token
+
+
+async def push_configured() -> bool:
+    """True if push can deliver — a local APNs key OR a resolved relay."""
+    if settings.apns_configured:
+        return True
+    url, token = await effective_relay()
+    return bool(url and token)
+
+
 async def send_to_all(title: str, body: str) -> dict:
-    """Push to every registered token. Routes through the hosted relay if one
-    is configured, else signs locally with the APNs key. Prunes dead tokens.
-    No-op if neither push path is configured."""
-    if not (settings.apns_configured or settings.apns_relay_configured):
+    """Push to every registered token. Prefers a local APNs key (most direct);
+    falls back to a hosted relay if one is configured (env or app-managed).
+    Prunes dead tokens. No-op if neither push path is configured."""
+    own = settings.apns_configured
+    relay_url, relay_token = await effective_relay()
+    relay = bool(relay_url and relay_token)
+    if not (own or relay):
         return {"sent": 0, "skipped": "apns not configured"}
     tokens = await db.list_push_tokens()
     if not tokens:
         return {"sent": 0, "pruned": 0, "total": 0}
-    if settings.apns_relay_configured:
-        res = await _push_via_relay([t["token"] for t in tokens], title, body)
-    else:
+    if own:
         res = await _push_tokens(tokens, title, body)
+    else:
+        res = await _push_via_relay([t["token"] for t in tokens], title, body,
+                                    relay_url, relay_token)  # type: ignore[arg-type]
     pruned = 0
     for tok in res.get("dead", []):
         await db.remove_push_token(tok)

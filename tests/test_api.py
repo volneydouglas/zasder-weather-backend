@@ -682,3 +682,52 @@ def test_alert_rule_validation(client):
 
 def test_alert_rules_requires_token(client):
     assert client.get("/api/alerts/rules").status_code == 401
+
+
+# ───────────────── push relay client mode (APNS_RELAY_* / app-managed) ─────────────────
+
+def test_apns_send_to_all_routes_via_env_relay(client, monkeypatch):
+    import asyncio
+    import app.apns as apns
+    client.post("/api/push/register", headers={"Authorization": "Bearer test-api-token"},
+                json={"token": "a" * 64, "env": "production"})
+    monkeypatch.setattr(apns.settings, "apns_relay_url", "https://relay.example/api/relay/push")
+    monkeypatch.setattr(apns.settings, "apns_relay_token", "rtok")
+    seen = {}
+    async def fake_relay(tokens, title, body, url, token):
+        seen.update(tokens=list(tokens), url=url, token=token)
+        return {"sent": len(tokens), "dead": [], "failed": 0}
+    monkeypatch.setattr(apns, "_push_via_relay", fake_relay)
+    res = asyncio.run(apns.send_to_all("Title", "Body"))
+    assert seen["tokens"] == ["a" * 64]
+    assert seen["url"] == "https://relay.example/api/relay/push" and seen["token"] == "rtok"
+    assert res["sent"] == 1 and res["total"] == 1
+
+def test_push_relay_config_roundtrip(client):
+    H = {"Authorization": "Bearer test-api-token"}
+    assert client.get("/api/push/relay", headers=H).json()["relay_configured"] is False
+    r = client.put("/api/push/relay", headers=H, json={
+        "relay_url": "https://weather.zasder.com/api/relay/push", "relay_token": "secret"})
+    assert r.status_code == 200 and r.json()["relay_configured"] is True
+    g = client.get("/api/push/relay", headers=H).json()
+    assert g["relay_url"].endswith("/api/relay/push")
+    assert g["relay_token_set"] is True and g["relay_configured"] is True
+    assert "relay_token" not in g                    # token is write-only
+    client.put("/api/push/relay", headers=H, json={"relay_token": ""})
+    assert client.get("/api/push/relay", headers=H).json()["relay_configured"] is False
+
+def test_send_to_all_uses_db_relay(client, monkeypatch):
+    import asyncio
+    import app.apns as apns
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/api/push/register", headers=H, json={"token": "c" * 64, "env": "production"})
+    client.put("/api/push/relay", headers=H, json={
+        "relay_url": "https://weather.zasder.com/api/relay/push", "relay_token": "dbtok"})
+    seen = {}
+    async def fake_relay(tokens, title, body, url, token):
+        seen.update(url=url, token=token)
+        return {"sent": len(tokens), "dead": [], "failed": 0}
+    monkeypatch.setattr(apns, "_push_via_relay", fake_relay)
+    res = asyncio.run(apns.send_to_all("T", "B"))
+    assert seen["token"] == "dbtok" and seen["url"].endswith("/api/relay/push")
+    assert res["sent"] == 1

@@ -523,6 +523,41 @@ async def push_test() -> JSONResponse:
     return JSONResponse({"ok": True, **res})
 
 
+class PushRelayIn(BaseModel):
+    # Both optional: omit a field to leave it unchanged, send "" to clear it.
+    relay_url: str | None = None
+    relay_token: str | None = None
+
+
+@app.get("/api/push/relay", dependencies=[Depends(require_token)])
+async def get_push_relay() -> JSONResponse:
+    """Report the app-managed relay config. The token is WRITE-ONLY — never
+    returned; only whether one is set + the effective enabled state."""
+    from .apns import effective_relay
+    cfg = await db.get_push_relay() or {}
+    url, token = await effective_relay()
+    return JSONResponse({"relay_url": cfg.get("url"),
+                         "relay_token_set": bool(cfg.get("token")),
+                         "relay_configured": bool(url and token)})
+
+
+@app.put("/api/push/relay", dependencies=[Depends(require_token)])
+async def put_push_relay(body: PushRelayIn) -> JSONResponse:
+    """The iOS app stores the relay token it obtained (via App Attest against
+    the relay) here so this backend can push through the relay. Write-only
+    token, same pattern as SMTP creds."""
+    cur = await db.get_push_relay() or {}
+    url = cur.get("url")
+    if body.relay_url is not None:
+        url = body.relay_url or None
+    token = cur.get("token")
+    if body.relay_token is not None:
+        token = body.relay_token or None
+    await db.set_push_relay(url, token)
+    return JSONResponse({"ok": True, "relay_url": url,
+                         "relay_configured": bool(url and token)})
+
+
 # ───────────────────────── threshold alert rules ─────────────────────────
 
 class AlertRuleIn(BaseModel):

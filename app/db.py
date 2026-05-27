@@ -136,6 +136,18 @@ CREATE TABLE IF NOT EXISTS alert_rule_state (
     changed_ms INTEGER,
     PRIMARY KEY (rule_id, mac)
 );
+
+-- App-managed push-relay config (single row). Lets the iOS app point this
+-- backend at a hosted push relay without a redeploy: the app does the App
+-- Attest handshake with the relay, gets a token, and PUTs {url,token} here.
+-- The token is write-only over the API (GET reports only whether it's set).
+-- Resolved DB-over-env by apns.effective_relay (mirrors the SMTP pattern).
+CREATE TABLE IF NOT EXISTS push_relay (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    relay_url   TEXT,
+    relay_token TEXT,
+    updated_ms  INTEGER
+);
 """
 
 
@@ -455,6 +467,34 @@ async def remove_push_token(token: str) -> None:
     """Prune a token APNs rejected as dead (410 Unregistered / BadDeviceToken)."""
     async with connect() as db:
         await db.execute("DELETE FROM push_tokens WHERE token = ?", (token,))
+        await db.commit()
+
+
+async def get_push_relay() -> dict[str, Any] | None:
+    """The app-managed relay config (single row), or None if unset."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT relay_url, relay_token FROM push_relay WHERE id = 1")).fetchone()
+    if row is None:
+        return None
+    return {"url": row["relay_url"], "token": row["relay_token"]}
+
+
+async def set_push_relay(url: str | None, token: str | None) -> None:
+    """Upsert the relay config. url/token = None clears that field."""
+    now = int(__import__("time").time() * 1000)
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO push_relay (id, relay_url, relay_token, updated_ms)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                relay_url = excluded.relay_url,
+                relay_token = excluded.relay_token,
+                updated_ms = excluded.updated_ms
+            """,
+            (url, token, now),
+        )
         await db.commit()
 
 

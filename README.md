@@ -267,7 +267,7 @@ calls these. Public-readable status page at `/`.
 | GET | `/api/forecast?lat=&lon=` | 7-day forecast (Open-Meteo) |
 | GET/PUT | `/api/alerts` | Device-down alert prefs (app-managed; SMTP password write-only) |
 | PUT | `/api/devices/{mac}/alert` | Per-device monitor toggle + threshold |
-| GET/POST/DELETE | `/api/alerts/rules` | Threshold alert rules (e.g. tempf above 100), evaluated server-side |
+| GET/POST/PATCH/DELETE | `/api/alerts/rules` | Threshold alert rules (e.g. tempf above 100), evaluated server-side; PATCH toggles `enabled` |
 | POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
 | POST | `/api/push/register` | Register an iOS APNs device token for push alerts |
 | POST | `/ingest/custom` | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |

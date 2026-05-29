@@ -587,6 +587,18 @@ async def create_rule(body: AlertRuleIn) -> JSONResponse:
     return JSONResponse(rule)
 
 
+class AlertRulePatch(BaseModel):
+    enabled: bool
+
+
+@app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_token)])
+async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
+    rule = await db.set_alert_rule_enabled(rule_id, body.enabled)
+    if rule is None:
+        raise HTTPException(status_code=404, detail="rule not found")
+    return JSONResponse(rule)
+
+
 @app.delete("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_token)])
 async def delete_rule(rule_id: int) -> JSONResponse:
     if not await db.delete_alert_rule(rule_id):

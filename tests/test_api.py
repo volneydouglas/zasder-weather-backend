@@ -731,3 +731,18 @@ def test_send_to_all_uses_db_relay(client, monkeypatch):
     res = asyncio.run(apns.send_to_all("T", "B"))
     assert seen["token"] == "dbtok" and seen["url"].endswith("/api/relay/push")
     assert res["sent"] == 1
+
+
+def test_alert_rule_toggle_enabled(client):
+    H = {"Authorization": "Bearer test-api-token"}
+    rid = client.post("/api/alerts/rules", headers=H,
+                      json={"field": "tempf", "comparator": "above", "threshold": 100}).json()["id"]
+    # disable
+    r = client.patch(f"/api/alerts/rules/{rid}", headers=H, json={"enabled": False})
+    assert r.status_code == 200 and r.json()["enabled"] is False
+    assert client.get("/api/alerts/rules", headers=H).json()[0]["enabled"] is False
+    # re-enable
+    assert client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                        json={"enabled": True}).json()["enabled"] is True
+    # unknown rule → 404
+    assert client.patch("/api/alerts/rules/99999", headers=H, json={"enabled": True}).status_code == 404

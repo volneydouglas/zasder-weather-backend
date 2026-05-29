@@ -419,6 +419,22 @@ async def delete_alert_rule(rule_id: int) -> int:
         return cur.rowcount or 0
 
 
+async def set_alert_rule_enabled(rule_id: int, enabled: bool) -> dict[str, Any] | None:
+    """Toggle a rule on/off. Returns the updated rule, or None if it doesn't exist."""
+    async with connect() as db:
+        cur = await db.execute("UPDATE alert_rules SET enabled = ? WHERE id = ?",
+                               (1 if enabled else 0, rule_id))
+        await db.commit()
+        if not cur.rowcount:
+            return None
+        r = await (await db.execute(
+            "SELECT id, target_mac, field, comparator, threshold, enabled "
+            "FROM alert_rules WHERE id = ?", (rule_id,))).fetchone()
+    return {"id": r["id"], "target_mac": r["target_mac"], "field": r["field"],
+            "comparator": r["comparator"], "threshold": r["threshold"],
+            "enabled": bool(r["enabled"])}
+
+
 async def get_rule_states() -> dict[tuple[int, str], int]:
     async with connect() as db:
         rows = await (await db.execute(

@@ -656,12 +656,6 @@ def test_push_register_roundtrip(client):
 def test_push_register_requires_token(client):
     assert client.post("/api/push/register", json={"token": "abcd1234efgh"}).status_code == 401
 
-def test_push_test_requires_apns(client):
-    # No APNs config in the test env → 400, not 500.
-    assert client.post("/api/push/test",
-                       headers={"Authorization": "Bearer test-api-token"}).status_code == 400
-
-
 def test_alert_rules_crud(client):
     H = {"Authorization": "Bearer test-api-token"}
     r = client.post("/api/alerts/rules", headers=H,

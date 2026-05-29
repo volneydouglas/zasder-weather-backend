@@ -512,17 +512,6 @@ async def push_register(body: PushRegisterIn) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
-@app.post("/api/push/test", dependencies=[Depends(require_token)])
-async def push_test() -> JSONResponse:
-    """Send a test push to every registered device — verifies APNs setup."""
-    from .apns import send_to_all
-    if not settings.apns_configured:
-        raise HTTPException(status_code=400,
-                            detail="APNs not configured (set APNS_KEY_ID / APNS_TEAM_ID / APNS_KEY_P8)")
-    res = await send_to_all("Zasder Weather", "Test push — alerts are wired up.")
-    return JSONResponse({"ok": True, **res})
-
-
 class PushRelayIn(BaseModel):
     # Both optional: omit a field to leave it unchanged, send "" to clear it.
     relay_url: str | None = None

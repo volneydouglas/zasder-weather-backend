@@ -626,6 +626,18 @@ async def delete_rule(rule_id: int) -> JSONResponse:
     return JSONResponse({"ok": True, "deleted": rule_id})
 
 
+@app.delete("/api/devices/{mac}", dependencies=[Depends(require_token)])
+async def delete_device(mac: str) -> JSONResponse:
+    """Remove a device + all its observations + alert state. Useful after
+    retiring a source (e.g. you stopped polling a cloud feed) so a stale
+    device doesn't sit on the dashboard. Returns a count summary."""
+    from .ingest import _format_mac
+    counts = await db.delete_device(_format_mac(mac))
+    if counts["devices"] == 0:
+        raise HTTPException(status_code=404, detail="device not found")
+    return JSONResponse({"ok": True, "deleted_mac": _format_mac(mac), **counts})
+
+
 @app.get("/api/devices/{mac}/current", dependencies=[Depends(require_token)])
 async def get_current(mac: str) -> JSONResponse:
     obs = await db.latest_observation(mac)

@@ -837,3 +837,36 @@ def test_relay_url_rejects_unsafe_schemes_and_hosts(client):
     assert client.put("/api/push/relay", headers=H, json={
         "relay_url": "https://weather.zasder.com/api/relay/push",
         "relay_token": "x"}).status_code == 200
+
+
+def test_delete_device_removes_observations_and_state(client):
+    H = {"Authorization": "Bearer test-api-token"}
+    # seed a device + observation
+    client.post("/ingest/custom",
+        headers={"Authorization": "Bearer test-ingest-token",
+                 "Content-Type": "application/json"},
+        json={"device": {"id": "AA:BB:CC:DD:EE:FF", "name": "Test"},
+              "timestamp_utc": "2026-06-02T12:00:00Z",
+              "outdoor": {"tempf": 75}})
+    devs = client.get("/api/devices", headers=H).json()
+    assert any(d["mac"] == "AA:BB:CC:DD:EE:FF" for d in devs)
+    # delete
+    r = client.delete("/api/devices/AA:BB:CC:DD:EE:FF", headers=H)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["devices"] == 1 and body["observations"] == 1
+    # gone
+    assert not any(d["mac"] == "AA:BB:CC:DD:EE:FF"
+                   for d in client.get("/api/devices", headers=H).json())
+    # MAC normalization works (compact form)
+    client.post("/ingest/custom",
+        headers={"Authorization": "Bearer test-ingest-token",
+                 "Content-Type": "application/json"},
+        json={"device": {"id": "112233445566"},
+              "timestamp_utc": "2026-06-02T12:00:00Z",
+              "outdoor": {"tempf": 70}})
+    assert client.delete("/api/devices/112233445566", headers=H).status_code == 200
+    # unknown → 404, no auth → 401
+    assert client.delete("/api/devices/00:11:22:33:44:55", headers=H).status_code == 404
+    assert client.delete("/api/devices/AA:BB:CC:DD:EE:FF").status_code == 401

@@ -291,6 +291,25 @@ async def list_devices() -> list[dict[str, Any]]:
     return out
 
 
+async def delete_device(mac: str) -> dict[str, int]:
+    """Remove a device and everything tied to it. Used when a source goes
+    away (e.g. you stop polling a cloud feed) so a stale row doesn't sit on
+    the dashboard. Returns a count summary; device count = 0 means unknown MAC."""
+    async with connect() as db:
+        async def _del(sql: str) -> int:
+            cur = await db.execute(sql, (mac,))
+            return cur.rowcount or 0
+        n_obs   = await _del("DELETE FROM observations WHERE mac = ?")
+        n_devs  = await _del("DELETE FROM devices      WHERE mac = ?")
+        n_pref  = await _del("DELETE FROM device_alert_prefs WHERE mac = ?")
+        n_state = await _del("DELETE FROM device_alert_state WHERE mac = ?")
+        n_rule  = await _del("DELETE FROM alert_rule_state   WHERE mac = ?")
+        await db.commit()
+    return {"devices": n_devs, "observations": n_obs,
+            "alert_prefs": n_pref, "alert_state": n_state,
+            "rule_state": n_rule}
+
+
 async def get_alert_states() -> dict[str, dict[str, Any]]:
     """All persisted per-device alert states, keyed by MAC."""
     async with connect() as db:

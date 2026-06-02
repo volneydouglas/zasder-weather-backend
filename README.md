@@ -104,6 +104,13 @@ reading as a device row.
 
 ## Path B — Davis WeatherLink cloud poller
 
+> **Have a WeatherLink Live (WLL) gateway on the same LAN as a Raspberry
+> Pi?** [Path E below](#path-e--davis-weatherlink-live-lan-local-poller)
+> is the better option: ~6× fresher data, no API key, no cloud round-trip.
+> Use Path B (cloud) only if your WLL isn't reachable from a host that can
+> POST to this backend.
+
+
 1. Sign in at https://www.weatherlink.com/account
 2. **Scroll to the bottom-left** of the Account page — there's a section
    labeled **"API Key v2"** (Davis tucks it below the fold; that's why most
@@ -164,12 +171,48 @@ curl -X POST "http://zasder-lilygo-1234.local/provision" \
 Data starts flowing in within seconds. `--data-urlencode` is safer than
 plain `-d` because tokens and URLs can contain characters `-d` would mangle.
 
-### Calibrating yearly rain (LilyGO only)
+## Path E — Davis WeatherLink LIVE (LAN, local poller)
 
-LilyGO boards POST the sensor's **raw lifetime rain counter** (an Atlas that's
-been running for years might report 30+ inches). Without calibration the iOS
-app shows that lifetime total as "yearly rain." Fix it with a per-MAC offset
-so the stored value = `lifetime − offset`:
+If your Davis station has a **WeatherLink Live** gateway (the small box that
+plugs into your router), a tiny poller on the same LAN can serve fresh
+sensor data every few seconds — *much* faster than the 60-second cloud
+poll, with no API key and no internet round-trip. The poller runs on a
+Raspberry Pi (or any always-on LAN host) and POSTs to your backend's
+`/ingest/custom`. The backend itself needs no extra configuration.
+
+See **[wll-poller/README.md](wll-poller/README.md)** for the full install.
+Short version, assuming Docker:
+
+```sh
+cd wll-poller
+cp .env.example .env
+# edit: WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
+docker compose up -d --build
+docker logs -f wll-poller
+```
+
+If you previously ran Path B (cloud) for the same Davis, point
+`WLL_DEVICE_MAC` at the cloud poller's MAC (default
+`5D:5D:05:00:00:01` already matches) so both feeds land on one device row
+— WLL wins by recency on every read. Then you can disable Path B:
+
+```sh
+fly secrets unset -a <app> \
+  WEATHERLINK_API_KEY WEATHERLINK_API_SECRET WEATHERLINK_STATION_ID \
+  WEATHERLINK_YEARLY_RAIN_BASELINE_IN WEATHERLINK_NAME WEATHERLINK_LOCATION \
+  WEATHERLINK_POLL_INTERVAL_SECONDS
+```
+
+If Path B had a `WEATHERLINK_YEARLY_RAIN_BASELINE_IN` set, move the
+equivalent offset to `INGEST_YEARLY_RAIN_OFFSETS` (next section) — same
+calibration mechanic, different polarity (`baseline = -offset`).
+
+### Calibrating yearly rain (LilyGO + WLL)
+
+LilyGO boards (and WLL local) POST the sensor's **raw lifetime rain counter**
+(an Atlas or Davis that's been running for years might report 30+ inches).
+Without calibration the iOS app shows that lifetime total as "yearly rain."
+Fix it with a per-MAC offset so the stored value = `lifetime − offset`:
 
 ```sh
 # 1. Read what the board is currently posting:

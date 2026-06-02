@@ -158,6 +158,9 @@ if [ "$mode" = "create" ]; then
     bold "Which ingest sources do you want to enable? (add more anytime by re-running)"
     info "AmbientWeather + Davis are cloud pollers (no hardware to flash)."
     info "LilyGO is real-time RF capture (needs an ESP32 board per band)."
+    info "Have a Davis WeatherLink LIVE on your LAN? Skip Davis here and"
+    info "set up wll-poller/ on a Pi — it POSTs through /ingest/custom"
+    info "(needs no Fly secrets). See README Path E."
     echo
     sel=""
     ask_yn "  AmbientWeather cloud poller?    [y/N]" N && sel="${sel:+$sel,}awn"

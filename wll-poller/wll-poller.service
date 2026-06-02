@@ -1,0 +1,29 @@
+[Unit]
+Description=Davis WeatherLink Live → Zasder Weather poller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/zasder/wll-poller.env
+ExecStart=/usr/bin/python3 /opt/wll-poller/poller.py
+Restart=on-failure
+RestartSec=10
+# Run as the same user that owns sdr-relay on this Pi.
+User=pi
+Group=pi
+# Keep the log line going to journald (journalctl -fu wll-poller).
+StandardOutput=journal
+StandardError=journal
+# Mild hardening (network + filesystem):
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

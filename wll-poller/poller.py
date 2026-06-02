@@ -122,16 +122,15 @@ def to_observation(
             solar["radiation_wm2"] = _num(c, "solar_rad")
             solar["uv"]            = _num(c, "uv_index")
 
-        elif st == 3:                                        # WLL indoor sensor
+        elif st == 3:                                        # LSS BAR — barometer
+            # Backend's _flatten reads pressure.relative_inhg (full word) and
+            # treats it as both relative and absolute for ingest sources.
+            pressure["relative_inhg"] = _num(c, "bar_sea_level")
+            pressure["absolute_inhg"] = _num(c, "bar_absolute")
+
+        elif st == 4:                                        # LSS Temp/Hum — WLL indoor
             indoor["tempf"]    = _num(c, "temp_in")
             indoor["humidity"] = _num(c, "hum_in")
-
-        elif st == 4:                                        # WLL barometer
-            pressure["rel_inhg"] = _num(c, "bar_sea_level")
-            pressure["abs_inhg"] = _num(c, "bar_absolute")
-            # Surface the barometer to the indoor block too so dashboards
-            # that share-barometer-from-indoor see it.
-            indoor.setdefault("pressure_inhg", _num(c, "bar_sea_level"))
 
     if not (outdoor or wind or rain or pressure or indoor or solar):
         return None

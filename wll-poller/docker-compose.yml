@@ -1,0 +1,15 @@
+services:
+  wll-poller:
+    build: .
+    image: zasder/wll-poller:latest
+    container_name: wll-poller
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Default bridge networking is fine: the container reaches WLL on the
+    # LAN and the backend over the internet without special config.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -34,9 +34,9 @@ def _sample():
                     "solar_rad": 815,
                     "uv_index": 5.5,
                 },
-                {"data_structure_type": 3,
-                 "temp_in": 78.0, "hum_in": 41.1},
                 {"data_structure_type": 4,
+                 "temp_in": 78.0, "hum_in": 41.1},
+                {"data_structure_type": 3,
                  "bar_sea_level": 30.115, "bar_absolute": 29.985},
             ],
         },
@@ -68,12 +68,11 @@ class TransformTests(unittest.TestCase):
 
     def test_pressure_and_indoor(self):
         obs = to_observation(_sample())
-        self.assertAlmostEqual(obs["pressure"]["rel_inhg"], 30.115)
-        self.assertAlmostEqual(obs["pressure"]["abs_inhg"], 29.985)
+        # Backend's ingest._flatten reads pressure.relative_inhg (full word).
+        self.assertAlmostEqual(obs["pressure"]["relative_inhg"], 30.115)
+        self.assertAlmostEqual(obs["pressure"]["absolute_inhg"], 29.985)
         self.assertEqual(obs["indoor"]["tempf"], 78.0)
         self.assertEqual(obs["indoor"]["humidity"], 41.1)
-        # Barometer mirrored into indoor.pressure_inhg
-        self.assertAlmostEqual(obs["indoor"]["pressure_inhg"], 30.115)
 
     def test_solar_block(self):
         s = to_observation(_sample())["solar"]

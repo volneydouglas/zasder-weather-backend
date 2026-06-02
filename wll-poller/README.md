@@ -96,5 +96,5 @@ WLL JSON samples; no network needed.
 | `rainfall_daily × rain_size`   | `rain.daily_in`       | counts → inches |
 | `rainfall_year × rain_size`    | `rain.yearly_in`      | apply `INGEST_YEARLY_RAIN_OFFSETS` on backend if needed |
 | `solar_rad` / `uv_index`       | `solar.radiation_wm2` / `solar.uv` | |
-| `temp_in` / `hum_in`           | `indoor.tempf` / `indoor.humidity` | WLL itself |
-| `bar_sea_level` / `bar_absolute` | `pressure.rel_inhg` / `pressure.abs_inhg` | also mirrored to `indoor.pressure_inhg` |
+| `temp_in` / `hum_in` (struct 4) | `indoor.tempf` / `indoor.humidity` | WLL itself (LSS Temp/Hum) |
+| `bar_sea_level` / `bar_absolute` (struct 3) | `pressure.relative_inhg` / `pressure.absolute_inhg` | LSS BAR — backend treats relative as rel + abs |

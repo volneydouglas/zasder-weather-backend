@@ -304,6 +304,7 @@ calls these. Public-readable status page at `/`.
 | GET | `/` | HTML status page (no auth) |
 | GET | `/healthz` | Liveness, no auth |
 | GET | `/api/devices` | All devices + latest reading |
+| DELETE | `/api/devices/{mac}` | Remove a retired device + all its observations + alert state (token-gated) |
 | GET | `/api/devices/{mac}/current` | Composite latest-non-null per field |
 | GET | `/api/devices/{mac}/history?hours=24` | Time series, auto-bucketed for 3d/7d/30d |
 | GET | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg/median + when |

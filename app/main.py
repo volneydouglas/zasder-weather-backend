@@ -518,6 +518,35 @@ class PushRelayIn(BaseModel):
     relay_token: str | None = None
 
 
+def _validate_relay_url(url: str) -> None:
+    """Reject relay URLs that could be used to exfiltrate APNs device tokens
+    via SSRF (reviewer P3). https only; refuse loopback/private/link-local IP
+    literals. Hostnames pass through — DNS-rebinding mitigation belongs at the
+    egress layer, not here."""
+    import ipaddress
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(url)
+    except Exception:
+        raise HTTPException(status_code=400, detail="relay_url is not a valid URL")
+    if u.scheme != "https":
+        raise HTTPException(status_code=400, detail="relay_url must be https://")
+    host = (u.hostname or "").lower()
+    if not host:
+        raise HTTPException(status_code=400, detail="relay_url is missing a host")
+    if host in ("localhost", "ip6-localhost", "broadcasthost"):
+        raise HTTPException(status_code=400,
+                            detail="relay_url cannot point at a local address")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return                                    # hostname (not an IP) → OK
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        raise HTTPException(status_code=400,
+                            detail="relay_url cannot point at a private/local address")
+
+
 @app.get("/api/push/relay", dependencies=[Depends(require_token)])
 async def get_push_relay() -> JSONResponse:
     """Report the app-managed relay config. The token is WRITE-ONLY — never
@@ -538,6 +567,8 @@ async def put_push_relay(body: PushRelayIn) -> JSONResponse:
     cur = await db.get_push_relay() or {}
     url = cur.get("url")
     if body.relay_url is not None:
+        if body.relay_url:
+            _validate_relay_url(body.relay_url)
         url = body.relay_url or None
     token = cur.get("token")
     if body.relay_token is not None:

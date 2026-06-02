@@ -740,3 +740,100 @@ def test_alert_rule_toggle_enabled(client):
                         json={"enabled": True}).json()["enabled"] is True
     # unknown rule → 404
     assert client.patch("/api/alerts/rules/99999", headers=H, json={"enabled": True}).status_code == 404
+
+
+# ───── reviewer P2: threshold alert state must not advance until delivery succeeds ─────
+
+def test_threshold_alert_retries_when_delivery_fails(client, monkeypatch):
+    """Repro of reviewer P2: with delivery failing, the rule's state must NOT
+    advance to triggered=1 — otherwise the next tick won't retry."""
+    import asyncio
+    import app.alerts as alerts
+    from app.alerts import AlertMonitor, effective_config
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    # crossing observation: tempf=105 > rule threshold 100
+    client.post("/ingest/custom",
+        headers={"Authorization": "Bearer test-ingest-token",
+                 "Content-Type": "application/json"},
+        json={"device": {"id": "AA:BB:CC:DD:EE:FF", "name": "Yard"},
+              "timestamp_utc": "2026-06-01T12:00:00Z",
+              "outdoor": {"tempf": 105}})
+    client.post("/api/alerts/rules", headers=H,
+                json={"field": "tempf", "comparator": "above", "threshold": 100})
+    calls = {"n": 0}
+    async def fake_deliver(cfg, subj, body, ptitle, pbody):
+        calls["n"] += 1
+        return False                      # delivery always fails
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    async def two_ticks():
+        cfg = await effective_config()
+        mon = AlertMonitor()
+        devs = await db.list_devices()
+        await mon._check_threshold_rules(cfg, devs, 1_000)
+        s1 = await db.get_rule_states()
+        await mon._check_threshold_rules(cfg, devs, 2_000)
+        s2 = await db.get_rule_states()
+        return s1, s2
+    s1, s2 = asyncio.run(two_ticks())
+    assert calls["n"] == 2, "delivery must be retried while it keeps failing"
+    assert all(v == 0 for v in s1.values()), "state must not advance on failed delivery"
+    assert all(v == 0 for v in s2.values())
+
+def test_threshold_alert_state_advances_on_successful_delivery(client, monkeypatch):
+    """When delivery succeeds, state flips to 1 and a second tick does NOT
+    re-fire (edge-triggered — that part is preserved)."""
+    import asyncio
+    import app.alerts as alerts
+    from app.alerts import AlertMonitor, effective_config
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/ingest/custom",
+        headers={"Authorization": "Bearer test-ingest-token",
+                 "Content-Type": "application/json"},
+        json={"device": {"id": "AA:BB:CC:DD:EE:FF", "name": "Yard"},
+              "timestamp_utc": "2026-06-01T12:00:00Z",
+              "outdoor": {"tempf": 105}})
+    client.post("/api/alerts/rules", headers=H,
+                json={"field": "tempf", "comparator": "above", "threshold": 100})
+    calls = {"n": 0}
+    async def fake_deliver(*a, **kw):
+        calls["n"] += 1
+        return True
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    async def two_ticks():
+        cfg = await effective_config()
+        mon = AlertMonitor()
+        devs = await db.list_devices()
+        await mon._check_threshold_rules(cfg, devs, 1_000)
+        await mon._check_threshold_rules(cfg, devs, 2_000)
+        return await db.get_rule_states()
+    states = asyncio.run(two_ticks())
+    assert calls["n"] == 1                # edge-trigger: only fires on the crossing
+    assert any(v == 1 for v in states.values())
+
+
+# ───── reviewer P3: relay URL must reject SSRF-able destinations ─────
+
+def test_relay_url_rejects_unsafe_schemes_and_hosts(client):
+    H = {"Authorization": "Bearer test-api-token"}
+    bad = [
+        "http://weather.zasder.com/api/relay/push",     # http (not https)
+        "https://localhost/x",                          # loopback name
+        "https://127.0.0.1/x",                          # loopback IP4
+        "https://[::1]/x",                              # loopback IP6
+        "https://10.0.0.1/x",                           # RFC1918
+        "https://192.168.1.1/x",                        # RFC1918
+        "https://169.254.169.254/x",                    # link-local (AWS metadata)
+        "https:///nohostpath",                          # missing host
+        "ftp://weather.zasder.com/x",                   # wrong scheme
+    ]
+    for u in bad:
+        r = client.put("/api/push/relay", headers=H, json={"relay_url": u})
+        assert r.status_code == 400, f"{u} should 400, got {r.status_code}: {r.text}"
+    # public https hostname is OK
+    assert client.put("/api/push/relay", headers=H, json={
+        "relay_url": "https://weather.zasder.com/api/relay/push",
+        "relay_token": "x"}).status_code == 200

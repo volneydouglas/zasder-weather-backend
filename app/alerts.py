@@ -344,15 +344,27 @@ class AlertMonitor:
                     continue
                 prev = rstates.get((rule["id"], d["mac"]), 0)
                 now_trig, fire = evaluate_rule(rule["comparator"], rule["threshold"], val, prev)
-                if int(now_trig) != prev:
-                    await db.upsert_rule_state(rule["id"], d["mac"], int(now_trig), now_ms)
                 if fire:
+                    # Reviewer P2: only persist triggered=1 AFTER delivery succeeds.
+                    # If SMTP/APNs/relay fails, leave state at 0 so the next tick
+                    # retries — the alternative (mark first, deliver second) silently
+                    # drops the alert until the reading clears and re-crosses.
                     dname = d.get("name") or d["mac"]
                     title, body = build_threshold_message(
                         dname, rule["field"], val, rule["comparator"], rule["threshold"])
-                    await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body)
-                    log.info("threshold alert fired: rule %s (%s) on %s value=%.3f",
-                             rule["id"], rule["field"], dname, val)
+                    delivered = await _deliver(
+                        cfg, f"[Zasder Weather] {title}", body, title, body)
+                    if delivered:
+                        await db.upsert_rule_state(rule["id"], d["mac"], 1, now_ms)
+                        log.info("threshold alert fired: rule %s (%s) on %s value=%.3f",
+                                 rule["id"], rule["field"], dname, val)
+                    else:
+                        log.warning(
+                            "threshold alert delivery failed for rule %s on %s; "
+                            "will retry next tick", rule["id"], d["mac"])
+                elif not now_trig and prev:
+                    # Cleared (1→0): persist so the rule re-arms. No delivery here.
+                    await db.upsert_rule_state(rule["id"], d["mac"], 0, now_ms)
 
 
 def _device_threshold(mac: str, dev_prefs: dict, default_min: float) -> float | None:

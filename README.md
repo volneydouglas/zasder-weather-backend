@@ -270,6 +270,7 @@ calls these. Public-readable status page at `/`.
 | GET/POST/PATCH/DELETE | `/api/alerts/rules` | Threshold alert rules (e.g. tempf above 100), evaluated server-side; PATCH toggles `enabled` |
 | POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
 | POST | `/api/push/register` | Register an iOS APNs device token for push alerts |
+| GET/PUT | `/api/push/relay` | App-managed relay config (URL + token); token write-only, never returned. PUT enforces `https://` + rejects private/loopback hosts |
 | POST | `/ingest/custom` | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
 | POST | `/ingest/discovery` | Source posts a `(model, id)` RF sighting |
 | GET | `/api/discoveries?since_hours=24` | Long-tail RF device survey |

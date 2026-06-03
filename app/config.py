@@ -47,12 +47,16 @@ class Settings(BaseSettings):
     aw_application_key: str | None = None
     aw_api_key: str | None = None
     api_token: str
-    # Optional secondary bearer token accepted alongside `api_token`. Use cases:
+    # Optional secondary bearer token accepted ONLY on read endpoints
+    # (GETs). Use cases:
     #   * App Store submission — give the reviewer a dedicated token in the
-    #     "App Review Information" section, revoke after approval.
-    #   * Token rotation — set both, switch clients to the new one, then drop
-    #     the old one without downtime.
-    # Leave unset to require the primary token only.
+    #     "App Review Information" section, revoke after approval. Read-only
+    #     so the reviewer can't mutate the user's alert rules / push config /
+    #     device rows even if they hit POST/PUT/PATCH/DELETE routes.
+    #   * Token rotation — set both, switch reading clients to the new one,
+    #     then promote it to `api_token` to gain write access. (Direct
+    #     rotation of `api_token` still requires a brief client update.)
+    # Writes always require the primary `api_token` (see `write_tokens`).
     reviewer_api_token: str | None = None
     # Bearer token for /ingest/custom — write-only, used by sources that POST
     # observations (relay containers, custom SDR, etc.). Distinct from
@@ -258,7 +262,17 @@ class Settings(BaseSettings):
 
     @property
     def valid_api_tokens(self) -> set[str]:
+        """Tokens accepted on READ endpoints (GET). Includes the optional
+        reviewer/demo token so App Store reviewers can exercise the read
+        surface without seeing the write-capable primary token."""
         return {t for t in [self.api_token, self.reviewer_api_token] if t}
+
+    @property
+    def write_tokens(self) -> set[str]:
+        """Tokens accepted on MUTATING endpoints (POST/PUT/PATCH/DELETE).
+        Only the primary `api_token` — the reviewer/demo token is locked
+        to reads so it can never alter user state."""
+        return {self.api_token} if self.api_token else set()
 
     @property
     def aw_configured(self) -> bool:

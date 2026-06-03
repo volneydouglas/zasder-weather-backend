@@ -870,3 +870,48 @@ def test_delete_device_removes_observations_and_state(client):
     # unknown → 404, no auth → 401
     assert client.delete("/api/devices/00:11:22:33:44:55", headers=H).status_code == 404
     assert client.delete("/api/devices/AA:BB:CC:DD:EE:FF").status_code == 401
+
+
+# ───── reviewer token is READ-only (P1 from reviewer-private-2026-06-02) ─────
+
+REVIEWER = {"Authorization": "Bearer test-reviewer-token"}
+WRITER   = {"Authorization": "Bearer test-api-token"}
+
+def test_reviewer_token_allowed_on_reads(client):
+    # the core read surface a reviewer would walk
+    for path in ("/api/devices", "/api/alerts", "/api/alerts/rules",
+                 "/api/push/relay"):
+        r = client.get(path, headers=REVIEWER)
+        assert r.status_code == 200, f"reviewer GET {path} → {r.status_code}: {r.text[:80]}"
+
+def test_reviewer_token_rejected_on_writes(client):
+    """The reviewer/demo token must not be able to mutate anything. Every
+    POST/PUT/PATCH/DELETE under /api/* should refuse it."""
+    rule_body = {"field": "tempf", "comparator": "above", "threshold": 100}
+    cases = [
+        ("POST",   "/api/alerts/rules",                rule_body),
+        ("PATCH",  "/api/alerts/rules/1",              {"enabled": False}),
+        ("DELETE", "/api/alerts/rules/1",              None),
+        ("PUT",    "/api/alerts",                      {"enabled": False}),
+        ("POST",   "/api/alerts/test",                 {}),
+        ("PUT",    "/api/devices/AA:BB:CC:DD:EE:FF/alert", {"monitor": False}),
+        ("POST",   "/api/push/register",               {"token": "a" * 64}),
+        ("PUT",    "/api/push/relay",                  {"relay_token": "x"}),
+        ("DELETE", "/api/devices/AA:BB:CC:DD:EE:FF",   None),
+    ]
+    for method, path, body in cases:
+        kwargs = {"headers": REVIEWER}
+        if body is not None: kwargs["json"] = body
+        r = client.request(method, path, **kwargs)
+        assert r.status_code == 401, (
+            f"reviewer {method} {path} should be 401, got {r.status_code} {r.text[:80]}")
+
+def test_primary_token_still_can_write(client):
+    """Sanity — the primary api_token writes are not collateral damage."""
+    r = client.post("/api/alerts/rules", headers=WRITER,
+                    json={"field": "tempf", "comparator": "above", "threshold": 100})
+    assert r.status_code == 200
+    rid = r.json()["id"]
+    assert client.patch(f"/api/alerts/rules/{rid}", headers=WRITER,
+                        json={"enabled": False}).status_code == 200
+    assert client.delete(f"/api/alerts/rules/{rid}", headers=WRITER).status_code == 200

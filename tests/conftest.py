@@ -29,6 +29,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     monkeypatch.setenv("API_TOKEN", "test-api-token")
     monkeypatch.setenv("INGEST_TOKEN", "test-ingest-token")
     monkeypatch.setenv("CAPTURE_TOKEN", "test-capture-token")
+    monkeypatch.setenv("REVIEWER_API_TOKEN", "test-reviewer-token")
     # AWN keys intentionally LEFT UNSET — most tests don't need the poller.
     # Also actively unset them in case the host shell has them, so the
     # poller stays disabled (it tries to hit the real AWN API otherwise).

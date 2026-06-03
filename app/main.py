@@ -165,11 +165,23 @@ async def _security_headers(request: Request, call_next):
     return response
 
 
-def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
+def _extract_bearer(authorization: str | None) -> str:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="invalid token")
-    presented = authorization.removeprefix("Bearer ")
-    if presented not in settings.valid_api_tokens:
+    return authorization.removeprefix("Bearer ")
+
+
+def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
+    """READ-allowing dep: accepts api_token OR reviewer_api_token. Use on GETs."""
+    if _extract_bearer(authorization) not in settings.valid_api_tokens:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+
+def require_write_token(authorization: Annotated[str | None, Header()] = None) -> None:
+    """MUTATING dep: only api_token. The reviewer/demo token is read-only,
+    so it can't alter user state if the reviewer hits a write route. Use on
+    every POST/PUT/PATCH/DELETE under /api/*."""
+    if _extract_bearer(authorization) not in settings.write_tokens:
         raise HTTPException(status_code=401, detail="invalid token")
 
 
@@ -438,7 +450,7 @@ async def get_alerts() -> JSONResponse:
     return JSONResponse(await _alerts_state())
 
 
-@app.put("/api/alerts", dependencies=[Depends(require_token)])
+@app.put("/api/alerts", dependencies=[Depends(require_write_token)])
 async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     fields: dict[str, Any] = {}
     if body.enabled is not None:
@@ -466,14 +478,14 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     return JSONResponse(await _alerts_state())
 
 
-@app.put("/api/devices/{mac}/alert", dependencies=[Depends(require_token)])
+@app.put("/api/devices/{mac}/alert", dependencies=[Depends(require_write_token)])
 async def put_device_alert(mac: str, body: DeviceAlertIn) -> JSONResponse:
     from .ingest import _format_mac
     await db.upsert_device_alert_pref(_format_mac(mac), body.monitor, body.threshold_minutes)
     return JSONResponse(await _alerts_state())
 
 
-@app.post("/api/alerts/test", dependencies=[Depends(require_token)])
+@app.post("/api/alerts/test", dependencies=[Depends(require_write_token)])
 async def test_alert() -> JSONResponse:
     """Send a one-off test email to the current recipients — lets the app's
     setup screen verify delivery end to end."""
@@ -503,7 +515,7 @@ class PushRegisterIn(BaseModel):
     platform: str = "ios"
 
 
-@app.post("/api/push/register", dependencies=[Depends(require_token)])
+@app.post("/api/push/register", dependencies=[Depends(require_write_token)])
 async def push_register(body: PushRegisterIn) -> JSONResponse:
     """The iOS app posts its APNs device token here after the user grants
     notification permission. Idempotent (upsert)."""
@@ -559,7 +571,7 @@ async def get_push_relay() -> JSONResponse:
                          "relay_configured": bool(url and token)})
 
 
-@app.put("/api/push/relay", dependencies=[Depends(require_token)])
+@app.put("/api/push/relay", dependencies=[Depends(require_write_token)])
 async def put_push_relay(body: PushRelayIn) -> JSONResponse:
     """The iOS app stores the relay token it obtained (via App Attest against
     the relay) here so this backend can push through the relay. Write-only
@@ -592,7 +604,7 @@ async def list_rules() -> JSONResponse:
     return JSONResponse(await db.list_alert_rules())
 
 
-@app.post("/api/alerts/rules", dependencies=[Depends(require_token)])
+@app.post("/api/alerts/rules", dependencies=[Depends(require_write_token)])
 async def create_rule(body: AlertRuleIn) -> JSONResponse:
     from .alerts import THRESHOLD_FIELDS, THRESHOLD_COMPARATORS
     from .ingest import _format_mac
@@ -611,7 +623,7 @@ class AlertRulePatch(BaseModel):
     enabled: bool
 
 
-@app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_token)])
+@app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_write_token)])
 async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
     rule = await db.set_alert_rule_enabled(rule_id, body.enabled)
     if rule is None:
@@ -619,14 +631,14 @@ async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
     return JSONResponse(rule)
 
 
-@app.delete("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_token)])
+@app.delete("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_write_token)])
 async def delete_rule(rule_id: int) -> JSONResponse:
     if not await db.delete_alert_rule(rule_id):
         raise HTTPException(status_code=404, detail="rule not found")
     return JSONResponse({"ok": True, "deleted": rule_id})
 
 
-@app.delete("/api/devices/{mac}", dependencies=[Depends(require_token)])
+@app.delete("/api/devices/{mac}", dependencies=[Depends(require_write_token)])
 async def delete_device(mac: str) -> JSONResponse:
     """Remove a device + all its observations + alert state. Useful after
     retiring a source (e.g. you stopped polling a cloud feed) so a stale

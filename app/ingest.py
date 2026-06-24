@@ -81,6 +81,11 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     wind = _scrub_numbers(normalized.get("wind"))
     rain = _scrub_numbers(normalized.get("rain"))
     press = _scrub_numbers(normalized.get("pressure"))
+    # Solar comes in two shapes: LilyGO/cloud pollers put solar_wm2 + uv
+    # inside `outdoor`; the WLL local poller posts a dedicated `solar`
+    # block ({radiation_wm2, uv}). Accept both — the block was silently
+    # dropped before, so WLL-sourced devices never stored solar at all.
+    solar = _scrub_numbers(normalized.get("solar"))
 
     ts_iso = normalized.get("timestamp_utc")
     if not ts_iso:
@@ -152,8 +157,12 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "weeklyrainin":   rain.get("weekly_in"),
         "monthlyrainin":  rain.get("monthly_in"),
         "yearlyrainin":   yearly_in,
-        "uv":             out.get("uv"),
-        "solarradiation": out.get("solar_wm2"),
+        # Explicit None checks, not `or` — 0 is a legitimate reading
+        # (UV/solar at night) and must not fall through.
+        "uv":             out.get("uv") if out.get("uv") is not None
+                          else solar.get("uv"),
+        "solarradiation": out.get("solar_wm2") if out.get("solar_wm2") is not None
+                          else solar.get("radiation_wm2"),
     }
 
 

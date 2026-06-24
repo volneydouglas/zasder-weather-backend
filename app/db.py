@@ -47,6 +47,17 @@ CREATE TABLE IF NOT EXISTS observations (
 CREATE INDEX IF NOT EXISTS idx_obs_mac_date
     ON observations (mac, dateutc_ms DESC);
 
+-- Covering index for the chart-history aggregation (db.history bucketed
+-- path). Includes every column that query reads so SQLite serves it
+-- index-only and never touches the fat data_json-bearing rows — a 7d/3d
+-- chart drops from ~9s to <0.1s. The trailing payload columns MUST stay in
+-- sync with the bucketed SELECT in db.history(); adding a charted field
+-- there without adding it here silently re-introduces the full-row fetch.
+CREATE INDEX IF NOT EXISTS idx_obs_chart
+    ON observations (mac, dateutc_ms, tempf, humidity, baromrelin, uv,
+                     windspeedmph, dew_point, solarradiation, hourlyrainin,
+                     winddir, yearlyrainin);
+
 -- "discoveries" = the long-tail of RF devices the SDR happens to hear that
 -- aren't our configured sensors: neighbors' weather stations, TPMS from
 -- passing cars, garage remotes, utility meters, etc. Useful for "what's
@@ -187,6 +198,13 @@ QUERYABLE_FIELDS = set(_FIELD_MAP.values())
 async def init_db() -> None:
     _ensure_dir()
     async with aiosqlite.connect(settings.database_path) as db:
+        # WAL lets the constant ingest writes and the chart-history reads run
+        # without blocking each other. Under the default rollback journal a
+        # multi-second history aggregation holds a lock that stalls ingest for
+        # its whole duration. journal_mode persists in the DB header, so this
+        # is effectively a one-time switch re-asserted on every boot.
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
         await db.executescript(SCHEMA)
         # Migrate older DBs: add any alert_prefs columns the schema gained
         # after the table was first created (SQLite CREATE IF NOT EXISTS
@@ -648,6 +666,13 @@ async def history(
     For bucketed windows: returns synthesized rows with AVG()-aggregated
     numeric fields and the bucket-midpoint timestamp. Same dict shape
     the iOS app already reads — just no `_source` (not needed for charts).
+
+    Bucketed rows also carry `<field>_min` / `<field>_max` for the
+    chartable fields. AVG() alone flattens the true extremes on 3d/7d
+    windows, so charts drawn from these rows understate highs and
+    overstate lows; the per-bucket range lets clients draw an honest
+    hi/lo band around the averaged line. Old clients ignore the extra
+    keys.
     """
     bucket_ms = _auto_bucket_ms(end_ms - start_ms)
     if bucket_ms == 0:
@@ -668,29 +693,41 @@ async def history(
     # is safe here. The midpoint timestamp puts the point in the middle of
     # the bucket, which is what most chart libraries expect.
     half = bucket_ms // 2
+    # Columns are restricted to exactly the set the iOS charts + dashboard
+    # read from bucketed history, and they ALL live in idx_obs_chart so this
+    # aggregation is served index-only (EXPLAIN: "USING COVERING INDEX").
+    # That matters because every `observations` row carries a ~1 KB data_json
+    # blob; touching a non-covered column forces a fetch of each of the tens
+    # of thousands of fat rows in the window and turns a 7d chart into a ~9 s
+    # query. Keep added columns in sync with idx_obs_chart, or the index stops
+    # covering and the slowdown returns.
     sql = f"""
         SELECT
           (dateutc_ms / {bucket_ms}) * {bucket_ms} + {half} AS dateutc,
           AVG(tempf)          AS tempf,
-          AVG(feels_like)     AS feelsLike,
           AVG(dew_point)      AS dewPoint,
           AVG(humidity)       AS humidity,
-          AVG(tempinf)        AS tempinf,
-          AVG(humidityin)     AS humidityin,
           AVG(baromrelin)     AS baromrelin,
-          AVG(baromabsin)     AS baromabsin,
           AVG(windspeedmph)   AS windspeedmph,
-          AVG(windgustmph)    AS windgustmph,
-          MAX(maxdailygust)   AS maxdailygust,
           AVG(winddir)        AS winddir,
           AVG(hourlyrainin)   AS hourlyrainin,
-          AVG(eventrainin)    AS eventrainin,
-          AVG(dailyrainin)    AS dailyrainin,
-          AVG(weeklyrainin)   AS weeklyrainin,
-          AVG(monthlyrainin)  AS monthlyrainin,
           AVG(yearlyrainin)   AS yearlyrainin,
           AVG(uv)             AS uv,
-          AVG(solarradiation) AS solarradiation
+          AVG(solarradiation) AS solarradiation,
+          MIN(tempf)          AS tempf_min,
+          MAX(tempf)          AS tempf_max,
+          MIN(dew_point)      AS dewPoint_min,
+          MAX(dew_point)      AS dewPoint_max,
+          MIN(humidity)       AS humidity_min,
+          MAX(humidity)       AS humidity_max,
+          MIN(baromrelin)     AS baromrelin_min,
+          MAX(baromrelin)     AS baromrelin_max,
+          MIN(windspeedmph)   AS windspeedmph_min,
+          MAX(windspeedmph)   AS windspeedmph_max,
+          MIN(hourlyrainin)   AS hourlyrainin_min,
+          MAX(hourlyrainin)   AS hourlyrainin_max,
+          MIN(solarradiation) AS solarradiation_min,
+          MAX(solarradiation) AS solarradiation_max
         FROM observations
         WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?
         GROUP BY dateutc_ms / {bucket_ms}

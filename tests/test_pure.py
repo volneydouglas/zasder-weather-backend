@@ -60,6 +60,29 @@ def test_flatten_returns_none_on_garbage_timestamp():
     p = _payload(tempf=70); p["timestamp_utc"] = "not a date"
     assert ingest._flatten(p) is None
 
+def test_flatten_maps_solar_block():
+    # WLL local poller posts a dedicated solar block (not outdoor.solar_wm2);
+    # it used to be dropped entirely so Davis-via-WLL never stored solar.
+    p = _payload(tempf=70)
+    p["solar"] = {"radiation_wm2": 815, "uv": 5}
+    flat = ingest._flatten(p)
+    assert flat["solarradiation"] == 815
+    assert flat["uv"] == 5
+
+def test_flatten_solar_block_zero_not_dropped():
+    p = _payload(tempf=70)
+    p["solar"] = {"radiation_wm2": 0, "uv": 0}
+    flat = ingest._flatten(p)
+    assert flat["solarradiation"] == 0
+    assert flat["uv"] == 0
+
+def test_flatten_outdoor_solar_wins_over_block():
+    p = _payload(tempf=70, solar_wm2=400, uv=3)
+    p["solar"] = {"radiation_wm2": 815, "uv": 5}
+    flat = ingest._flatten(p)
+    assert flat["solarradiation"] == 400
+    assert flat["uv"] == 3
+
 
 # ───────────────────── _device_label / _auto_device_name ─────────────────────
 

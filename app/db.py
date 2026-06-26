@@ -54,8 +54,8 @@ CREATE INDEX IF NOT EXISTS idx_obs_mac_date
 -- sync with the bucketed SELECT in db.history(); adding a charted field
 -- there without adding it here silently re-introduces the full-row fetch.
 CREATE INDEX IF NOT EXISTS idx_obs_chart
-    ON observations (mac, dateutc_ms, tempf, humidity, baromrelin, uv,
-                     windspeedmph, dew_point, solarradiation, hourlyrainin,
+    ON observations (mac, dateutc_ms, tempf, feels_like, humidity, baromrelin,
+                     uv, windspeedmph, dew_point, solarradiation, hourlyrainin,
                      winddir, yearlyrainin);
 
 -- Operator-set per-device location (lat/lon), entered from the iOS app's
@@ -775,6 +775,7 @@ async def history(
         SELECT
           (dateutc_ms / {bucket_ms}) * {bucket_ms} + {half} AS dateutc,
           AVG(tempf)          AS tempf,
+          AVG(feels_like)     AS feelsLike,
           AVG(dew_point)      AS dewPoint,
           AVG(humidity)       AS humidity,
           AVG(baromrelin)     AS baromrelin,
@@ -786,6 +787,8 @@ async def history(
           AVG(solarradiation) AS solarradiation,
           MIN(tempf)          AS tempf_min,
           MAX(tempf)          AS tempf_max,
+          MIN(feels_like)     AS feelsLike_min,
+          MAX(feels_like)     AS feelsLike_max,
           MIN(dew_point)      AS dewPoint_min,
           MAX(dew_point)      AS dewPoint_max,
           MIN(humidity)       AS humidity_min,

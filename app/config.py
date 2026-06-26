@@ -118,6 +118,19 @@ class Settings(BaseSettings):
     # 2 in/hr is well above any real rainfall rate. Set 0 to disable.
     ingest_max_rain_rate_in_per_hr: float = 2.0
 
+    # History-write throttle (seconds). Steady high-cadence sources — e.g. a
+    # 10s SDR relay — flood the observations table with near-duplicate rows
+    # (roughly half of a 10s Atlas feed is byte-identical to the prior row),
+    # which is the main driver of unbounded DB growth. When > 0, a reading that
+    # arrives within this many seconds of the last STORED row for the same
+    # device is NOT written to history — UNLESS it carries a field the last row
+    # was missing, so multi-source composite posts are never dropped. The live
+    # view (device lastData) is refreshed on every post regardless; only the
+    # stored-history resolution is coarsened. Charts bucket windows > 6h anyway,
+    # and weather changes on minute scales, so 60 is a good fit. 0 = store every
+    # reading (default — no behavior change for existing deployments).
+    ingest_min_interval_seconds: int = 0
+
     # ── APNs push (token-based) ──────────────────────────────────────────
     # Server-side push for alerts, alongside email. Enabled when key_id +
     # team_id + key_p8 are set (set them as Fly secrets). Create an "Apple

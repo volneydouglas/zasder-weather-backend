@@ -615,18 +615,24 @@ def test_alerts_smtp_write_only(client):
 
 
 def test_rain_glitch_rejected(client):
+    from datetime import datetime, timedelta, timezone
     ih = {"Authorization": "Bearer test-ingest-token"}
     ah = {"Authorization": "Bearer test-api-token"}
+    # Timestamps relative to now so the data always lands inside the history
+    # window queried below — hardcoded calendar dates silently fall out of the
+    # 720h window as real time passes.
+    base = datetime.now(timezone.utc) - timedelta(minutes=10)
+    def iso(mins): return (base + timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
     def post(ts, yearly):
         return client.post("/ingest/custom", headers=ih, json={
             "device": {"id": "5D5D0200007D"}, "timestamp_utc": ts,
             "outdoor": {"tempf": 70, "humidity": 50}, "wind": {}, "pressure": {},
             "rain": {"yearly_in": yearly}, "source": "fineoffset-wh24"})
-    assert post("2026-05-25T10:00:00Z", 3.58).status_code == 200
+    assert post(iso(0), 3.58).status_code == 200
     # +6 inches in one minute is physically impossible → dropped as a glitch
-    assert post("2026-05-25T10:01:00Z", 9.58).status_code == 200
+    assert post(iso(1), 9.58).status_code == 200
     # a small, plausible increase a minute later is kept
-    assert post("2026-05-25T10:02:00Z", 3.60).status_code == 200
+    assert post(iso(2), 3.60).status_code == 200
     hist = client.get("/api/devices/5D:5D:02:00:00:7D/history?hours=720",
                       headers=ah).json()["rows"]
     ys = [r["yearlyrainin"] for r in hist if r.get("yearlyrainin") is not None]
@@ -634,6 +640,56 @@ def test_rain_glitch_rejected(client):
     # that the 9.58 glitch never made it in (a stored glitch would pull any
     # bucket average far above the real ~3.6).
     assert ys and max(ys) < 5.0
+
+
+def test_history_write_throttle(client, monkeypatch):
+    from app import config
+    ih = {"Authorization": "Bearer test-ingest-token"}
+
+    def post(ts, temp, wind=None):
+        return client.post("/ingest/custom", headers=ih, json={
+            "device": {"id": "5D5D0200007D"}, "timestamp_utc": ts,
+            "outdoor": {"tempf": temp, "humidity": 50},
+            "wind": wind or {}, "pressure": {}, "rain": {},
+            "source": "fineoffset-wh24"}).json()
+
+    # Throttle off (default): every reading is stored.
+    monkeypatch.setattr(config.settings, "ingest_min_interval_seconds", 0)
+    assert post("2026-05-25T10:00:00Z", 70)["inserted"] == 1
+    assert post("2026-05-25T10:00:10Z", 70)["inserted"] == 1
+
+    # Throttle at 60s: a reading within 60s of the last STORED row (10:00:10),
+    # changing only existing values, is coalesced away.
+    monkeypatch.setattr(config.settings, "ingest_min_interval_seconds", 60)
+    r = post("2026-05-25T10:00:40Z", 71)
+    assert r["inserted"] == 0 and r["throttled"] is True
+
+    # A reading past the interval is stored again (80s after 10:00:10).
+    assert post("2026-05-25T10:01:30Z", 72)["inserted"] == 1
+
+    # Inside the window but contributing a field the last stored row lacked
+    # (windspeed) → kept, so multi-source composite posts aren't dropped.
+    assert post("2026-05-25T10:01:50Z", 72, wind={"speed_mph": 5})["inserted"] == 1
+
+
+def test_device_location_override(client):
+    ih = {"Authorization": "Bearer test-ingest-token"}
+    ah = {"Authorization": "Bearer test-api-token"}
+    client.post("/ingest/custom", headers=ih, json={
+        "device": {"id": "5D5D0200007D"}, "timestamp_utc": "2026-05-25T10:00:00Z",
+        "outdoor": {"tempf": 70, "humidity": 50}, "wind": {}, "pressure": {},
+        "rain": {}, "source": "fineoffset-wh24"})
+    r = client.put("/api/devices/5D:5D:02:00:00:7D/location", headers=ah,
+                   json={"lat": 33.3004, "lon": -111.9378, "label": "Home"})
+    assert r.status_code == 200
+    devs = client.get("/api/devices", headers=ah).json()
+    d = next(x for x in devs if x["mac"] == "5D:5D:02:00:00:7D")
+    coords = d["info"]["coords"]["coords"]
+    assert abs(coords["lat"] - 33.3004) < 1e-6
+    assert abs(coords["lon"] - (-111.9378)) < 1e-6
+    # out-of-range is rejected
+    assert client.put("/api/devices/5D:5D:02:00:00:7D/location", headers=ah,
+                      json={"lat": 200, "lon": 0}).status_code == 400
 
 
 def test_alert_monitor_always_started(client):

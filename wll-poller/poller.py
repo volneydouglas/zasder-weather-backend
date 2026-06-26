@@ -98,12 +98,13 @@ def to_observation(
             outdoor["tempf"]        = _num(c, "temp")
             outdoor["humidity"]     = _num(c, "hum")
             outdoor["dew_point_f"]  = _num(c, "dew_point")
-            # Davis publishes several derived temps; prefer THSW (sun-aware)
-            # then heat index, then wind chill. Backend's _compute_feels_like
-            # will derive one if all three are null.
+            # "Feels like" = NWS heat index / wind chill, matching what the
+            # other stations (AmbientWeather, SDR via backend _compute_feels_like)
+            # report. Deliberately NOT thsw_index: THSW adds a direct-sun load
+            # that runs ~5-10°F hotter (e.g. 99°F/30%/471 W/m² → THSW 110 vs
+            # heat-index 104), which reads as wrong next to every other source.
             outdoor["feels_like"] = (
-                _num(c, "thsw_index")
-                or _num(c, "heat_index")
+                _num(c, "heat_index")
                 or _num(c, "wind_chill"))
             wind["speed_mph"] = _num(c, "wind_speed_last")
             wind["dir_deg"]   = _num(c, "wind_dir_last")

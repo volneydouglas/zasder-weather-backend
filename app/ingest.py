@@ -234,6 +234,26 @@ def _device_label(normalized: dict[str, Any]) -> tuple[str | None, str | None]:
     return explicit_name, location
 
 
+def _payload_coords(normalized: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract a source-provided lat/lon in the shape the iOS Device model reads
+    (info.coords.coords.{lat,lon}), or None if the source didn't include one.
+    Accepts either a flat {lat,lon} or a nested {coords:{lat,lon}} under the
+    top-level or device block."""
+    dev = normalized.get("device") or {}
+    raw = normalized.get("coords") or dev.get("coords") or {}
+    if not isinstance(raw, dict):
+        return None
+    inner = raw.get("coords") if isinstance(raw.get("coords"), dict) else raw
+    if not isinstance(inner, dict):
+        return None
+    try:
+        lat = float(inner["lat"])
+        lon = float(inner["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return {"location": raw.get("location"), "coords": {"lat": lat, "lon": lon}}
+
+
 def _auto_device_name(normalized: dict[str, Any]) -> str:
     """Auto-generated name used ONLY on first INSERT of a device row."""
     dev = normalized.get("device") or {}
@@ -262,6 +282,25 @@ def _token_from_header(authorization: str | None,
     if authorization and authorization.startswith("Bearer "):
         return authorization.removeprefix("Bearer ").strip()
     return ""
+
+
+# Metadata keys ignored when deciding whether a throttled-window reading
+# carries genuinely new data: timestamps, the source tag, and the free-text
+# lastRain marker all churn without representing a sensor field.
+_THROTTLE_IGNORE = frozenset({"_source", "dateutc", "date", "tz", "lastRain"})
+
+
+def _adds_field(new: dict[str, Any], prev: dict[str, Any]) -> bool:
+    """True if `new` provides a non-null value for a sensor field that `prev`
+    lacks (null or absent). Such a reading is a multi-source composite
+    contribution and must be stored even inside the throttle window; a reading
+    that only changes existing values can be safely coalesced."""
+    for k, v in new.items():
+        if k in _THROTTLE_IGNORE or v is None:
+            continue
+        if prev.get(k) is None:
+            return True
+    return False
 
 
 async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
@@ -300,20 +339,53 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
 
     explicit_name, location = _device_label(payload_obj)
     auto_name = _auto_device_name(payload_obj)
+    inner_info: dict[str, Any] = {
+        "name": explicit_name or auto_name,
+        "location": location,
+        "source": payload_obj.get("source"),
+    }
+    # Stamp the operator's configured home location onto devices whose source
+    # doesn't report coordinates (SDR relays, the local WLL poller). Without a
+    # location the iOS sunrise/sunset + forecast + UV features have nothing to
+    # work from and fall back to (0,0). forecast_lat/lon is the single source
+    # of "where am I", so it stays correct no matter which poller is active.
+    coords_from_payload = _payload_coords(payload_obj)
+    if coords_from_payload is not None:
+        inner_info["coords"] = coords_from_payload
+    elif settings.forecast_lat is not None and settings.forecast_lon is not None:
+        inner_info["coords"] = {
+            "location": location,
+            "coords": {"lat": settings.forecast_lat, "lon": settings.forecast_lon},
+        }
     info = {
         # `name` here is the operator-explicit value (None if not provided).
         # `info.auto_name` is the fallback used only on first INSERT.
         "name": explicit_name,
         "auto_name": auto_name,
-        "info": {"name": explicit_name or auto_name,
-                 "location": location,
-                 "source": payload_obj.get("source")},
+        "info": inner_info,
         "lastData": flat,
     }
+    # Always refresh the device row (lastData / live view) so throttling the
+    # history write below never staleness the dashboard.
     await db.upsert_device(mac, info)
-    inserted = await db.insert_observations(
-        mac, [{**flat, "_source": _truncate_source(payload_obj)}])
-    return {"ok": True, "mac": mac, "inserted": inserted, "ts_ms": flat["dateutc"]}
+
+    # History-write throttle: drop a reading that lands within
+    # ingest_min_interval_seconds of the last STORED row for this device,
+    # unless it contributes a field that row was missing (multi-source
+    # composite). See settings.ingest_min_interval_seconds.
+    row = {**flat, "_source": _truncate_source(payload_obj)}
+    store = True
+    min_interval_ms = settings.ingest_min_interval_seconds * 1000
+    if min_interval_ms > 0:
+        last = await db.last_stored_observation(mac)
+        if last is not None:
+            last_ts, last_data = last
+            recent = 0 <= flat["dateutc"] - last_ts < min_interval_ms
+            if recent and not _adds_field(flat, last_data):
+                store = False
+    inserted = await db.insert_observations(mac, [row]) if store else 0
+    return {"ok": True, "mac": mac, "inserted": inserted,
+            "ts_ms": flat["dateutc"], "throttled": not store}
 
 
 # Per-request body size cap. A normal observation is ~500 bytes; even a

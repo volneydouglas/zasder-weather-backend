@@ -58,6 +58,19 @@ CREATE INDEX IF NOT EXISTS idx_obs_chart
                      windspeedmph, dew_point, solarradiation, hourlyrainin,
                      winddir, yearlyrainin);
 
+-- Operator-set per-device location (lat/lon), entered from the iOS app's
+-- per-device Location setting. Takes precedence over the ingest-time default
+-- (config.forecast_lat/lon) so a station the operator pinned to a specific
+-- place isn't overwritten by the next reading. Overlaid onto info.coords in
+-- list_devices; the top-ordered device drives the forecast + sun/moon dial.
+CREATE TABLE IF NOT EXISTS device_location (
+    mac         TEXT PRIMARY KEY,
+    lat         REAL NOT NULL,
+    lon         REAL NOT NULL,
+    label       TEXT,
+    updated_ms  INTEGER
+);
+
 -- "discoveries" = the long-tail of RF devices the SDR happens to hear that
 -- aren't our configured sensors: neighbors' weather stations, TPMS from
 -- passing cars, garage remotes, utility meters, etc. Useful for "what's
@@ -286,6 +299,55 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
         return cur.rowcount or 0
 
 
+async def last_stored_observation(mac: str) -> tuple[int, dict[str, Any]] | None:
+    """(dateutc_ms, parsed data_json) of the single most recent stored row for
+    `mac`, or None if the device has no history. Single-row lookup via
+    idx_obs_mac_date. Used by the ingest write-throttle to decide whether a new
+    reading is too close behind the last stored one. (Distinct from
+    `latest_observation`, which composites non-null fields across a lookback
+    window for the live /current view.)"""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT dateutc_ms, data_json FROM observations WHERE mac = ? "
+            "ORDER BY dateutc_ms DESC LIMIT 1", (mac,)
+        )).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["data_json"])
+    except (json.JSONDecodeError, TypeError):
+        data = {}
+    return int(row["dateutc_ms"]), data
+
+
+async def set_device_location(mac: str, lat: float, lon: float,
+                              label: str | None, now_ms: int) -> None:
+    """Persist an operator-set location for a device (iOS per-device Location
+    setting). Overrides the ingest-time default in list_devices."""
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO device_location (mac, lat, lon, label, updated_ms)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(mac) DO UPDATE SET
+                lat = excluded.lat, lon = excluded.lon,
+                label = excluded.label, updated_ms = excluded.updated_ms
+            """,
+            (mac, lat, lon, label, now_ms),
+        )
+        await db.commit()
+
+
+async def device_locations() -> dict[str, dict[str, Any]]:
+    """All operator-set locations, keyed by MAC."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, lat, lon, label FROM device_location"
+        )).fetchall()
+    return {r["mac"]: {"lat": r["lat"], "lon": r["lon"], "label": r["label"]}
+            for r in rows}
+
+
 async def list_devices() -> list[dict[str, Any]]:
     async with connect() as db:
         # Stable insertion order via rowid — first device added (typically the
@@ -295,16 +357,24 @@ async def list_devices() -> list[dict[str, Any]]:
         rows = await (await db.execute(
             "SELECT mac, name, location, info_json, last_seen_ms FROM devices ORDER BY rowid"
         )).fetchall()
+    overrides = await device_locations()
     out: list[dict[str, Any]] = []
     for r in rows:
         info = json.loads(r["info_json"]) if r["info_json"] else {}
+        inner = info.get("info") or {}
+        # Operator-set location wins over whatever the ingest path stamped.
+        loc = overrides.get(r["mac"])
+        if loc is not None:
+            inner = {**inner, "coords": {
+                "location": loc.get("label") or inner.get("location"),
+                "coords": {"lat": loc["lat"], "lon": loc["lon"]}}}
         out.append({
             "mac": r["mac"],
             "name": r["name"],
             "location": r["location"],
             "lastSeen": r["last_seen_ms"],
             "lastData": info.get("lastData"),
-            "info": info.get("info"),
+            "info": inner,
         })
     return out
 

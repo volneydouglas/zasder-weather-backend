@@ -485,6 +485,26 @@ async def put_device_alert(mac: str, body: DeviceAlertIn) -> JSONResponse:
     return JSONResponse(await _alerts_state())
 
 
+class DeviceLocationIn(BaseModel):
+    lat: float
+    lon: float
+    label: str | None = None
+
+
+@app.put("/api/devices/{mac}/location", dependencies=[Depends(require_write_token)])
+async def put_device_location(mac: str, body: DeviceLocationIn) -> JSONResponse:
+    """Set a device's location (iOS per-device Location setting). Overrides the
+    ingest-time default; the top-ordered device drives the forecast + sun dial."""
+    from .ingest import _format_mac
+    if not (-90.0 <= body.lat <= 90.0) or not (-180.0 <= body.lon <= 180.0):
+        raise HTTPException(status_code=400, detail="lat/lon out of range")
+    norm = _format_mac(mac)
+    await db.set_device_location(norm, body.lat, body.lon, body.label,
+                                 int(time.time() * 1000))
+    return JSONResponse({"ok": True, "mac": norm, "lat": body.lat,
+                         "lon": body.lon, "label": body.label})
+
+
 @app.post("/api/alerts/test", dependencies=[Depends(require_write_token)])
 async def test_alert() -> JSONResponse:
     """Send a one-off test email to the current recipients — lets the app's

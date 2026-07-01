@@ -28,6 +28,7 @@
 #include "esp_system.h"          // esp_restart, esp_reset_reason
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <time.h>                // time, gmtime_r — for the nightly restart
 
 // Per-packet JSON buffer handed to rtl_433_ESP's decoder. 512 B is the
 // upstream example default and covers every weather-station packet we
@@ -37,6 +38,12 @@ static char messageBuffer[JSON_MSG_BUFFER];
 
 rtl_433_ESP rtl_433;
 
+// millis() of the last decoded packet — fed in rtl_433_Callback, checked by
+// the RX-liveness watchdog. The SX1276 receive path can wedge while loop()
+// keeps running (so the loop-stall watchdog never fires and HTTP/status stays
+// up), which silently kills all sensor data. 0 = no packet seen yet.
+static volatile uint32_t g_lastRxMs = 0;
+
 void rtl_433_Callback(char *message) {
   // rtl_433_ESP hands us one JSON object per decoded packet. We don't
   // try to coalesce Atlas's 8-message-type cycle on-device (limited
@@ -44,6 +51,7 @@ void rtl_433_Callback(char *message) {
   // UPSERT). v1 behavior: post every packet, accept the small window
   // of partial observations between cycles.
   digitalWrite(LED_BUILTIN_RX, HIGH);
+  g_lastRxMs = millis();          // feed the RX-liveness watchdog
   // Note the packet on the status server so /status reflects what we
   // just heard even if the POST is about to fail.
   {
@@ -75,6 +83,62 @@ static volatile uint32_t g_lastLoopMs = 0;
 static volatile bool g_wifiReconnect = false;
 #define WDT_STALL_MS 60000UL     // reset if loop() stalls this long
 
+// RX-liveness watchdog: reboot if the radio goes silent this long AFTER it
+// has heard at least one packet. The Atlas (and ambient 433 traffic) arrives
+// every ~10-30s, so a multi-minute silence means the SX1276 receive path has
+// wedged even though loop() is still cycling. Generous default avoids false
+// reboots during brief RF-quiet spells; override via build flag.
+#ifndef RX_STALL_MS
+#define RX_STALL_MS (5UL * 60UL * 1000UL)   // 5 minutes
+#endif
+
+// ── scheduled nightly restart ──────────────────────────────────────────
+// Symptom we're chasing: after a few days of 24/7 uptime the OLED can
+// desync into garbage (SSD1306 controller losing I2C sync on the shared
+// power rail; possibly slow heap fragmentation too). Rather than pin down
+// the exact cause, reboot once a night at a quiet local hour for a clean
+// slate — this covers a memory leak OR a peripheral desync equally. A
+// reboot costs ~15s of RF downtime (Wi-Fi + NTP re-sync); the Atlas
+// re-posts within seconds and the backend is last-write-wins, so the gap
+// is invisible in the app.
+//
+// Configurable via build flags. NIGHTLY_REBOOT_HOUR/MINUTE are the LOCAL
+// wall-clock time; set the hour to -1 to disable. LOCAL_TZ_OFFSET_MINUTES
+// shifts NTP's UTC to local time for this check only — it does NOT touch
+// the UTC timestamps we POST (those stay on TZ_OFFSET_MINUTES). Arizona is
+// MST (UTC-7) year-round with no DST, so -420 → 03:30 reboot = 3:30 AM AZ.
+#ifndef NIGHTLY_REBOOT_HOUR
+#define NIGHTLY_REBOOT_HOUR     3
+#endif
+#ifndef NIGHTLY_REBOOT_MINUTE
+#define NIGHTLY_REBOOT_MINUTE   30
+#endif
+#ifndef LOCAL_TZ_OFFSET_MINUTES
+#define LOCAL_TZ_OFFSET_MINUTES 0
+#endif
+// Ignore the reboot window during the first 2h of uptime. Uptime resets to
+// 0 on reboot, so after the nightly restart the next eligible check is
+// hours away — comfortably past the one-minute reboot window. Without this
+// guard the board would re-trigger every 5s for the whole target minute.
+#define NIGHTLY_MIN_UPTIME_MS   (2UL * 60UL * 60UL * 1000UL)
+
+static void maybeNightlyRestart() {
+#if NIGHTLY_REBOOT_HOUR >= 0
+  if (millis() < NIGHTLY_MIN_UPTIME_MS) return;
+  time_t nowUtc = time(nullptr);
+  if (nowUtc < 1700000000) return;          // NTP not synced yet (pre-2023)
+  time_t localEpoch = nowUtc + (time_t) LOCAL_TZ_OFFSET_MINUTES * 60;
+  struct tm tmv;
+  gmtime_r(&localEpoch, &tmv);              // offset epoch read as UTC = local wall clock
+  if (tmv.tm_hour == NIGHTLY_REBOOT_HOUR && tmv.tm_min == NIGHTLY_REBOOT_MINUTE) {
+    Serial.printf("[nightly] %02d:%02d local — scheduled restart\n",
+                  tmv.tm_hour, tmv.tm_min);
+    Serial.flush();
+    esp_restart();
+  }
+#endif
+}
+
 static void watchdogTask(void *) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(5000));
@@ -84,6 +148,18 @@ static void watchdogTask(void *) {
       Serial.flush();
       esp_restart();
     }
+    // RX-liveness: catch a wedged SX1276 that the loop-stall check above
+    // can't see (loop keeps running, HTTP/status stays up, but no packets).
+    uint32_t lastRx = g_lastRxMs;
+    if (lastRx != 0 && (millis() - lastRx) > RX_STALL_MS) {
+      Serial.printf("[watchdog] no RX for >%lus — receiver wedged, restarting\n",
+                    (unsigned long) (RX_STALL_MS / 1000));
+      Serial.flush();
+      esp_restart();
+    }
+    // Runs on core 0 alongside the stall check, so the nightly reboot fires
+    // even if loop() (core 1) is wedged.
+    maybeNightlyRestart();
   }
 }
 

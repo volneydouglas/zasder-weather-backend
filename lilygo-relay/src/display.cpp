@@ -28,6 +28,14 @@ static constexpr unsigned long  INVERT_INTERVAL_MS  = 4UL * 60UL * 60UL * 1000UL
 static unsigned long            _lastInvertMs       = 0;
 static bool                     _inverted           = false;
 
+// Anti-corruption: the SSD1306 controller can drift out of sync after days
+// of 24/7 use (noise/ESD on the rail shared with the SX1276), then render
+// garbage even though the data path is fine. Periodically re-send the full
+// init sequence to recover the panel — far cheaper than rebooting and it
+// drops no RF. The nightly restart in main.cpp is the heavier backstop.
+static constexpr unsigned long  REINIT_INTERVAL_MS  = 6UL * 60UL * 60UL * 1000UL;
+static unsigned long            _lastReinitMs       = 0;
+
 static String _header;
 static String _line1;
 static String _line2;
@@ -73,6 +81,7 @@ void begin() {
       Wire.setClock(400000);
       u8g2.setContrast(OLED_CONTRAST);
       _lastInvertMs = millis();
+      _lastReinitMs = millis();
       _displayPresent = true;
       _header = "Zasder LilyGO";
       _line1  = "booting...";
@@ -100,6 +109,16 @@ void loop() {
     // SSD1306 raw commands: 0xA6 = normal, 0xA7 = inverted.
     u8g2.sendF("c", _inverted ? 0xA7 : 0xA6);
     _lastInvertMs = now;
+  }
+  if (now - _lastReinitMs >= REINIT_INTERVAL_MS) {
+    // Re-send the SSD1306 init sequence to clear any controller desync,
+    // then restore contrast + the current invert state and repaint. Wire's
+    // 50 ms timeout (set in begin) keeps a stuck bus from wedging the loop.
+    u8g2.begin();
+    u8g2.setContrast(OLED_CONTRAST);
+    u8g2.sendF("c", _inverted ? 0xA7 : 0xA6);
+    render();
+    _lastReinitMs = now;
   }
 }
 

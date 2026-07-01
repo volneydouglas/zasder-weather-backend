@@ -89,6 +89,13 @@ The backend listens on `http://localhost:8080/`. The iOS app needs to reach
 it on your LAN — point the app at `http://<your-host-ip>:8080` and the same
 `API_TOKEN` from `.env`.
 
+> **LilyGO boards require an HTTPS backend URL.** The firmware is TLS-only
+> (it always uses `WiFiClientSecure`), so a plain-`http://…:8080` local-Docker
+> backend will provision fine but **never receive LilyGO data** — the POSTs
+> silently fail. To use Paths C/D, either deploy to Fly.io (automatic HTTPS)
+> or put a TLS-terminating reverse proxy in front of local Docker and provision
+> the board with that `https://` URL.
+
 ## Path A — AmbientWeather cloud poller
 
 Add to `.env` (or as Fly secrets):
@@ -141,6 +148,11 @@ gives 1-minute. Both work; adjust `WEATHERLINK_POLL_INTERVAL_SECONDS`
 
 These give real-time RF capture without going through any vendor cloud. One
 LilyGO board per band (one for 433 MHz Atlas, one for 915 MHz Fineoffset).
+
+> **The backend URL you provision must be HTTPS.** The firmware is TLS-only,
+> so a plain-HTTP local-Docker backend (`http://<host-ip>:8080`) will NOT
+> receive LilyGO data even though provisioning appears to succeed. Use Fly.io
+> (auto HTTPS) or front local Docker with a TLS-terminating reverse proxy.
 
 See **[lilygo-relay/README.md](lilygo-relay/README.md)** for hardware, flashing,
 provisioning, and field-tested gotchas. Short version:

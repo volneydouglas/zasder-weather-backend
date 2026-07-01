@@ -9,7 +9,7 @@ EnvironmentFile=/etc/zasder/wll-poller.env
 ExecStart=/usr/bin/python3 /opt/wll-poller/poller.py
 Restart=on-failure
 RestartSec=10
-# Run as the same user that owns sdr-relay on this Pi.
+# Run as an unprivileged local user (adjust to taste).
 User=pi
 Group=pi
 # Keep the log line going to journald (journalctl -fu wll-poller).

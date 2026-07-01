@@ -237,10 +237,8 @@ if [ "$mode" = "create" ]; then
   echo
   info "Generated API_TOKEN (iOS app reads with this):"
   printf '  \033[33m%s\033[0m\n' "$api_token"
-  if source_enabled lilygo; then
-    info "Generated INGEST_TOKEN (LilyGO boards POST with this):"
-    printf '  \033[33m%s\033[0m\n' "$ingest_token"
-  fi
+  info "Generated INGEST_TOKEN (LilyGO boards / WLL poller / any /ingest/custom source POST with this):"
+  printf '  \033[33m%s\033[0m\n' "$ingest_token"
   echo
 
   # 8. Create app + volume
@@ -306,6 +304,11 @@ if [ "$mode" = "create" ]; then
   emit "iOS app → Settings, paste:"
   emit "  Backend URL:   $url"
   emit "  Bearer Token:  $api_token"
+
+  emit ""
+  emit "INGEST_TOKEN (any source that POSTs to /ingest/custom uses this —"
+  emit "LilyGO boards, the wll-poller, or a custom relay):"
+  emit "  $ingest_token"
 
   if source_enabled lilygo; then
     emit ""

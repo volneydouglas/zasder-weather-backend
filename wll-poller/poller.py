@@ -3,8 +3,9 @@
 
 Polls a WLL gateway's local HTTP API (`/v1/current_conditions`) every few
 seconds and forwards a normalized observation to a Zasder Weather backend's
-`/ingest/custom` endpoint. Designed to run on the same Raspberry Pi as
-sdr-relay — pure stdlib so installs are a single file copy.
+`/ingest/custom` endpoint. Designed to run on a small always-on host on the
+same LAN as the WLL gateway (e.g. a Raspberry Pi) — pure stdlib so installs
+are a single file copy.
 
 WLL local API: https://weatherlink.github.io/weatherlink-live-local-api/
 

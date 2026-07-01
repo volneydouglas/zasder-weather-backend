@@ -2,8 +2,8 @@
 
 A tiny pure-stdlib Python service that polls a **Davis WeatherLink Live**
 gateway on your LAN and forwards observations to a Zasder Weather backend
-via `/ingest/custom`. Designed to run on the same Raspberry Pi as
-`sdr-relay`.
+via `/ingest/custom`. Runs on any always-on LAN host — a Raspberry Pi is
+ideal.
 
 ## Why local instead of the cloud poller
 
@@ -16,7 +16,7 @@ over UDP). Same physical Davis VP2, ~6× lower latency, no key, no quotas.
 
 - GETs `http://<WLL_HOST>/v1/current_conditions` every `WLL_POLL_SECONDS`
 - Normalizes ISS / barometer / WLL-indoor sensor blocks into the
-  `/ingest/custom` shape the backend expects (same shape `sdr-relay` uses)
+  `/ingest/custom` shape the backend expects
 - POSTs to `${BACKEND_URL}/ingest/custom` with the ingest bearer token
 - Stateless — backend stores observations; the poller just translates +
   forwards and keeps going on errors
@@ -27,7 +27,31 @@ over UDP). Same physical Davis VP2, ~6× lower latency, no key, no quotas.
 - A running Zasder Weather backend with an `INGEST_TOKEN`
 - A Davis WeatherLink Live on the same LAN as the Pi
 
-## Install on the Pi
+## Install with Docker Compose (recommended)
+
+The simplest path — a small container that restarts on boot. Needs Docker +
+the Compose plugin (`docker compose version`).
+
+```sh
+# 1. Configure
+cp .env.example .env
+# edit: WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
+
+# 2. Build + start (detached, auto-restarts)
+docker compose up -d --build
+
+# 3. Watch it run
+docker logs -f wll-poller
+```
+
+The compose service reads `.env`, uses default bridge networking (it reaches
+the WLL on your LAN and the backend over the internet with no extra config),
+and caps its logs. To stop: `docker compose down`. To update after a `git
+pull`: `docker compose up -d --build`.
+
+## Install on the Pi (systemd, no Docker)
+
+Prefer running the script directly under systemd instead of a container:
 
 ```sh
 # 1. Drop the script into /opt and the env file under /etc/zasder

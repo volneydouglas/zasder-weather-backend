@@ -165,8 +165,9 @@ pio run -e t3_v161_433 -t upload    # for the 433 board
 pio run -e t3_v161_915 -t upload    # for the 915 board
 ```
 
-After flashing, the board comes up as a `ZasderLilyGO` Wi-Fi access point.
-Join it from a phone, fill in your home Wi-Fi creds, save. Then point it at
+After flashing, the board comes up as a `ZasderLilyGO` Wi-Fi access point
+(WPA2 password `zasder-setup`). Join it from a phone, fill in your home
+Wi-Fi creds, save. Then point it at
 your backend. Set the two values once and reuse them so you don't fat-finger
 the token (the board also advertises mDNS as `zasder-lilygo-XXXX.local`,
 where `XXXX` is the last 2 bytes of its MAC):
@@ -296,6 +297,7 @@ See `.env.example` for both blocks. Leave all of it unset to use email only.
 app/                    FastAPI app — pollers, /ingest/custom, /api/*, status page
 tests/                  pytest suite (run `pytest -q`)
 lilygo-relay/           ESP32+SX1276 firmware (PlatformIO project)
+wll-poller/             Davis WeatherLink Live LAN poller (Path E)
 bin/setup-fly.sh        Path-based Fly.io setup (sources → app, volume, secrets, summary)
 bin/setup-local.sh      Guided local Docker setup (tokens, .env, docker compose up)
 bin/doctor.sh           Health checklist (auth, /healthz, tokens, volume, pollers, data)

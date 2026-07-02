@@ -75,12 +75,12 @@ journalctl -fu wll-poller
 ## Verify it's working
 
 ```sh
-# Direct WLL check (no auth, just GET it)
-curl -s http://10.0.1.56/v1/current_conditions | python3 -m json.tool | head -40
+# Direct WLL check (no auth, just GET it) — use your WLL's LAN IP
+curl -s http://<wll-host>/v1/current_conditions | python3 -m json.tool | head -40
 
 # Backend should be receiving — recent observations on the device MAC
 curl -s -H "Authorization: Bearer $API_TOKEN" \
-  https://weather.zasder.com/api/devices | jq '.[] | select(.mac == "5D:5D:05:00:00:01")'
+  https://<your-backend>/api/devices | jq '.[] | select(.mac == "5D:5D:05:00:00:01")'
 ```
 
 If the dashboard's Davis card starts updating every ~10s instead of every
@@ -93,7 +93,7 @@ On the backend host:
 
 ```sh
 fly secrets unset WEATHERLINK_API_KEY WEATHERLINK_API_SECRET \
-                  WEATHERLINK_STATION_ID -a zasder-weather
+                  WEATHERLINK_STATION_ID -a <your-app>
 ```
 
 The backend will log "WeatherLink not configured — skipping Davis cloud

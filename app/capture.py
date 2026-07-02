@@ -22,6 +22,8 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
+from .config import tokens_match
+
 router = APIRouter()
 
 # Hard limit on a captured payload. Real station POSTs are < 4 KB; 64 KB is
@@ -49,7 +51,7 @@ def _require_capture_token(authorization: str | None, query_token: str | None) -
         presented = authorization.removeprefix("Bearer ").strip()
     elif query_token:
         presented = query_token.strip()
-    if presented != expected:
+    if not presented or not tokens_match(presented, expected):
         raise HTTPException(status_code=404, detail="not found")
 
 

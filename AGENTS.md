@@ -50,6 +50,10 @@ requirements.txt             Runtime deps (FastAPI, httpx, aiosqlite, pydantic)
 requirements-dev.txt         Test deps (pytest, testclient, anyio)
 pytest.ini
 
+wll-poller/                  Path E — Davis WeatherLink Live LAN poller
+                             (pure-stdlib Python; docker compose or systemd
+                             on a LAN host; posts to /ingest/custom)
+
 lilygo-relay/                ESP32 firmware (PlatformIO)
   src/
     main.cpp                 Setup, WiFi, rtl_433_ESP callback, loop
@@ -79,6 +83,10 @@ Q: What hardware does the user have?
 │
 ├─ Davis Vantage Vue or Pro 2 + WeatherLink Console (any model)
 │   → Use Path B (WeatherLink cloud poller).
+│   → If they ALSO have a WeatherLink Live (6100) gateway on the LAN:
+│     prefer Path E (wll-poller) — ~2s freshness vs 60s cloud, no API
+│     key needed. See wll-poller/README.md. Needs a small always-on
+│     LAN host (Pi/NAS) since the backend can't reach the LAN.
 │   → If they have the older Vantage Vue console (not 6313), they can
 │     ADDITIONALLY use rtldavis SDR for sub-second data — but that
 │     setup is NOT in the public repo. Recommend cloud.
@@ -91,7 +99,7 @@ Q: What hardware does the user have?
 │   → If WH32B indoor sensor: same LilyGO covers it via merge into outdoor.
 │
 └─ Multiple sensors / mix
-    → Any combination of A+B+C+D works. They all post into the same
+    → Any combination of A+B+C+D+E works. They all post into the same
       backend and show up as separate device rows in the iOS app.
 
 Q: Where do they want the backend?
@@ -214,8 +222,9 @@ and a different `RF_MODULE_FREQUENCY` + source tag.
 
 ### Provisioning (after first boot)
 
-1. On the user's phone, join Wi-Fi network **`ZasderLilyGO`** (open,
-   no password). Captive portal opens → enter home Wi-Fi creds → Save.
+1. On the user's phone, join Wi-Fi network **`ZasderLilyGO`** (WPA2,
+   password `zasder-setup`). Captive portal opens → enter home Wi-Fi
+   creds → Save.
 2. Board reboots and joins home Wi-Fi. Find its IP from your router or
    serial monitor.
 3. From any device on the LAN:

@@ -312,7 +312,8 @@ if [ "$mode" = "create" ]; then
 
   if source_enabled lilygo; then
     emit ""
-    emit "LilyGO provisioning — flash, join the 'ZasderLilyGO' Wi-Fi AP, enter"
+    emit "LilyGO provisioning — flash, join the 'ZasderLilyGO' Wi-Fi AP (WPA2"
+    emit "password: zasder-setup), enter"
     emit "your home Wi-Fi, then from any LAN device run (board mDNS name is"
     emit "zasder-lilygo-XXXX.local, XXXX = last 2 bytes of its MAC):"
     emit ""

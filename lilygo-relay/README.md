@@ -60,9 +60,9 @@ band matches the dongle.
 - **`huge_app.csv` partition** is required (set in `platformio.ini`)
   — default ESP32 partitions give the app only 1.25 MB; rtl_433_ESP +
   WiFiManager + ArduinoJson is ~1.4 MB.
-- If you see `kAMDMobileImageMounterDeviceLocked` or any other USB
-  hiccup, the CP2104 auto-reset can flake — power-cycle the board
-  with the USB cable plugged in and retry the upload.
+- If the upload fails with a serial/USB error partway through, the
+  CP2104 auto-reset can flake — power-cycle the board with the USB
+  cable plugged in and retry the upload.
 
 ## First-boot provisioning
 
@@ -73,7 +73,10 @@ simple and avoids the field-loss bug we hit with WiFiManager params.
 ### Step 1 — Wi-Fi
 
 After flashing, the board comes up as a Wi-Fi access point named
-**`ZasderLilyGO`**. Join it from a phone or laptop — a captive portal
+**`ZasderLilyGO`** (WPA2 password: **`zasder-setup`** — it's a fixed,
+publicly-documented password; its job is only to keep your home Wi-Fi
+credentials off an open network while you type them). Join it from a
+phone or laptop — a captive portal
 opens automatically (or browse to `http://192.168.4.1`). Fill in your
 home Wi-Fi SSID + password and hit Save. The board reboots, joins your
 Wi-Fi, and announces itself via mDNS as `zasder-lilygo-XXXX.local`

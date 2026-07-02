@@ -18,7 +18,7 @@ from . import db
 from .alerts import AlertMonitor
 from .ambient_client import AmbientWeatherClient
 from .capture import router as capture_router
-from .config import settings
+from .config import settings, tokens_match
 from .discovery import router as discovery_router
 from .ingest import router as ingest_router
 from .poller import Poller
@@ -173,7 +173,7 @@ def _extract_bearer(authorization: str | None) -> str:
 
 def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
     """READ-allowing dep: accepts api_token OR reviewer_api_token. Use on GETs."""
-    if _extract_bearer(authorization) not in settings.valid_api_tokens:
+    if not tokens_match(_extract_bearer(authorization), settings.valid_api_tokens):
         raise HTTPException(status_code=401, detail="invalid token")
 
 
@@ -181,8 +181,13 @@ def require_write_token(authorization: Annotated[str | None, Header()] = None) -
     """MUTATING dep: only api_token. The reviewer/demo token is read-only,
     so it can't alter user state if the reviewer hits a write route. Use on
     every POST/PUT/PATCH/DELETE under /api/*."""
-    if _extract_bearer(authorization) not in settings.write_tokens:
+    if not tokens_match(_extract_bearer(authorization), settings.write_tokens):
         raise HTTPException(status_code=401, detail="invalid token")
+
+
+def _is_reviewer(authorization: str | None) -> bool:
+    """True when the presented bearer is the read-only reviewer/demo token."""
+    return tokens_match(_extract_bearer(authorization), settings.reviewer_api_token)
 
 
 @app.get("/healthz")
@@ -446,8 +451,18 @@ async def _alerts_state() -> dict[str, Any]:
 
 
 @app.get("/api/alerts", dependencies=[Depends(require_token)])
-async def get_alerts() -> JSONResponse:
-    return JSONResponse(await _alerts_state())
+async def get_alerts(
+    authorization: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    state = await _alerts_state()
+    if _is_reviewer(authorization):
+        # The read-only reviewer/demo token gets the alerts UI state but not
+        # the SMTP transport identifiers (host/username/from reveal the
+        # maintainer's mail infrastructure; password was already write-only).
+        for k in ("smtp_host", "smtp_username", "smtp_from"):
+            if state.get(k):
+                state[k] = "(hidden)"
+    return JSONResponse(state)
 
 
 @app.put("/api/alerts", dependencies=[Depends(require_write_token)])

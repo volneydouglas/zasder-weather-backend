@@ -40,7 +40,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from . import db
-from .config import settings
+from .config import settings, tokens_match
 
 log = logging.getLogger("ingest")
 
@@ -150,7 +150,12 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "windspeedmph":   wind.get("speed_mph"),
         "windgustmph":    wind.get("gust_mph"),
         "maxdailygust":   wind.get("gust_mph"),  # best-effort; relays don't track daily peak
-        "winddir":        wind.get("direction"),
+        # Accept both key shapes: docs/AGENTS say "direction", but the WLL
+        # poller has always posted "dir_deg" — reading only one silently
+        # dropped Davis wind direction. Explicit None check so 0° (north)
+        # survives.
+        "winddir":        wind.get("direction") if wind.get("direction") is not None
+                          else wind.get("dir_deg"),
         "hourlyrainin":   rain.get("hourly_in"),
         "eventrainin":    rain.get("event_in"),
         "dailyrainin":    rain.get("daily_in"),
@@ -269,8 +274,7 @@ def _auto_device_name(normalized: dict[str, Any]) -> str:
 
 
 def _require_ingest_token(token: str) -> None:
-    expected = settings.ingest_token
-    if not expected or token != expected:
+    if not tokens_match(token, settings.ingest_token):
         raise HTTPException(status_code=401, detail="invalid ingest token")
 
 

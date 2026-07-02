@@ -60,6 +60,19 @@ def test_flatten_returns_none_on_garbage_timestamp():
     p = _payload(tempf=70); p["timestamp_utc"] = "not a date"
     assert ingest._flatten(p) is None
 
+def test_flatten_wind_dir_deg_fallback():
+    # The WLL poller posts wind.dir_deg (docs say wind.direction); reading
+    # only "direction" silently dropped Davis wind direction for weeks.
+    p = _payload(tempf=70)
+    p["wind"] = {"speed_mph": 4.7, "dir_deg": 247}
+    flat = ingest._flatten(p)
+    assert flat["winddir"] == 247
+
+def test_flatten_wind_direction_wins_and_zero_survives():
+    p = _payload(tempf=70)
+    p["wind"] = {"direction": 0, "dir_deg": 90}   # 0° = north, must not fall through
+    assert ingest._flatten(p)["winddir"] == 0
+
 def test_flatten_maps_solar_block():
     # WLL local poller posts a dedicated solar block (not outdoor.solar_wm2);
     # it used to be dropped entirely so Davis-via-WLL never stored solar.

@@ -20,7 +20,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 
 from . import db
-from .config import settings
+from .config import settings, tokens_match
 
 router = APIRouter()
 
@@ -89,7 +89,7 @@ def _require_api_token(authorization: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="invalid token")
     presented = authorization.removeprefix("Bearer ")
-    if presented not in settings.valid_api_tokens:
+    if not tokens_match(presented, settings.valid_api_tokens):
         raise HTTPException(status_code=401, detail="invalid token")
 
 

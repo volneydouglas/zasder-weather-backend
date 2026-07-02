@@ -1,8 +1,28 @@
 import json as _json
-from typing import ClassVar
+import secrets as _secrets
+from typing import ClassVar, Iterable
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def tokens_match(presented: str, allowed: str | Iterable[str] | None) -> bool:
+    """Constant-time token membership test.
+
+    Replaces `presented in token_set` / `presented != expected` at every
+    auth gate: plain equality short-circuits on the first differing byte,
+    which leaks prefix-match length as a timing side channel. Deliberately
+    checks EVERY candidate (no early return) via secrets.compare_digest.
+    """
+    if not presented or not allowed:
+        return False
+    if isinstance(allowed, str):
+        allowed = (allowed,)
+    ok = False
+    for t in allowed:
+        if t and _secrets.compare_digest(presented, t):
+            ok = True
+    return ok
 
 
 def _normalize_mac_map(v) -> dict[str, float]:

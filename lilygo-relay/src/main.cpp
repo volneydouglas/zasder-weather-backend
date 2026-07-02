@@ -5,7 +5,8 @@
 // rtl_433_Callback() → zasder_post() → HTTPS POST → backend → SQLite.
 //
 // Provisioning flow:
-//   1. First boot: WiFiManager comes up as AP "ZasderLilyGO". User
+//   1. First boot: WiFiManager comes up as WPA2 AP "ZasderLilyGO"
+//      (password "zasder-setup"). User
 //      joins from a phone, captive portal asks for Wi-Fi creds only
 //      (NOT backend URL / token — those are configured later over the
 //      LAN, which is way more forgiving than a one-shot captive form).
@@ -206,8 +207,13 @@ void setup() {
   // (Save button doesn't always persist params).
   WiFiManager wm;
   wm.setConfigPortalTimeout(300);
-  Serial.println("Wi-Fi: trying saved creds, AP=ZasderLilyGO if none");
-  if (!wm.autoConnect("ZasderLilyGO")) {
+  // WPA2 password on the setup AP: without it the portal is an OPEN
+  // network, and the home Wi-Fi credentials the user types into it
+  // transit in cleartext — sniffable by anyone in RF range. A fixed,
+  // README-documented password defeats passive capture (an evil-twin AP
+  // remains inherent to the captive-portal pattern; documented in README).
+  Serial.println("Wi-Fi: trying saved creds, AP=ZasderLilyGO (pw zasder-setup) if none");
+  if (!wm.autoConnect("ZasderLilyGO", "zasder-setup")) {
     Serial.println("WiFi setup timed out — restarting");
     delay(500);
     ESP.restart();

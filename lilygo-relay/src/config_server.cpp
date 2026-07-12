@@ -11,6 +11,7 @@ namespace ZasderConfigServer {
 
 String backendUrl;
 String ingestToken;
+bool forwardAll = false;
 
 static WebServer server(80);
 static Preferences prefs;
@@ -56,6 +57,7 @@ void loadFromNvs() {
   backendUrl  = prefs.getString("backend_url",  "");
   ingestToken = prefs.getString("ingest_token", "");
   provisioned = prefs.getBool("provisioned", false);
+  forwardAll  = prefs.getBool("forward_all", false);
   // Self-heal: if NVS lost the flag but both creds are present (e.g.
   // upgrading from a firmware build that predates the lock), treat the
   // board as already provisioned so the lock takes effect immediately
@@ -123,6 +125,7 @@ static void handleStatus() {
   body += "  \"has_token\": "    + String(ingestToken.length() > 0 ? "true" : "false") + ",\n";
   body += "  \"token_len\": "    + String((unsigned) ingestToken.length()) + ",\n";
   body += "  \"provisioned\": "  + String(provisioned ? "true" : "false") + ",\n";
+  body += "  \"forward_all\": "  + String(forwardAll ? "true" : "false") + ",\n";
   body += "  \"pkts_decoded\": " + String(pktsDecoded) + ",\n";
   body += "  \"pkts_posted_ok\": "+ String(pktsPostedOk) + ",\n";
   body += "  \"pkts_401\": "     + String(pkts401) + ",\n";
@@ -192,10 +195,20 @@ static void handleProvision() {
       changed = true;
     }
   }
+  // Optional: forward-all toggle (see config_server.h). Accepts 1/0,
+  // true/false, on/off.
+  if (server.hasArg("forward_all")) {
+    String v = server.arg("forward_all");
+    v.trim(); v.toLowerCase();
+    forwardAll = (v == "1" || v == "true" || v == "on");
+    prefs.putBool("forward_all", forwardAll);
+    Serial.printf("forward_all=%s\n", forwardAll ? "true" : "false");
+    changed = true;
+  }
   if (!changed) {
     server.send(400, "text/plain",
-                "expected at least one of backend_url, ingest_token "
-                "as form/query args");
+                "expected at least one of backend_url, ingest_token, "
+                "forward_all as form/query args");
     return;
   }
   // First successful provision flips the lock; from now on changes

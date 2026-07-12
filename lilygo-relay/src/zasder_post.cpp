@@ -54,6 +54,36 @@ struct WH32BCache {
 };
 static WH32BCache wh32b;
 
+// Generic type tag for models forwarded via the opt-in forward_all path
+// (any decoded rtl_433 station that isn't on the whitelist). The synthetic
+// MAC mixes a hash of the model string into the id bytes so two different
+// models that happen to share an id don't collide on one device row.
+static constexpr uint8_t GENERIC_TYPE_TAG = 0x0A;
+
+// djb2, folded to one byte — stable across boots (pure function of the
+// model string), so the same sensor always lands on the same device row.
+static uint8_t modelHash8(const char *model) {
+  uint32_t h = 5381;
+  for (const char *p = model; *p; p++) h = ((h << 5) + h) ^ (uint8_t) *p;
+  return (uint8_t) (h ^ (h >> 8) ^ (h >> 16) ^ (h >> 24));
+}
+
+// A packet is "weather-shaped" if it carries at least one field we can map.
+// Gates the forward_all path so garage doors / TPMS / doorbells the 433
+// dongle also hears don't become backend device rows.
+static bool hasWeatherFields(const JsonDocument &in) {
+  static const char *keys[] = {
+    "temperature_C", "temperature_F", "humidity",
+    "wind_avg_m_s", "wind_avg_mi_h", "wind_avg_km_h",
+    "rain_mm", "rain_in", "uv", "uvi", "light_lux", "lux",
+    "pressure_hPa",
+  };
+  for (const char *k : keys) {
+    if (in[k].is<float>() || in[k].is<int>() || in[k].is<double>()) return true;
+  }
+  return false;
+}
+
 static String synthMac(uint8_t typeTag, uint32_t id) {
   char buf[13];
   snprintf(buf, sizeof(buf), "5D5D%02X%02X%02X%02X",
@@ -157,9 +187,24 @@ void zasder_post(const char *rtl433Json,
   // sensors before we POST. Otherwise the 433 dongle's broad RX
   // creates a "Secplus-v1" device row for the neighbor's garage door,
   // and similar junk for TPMS, smoke detectors, etc.
+  //
+  // forward_all (opt-in, POST /provision forward_all=1) relaxes this to
+  // "any decoded model that carries weather fields" — the forward-compat
+  // path for stations the bundled decoders learn later (e.g. AcuRite
+  // Optimus once rtl_433 #3444 lands) and for oddballs like LaCrosse.
+  // The generic mapping below already handles the standard rtl_433 field
+  // names in both metric + imperial variants.
+  bool generic = false;
   uint8_t typeTag = modelTypeTag(model);
   if (typeTag == 0) {
-    return;
+    if (!ZasderConfigServer::forwardAll || !hasWeatherFields(in)) {
+      return;
+    }
+    generic = true;
+    typeTag = GENERIC_TYPE_TAG;
+    // Fold the model name into the id so distinct models with equal ids
+    // get distinct device rows.
+    id = ((uint32_t) modelHash8(model) << 16) ^ (id & 0xFFFFFF);
   }
 
   // Don't POST until NTP has synced. The backend would otherwise store
@@ -185,11 +230,19 @@ void zasder_post(const char *rtl433Json,
   JsonDocument out;
   auto device       = out["device"].to<JsonObject>();
   device["id"]      = synthMac(typeTag, id);
+  // Generic (forward_all) rows get the rtl_433 model + id as their name so
+  // multiple discovered stations are tellable-apart in the app. Whitelisted
+  // models keep omitting the name (see comment above) so an sdr-relay or
+  // operator-set friendly name survives the UPSERT.
+  if (generic) {
+    device["name"] = String(model) + " " + String((unsigned) in["id"].as<uint32_t>());
+  }
   out["timestamp_utc"] = nowIsoUtc();
   out["source"]        = ZASDER_SOURCE_TAG;
 
   // ── outdoor block ──
-  if (in["temperature_C"].is<float>() || in["humidity"].is<float>()) {
+  if (in["temperature_C"].is<float>() || in["temperature_F"].is<float>() ||
+      in["humidity"].is<float>()) {
     auto outdoor = out["outdoor"].to<JsonObject>();
     if (in["temperature_C"].is<float>())
       outdoor["tempf"] = c_to_f(in["temperature_C"].as<float>());
@@ -229,18 +282,24 @@ void zasder_post(const char *rtl433Json,
     }
   }
 
-  // ── wind block ──
+  // ── wind block ── rtl_433 decoders emit m/s, mi/h, or km/h depending
+  // on the protocol's native unit; accept all three.
   if (in["wind_avg_m_s"].is<float>() || in["wind_max_m_s"].is<float>() ||
-      in["wind_avg_mi_h"].is<float>() || in["wind_dir_deg"].is<int>()) {
+      in["wind_avg_mi_h"].is<float>() || in["wind_avg_km_h"].is<float>() ||
+      in["wind_dir_deg"].is<int>()) {
     auto wind = out["wind"].to<JsonObject>();
     if (in["wind_avg_m_s"].is<float>())
       wind["speed_mph"] = ms_to_mph(in["wind_avg_m_s"].as<float>());
     else if (in["wind_avg_mi_h"].is<float>())
       wind["speed_mph"] = in["wind_avg_mi_h"].as<float>();
+    else if (in["wind_avg_km_h"].is<float>())
+      wind["speed_mph"] = in["wind_avg_km_h"].as<float>() * 0.621371f;
     if (in["wind_max_m_s"].is<float>())
       wind["gust_mph"] = ms_to_mph(in["wind_max_m_s"].as<float>());
     else if (in["wind_max_mi_h"].is<float>())
       wind["gust_mph"] = in["wind_max_mi_h"].as<float>();
+    else if (in["wind_max_km_h"].is<float>())
+      wind["gust_mph"] = in["wind_max_km_h"].as<float>() * 0.621371f;
     copyIf(in, "wind_dir_deg", wind, "direction");
   }
 

@@ -34,6 +34,16 @@ void notePostResult(int httpCode);
 extern String backendUrl;
 extern String ingestToken;
 
+// Opt-in: forward ANY decoded rtl_433 station that carries weather fields
+// (temp/humidity/wind/rain), not just the whitelisted Atlas/Fineoffset
+// models. Off by default — the 433 band is full of neighbors' sensors and
+// each forwarded model+id becomes its own device row on the backend.
+// This is the forward-compat path for new hardware (e.g. AcuRite Optimus,
+// rtl_433 issue #3444): the moment the bundled decoders learn a model it
+// flows through with no firmware change. Set via POST /provision field
+// `forward_all` (1/0).
+extern bool forwardAll;
+
 void loadFromNvs();  // populates backendUrl + ingestToken from NVS
 void wipeIngestToken();  // for the 401-auto-recovery path
 

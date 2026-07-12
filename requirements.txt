@@ -1,4 +1,8 @@
-fastapi==0.115.5
+# Bumped 2026-07-11 (security review): FastAPI 0.115.5 pulled Starlette
+# 0.41.3, which has the quadratic Range-header DoS (GHSA-7f5h-v6xp-fcq8)
+# reachable through the unauthenticated /static mount. 0.139.x pulls
+# Starlette >=1.3.1 (fixed); full test suite verified green on it.
+fastapi>=0.139,<0.140
 uvicorn[standard]==0.32.1
 httpx==0.27.2
 # Bumped 2026-05-21 — pydantic-core 2.23.x (pinned by pydantic 2.9.x)

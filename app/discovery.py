@@ -81,7 +81,9 @@ def _require_ingest_token(authorization: str | None,
     if x_ingest_token: presented = x_ingest_token.strip()
     elif authorization and authorization.startswith("Bearer "):
         presented = authorization.removeprefix("Bearer ").strip()
-    if not expected or presented != expected:
+    # Constant-time compare (consistent with every other auth gate) so token
+    # verification doesn't leak prefix length via a timing side channel.
+    if not expected or not tokens_match(presented, expected):
         raise HTTPException(status_code=401, detail="invalid ingest token")
 
 
@@ -89,7 +91,10 @@ def _require_api_token(authorization: str | None) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="invalid token")
     presented = authorization.removeprefix("Bearer ")
-    if not tokens_match(presented, settings.valid_api_tokens):
+    # PRIMARY token only (write_tokens), NOT the read-only reviewer/demo token.
+    # The nearby-RF survey is operator diagnostics, not part of the weather
+    # views an App Store reviewer needs — keep it out of the demo token's reach.
+    if not tokens_match(presented, settings.write_tokens):
         raise HTTPException(status_code=401, detail="invalid token")
 
 

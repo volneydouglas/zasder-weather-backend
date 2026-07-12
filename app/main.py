@@ -14,6 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .limits import BodySizeLimitMiddleware
+
 from . import db
 from .alerts import AlertMonitor
 from .ambient_client import AmbientWeatherClient
@@ -132,6 +134,12 @@ _ALLOWED_HOSTS = [h.strip() for h in _allowed_raw.split(",") if h.strip()] or ["
 if _ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
 
+# 3. Global body-size cap (added last → outermost middleware → runs FIRST):
+#    bounds every request body before FastAPI parses JSON or checks auth, so
+#    an anonymous malformed/chunked request can't stream unbounded data into
+#    memory. See app/limits.py. Covers the /static mount too.
+app.add_middleware(BodySizeLimitMiddleware)
+
 
 @app.middleware("http")
 async def _security_headers(request: Request, call_next):
@@ -230,10 +238,15 @@ async def status_page() -> HTMLResponse:
                     "ts_ms": obs_ms,
                     "device": d.get("name") or d["mac"],
                 }
+        # Public page: mask the MAC to its last 2 bytes and DON'T publish the
+        # operator's free-text location label (it can name a home). Device
+        # name + counts + freshness stay — enough to eyeball "the deploy is
+        # alive and ingesting" without disclosing who/where.
+        raw_mac = d["mac"]
+        masked_mac = ("··:" * 4 + raw_mac[-5:]) if len(raw_mac) >= 5 else "··"
         rows.append({
-            "name": d.get("name") or d["mac"],
-            "location": d.get("location") or "—",
-            "mac": d["mac"],
+            "name": d.get("name") or masked_mac,
+            "mac": masked_mac,
             "count": n,
             "last_seen": last_seen_label,
             "last_seen_class": last_seen_class,
@@ -261,11 +274,11 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     # doesn't need escaping.
     def esc(s: object) -> str: return _html.escape(str(s), quote=True)
     rows_html = "\n".join(
-        f'<tr><td>{esc(r["name"])}</td><td class="muted">{esc(r["location"])}</td>'
+        f'<tr><td>{esc(r["name"])}</td>'
         f'<td class="mono">{esc(r["mac"])}</td><td class="num">{r["count"]:,}</td>'
         f'<td class="age {r["last_seen_class"]}">{esc(r["last_seen"])}</td></tr>'
         for r in rows
-    ) or '<tr><td colspan="5" class="muted">No devices yet — waiting for first poll.</td></tr>'
+    ) or '<tr><td colspan="4" class="muted">No devices yet — waiting for first poll.</td></tr>'
     days = int(uptime_s // 86400)
     hours = int((uptime_s % 86400) // 3600)
     mins = int((uptime_s % 3600) // 60)
@@ -362,7 +375,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
       <div class="stat"><div class="k">Latest temp</div><div class="v">{temp_val_html}</div>{temp_sub_html}</div>
     </div>
     <table>
-      <thead><tr><th>Device</th><th>Location</th><th>MAC</th><th>Rows</th><th>Last seen</th></tr></thead>
+      <thead><tr><th>Device</th><th>MAC</th><th>Rows</th><th>Last seen</th></tr></thead>
       <tbody>
         {rows_html}
       </tbody>
@@ -742,22 +755,29 @@ async def get_summary(
 
 from typing import Any  # noqa: E402
 
-@app.get("/api/captures/{slug}", dependencies=[Depends(require_token)])
+@app.get("/api/captures/{slug}", dependencies=[Depends(require_write_token)])
 async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSONResponse:
-    """Read recent capture-endpoint hits for a slug. Token-gated so random
-    folks on the internet can't enumerate someone else's traffic."""
+    """Read recent capture-endpoint hits for a slug. Gated on the PRIMARY
+    api_token only (require_write_token) — the read-only reviewer/demo token
+    must NOT be able to read raw captured request bodies/headers, which can
+    contain other sources' secrets. Random folks on the internet can't
+    enumerate someone else's traffic either."""
     from .capture import _log_path
     path = _log_path(slug)
     if not path.exists():
         return JSONResponse({"slug": slug, "rows": []})
     import json as _json
+    from collections import deque
+    # Read only the requested tail into memory (bounded by `tail`, not the
+    # whole file) so a large append-only capture log can't be turned into a
+    # memory-exhaustion read.
     with path.open("r", encoding="utf-8") as f:
-        lines = f.readlines()
+        last_lines = deque(f, maxlen=tail)
     # Tolerate corrupt/partial JSONL — older log lines from a crashed
     # write can have a truncated trailing line. Skip rather than 500.
     rows: list[dict] = []
     skipped = 0
-    for line in lines[-tail:]:
+    for line in last_lines:
         try: rows.append(_json.loads(line))
         except _json.JSONDecodeError: skipped += 1
     out: dict[str, Any] = {"slug": slug, "count": len(rows), "rows": rows}

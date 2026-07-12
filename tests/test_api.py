@@ -221,6 +221,51 @@ def test_captures_tolerates_malformed_jsonl(client, temp_env):
     assert body.get("skipped_malformed") == 1
 
 
+def test_captures_reject_reviewer_token(client, temp_env):
+    """The read-only reviewer/demo token must NOT be able to read raw
+    captured request bodies + headers (they can carry other sources'
+    secrets). Only the primary api_token may."""
+    client.post("/ingest/capture/reviewer-test",
+                headers={"Authorization": "Bearer test-capture-token"},
+                data="secret-body")
+    # reviewer token → rejected
+    r = client.get("/api/captures/reviewer-test",
+                   headers={"Authorization": "Bearer test-reviewer-token"})
+    assert r.status_code == 401
+    # primary api token → allowed
+    r = client.get("/api/captures/reviewer-test",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+
+
+def test_oversize_content_length_rejected(client):
+    """A Content-Length above the global cap is rejected with 413 before the
+    body is read (unauthenticated memory-exhaustion guard)."""
+    r = client.post(
+        "/ingest/custom",
+        headers={"Authorization": "Bearer test-ingest-token",
+                 "Content-Type": "application/json",
+                 "Content-Length": str(5 * 1024 * 1024)},
+        content=b'{"device":{"id":"AABBCCDDEEFF"}}',
+    )
+    assert r.status_code == 413
+
+
+def test_oversize_streamed_body_bounded(client):
+    """A large body with no oversized Content-Length still can't sail
+    through — the route rejects it (bounded-memory guard did its job)."""
+    big = b'{"junk":"' + b'x' * (2 * 1024 * 1024) + b'"}'
+    r = client.post(
+        "/ingest/custom",
+        headers={"Authorization": "Bearer test-ingest-token",
+                 "Content-Type": "application/json"},
+        content=big,
+    )
+    # 413 (our cap) or 400 (route's own size/JSON guard on the truncated
+    # body) — never a 200, never an OOM.
+    assert r.status_code in (400, 413)
+
+
 # ─────────────────── discoveries (long-tail RF survey) ───────────────────
 
 def test_discovery_upsert_dedupes_by_model_id(client):
@@ -512,11 +557,14 @@ def test_status_escapes_device_name(client):
     assert r.status_code == 200
 
     page = client.get("/status").text
-    # Raw payload must NOT appear; the escaped form must.
+    # Device name still renders (escaped) — raw payload must NOT appear.
     assert "<script>alert(1)</script>" not in page
-    assert "<img src=x onerror=" not in page
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page
-    assert "&lt;img src=x onerror=alert(2)&gt;" in page
+    # Location label is no longer published on the public status page (it can
+    # name a home) — it must not appear in ANY form, raw or escaped.
+    assert "<img src=x onerror=" not in page
+    assert "&lt;img src=x onerror=alert(2)&gt;" not in page
+    assert "onerror" not in page
 
 
 # ───────────────────────── alert preferences API ─────────────────────────

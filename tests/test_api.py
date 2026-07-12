@@ -760,6 +760,19 @@ def test_push_register_roundtrip(client):
 def test_push_register_requires_token(client):
     assert client.post("/api/push/register", json={"token": "abcd1234efgh"}).status_code == 401
 
+def test_push_register_android_platform(client):
+    """Android app registers an FCM token with platform=android; stored + listed."""
+    import asyncio
+    from app import db, fcm
+    H = {"Authorization": "Bearer test-api-token"}
+    assert client.post("/api/push/register", headers=H,
+                       json={"token": "fcm-token-abcdef123456", "platform": "android"}).json()["ok"] is True
+    toks = asyncio.get_event_loop().run_until_complete(db.list_push_tokens())
+    row = next(t for t in toks if t["token"] == "fcm-token-abcdef123456")
+    assert row["platform"] == "android"
+    # FCM is unconfigured in tests → configured() is False (no-op path), no crash.
+    assert fcm.fcm_configured() is False
+
 def test_alert_rules_crud(client):
     H = {"Authorization": "Bearer test-api-token"}
     r = client.post("/api/alerts/rules", headers=H,

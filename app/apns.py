@@ -126,33 +126,55 @@ async def effective_relay() -> tuple[str | None, str | None]:
 
 
 async def push_configured() -> bool:
-    """True if push can deliver — a local APNs key OR a resolved relay."""
+    """True if push can deliver — a local APNs key OR a resolved relay OR FCM."""
     if settings.apns_configured:
+        return True
+    from . import fcm
+    if fcm.fcm_configured():
         return True
     url, token = await effective_relay()
     return bool(url and token)
 
 
 async def send_to_all(title: str, body: str) -> dict:
-    """Push to every registered token. Prefers a local APNs key (most direct);
-    falls back to a hosted relay if one is configured (env or app-managed).
-    Prunes dead tokens. No-op if neither push path is configured."""
+    """Push to every registered token, split by platform:
+      * iOS tokens → local APNs key (preferred) or the hosted relay.
+      * Android tokens → FCM (HTTP v1).
+    Prunes dead tokens from whichever path reports them. No-op per platform
+    when that platform's push isn't configured."""
+    from . import fcm
     own = settings.apns_configured
     relay_url, relay_token = await effective_relay()
     relay = bool(relay_url and relay_token)
-    if not (own or relay):
-        return {"sent": 0, "skipped": "apns not configured"}
+    fcm_on = fcm.fcm_configured()
+
     tokens = await db.list_push_tokens()
     if not tokens:
         return {"sent": 0, "pruned": 0, "total": 0}
-    if own:
-        res = await _push_tokens(tokens, title, body)
-    else:
-        res = await _push_via_relay([t["token"] for t in tokens], title, body,
-                                    relay_url, relay_token)  # type: ignore[arg-type]
-    pruned = 0
-    for tok in res.get("dead", []):
+    ios = [t for t in tokens if (t.get("platform") or "ios") != "android"]
+    android = [t for t in tokens if t.get("platform") == "android"]
+
+    sent = failed = pruned = 0
+    dead: list[str] = []
+
+    # iOS
+    if ios and (own or relay):
+        res = (await _push_tokens(ios, title, body)) if own else \
+            await _push_via_relay([t["token"] for t in ios], title, body,
+                                  relay_url, relay_token)  # type: ignore[arg-type]
+        sent += res.get("sent", 0); failed += res.get("failed", 0)
+        dead += res.get("dead", [])
+
+    # Android
+    if android and fcm_on:
+        res = await fcm.push_tokens_fcm([t["token"] for t in android], title, body)
+        sent += res.get("sent", 0); failed += res.get("failed", 0)
+        dead += res.get("dead", [])
+
+    for tok in dead:
         await db.remove_push_token(tok)
         pruned += 1
-    return {"sent": res.get("sent", 0), "pruned": pruned,
-            "failed": res.get("failed", 0), "total": len(tokens)}
+
+    if sent == 0 and failed == 0 and pruned == 0:
+        return {"sent": 0, "skipped": "no push channel for the registered tokens"}
+    return {"sent": sent, "pruned": pruned, "failed": failed, "total": len(tokens)}

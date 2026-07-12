@@ -15,7 +15,9 @@ working when vendors change their minds.
 you have and what you want, then prints a tailored, difficulty-tagged
 checklist — which LilyGO board(s) to buy, the exact commands to run, and a
 ready-to-paste `setup-fly.sh` one-liner. It runs entirely in your browser
-(no login, nothing stored on a server).
+(no login, nothing stored on a server). It also has a **device finder** —
+search your station by brand/model (AcuRite, LaCrosse, Oregon Scientific,
+Ecowitt, Davis, …) to see how it's supported and what to buy.
 
 If you want LLM-assisted setup (Claude Code, Cursor, Aider, etc.), read
 **[AGENTS.md](AGENTS.md)** — the same setup story written for an AI agent.
@@ -29,8 +31,15 @@ as separate device rows in the iOS app.
 |---|---|---|---|
 | **A. AmbientWeather cloud** | An AmbientWeather-registered station (WS-2000, WS-2902, etc.) | 60s cadence | Easiest if you already have one. Cloud-only — at the mercy of AWN's API. |
 | **B. Davis WeatherLink cloud** | Davis Vantage Vue / Pro 2 + WeatherLink Console (any) | 1–5 min cadence (subscription-tier dependent) | Davis VP2 + 6313 Console works only via cloud — the new console doesn't broadcast in the legacy unencrypted protocol. |
-| **C. LilyGO 433 MHz** | LilyGO T3 LoRa32 V1.6.1 board (~$25), AcuRite Atlas | ~16s real-time | Captures AcuRite Atlas via RTL433-style decode on ESP32. |
-| **D. LilyGO 915 MHz** | Second LilyGO board, Fine Offset / AmbientWeather WS-2000 outdoor + WH32B indoor | ~16s real-time | Captures Fineoffset family (FSK). Merges WH32B indoor data into the outdoor station's tile grid. |
+| **C. LilyGO 433 MHz** | LilyGO T3 LoRa32 V1.6.1 board (~$20), AcuRite Atlas — or any 433 MHz OOK station via **discovery mode** | ~16s real-time | Captures AcuRite Atlas first-class; `forward_all=1` additionally posts any decoded 433 MHz weather station (LaCrosse, Oregon Scientific, AcuRite towers/5-in-1, Auriol, TFA, … ~180 protocols). |
+| **D. LilyGO 915 MHz** | Second LilyGO board, Fine Offset / AmbientWeather WS-2000 outdoor + WH32B indoor — or other 915 MHz FSK stations via **discovery mode** | ~16s real-time | Captures Fineoffset family (FSK) first-class; merges WH32B indoor data into the outdoor station's tile grid. |
+
+Board to buy for C/D: **LilyGO T3 LoRa32 V1.6.1** from the
+[official LilyGO store](https://lilygo.cc/products/lora3) — variant
+**"LILYGO 433MHz [Q134]"** for path C, **"Paxcounter 915MHz [Q211]"** for
+path D. (Not an affiliate link; buy anywhere — just match the model and
+frequency. The firmware it ships with doesn't matter, you'll flash this
+repo's.)
 
 Two deployment modes for the backend itself:
 
@@ -183,6 +192,37 @@ curl -X POST "http://zasder-lilygo-1234.local/provision" \
 
 Data starts flowing in within seconds. `--data-urlencode` is safer than
 plain `-d` because tokens and URLs can contain characters `-d` would mangle.
+
+### Discovery mode — stations beyond Atlas/Fineoffset
+
+Out of the box a board posts only the first-class models (Atlas on 433,
+Fineoffset family on 915) and drops everything else it decodes. Flip on
+**discovery mode** to forward *any* decoded weather station — the firmware
+bundles the full rtl_433 decoder set (~180 protocols at 433 MHz OOK:
+LaCrosse, Oregon Scientific, AcuRite 5-in-1/towers/986, Ambient F007TH,
+Auriol, TFA, Nexus/Prologue, …):
+
+```sh
+curl -X POST "http://zasder-lilygo-1234.local/provision" \
+  --data-urlencode "forward_all=1"     # add current_token=... once provisioned
+```
+
+- Each discovered station shows up as its own device row named
+  `<Model> <id>` (e.g. `LaCrosse-TX141THBv2 3404534`) — hide any
+  neighbors' sensors you don't want in the iOS app.
+- Non-weather transmissions (garage doors, TPMS, smoke detectors) are
+  filtered out automatically — only packets carrying temp/humidity/wind/
+  rain/UV/pressure fields are forwarded.
+- Turn it back off with `forward_all=0`; the flag persists across reboots
+  and shows in `GET /status`.
+- New hardware support arrives with rtl_433 itself — e.g. the AcuRite
+  Optimus will flow through as soon as
+  [merbanan/rtl_433#3444](https://github.com/merbanan/rtl_433/issues/3444)
+  lands a decoder, no firmware change needed here.
+
+Search your exact station in the
+[planner's device finder](https://zasder.com/weather-helper) to see which
+band/board it needs.
 
 ## Path E — Davis WeatherLink LIVE (LAN, local poller)
 

@@ -97,8 +97,29 @@ backend's environment. The board immediately starts POSTing
 observations every time it decodes a packet.
 
 The status page at `http://<board>/status` returns JSON: IP, uptime,
-packet counts, last-RX info, last-POST result. The status page also
-ships a browser-friendly form at `/` for non-curl users.
+packet counts, last-RX info, last-POST result, and the `forward_all`
+flag. The status page also ships a browser-friendly form at `/` for
+non-curl users.
+
+### Discovery mode (`forward_all`)
+
+By default the firmware posts only the first-class models (AcuRite Atlas
+on 433; Fineoffset WH24/WH65B/WS80 + WH32B merge on 915) and drops every
+other decode. The full rtl_433 decoder set is compiled in, so an opt-in
+flag forwards *any* decoded station that carries weather-shaped fields
+(temp / humidity / wind / rain / UV / lux / pressure):
+
+```sh
+curl -X POST http://<board>/provision \
+  -H "Authorization: Bearer $CURRENT_INGEST_TOKEN" \
+  --data-urlencode "forward_all=1"      # forward_all=0 to turn back off
+```
+
+Discovered stations post under synthetic MAC prefix `5D:5D:0A:*` (a hash
+of the rtl_433 model name folded into the sensor id) and are named
+`<Model> <id>` so multiple finds are tellable-apart. Non-weather
+transmissions (garage doors, TPMS, …) are filtered by field shape. The
+flag persists in NVS across reboots.
 
 ### Re-provisioning
 

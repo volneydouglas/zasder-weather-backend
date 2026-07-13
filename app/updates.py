@@ -95,20 +95,37 @@ class UpdateChecker:
             await asyncio.sleep(_CHECK_INTERVAL_S if ok else _RETRY_ON_FAIL_S)
 
     async def _check_once(self) -> bool:
-        url = f"https://api.github.com/repos/{_repo()}/releases/latest"
+        # Resolve the latest release WITHOUT the GitHub REST API: request
+        # github.com/<repo>/releases/latest and read the redirect to
+        # .../releases/tag/v<X.Y.Z>. The REST API (api.github.com) rate-limits
+        # unauthenticated calls to 60/hr PER IP, and cloud hosts like Fly share
+        # egress IPs across many tenants, so the API returns 403. The web
+        # redirect isn't subject to that limit and needs no token — so the
+        # zero-config self-hoster experience works from any host.
+        url = f"https://github.com/{_repo()}/releases/latest"
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
                 resp = await client.get(url, headers={
-                    "Accept": "application/vnd.github+json",
                     "User-Agent": f"zasder-weather/{__version__}",
                 })
         except Exception as e:  # noqa: BLE001 — never let a check break serving
             log.info("update check failed (network): %s", e)
             return False
-        if resp.status_code != 200:
+        # 3xx → Location has the tag; a 200 means we already landed on it.
+        location = resp.headers.get("location", "") or str(resp.url)
+        if resp.status_code not in (200, 301, 302, 303, 307, 308):
             log.info("update check: GitHub HTTP %s", resp.status_code)
             return False
-        tag = (resp.json() or {}).get("tag_name") or ""
+        if "/releases/tag/" not in location:
+            # No releases yet (redirects to /releases) — not an error.
+            log.info("update check: no release tag found")
+            self.app.state.update_info = {
+                "version": __version__, "latest": None,
+                "update_available": False,
+                "checked_ms": int(time.time() * 1000), "enabled": True,
+            }
+            return True
+        tag = location.rsplit("/releases/tag/", 1)[-1].strip("/")
         latest = tag.lstrip("vV") or None
         self.app.state.update_info = {
             "version": __version__,

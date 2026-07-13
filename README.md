@@ -1,5 +1,8 @@
 # Zasder Weather (backend)
 
+[![Release](https://img.shields.io/github/v/release/volneydouglas/zasder-weather-backend?label=release)](https://github.com/volneydouglas/zasder-weather-backend/releases)
+[![Changelog](https://img.shields.io/badge/changelog-md-blue)](CHANGELOG.md)
+
 Self-hosted weather-station backend. Pulls data from any combination of
 **AmbientWeather cloud**, **Davis WeatherLink cloud**, or direct **433/915 MHz
 RF capture** (LilyGO ESP32+SX1276), stores it in SQLite, and exposes a small
@@ -330,6 +333,35 @@ ways to enable it:
   needed on your side.
 
 See `.env.example` for both blocks. Leave all of it unset to use email only.
+
+## Upgrading
+
+The backend checks GitHub once a day and shows an **"update available"** banner
+on the status page (and at `GET /api/version`) when a newer release exists.
+Disable with `UPDATE_CHECK=0`. See [CHANGELOG.md](CHANGELOG.md) for what changed.
+
+To upgrade, from the repo directory:
+
+```sh
+./bin/upgrade.sh          # auto-detects Fly.io or Docker
+```
+
+Or by hand:
+
+```sh
+# Fly.io
+git pull && fly deploy
+
+# Docker (published image — no local rebuild)
+git pull && docker compose pull && docker compose up -d
+```
+
+The SQLite schema **auto-migrates on boot** (idempotent `CREATE TABLE IF NOT
+EXISTS` + `ALTER`), and your `/data` volume is never touched — upgrades are
+safe and reversible (pin an older tag to roll back). Docker users pull the
+published image from
+`ghcr.io/volneydouglas/zasder-weather-backend` (pin a version by replacing
+`:latest` with e.g. `:1.0.0` in `docker-compose.yml`).
 
 ## What's in this repo
 

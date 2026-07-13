@@ -399,3 +399,24 @@ def test_derive_hourly_rain_clamps_counter_reset():
     ]
     _db._derive_hourly_rain(rows)
     assert rows[1]["hourlyrainin"] == 0.0
+
+
+# ── update checker version compare (app/updates.py) ──
+from app import updates as _updates  # noqa: E402
+
+
+def test_parse_version_variants():
+    assert _updates.parse_version("v1.2.3") == (1, 2, 3)
+    assert _updates.parse_version("1.2.3") == (1, 2, 3)
+    assert _updates.parse_version("1.2.3-rc1") == (1, 2, 3)
+    assert _updates.parse_version("2.0") == (2, 0)
+    assert _updates.parse_version("garbage") == (0,)
+
+
+def test_is_newer():
+    assert _updates.is_newer("1.1.0", "1.0.0") is True
+    assert _updates.is_newer("1.0.1", "1.0.0") is True
+    assert _updates.is_newer("2.0.0", "1.9.9") is True
+    assert _updates.is_newer("1.0.0", "1.0.0") is False
+    assert _updates.is_newer("0.9.0", "1.0.0") is False
+    assert _updates.is_newer("v1.2.0", "1.1.0") is True

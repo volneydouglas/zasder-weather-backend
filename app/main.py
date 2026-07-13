@@ -15,6 +15,8 @@ from pathlib import Path
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .limits import BodySizeLimitMiddleware
+from .updates import UpdateChecker
+from .version import __version__
 
 from . import db
 from .alerts import AlertMonitor
@@ -84,6 +86,11 @@ async def lifespan(app: FastAPI):
     app.state.alert_monitor = alert_monitor
     log.info("staleness alert monitor started (active once alerts are configured)")
 
+    # Daily "is there a newer release?" check → status-page banner + /api/version.
+    update_checker = UpdateChecker(app)
+    update_checker.start()
+    app.state.update_checker = update_checker
+
     try:
         yield
     finally:
@@ -92,6 +99,7 @@ async def lifespan(app: FastAPI):
         if wl_poller is not None: await wl_poller.stop()
         if wl_client is not None: await wl_client.aclose()
         if alert_monitor is not None: await alert_monitor.stop()
+        await update_checker.stop()
 
 
 # /docs, /redoc, /openapi.json are exposed by default in FastAPI and
@@ -200,7 +208,20 @@ def _is_reviewer(authorization: str | None) -> bool:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": __version__}
+
+
+@app.get("/api/version")
+async def api_version() -> JSONResponse:
+    """Running version + (if the daily check has run) the latest published
+    release and whether an update is available. Open — version info is not a
+    secret in an open-source project, and the app / monitoring read it to
+    surface an update hint. See app/updates.py (opt-out with UPDATE_CHECK=0)."""
+    info = getattr(app.state, "update_info", {"version": __version__,
+                                              "latest": None,
+                                              "update_available": False,
+                                              "checked_ms": None, "enabled": False})
+    return JSONResponse(info)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -253,7 +274,8 @@ async def status_page() -> HTMLResponse:
         })
 
     uptime = time.time() - getattr(app.state, "started_at", time.time())
-    return HTMLResponse(_render_status_html(rows, total_obs, uptime, latest_temp, now_ms))
+    update_info = getattr(app.state, "update_info", None)
+    return HTMLResponse(_render_status_html(rows, total_obs, uptime, latest_temp, now_ms, update_info))
 
 
 def _humanize_age(seconds: float) -> str:
@@ -265,8 +287,22 @@ def _humanize_age(seconds: float) -> str:
 
 def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
                         latest_temp: dict | None = None,
-                        now_ms: int | None = None) -> str:
+                        now_ms: int | None = None,
+                        update_info: dict | None = None) -> str:
     started = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    # Version line + "update available" banner (from the daily GitHub check).
+    ui = update_info or {}
+    _repo_url = "https://github.com/volneydouglas/zasder-weather-backend"
+    version_html = f'<span class="ver">v{__version__}</span>'
+    update_banner = ""
+    if ui.get("update_available") and ui.get("latest"):
+        update_banner = (
+            f'<div class="update-banner">⬆ Update available: '
+            f'<strong>v{_html.escape(str(ui["latest"]))}</strong> '
+            f'(you have v{__version__}) — '
+            f'<a href="{_repo_url}/releases" target="_blank" rel="noopener">'
+            f'what\'s new →</a></div>'
+        )
     # Escape every operator/source-supplied value before interpolating.
     # device.name and device.location flow in through /ingest/custom from
     # whoever is running the relay; the page is public so we can't trust them.
@@ -307,6 +343,12 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     h1 {{ font-size: 18px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.2px; }}
     .sub {{ font-size: 12px; color: rgba(255,255,255,0.55); margin-bottom: 24px; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 24px; }}
+    .ver {{ font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.4);
+            vertical-align: middle; margin-left: 6px; }}
+    .update-banner {{ margin: 14px 0 0; padding: 10px 14px; border-radius: 8px;
+            background: rgba(212,168,83,0.14); border: 1px solid rgba(212,168,83,0.4);
+            color: #e6c56a; font-size: 13px; }}
+    .update-banner a {{ color: #e6c56a; font-weight: 700; }}
     .stat {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
               border-radius: 10px; padding: 12px; }}
     .stat .k {{ font-size: 9px; font-weight: 800; letter-spacing: 1.2px;
@@ -350,8 +392,9 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
 </head>
 <body>
   <div class="wrap">
-    <h1>Zasder Weather</h1>
+    <h1>Zasder Weather {version_html}</h1>
     <div class="sub">Read-only status — no auth required. The iOS app reads protected endpoints under <code>/api</code>.</div>
+    {update_banner}
     <div class="hero">
       <div class="hero-shots">
         <div class="hero-shot">

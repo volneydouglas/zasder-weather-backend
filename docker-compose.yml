@@ -1,5 +1,10 @@
 services:
   zasder-weather:
+    # Prefer the published image so upgrades are `docker compose pull && up -d`
+    # (no local rebuild). `build: .` stays as a fallback — run
+    # `docker compose build` to build from source instead. Pin a version by
+    # replacing `:latest` with e.g. `:1.0.0`.
+    image: ghcr.io/volneydouglas/zasder-weather-backend:latest
     build: .
     container_name: zasder-weather
     restart: unless-stopped

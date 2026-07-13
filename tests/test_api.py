@@ -11,9 +11,10 @@ import json
 # ───────────────────────── liveness + read auth ─────────────────────────
 
 def test_healthz_open(client):
+    from app.version import __version__
     r = client.get("/healthz")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok"}
+    assert r.json() == {"status": "ok", "version": __version__}
 
 def test_devices_requires_bearer(client):
     assert client.get("/api/devices").status_code == 401
@@ -1032,3 +1033,19 @@ def test_primary_token_still_can_write(client):
     assert client.patch(f"/api/alerts/rules/{rid}", headers=WRITER,
                         json={"enabled": False}).status_code == 200
     assert client.delete(f"/api/alerts/rules/{rid}", headers=WRITER).status_code == 200
+
+
+def test_healthz_reports_version(client):
+    from app.version import __version__
+    j = client.get("/healthz").json()
+    assert j["status"] == "ok"
+    assert j["version"] == __version__
+
+
+def test_api_version_open_and_shaped(client):
+    from app.version import __version__
+    r = client.get("/api/version")  # open, no auth
+    assert r.status_code == 200
+    j = r.json()
+    assert j["version"] == __version__
+    assert "update_available" in j and "latest" in j and "enabled" in j

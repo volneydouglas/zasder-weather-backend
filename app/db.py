@@ -712,6 +712,47 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
     return out
 
 
+def _derive_hourly_rain(rows: list[dict[str, Any]]) -> None:
+    """Fill `hourlyrainin` for chart rows that don't have it.
+
+    SDR / LilyGO sources only post the cumulative `yearlyrainin` counter, so
+    the stored `hourlyrainin` column is NULL for those stations and the rain
+    chart shows a flat zero even when it rained (the /current endpoint derives
+    rain for the dashboard tile, but historical rows were never enriched — so
+    the chart missed it). Here we reconstruct a trailing-1-hour rainfall series
+    from the yearlyrainin delta: for each point at time t,
+        hourlyrainin(t) = max(0, yearly(t) − yearly(at or before t − 1h)).
+    Two-pointer over time-ordered rows, O(n). Rows that already carry a real
+    hourlyrainin (e.g. AmbientWeather) are left untouched. Negative deltas
+    (counter reset / rain-offset recalibration) clamp to 0.
+    """
+    HOUR_MS = 3_600_000
+    j = 0
+    for r in rows:
+        if r.get("hourlyrainin") is not None:
+            continue
+        yr = r.get("yearlyrainin")
+        t = r.get("dateutc")
+        if yr is None or t is None:
+            continue
+        while j + 1 < len(rows) and (rows[j + 1].get("dateutc") or 0) <= t - HOUR_MS:
+            j += 1
+        # reference = cumulative yearly at/just-before (t − 1h); fall back to the
+        # earliest row when the window doesn't reach back a full hour.
+        ref_row = rows[j] if (rows[j].get("dateutc") or 0) <= t - HOUR_MS else rows[0]
+        ref = ref_row.get("yearlyrainin")
+        if ref is None:
+            continue
+        val = round(max(0.0, float(yr) - float(ref)), 3)
+        r["hourlyrainin"] = val
+        # Rain has no meaningful hi/lo band; flatten it to the derived value so
+        # the chart's band renders as the line rather than a stale zero.
+        if "hourlyrainin_min" in r:
+            r["hourlyrainin_min"] = val
+        if "hourlyrainin_max" in r:
+            r["hourlyrainin_max"] = val
+
+
 def _auto_bucket_ms(window_ms: int) -> int:
     """Pick a bucket size so a chart of `window_ms` returns a tractable
     number of points (~200-2000) without being capped by a row LIMIT.
@@ -756,7 +797,9 @@ async def history(
                 """,
                 (mac, start_ms, end_ms, limit),
             )).fetchall()
-        return [json.loads(r["data_json"]) for r in rows]
+        parsed = [json.loads(r["data_json"]) for r in rows]
+        _derive_hourly_rain(parsed)
+        return parsed
 
     # Bucketed: GROUP BY (dateutc_ms / bucket_ms), AVG every numeric column.
     # bucket_ms is computed by us (not user input) so f-string interpolation
@@ -782,7 +825,7 @@ async def history(
           AVG(windspeedmph)   AS windspeedmph,
           AVG(winddir)        AS winddir,
           AVG(hourlyrainin)   AS hourlyrainin,
-          AVG(yearlyrainin)   AS yearlyrainin,
+          MAX(yearlyrainin)   AS yearlyrainin,
           AVG(uv)             AS uv,
           AVG(solarradiation) AS solarradiation,
           MIN(tempf)          AS tempf_min,
@@ -810,7 +853,9 @@ async def history(
     async with connect() as db:
         rows = await (await db.execute(sql,
             (mac, start_ms, end_ms, limit))).fetchall()
-    return [dict(r) for r in rows]
+    bucketed = [dict(r) for r in rows]
+    _derive_hourly_rain(bucketed)
+    return bucketed
 
 
 async def upsert_discovery(model: str, sensor_id: str,

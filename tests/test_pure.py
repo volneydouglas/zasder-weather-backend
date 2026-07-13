@@ -358,3 +358,44 @@ def test_build_threshold_message():
     title, body = alerts.build_threshold_message("Crestview", "tempf", 102.3, "above", 100)
     assert "Crestview" in title and "Temperature" in title
     assert "102.3°F" in body and "> 100°F" in body
+
+
+# ── rain-chart derivation from cumulative yearlyrainin (db._derive_hourly_rain) ──
+from app import db as _db  # noqa: E402
+
+
+def test_derive_hourly_rain_from_yearly_bump():
+    """A 0.01" cumulative bump becomes a trailing-1h rainfall the chart can
+    show, for SDR sources that only post yearlyrainin (hourlyrainin=None)."""
+    H = 3_600_000
+    t0 = 1_700_000_000_000
+    rows = [
+        {"dateutc": t0 + 0 * H, "yearlyrainin": 0.73, "hourlyrainin": None},
+        {"dateutc": t0 + 1 * H, "yearlyrainin": 0.73, "hourlyrainin": None},
+        {"dateutc": t0 + 2 * H, "yearlyrainin": 0.74, "hourlyrainin": None},  # +0.01 fell
+        {"dateutc": t0 + 3 * H, "yearlyrainin": 0.74, "hourlyrainin": None},  # ages out next hr
+    ]
+    _db._derive_hourly_rain(rows)
+    assert rows[2]["hourlyrainin"] == 0.01   # rain shows during the event hour
+    assert rows[3]["hourlyrainin"] == 0.0    # trailing hour has moved past it
+    assert rows[0]["hourlyrainin"] == 0.0
+
+
+def test_derive_hourly_rain_preserves_real_values():
+    """Rows that already carry a real hourlyrainin (AmbientWeather) untouched."""
+    rows = [{"dateutc": 1_700_000_000_000, "yearlyrainin": 5.0, "hourlyrainin": 0.2}]
+    _db._derive_hourly_rain(rows)
+    assert rows[0]["hourlyrainin"] == 0.2
+
+
+def test_derive_hourly_rain_clamps_counter_reset():
+    """A yearlyrainin drop (year rollover / recalibration) clamps to 0, not
+    a negative rainfall."""
+    H = 3_600_000
+    t0 = 1_700_000_000_000
+    rows = [
+        {"dateutc": t0, "yearlyrainin": 9.0, "hourlyrainin": None},
+        {"dateutc": t0 + 2 * H, "yearlyrainin": 0.0, "hourlyrainin": None},  # reset
+    ]
+    _db._derive_hourly_rain(rows)
+    assert rows[1]["hourlyrainin"] == 0.0

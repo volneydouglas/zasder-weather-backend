@@ -317,22 +317,26 @@ so they fire even when the app is closed.
 
 ## Push notifications (optional)
 
-Alerts can also arrive as iOS push, not just email. Email needs no Apple
-account and is the simplest default — push is an optional upgrade with two
-ways to enable it:
+Alerts can also arrive as mobile push, not just email. Email needs no vendor
+account and is the simplest default — push is an optional upgrade:
 
-- **Your own APNs key** — if you build and ship your own iOS app under your
-  own Apple Developer account, set `APNS_KEY_ID` / `APNS_TEAM_ID` /
+- **iOS — your own APNs key** — if you build and ship your own iOS app under
+  your own Apple Developer account, set `APNS_KEY_ID` / `APNS_TEAM_ID` /
   `APNS_KEY_P8` / `APNS_TOPIC` / `APNS_ENV` (as secrets). The backend then
   signs and sends push directly to Apple.
-- **A hosted relay** — if you run the official Zasder Weather app with your
-  own backend, you can't hold Apple's key for that app. Instead this backend
-  forwards alerts to a relay that does: set `APNS_RELAY_URL` +
+- **iOS — a hosted relay** — if you run the official Zasder Weather app with
+  your own backend, you can't hold Apple's key for that app. Instead this
+  backend forwards alerts to a relay that does: set `APNS_RELAY_URL` +
   `APNS_RELAY_TOKEN`. Enable push in the app (Settings → Notifications) and it
   obtains the token and configures the backend for you — no Apple account
   needed on your side.
+- **Android — FCM** — if you build and ship your own Android app with your own
+  Firebase project, set `FCM_SERVICE_ACCOUNT_JSON` (the service-account key
+  JSON, as a secret; `project_id` is read from it). The backend delivers to
+  Android via FCM and iOS via APNs in parallel — the alert monitor splits by
+  each registered token's platform.
 
-See `.env.example` for both blocks. Leave all of it unset to use email only.
+See `.env.example` for the blocks. Leave all of it unset to use email only.
 
 ## Upgrading
 
@@ -388,7 +392,8 @@ calls these. Public-readable status page at `/`.
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/` | HTML status page (no auth) |
-| GET | `/healthz` | Liveness, no auth |
+| GET | `/healthz` | Liveness + running version, no auth |
+| GET | `/api/version` | Running version, latest release, and whether an update is available (no auth) |
 | GET | `/api/devices` | All devices + latest reading |
 | DELETE | `/api/devices/{mac}` | Remove a retired device + all its observations + alert state (token-gated) |
 | GET | `/api/devices/{mac}/current` | Composite latest-non-null per field |
@@ -399,7 +404,7 @@ calls these. Public-readable status page at `/`.
 | PUT | `/api/devices/{mac}/alert` | Per-device monitor toggle + threshold |
 | GET/POST/PATCH/DELETE | `/api/alerts/rules` | Threshold alert rules (e.g. tempf above 100), evaluated server-side; PATCH toggles `enabled` |
 | POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
-| POST | `/api/push/register` | Register an iOS APNs device token for push alerts |
+| POST | `/api/push/register` | Register a push token (iOS APNs or Android FCM — `platform` field) |
 | GET/PUT | `/api/push/relay` | App-managed relay config (URL + token); token write-only, never returned. PUT enforces `https://` + rejects private/loopback hosts |
 | POST | `/ingest/custom` | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
 | POST | `/ingest/discovery` | Source posts a `(model, id)` RF sighting |

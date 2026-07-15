@@ -56,3 +56,44 @@ async def test_history_returns_chronological(db_module):
     temps = [r.get("tempf") for r in rows]
     # history is ORDER BY dateutc_ms ASC
     assert temps == [71, 72, 73]
+
+
+@pytest.mark.asyncio
+async def test_rain_rollups_falls_back_to_monthly_when_yearly_broken(db_module):
+    """Regression: a Davis WeatherLink whose yearly counter reset while a stale
+    rain offset clamps it to ~0 (yearly < monthly) must still report weekly
+    rain — derived from the reliable monthly counter, not the broken yearly."""
+    from app import db
+    import time
+    await db.init_db()
+    mac = "5D:5D:05:00:00:01"
+    HOUR = 3_600_000
+    now = int(time.time() * 1000)
+    # Start-of-week ~4 days ago with monthly=0.0, then rain brought monthly to
+    # 0.14; yearly is stuck at 0.0 (broken) the whole time.
+    await db.insert_observations(mac, [
+        {"dateutc": now - 5 * 24 * HOUR, "yearlyrainin": 0.0, "monthlyrainin": 0.0, "dailyrainin": 0.0},
+        {"dateutc": now - 1 * 24 * HOUR, "yearlyrainin": 0.0, "monthlyrainin": 0.14, "dailyrainin": 0.14},
+        {"dateutc": now,                 "yearlyrainin": 0.0, "monthlyrainin": 0.14, "dailyrainin": 0.0},
+    ])
+    r = await db.rain_rollups(mac, "America/Phoenix")
+    assert r["monthly_in"] == 0.14           # direct from the monthly counter
+    assert r["weekly_in"] == 0.14            # derived from monthly, NOT the 0 yearly
+
+
+@pytest.mark.asyncio
+async def test_rain_rollups_uses_yearly_for_lifetime_counter(db_module):
+    """SDR/LilyGO sensors post only a monotonic lifetime yearly (no monthly);
+    the trusted yearly path is unchanged."""
+    from app import db
+    import time
+    await db.init_db()
+    mac = "5D:5D:01:00:02:C7"
+    HOUR = 3_600_000
+    now = int(time.time() * 1000)
+    await db.insert_observations(mac, [
+        {"dateutc": now - 5 * 24 * HOUR, "yearlyrainin": 0.73},
+        {"dateutc": now,                 "yearlyrainin": 0.74},
+    ])
+    r = await db.rain_rollups(mac, "America/Phoenix")
+    assert r["weekly_in"] == 0.01            # 0.74 - 0.73 via the yearly counter

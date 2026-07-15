@@ -914,34 +914,35 @@ async def list_discoveries(since_ms: int | None = None,
     return out
 
 
-async def yearly_rain_at_or_before(mac: str, cutoff_ms: int) -> float | None:
-    """Most recent yearlyrainin value for `mac` at or before `cutoff_ms`.
-    Falls back to the earliest yearlyrainin we have on file if no row sits
-    before the cutoff — so a freshly-deployed SDR sensor still gets sensible
-    daily/weekly/monthly rollups (treated as "rain since start of monitoring"
-    until our data span covers the full period). Returns None only if the
-    device has zero yearlyrainin observations at all."""
+async def _rain_col_at_or_before(mac: str, col: str, cutoff_ms: int) -> float | None:
+    """Most recent value of a cumulative rain column at or before `cutoff_ms`.
+    Falls back to the earliest value on file if no row sits before the cutoff
+    (so a freshly-deployed sensor still gets sensible rollups). Returns None
+    only if the device has zero non-null values for the column.
+
+    `col` is an INTERNAL whitelisted column name (never user input), so the
+    f-string interpolation is safe."""
+    assert col in ("yearlyrainin", "monthlyrainin"), f"bad rain col: {col}"
     async with connect() as db:
         row = await (await db.execute(
-            """
-            SELECT yearlyrainin FROM observations
-            WHERE mac = ? AND dateutc_ms <= ? AND yearlyrainin IS NOT NULL
-            ORDER BY dateutc_ms DESC LIMIT 1
-            """,
+            f"SELECT {col} AS v FROM observations "
+            f"WHERE mac = ? AND dateutc_ms <= ? AND {col} IS NOT NULL "
+            f"ORDER BY dateutc_ms DESC LIMIT 1",
             (mac, cutoff_ms),
         )).fetchone()
         if row:
-            return row["yearlyrainin"]
-        # Fallback — first-ever value for the device.
+            return row["v"]
         row = await (await db.execute(
-            """
-            SELECT yearlyrainin FROM observations
-            WHERE mac = ? AND yearlyrainin IS NOT NULL
-            ORDER BY dateutc_ms ASC LIMIT 1
-            """,
+            f"SELECT {col} AS v FROM observations "
+            f"WHERE mac = ? AND {col} IS NOT NULL ORDER BY dateutc_ms ASC LIMIT 1",
             (mac,),
         )).fetchone()
-    return row["yearlyrainin"] if row else None
+    return row["v"] if row else None
+
+
+async def yearly_rain_at_or_before(mac: str, cutoff_ms: int) -> float | None:
+    """Most recent yearlyrainin at or before `cutoff_ms` (see _rain_col_at_or_before)."""
+    return await _rain_col_at_or_before(mac, "yearlyrainin", cutoff_ms)
 
 
 async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None]:
@@ -958,14 +959,17 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
         tz = ZoneInfo("UTC")
     async with connect() as db:
         row = await (await db.execute(
-            "SELECT yearlyrainin FROM observations WHERE mac = ? "
-            "AND yearlyrainin IS NOT NULL ORDER BY dateutc_ms DESC LIMIT 1",
+            "SELECT yearlyrainin, monthlyrainin FROM observations WHERE mac = ? "
+            "AND (yearlyrainin IS NOT NULL OR monthlyrainin IS NOT NULL) "
+            "ORDER BY dateutc_ms DESC LIMIT 1",
             (mac,),
         )).fetchone()
-    if not row or row["yearlyrainin"] is None:
+    if not row:
         return {"hourly_in": None, "daily_in": None,
                 "weekly_in": None, "monthly_in": None}
-    current = float(row["yearlyrainin"])
+    cur_year = None if row["yearlyrainin"] is None else float(row["yearlyrainin"])
+    cur_month = None if row["monthlyrainin"] is None else float(row["monthlyrainin"])
+
     now_local = datetime.now(tz=tz)
     top_of_hour    = now_local.replace(minute=0, second=0, microsecond=0)
     start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -973,15 +977,58 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
     # Mon=0..Sun=6 → days since Sunday = (weekday + 1) % 7.
     start_of_week  = start_of_today - timedelta(days=(now_local.weekday() + 1) % 7)
     start_of_month = start_of_today.replace(day=1)
+    start_of_month_ms = int(start_of_month.timestamp() * 1000)
+
+    # Is the yearly counter trustworthy? The year contains the month, so a
+    # correct yearlyrainin is always >= monthlyrainin. A yearly that's BELOW
+    # the monthly (e.g. a Davis WeatherLink annual reset while a stale rain
+    # offset clamps it to ~0) is broken — differencing it silently yields 0
+    # for daily/weekly. When that happens, derive from the MONTHLY counter
+    # (reliable, resets predictably at month start) instead. SDR/LilyGO
+    # sensors post only the (lifetime, monotonic) yearly and no monthly, so
+    # cur_month is None there and the trusted yearly path is unchanged.
+    yearly_ok = cur_year is not None and (cur_month is None or cur_year + 1e-6 >= cur_month)
+
     out: dict[str, float | None] = {}
     for name, boundary in (("hourly_in", top_of_hour),
                             ("daily_in", start_of_today),
                             ("weekly_in", start_of_week),
                             ("monthly_in", start_of_month)):
         boundary_ms = int(boundary.timestamp() * 1000)
-        prior = await yearly_rain_at_or_before(mac, boundary_ms)
-        out[name] = None if prior is None else round(max(0.0, current - prior), 3)
+        if yearly_ok:
+            prior = await yearly_rain_at_or_before(mac, boundary_ms)
+            out[name] = None if prior is None else round(max(0.0, cur_year - prior), 3)
+        else:
+            out[name] = await _rollup_from_monthly(
+                mac, name, boundary_ms, start_of_month_ms, cur_month)
     return out
+
+
+async def _rollup_from_monthly(mac: str, name: str, boundary_ms: int,
+                               start_of_month_ms: int,
+                               cur_month: float | None) -> float | None:
+    """Rain for a period from the MONTHLY counter, used when the yearly counter
+    is unreliable (see rain_rollups). The monthly counter resets at the start
+    of each month, so:
+      * monthly period → the counter's current value directly.
+      * boundary within the current month → simple difference.
+      * a boundary before this month (only the weekly window can straddle a
+        month boundary) → this month's total plus the tail of last month after
+        the boundary.
+    """
+    if cur_month is None:
+        return None
+    if name == "monthly_in":
+        return round(max(0.0, cur_month), 3)
+    if boundary_ms >= start_of_month_ms:
+        prior = await _rain_col_at_or_before(mac, "monthlyrainin", boundary_ms)
+        return None if prior is None else round(max(0.0, cur_month - prior), 3)
+    # Straddles the month boundary: this month's rain + last month's tail.
+    prev_final = await _rain_col_at_or_before(mac, "monthlyrainin", start_of_month_ms - 1)
+    prior = await _rain_col_at_or_before(mac, "monthlyrainin", boundary_ms)
+    if prev_final is None or prior is None:
+        return round(max(0.0, cur_month), 3)  # best effort: at least this month
+    return round(max(0.0, cur_month + max(0.0, prev_final - prior)), 3)
 
 
 async def aggregate(

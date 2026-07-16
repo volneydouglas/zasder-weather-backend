@@ -1049,3 +1049,62 @@ def test_api_version_open_and_shaped(client):
     j = r.json()
     assert j["version"] == __version__
     assert "update_available" in j and "latest" in j and "enabled" in j
+
+
+def test_public_dashboard_off_by_default(client):
+    """Default: status page shows the app screenshots, not the live dashboard."""
+    page = client.get("/").text
+    assert 'class="hero-shots"' in page  # screenshots markup present
+    assert "app-cta" not in page         # dashboard CTA absent
+
+
+def test_public_dashboard_on_renders_charts(client, monkeypatch):
+    """PUBLIC_DASHBOARD=1 → live dashboard + App Store link replace the shots."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    # Ingest a couple of recent readings (within the 24h chart window).
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for mins, temp in ((120, 88.0), (60, 91.0)):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEEFF", "name": "Davis Vantage Pro 2"},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": temp, "humidity": 40},
+                          "wind": {"speed_mph": 3}, "rain": {}, "pressure": {"relative_inhg": 29.9},
+                          "source": "test"})
+    page = client.get("/").text
+    assert "app-cta" in page and "Get the iOS app" in page
+    assert 'class="hero-shots"' not in page       # screenshots markup replaced
+    assert "Davis Vantage Pro 2" in page          # station shown
+    assert "Temperature" in page and "<svg" in page  # charts rendered
+    assert 'http-equiv="refresh"' in page         # auto-refresh on
+
+
+def test_public_dashboard_explicit_mac_selects_station(client, monkeypatch):
+    """PUBLIC_DASHBOARD_MACS pins a specific station. The selector must match
+    the device whether the operator wrote the MAC compact or colonized (this
+    path once NameError'd on an undefined _format_mac)."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    # Two stations; pin the second one via a COMPACT (colon-less) MAC.
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = (now - _dt.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for dev_id, name, temp in (("AABBCCDDEEFF", "Crestview SDR", 87.0),
+                               ("5D5D05000001", "Davis Vantage Pro 2", 91.0)):
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": dev_id, "name": name},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": temp, "humidity": 40},
+                          "wind": {"speed_mph": 3}, "rain": {}, "pressure": {"relative_inhg": 29.9},
+                          "source": "test"})
+    monkeypatch.setattr(settings, "public_dashboard_macs", "5d5d05000001")  # compact, lowercase
+    page = client.get("/").text
+    assert page[:20] != "Internal Server Erro"     # no 500 (the _format_mac regression)
+    # Assert on the dashboard's current-conditions header (cc-name), not the
+    # page — both stations still appear in the lower device-stats table.
+    assert 'class="cc-name">Davis Vantage Pro 2' in page   # pinned station rendered
+    assert 'class="cc-name">Crestview SDR' not in page     # other one filtered out

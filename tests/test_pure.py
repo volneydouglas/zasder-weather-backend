@@ -420,3 +420,78 @@ def test_is_newer():
     assert _updates.is_newer("1.0.0", "1.0.0") is False
     assert _updates.is_newer("0.9.0", "1.0.0") is False
     assert _updates.is_newer("v1.2.0", "1.1.0") is True
+
+
+# ── public dashboard renderer (app/public_dashboard.py) ──
+from app import public_dashboard as _pdash  # noqa: E402
+
+
+def test_public_dashboard_svg_chart():
+    svg = _pdash.svg_chart([(0, 70.0), (1000, 72.0), (2000, 71.0)], "#ff9e33")
+    assert "<svg" in svg and "polyline" in svg and "#ff9e33" in svg
+
+
+def test_public_dashboard_svg_empty():
+    assert "no data" in _pdash.svg_chart([], "#fff")
+    assert "no data" in _pdash.svg_chart([(0, 5.0)], "#fff")  # <2 points
+
+
+def test_public_dashboard_resolve_fields():
+    assert _pdash.resolve_fields(None) == _pdash.CORE_FIELDS
+    assert _pdash.resolve_fields("tempf,humidity") == ["tempf", "humidity"]
+    assert _pdash.resolve_fields("bogus,tempf") == ["tempf"]
+    assert _pdash.resolve_fields("nonsense") == _pdash.CORE_FIELDS  # falls back
+
+
+def test_public_dashboard_render_station():
+    html = _pdash.render_station(
+        "Davis Vantage Pro 2",
+        {"tempf": 91.4, "feelsLike": 95.0, "humidity": 46},
+        {"tempf": [(0, 90.0), (1, 91.4)], "humidity": [(0, 45.0), (1, 46.0)]},
+        ["tempf", "humidity"],
+    )
+    assert "Davis Vantage Pro 2" in html
+    assert "91°" in html                 # hero temp rounded
+    assert "feels 95°" in html
+    assert "Temperature" in html and "Humidity" in html
+
+
+def test_public_dashboard_svg_chart_feels_overlay():
+    """Temp chart overlays a second (feels-like) dashed line + legend."""
+    svg = _pdash.svg_chart(
+        [(0, 88.0), (1000, 90.0), (2000, 91.0)], "#ff9e33",
+        overlay=[(0, 92.0), (1000, 95.0), (2000, 97.0)],
+        overlay_color="#ff5a5f", primary_label="Temp", overlay_label="Feels like",
+    )
+    assert svg.count("polyline") == 2        # temp + feels lines
+    assert "stroke-dasharray" in svg         # overlay is dashed
+    assert "Feels like" in svg and "chart-legend" in svg
+    # Axis spans BOTH series (feels hits 97, temp bottoms at 88).
+    assert "97" in svg and "88" in svg
+
+
+def test_public_dashboard_wind_rose():
+    # Wind mostly from the SW at a spread of speeds → a real rose.
+    samples = [(225.0, 3.0), (225.0, 8.0), (230.0, 12.0), (220.0, 18.0),
+               (240.0, 22.0), (200.0, 6.0), (270.0, 4.0), (180.0, 9.0)]
+    svg = _pdash.svg_wind_rose(samples)
+    assert "<svg" in svg and "rose-svg" in svg
+    assert "<path" in svg                    # at least one petal drawn
+    assert ">N<" in svg and ">S<" in svg     # cardinal labels
+    assert "rose-legend" in svg and "mph" in svg
+
+
+def test_public_dashboard_wind_rose_empty():
+    assert "no wind data" in _pdash.svg_wind_rose([])
+    assert "no wind data" in _pdash.svg_wind_rose([(90.0, 5.0), (90.0, 6.0)])  # <3
+
+
+def test_public_dashboard_render_station_wind_rose_tile():
+    html = _pdash.render_station(
+        "Davis", {"tempf": 90.0, "windspeedmph": 5},
+        {"windspeedmph": [(0, 4.0), (1, 6.0), (2, 5.0)],
+         "tempf": [(0, 89.0), (1, 90.0)]},
+        ["tempf", "windspeedmph"],
+        wind_samples=[(225.0, 4.0), (230.0, 6.0), (220.0, 5.0)],
+    )
+    assert "Wind rose" in html and "rose-svg" in html

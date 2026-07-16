@@ -338,6 +338,26 @@ account and is the simplest default — push is an optional upgrade:
 
 See `.env.example` for the blocks. Leave all of it unset to use email only.
 
+## Public dashboard (optional)
+
+By default the status page at `/` shows the app screenshots. Set
+`PUBLIC_DASHBOARD=1` to replace them with a live, read-only dashboard of your
+station — current conditions plus inline 24-hour charts, and a "Get the iOS app"
+link. It's fully server-rendered: no client JavaScript, no public data API. Your
+`/api/*` endpoints stay token-gated; only the pre-rendered numbers and charts on
+that one page are exposed.
+
+- `PUBLIC_DASHBOARD_MACS` — unset shows your **primary** (first) station only;
+  `all` shows every visible device; or a comma-separated MAC allowlist.
+- `PUBLIC_DASHBOARD_FIELDS` — unset charts the core set
+  (`tempf,humidity,windspeedmph,baromrelin,hourlyrainin`); pass a comma-separated
+  subset to pick which, in page order.
+- `PUBLIC_DASHBOARD_APP_URL` — the app-link target (defaults to the App Store
+  listing).
+
+The page auto-refreshes every 2 minutes. Leave `PUBLIC_DASHBOARD` unset (or `0`)
+to keep the screenshots.
+
 ## Upgrading
 
 The backend checks GitHub once a day and shows an **"update available"** banner

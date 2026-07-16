@@ -8,6 +8,29 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.1.0] — 2026-07-15
+
+### Added
+- **Public dashboard** (opt-in, `PUBLIC_DASHBOARD=1`). The status page at `/`
+  can show a live, read-only view of your station — current conditions plus
+  inline 24-hour charts and a link to the iOS app — in place of the app
+  screenshots. Fully server-rendered (no client JS, no public data API; `/api/*`
+  stays token-gated). Configure which station(s) with `PUBLIC_DASHBOARD_MACS`
+  (unset = primary only, `all`, or a MAC allowlist) and which metrics with
+  `PUBLIC_DASHBOARD_FIELDS` (default: temp, humidity, wind, pressure, rain).
+  The temperature chart overlays the feels-like line, and a **wind rose**
+  (16-sector, stacked by speed) rides alongside the wind chart. Page
+  auto-refreshes every 2 minutes.
+
+### Fixed
+- **Rain rollups fall back to the monthly counter when the yearly counter is
+  broken.** After a WeatherLink Jan-1 year reset, a stale yearly-rain baseline
+  could clamp the derived weekly total to 0 even while the month showed rain.
+  The rollup now detects a broken yearly counter and derives weekly/daily from
+  the monthly counter instead.
+- **Rain charts now catch sub-hundredth increments** from SDR sources by
+  deriving `hourlyrainin` from the cumulative `yearlyrainin` deltas.
+
 ## [1.0.0] — 2026-07-13
 
 First formally versioned release. Everything the backend has shipped to date,

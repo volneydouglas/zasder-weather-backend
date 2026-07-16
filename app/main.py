@@ -275,7 +275,67 @@ async def status_page() -> HTMLResponse:
 
     uptime = time.time() - getattr(app.state, "started_at", time.time())
     update_info = getattr(app.state, "update_info", None)
-    return HTMLResponse(_render_status_html(rows, total_obs, uptime, latest_temp, now_ms, update_info))
+
+    # Optional public dashboard: current conditions + 24h charts for the
+    # operator's station(s), rendered in place of the app screenshots.
+    dashboard_html = ""
+    if settings.public_dashboard and devices:
+        dashboard_html = await _build_public_dashboard(devices, now_ms)
+
+    return HTMLResponse(_render_status_html(
+        rows, total_obs, uptime, latest_temp, now_ms, update_info,
+        dashboard_html=dashboard_html,
+        app_url=settings.public_dashboard_app_url))
+
+
+async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
+    """Gather current + 24h history for the selected station(s) and render the
+    dashboard section. Selection: PUBLIC_DASHBOARD_MACS ('all' | csv | unset →
+    primary/first device)."""
+    from . import public_dashboard as pd
+    fields = pd.resolve_fields(settings.public_dashboard_fields)
+    sel = (settings.public_dashboard_macs or "").strip()
+    by_mac = {d["mac"]: d for d in devices}
+    if sel.lower() == "all":
+        macs = [d["mac"] for d in devices]
+    elif sel:
+        # Match on the separator-stripped uppercase form so the operator can
+        # write the MAC colonized or compact, lower or upper case.
+        def _compact(m: str) -> str:
+            return m.upper().replace("-", "").replace(":", "")
+        want = {_compact(m) for m in sel.split(",") if m.strip()}
+        macs = [d["mac"] for d in devices if _compact(d["mac"]) in want] or [devices[0]["mac"]]
+    else:
+        macs = [devices[0]["mac"]]  # primary = first device
+
+    start_ms = now_ms - 24 * 3600 * 1000
+    stations = []
+    for mac in macs:
+        d = by_mac.get(mac)
+        if not d:
+            continue
+        obs = await db.latest_observation(mac)
+        rows = await db.history(mac, start_ms, now_ms, limit=5000)
+        # Always carry feelsLike too (overlaid on the temp chart), regardless
+        # of the selected fields.
+        series: dict[str, list] = {}
+        for key in list(fields) + ["feelsLike"]:
+            pts = []
+            for r in rows:
+                t = r.get("dateutc")
+                v = r.get(key)
+                if t is not None and v is not None:
+                    pts.append((int(t), float(v)))
+            series[key] = pts
+        # Paired (direction, speed) samples for the wind rose.
+        wind_samples = []
+        for r in rows:
+            wd, ws = r.get("winddir"), r.get("windspeedmph")
+            if wd is not None and ws is not None:
+                wind_samples.append((float(wd), float(ws)))
+        stations.append({"name": d.get("name") or mac, "obs": obs,
+                         "series": series, "wind_samples": wind_samples})
+    return pd.render_dashboard(stations, fields)
 
 
 def _humanize_age(seconds: float) -> str:
@@ -285,11 +345,49 @@ def _humanize_age(seconds: float) -> str:
     return f"{int(seconds // 86400)}d ago"
 
 
+_DEFAULT_HERO_HTML = """<div class="hero">
+      <div class="hero-shots">
+        <div class="hero-shot">
+          <img src="/static/dashboard.png" alt="Zasder Weather iOS app — Dashboard tab showing current conditions, 24h temperature chart, and stat tiles" loading="lazy">
+          <div class="cap">Dashboard</div>
+        </div>
+        <div class="hero-shot">
+          <img src="/static/charts.png" alt="Zasder Weather iOS app — Charts tab showing temperature time series with selectable field and time-range pickers" loading="lazy">
+          <div class="cap">Charts</div>
+        </div>
+      </div>
+      <div class="hero-copy">
+        <p>A clean, dark, fast iOS app for personal weather stations. Bring your own backend (this one) and your station data is yours, end to end. No ads, no tracking, no subscriptions.</p>
+        <p>Supports AmbientWeather and AcuRite Atlas out of the box. Multi-device dashboard, history charts across six fields, threshold-based local alerts, and a 7-day Open-Meteo forecast.</p>
+      </div>
+    </div>"""
+
+
 def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
                         latest_temp: dict | None = None,
                         now_ms: int | None = None,
-                        update_info: dict | None = None) -> str:
+                        update_info: dict | None = None,
+                        dashboard_html: str = "",
+                        app_url: str = "") -> str:
     started = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+    # Public dashboard on ⇒ swap the app screenshots for the live charts + an
+    # App Store link, add its CSS, and auto-refresh the page.
+    from . import public_dashboard as _pd
+    if dashboard_html:
+        dashboard_css = _pd.DASHBOARD_CSS
+        refresh_meta = '<meta http-equiv="refresh" content="120">'
+        _cta = (f'<a href="{_html.escape(app_url, quote=True)}" target="_blank" '
+                f'rel="noopener">Get the iOS app ↗</a>'
+                if app_url else "")
+        hero_html = (
+            f'<div class="app-cta">{_cta}'
+            f'<span class="sub">Live conditions below · same data in the app</span></div>'
+            f'{dashboard_html}'
+        )
+    else:
+        dashboard_css = ""
+        refresh_meta = ""
+        hero_html = _DEFAULT_HERO_HTML
     # Version line + "update available" banner (from the daily GitHub check).
     ui = update_info or {}
     _repo_url = "https://github.com/volneydouglas/zasder-weather-backend"
@@ -334,6 +432,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {refresh_meta}
   <title>Zasder Weather — Status</title>
   <style>
     :root {{ color-scheme: dark; }}
@@ -388,6 +487,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     }}
     footer {{ margin-top: 24px; font-size: 10px; color: rgba(255,255,255,0.35); }}
     a {{ color: oklch(70% 0.14 245); text-decoration: none; }}
+    {dashboard_css}
   </style>
 </head>
 <body>
@@ -395,22 +495,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     <h1>Zasder Weather {version_html}</h1>
     <div class="sub">Read-only status — no auth required. The iOS app reads protected endpoints under <code>/api</code>.</div>
     {update_banner}
-    <div class="hero">
-      <div class="hero-shots">
-        <div class="hero-shot">
-          <img src="/static/dashboard.png" alt="Zasder Weather iOS app — Dashboard tab showing current conditions, 24h temperature chart, and stat tiles" loading="lazy">
-          <div class="cap">Dashboard</div>
-        </div>
-        <div class="hero-shot">
-          <img src="/static/charts.png" alt="Zasder Weather iOS app — Charts tab showing temperature time series with selectable field and time-range pickers" loading="lazy">
-          <div class="cap">Charts</div>
-        </div>
-      </div>
-      <div class="hero-copy">
-        <p>A clean, dark, fast iOS app for personal weather stations. Bring your own backend (this one) and your station data is yours, end to end. No ads, no tracking, no subscriptions.</p>
-        <p>Supports AmbientWeather and AcuRite Atlas out of the box. Multi-device dashboard, history charts across six fields, threshold-based local alerts, and a 7-day Open-Meteo forecast.</p>
-      </div>
-    </div>
+    {hero_html}
     <div class="grid">
       <div class="stat"><div class="k">Status</div><div class="v">Up</div></div>
       <div class="stat"><div class="k">Devices</div><div class="v">{len(rows)}</div></div>

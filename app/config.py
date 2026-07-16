@@ -183,6 +183,24 @@ class Settings(BaseSettings):
     def apns_relay_configured(self) -> bool:
         return bool(self.apns_relay_url and self.apns_relay_token)
 
+    # ── Public dashboard (opt-in) ────────────────────────────────────────
+    # When on, the public status page (/) becomes a live weather dashboard:
+    # current conditions + 24h charts for your station(s), and the app
+    # screenshots are replaced with an App Store link. OFF by default — a
+    # public page that shows your live weather data should be a deliberate
+    # choice. Set PUBLIC_DASHBOARD=1 to enable.
+    public_dashboard: bool = False
+    # Which stations to show. Empty/unset = the primary (first) device only.
+    # A comma-separated MAC list pins specific stations; "all" shows every one.
+    public_dashboard_macs: str | None = None
+    # Which 24h charts. Empty/unset = the core set (temp/humidity/wind/
+    # pressure/rain). Comma-separated API field names to override, e.g.
+    # "tempf,humidity,baromrelin".
+    public_dashboard_fields: str | None = None
+    # "Get the app" link shown in place of the screenshots. Defaults to the
+    # published iOS app; point it at your own listing if you ship your own.
+    public_dashboard_app_url: str = "https://apps.apple.com/us/app/zasder-weather/id6774523656"
+
     # ── Staleness alerting (email) ───────────────────────────────────────
     # Email an operator when a device that was reporting goes quiet for
     # longer than its threshold (e.g. an SDR board hangs, a sensor battery

@@ -5,7 +5,10 @@
 //   GET  /              JSON status (uptime, IP, mac, last packet/post,
 //                       which creds are set — never the token itself)
 //   POST /provision     form fields backend_url + ingest_token; saves
-//                       to NVS, replies 200 with new status
+//                       to NVS, replies 200 with new status. Once a board
+//                       is provisioned, changes require the current ingest
+//                       token OR the per-device setup key (see below) as
+//                       proof-of-ownership — no anonymous re-provisioning.
 //   POST /identify      blinks the on-board LED for 3 s so you can pick
 //                       this board out of a row of identical-looking
 //                       LilyGOs on a shelf
@@ -33,6 +36,15 @@ void notePostResult(int httpCode);
 // main + zasder_post read these directly (extern below).
 extern String backendUrl;
 extern String ingestToken;
+
+// Per-device setup key: a random 8-char secret minted on first boot and
+// kept in NVS across token wipes. It's the proof-of-ownership needed to
+// re-provision a board whose token was wiped after repeated 401s (the
+// current token is gone, so the setup key is the only remaining
+// credential). Shown on the OLED + serial only when re-pairing is needed;
+// never exposed over HTTP. Lost it? Physical USB reflash with NVS erase
+// (`pio run -t erase`) mints a fresh one. See config_server.cpp.
+extern String setupKey;
 
 // Opt-in: forward ANY decoded rtl_433 station that carries weather fields
 // (temp/humidity/wind/rain), not just the whitelisted Atlas/Fineoffset

@@ -10,9 +10,10 @@
 #include "config_server.h"
 #include "root_ca.h"
 
-// 5 consecutive 401s = the token is wrong. Wipe it from NVS and reboot
-// so the firmware's "ingest_token empty → AP portal" path takes over,
-// letting the user re-enter it without a reflash.
+// 5 consecutive 401s = the token is wrong. Wipe it from NVS; the board
+// stays on Wi-Fi and LOCKED (provisioned flag kept), serving /provision
+// so the user can re-enter a token via the setup key — no reflash, no
+// anonymous re-provisioning window.
 static constexpr int MAX_CONSECUTIVE_401 = 5;
 static int consecutive401 = 0;
 
@@ -399,10 +400,10 @@ void zasder_post(const char *rtl433Json,
     consecutive401++;
     Serial.printf("[post-fail 401] (consecutive=%d)\n", consecutive401);
     if (consecutive401 >= MAX_CONSECUTIVE_401) {
-      Serial.println("Token rejected repeatedly — wiping NVS token "
-                     "AND clearing provisioned flag (so /provision "
-                     "is reachable again without prior-token proof). "
-                     "Re-pair via POST /provision over HTTP.");
+      Serial.println("Token rejected repeatedly — wiping NVS token. "
+                     "Board stays LOCKED; re-pair via POST /provision "
+                     "using the setup key shown on the OLED "
+                     "(setup_key=<...>), not anonymously.");
       http.end();
       ZasderConfigServer::wipeIngestToken();
       consecutive401 = 0;

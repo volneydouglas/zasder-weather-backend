@@ -4,6 +4,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_random.h>
 
 #include "display.h"
 
@@ -11,6 +12,7 @@ namespace ZasderConfigServer {
 
 String backendUrl;
 String ingestToken;
+String setupKey;
 bool forwardAll = false;
 
 static WebServer server(80);
@@ -18,16 +20,17 @@ static Preferences prefs;
 // Set to true on first successful /provision that lands both
 // backend_url AND ingest_token. From that point on, /provision and
 // /reset require the caller to prove they know the current
-// ingest_token (Authorization: Bearer header OR `current_token` form
-// field). Prevents LAN hijack: a malicious page on the same network
-// can't repoint the board and silently capture the token.
+// ingest_token OR the per-device setup key (Authorization: Bearer
+// header, `current_token`, or `setup_key` form field). Prevents LAN
+// hijack: a malicious page on the same network can't repoint the board
+// and silently capture the token — even right after a 401 token wipe,
+// when the board stays LOCKED and only the setup key (physical-access
+// secret) re-opens /provision.
 //
-// Recovery if the token is lost: hold RST and re-plug while pressing
-// reset, then reflash the firmware over USB — that re-flashes NVS
-// only optionally (depending on partition); the NVS-clear path is
-// the dedicated /reset route which itself requires auth. The board
-// can be physically reset by holding RST + power cycle and reflashing
-// with NVS erase via `pio run -t erase`.
+// Recovery if BOTH the token and setup key are lost: physical USB
+// reflash with NVS erase (`pio run -t erase`), which mints a fresh
+// setup key on next boot. The dedicated /reset route also wipes NVS
+// but itself requires auth.
 static bool provisioned = false;
 static String        lastPacket    = "(none)";
 static String        lastPostText  = "(none)";
@@ -52,12 +55,31 @@ static int _diagIndex = 0;
 // `zasder-lilygo.local` and the resolver picks one at random.
 static String mdnsName;
 
+// Mint a random 8-char setup key. Alphabet excludes ambiguous glyphs
+// (0/O/1/I) so it's readable off the small OLED. ~40 bits of entropy —
+// far beyond brute-forcing over a home LAN against a single ESP32.
+static String generateSetupKey() {
+  static const char alphabet[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";  // 32 chars
+  String k;
+  k.reserve(8);
+  for (int i = 0; i < 8; i++) k += alphabet[esp_random() % 32];
+  return k;
+}
+
 void loadFromNvs() {
   prefs.begin("zasder", /*readOnly=*/false);
   backendUrl  = prefs.getString("backend_url",  "");
   ingestToken = prefs.getString("ingest_token", "");
   provisioned = prefs.getBool("provisioned", false);
   forwardAll  = prefs.getBool("forward_all", false);
+  // Per-device setup key: mint + persist on first boot (or after an NVS
+  // erase). Kept separate from the token so a 401 wipe never removes it.
+  setupKey = prefs.getString("setup_key", "");
+  if (setupKey.length() == 0) {
+    setupKey = generateSetupKey();
+    prefs.putString("setup_key", setupKey);
+  }
+  Serial.printf("setup key (re-pair proof): %s\n", setupKey.c_str());
   // Self-heal: if NVS lost the flag but both creds are present (e.g.
   // upgrading from a firmware build that predates the lock), treat the
   // board as already provisioned so the lock takes effect immediately
@@ -69,17 +91,13 @@ void loadFromNvs() {
 }
 
 void wipeIngestToken() {
-  // Also clear the provisioned flag: checkAuth() requires a non-empty
-  // current token to verify Bearer auth, so leaving provisioned=true
-  // after wiping the token would lock /provision out forever (only
-  // recovery would be USB-reflash + NVS-erase). Reverting to the
-  // unprovisioned state lets the operator re-pair from any LAN
-  // device with no proof-of-ownership required (matching the
-  // first-boot bootstrap path).
+  // Wipe ONLY the stale token — keep provisioned=true so the board stays
+  // locked. checkAuth() still authorizes re-provisioning via the setup
+  // key (the token is gone, but the setup key persists), so an attacker
+  // on the LAN can't repoint the board just because a 401 fired. The
+  // operator re-pairs with the setup key shown on the device.
   prefs.remove("ingest_token");
-  prefs.remove("provisioned");
   ingestToken = "";
-  provisioned = false;
 }
 
 // ── handlers ──────────────────────────────────────────────────────────
@@ -146,12 +164,14 @@ static bool secureEquals(const String &a, const String &b) {
   return diff == 0;
 }
 
-// Returns true if the caller proved they know the current
-// ingest_token. Two delivery channels accepted:
-//   * Authorization: Bearer <token>   (preferred — curl friendly)
-//   * current_token form field        (browser-form friendly)
-// On an unprovisioned board, every request is treated as authorized
-// so the first /provision works without a chicken-and-egg loop.
+// Returns true if the caller proved ownership of this board — by knowing
+// EITHER the current ingest_token OR the per-device setup key. Three
+// delivery channels accepted, checked against both credentials:
+//   * Authorization: Bearer <secret>   (preferred — curl friendly)
+//   * current_token form field         (browser-form friendly)
+//   * setup_key form field             (explicit re-pair after a wipe)
+// On an unprovisioned board, every request is authorized so the first
+// /provision works without a chicken-and-egg loop.
 static bool checkAuth() {
   if (!provisioned) return true;
   String supplied;
@@ -162,15 +182,25 @@ static bool checkAuth() {
   if (supplied.length() == 0 && server.hasArg("current_token")) {
     supplied = server.arg("current_token");
   }
-  return supplied.length() > 0 && secureEquals(supplied, ingestToken);
+  if (supplied.length() == 0 && server.hasArg("setup_key")) {
+    supplied = server.arg("setup_key");
+  }
+  if (supplied.length() == 0) return false;
+  // secureEquals short-circuits on length mismatch; evaluate both so a
+  // non-empty token and the setup key are each accepted.
+  bool tokenOk = ingestToken.length() > 0 && secureEquals(supplied, ingestToken);
+  bool keyOk   = setupKey.length()   > 0 && secureEquals(supplied, setupKey);
+  return tokenOk || keyOk;
 }
 
 static void handleProvision() {
   if (!checkAuth()) {
     server.send(403, "text/plain",
                 "forbidden: this board is already provisioned. Re-send "
-                "with Authorization: Bearer <current_ingest_token> or "
-                "include current_token=<...> as a form field.\n");
+                "with Authorization: Bearer <current_ingest_token>, or "
+                "include current_token=<...> as a form field. If the "
+                "token was wiped (repeated 401s), use the setup key shown "
+                "on the board's screen: setup_key=<...>.\n");
     return;
   }
   // Accept both form-encoded and ?query=string. backend_url is
@@ -267,10 +297,19 @@ static void handleRoot() {
     "<p>JSON: <code><a href='/status'>/status</a></code></p>";
 
   if (provisioned) {
+    bool awaitingRepair = ingestToken.length() == 0;
     body +=
-      "<p><b>Locked.</b> Changes require the current ingest token.</p>"
+      "<p><b>Locked.</b> Changes require the current ingest token "
+      "&mdash; or, if the token was wiped after repeated 401s, the "
+      "<b>setup key</b> shown on the board's screen.</p>";
+    if (awaitingRepair) {
+      body +=
+        "<p style='color:#b00'>Token was wiped &mdash; enter the setup "
+        "key (on the OLED) below to re-pair.</p>";
+    }
+    body +=
       "<form method='POST' action='/provision'>"
-      "Current ingest token (proof-of-ownership): "
+      "Current ingest token <i>or</i> setup key (proof-of-ownership): "
       "<input name='current_token' size='40' type='password'><br>"
       "New backend URL (leave blank to keep): "
       "<input name='backend_url' size='40'><br>"
@@ -346,6 +385,15 @@ void onReconnect() {
 static void cycleDiagLine() {
   unsigned long now = millis();
   char buf[24];
+  // Locked with a wiped token = awaiting re-pair. Surface the setup key
+  // so the operator standing at the board can read it and re-provision.
+  // Only shown in this state — hidden during normal operation so the
+  // recovery secret isn't left on-screen permanently.
+  if (provisioned && ingestToken.length() == 0) {
+    snprintf(buf, sizeof(buf), "re-pair key: %s", setupKey.c_str());
+    ZasderDisplay::update(nullptr, nullptr, buf, nullptr, nullptr);
+    return;
+  }
   switch (_diagIndex) {
     case 0:
       snprintf(buf, sizeof(buf), "IP: %s",

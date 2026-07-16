@@ -146,7 +146,30 @@ that doesn't know the current token can't repoint the board to a
 malicious backend and capture the next post. `/status` stays open
 (read-only diagnostic; reports `provisioned: true|false`).
 
-If you lost the current token: hold RST and power-cycle, then USB-reflash with `pio run -t erase` to wipe NVS, then re-flash and start fresh.
+### Setup key (re-pair after a token wipe)
+
+Each board mints a random 8-char **setup key** on first boot, stored in
+NVS separately from the token so it survives a token wipe. It's a second
+proof-of-ownership credential: any `/provision` call accepts **either**
+the current ingest token **or** the setup key. Its job is recovery — if
+the token gets wiped (see auto-wipe below) the current token is gone, so
+the setup key is the only thing that re-opens `/provision`. The board
+stays **locked** the whole time; there is no anonymous re-provisioning
+window.
+
+The setup key is shown on the board's **OLED** (only while a re-pair is
+pending) and printed to the **serial** log at every boot — it is never
+exposed over HTTP. Read it off the device, then:
+
+```sh
+curl -X POST http://<board>/provision \
+  --data-urlencode "setup_key=$SETUP_KEY" \
+  --data-urlencode "ingest_token=$NEW_TOKEN"
+```
+
+If you lost **both** the token and the setup key: USB-reflash with
+`pio run -t erase` to wipe NVS, then re-flash — a fresh setup key is
+minted on the next boot.
 
 ## Verify
 
@@ -222,7 +245,10 @@ it lives somewhere you don't routinely check:
 - **Provisioning lock** — first successful `/provision` flips an NVS
   flag; from then on `/provision`, `/reset`, and `/identify` require
   the current ingest token as Bearer auth (or `current_token=` form
-  field). `/status` stays open.
+  field) — **or** the per-device **setup key** (`setup_key=`), a random
+  secret minted on first boot for recovery after a token wipe. The lock
+  is never dropped, so there's no anonymous re-provisioning window on the
+  LAN. `/status` stays open.
 - **Token in NVS** — secrets live in the ESP32's NVS partition via
   Arduino `Preferences`. NVS is **not encrypted by default** — this
   build does not enable ESP-IDF flash encryption. A physical-access
@@ -230,10 +256,11 @@ it lives somewhere you don't routinely check:
   that's in your threat model, enable flash encryption + secure boot
   per Espressif's flash-encryption guide and rebuild; the firmware
   doesn't depend on either being on or off.
-- **Auto-wipe on 5x 401** — if the backend rejects 5 consecutive
-  posts with 401, the firmware wipes both the stored token AND the
-  `provisioned` flag, returning to the unprovisioned bootstrap state
-  so `/provision` is reachable again without prior-token proof.
+- **Auto-wipe on 5x 401** — if the backend rejects 5 consecutive posts
+  with 401, the firmware wipes the stale token from NVS but keeps the
+  board **locked** (the `provisioned` flag stays set). It re-pairs via
+  the setup key, not anonymously — closing the window where a wiped board
+  could be silently repointed by anything on the LAN.
 
 ## Limitations (v1)
 

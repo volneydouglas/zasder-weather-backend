@@ -6,4 +6,4 @@ The self-check in app/updates.py compares this against the latest GitHub
 release so operators see an "update available" banner. See CHANGELOG.md.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"

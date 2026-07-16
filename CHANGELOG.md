@@ -8,6 +8,23 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.1.1] — 2026-07-16
+
+### Security
+- **LilyGO firmware: no anonymous re-provisioning after a token wipe.**
+  Previously, when the backend rejected 5 consecutive posts with 401 the board
+  wiped its token **and** cleared the `provisioned` flag, dropping back to the
+  unauthenticated bootstrap state — a window where anything on your LAN could
+  `POST /provision` and silently repoint the board at a hostile backend. The
+  board now stays **locked** after a wipe. Re-pairing requires a per-device
+  **setup key**: a random 8-char secret minted on first boot, stored in NVS
+  separately from the token (so it survives wipes), shown on the OLED (only
+  while a re-pair is pending) and the serial boot log, and never exposed over
+  HTTP. `/provision` accepts either the current ingest token or the setup key.
+  **Self-hosters running a LilyGO relay should reflash** (`pio run -e
+  t3_v161_433 -t upload` / `_915`); existing Wi-Fi + backend creds are
+  preserved across the flash.
+
 ## [1.1.0] — 2026-07-15
 
 ### Added

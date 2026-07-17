@@ -202,12 +202,15 @@ def _esc(s: Any) -> str:
 def render_station(name: str, obs: dict[str, Any] | None,
                    series: dict[str, list[tuple[int, float]]],
                    fields: list[str],
-                   wind_samples: list[tuple[float, float]] | None = None) -> str:
+                   wind_samples: list[tuple[float, float]] | None = None,
+                   records: dict[str, Any] | None = None,
+                   tz_name: str = "UTC") -> str:
     """One station block: current-conditions header + a chart per field.
 
     The temperature chart overlays the feels-like line (from
     series["feelsLike"]); a wind rose tile is appended after the wind chart
-    when direction+speed samples are available.
+    when direction+speed samples are available; an all-time records strip is
+    appended below the charts when records are supplied.
     """
     o = obs or {}
     temp = _num(o.get("tempf"))
@@ -262,17 +265,77 @@ def render_station(name: str, obs: dict[str, Any] | None,
         f'    <div class="cc-chips">{"".join(chips)}</div>'
         f'  </div>'
         f'  <div class="charts">{"".join(charts)}</div>'
+        f'  {render_records(records, tz_name)}'
         f'</section>'
     )
 
 
-def render_dashboard(stations: list[dict[str, Any]], fields: list[str]) -> str:
+# All-time record cards shown under the charts. (field, hi|lo, label, unit).
+_RECORD_CARDS = [
+    ("tempf",        "max", "Hottest",       "°F"),
+    ("tempf",        "min", "Coldest",       "°F"),
+    ("windgustmph",  "max", "Peak gust",     "mph"),
+    ("dailyrainin",  "max", "Wettest day",   "in"),
+    ("baromrelin",   "max", "High pressure", "inHg"),
+    ("baromrelin",   "min", "Low pressure",  "inHg"),
+]
+
+
+def _record_date(ms: Any, tz_name: str) -> str:
+    """Short local date for a record's timestamp, e.g. 'Jul 3, 2026'."""
+    if not ms:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = timezone.utc
+        dt = datetime.fromtimestamp(int(ms) / 1000, tz=tz)
+        return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+    except Exception:
+        return ""
+
+
+def render_records(records: dict[str, Any] | None, tz_name: str) -> str:
+    """Compact all-time records strip (hottest/coldest/peak gust/etc.)."""
+    if not records:
+        return ""
+    allf = (records.get("periods", {}).get("all", {}) or {}).get("fields", {}) or {}
+    cards = []
+    for field, which, label, unit in _RECORD_CARDS:
+        rec = allf.get(field)
+        if not rec:
+            continue
+        val = rec.get(which)
+        if val is None:
+            continue
+        at = rec.get("maxAt" if which == "max" else "minAt")
+        when = _record_date(at, tz_name)
+        cards.append(
+            f'<div class="rec"><div class="rec-k">{_esc(label)}</div>'
+            f'<div class="rec-v">{_fmt(_num(val), unit)}</div>'
+            f'<div class="rec-d">{_esc(when)}</div></div>'
+        )
+    if not cards:
+        return ""
+    return (
+        f'<div class="records"><div class="records-h">Records '
+        f'<span class="chart-unit">· all-time</span></div>'
+        f'<div class="records-grid">{"".join(cards)}</div></div>'
+    )
+
+
+def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
+                     tz_name: str = "UTC") -> str:
     """Full dashboard section for all selected stations."""
     if not stations:
         return '<div class="chart-empty">No station data yet.</div>'
     return "".join(
         render_station(s["name"], s.get("obs"), s.get("series", {}), fields,
-                       wind_samples=s.get("wind_samples"))
+                       wind_samples=s.get("wind_samples"),
+                       records=s.get("records"), tz_name=tz_name)
         for s in stations
     )
 
@@ -317,4 +380,13 @@ DASHBOARD_CSS = """
         font-size:9px; color:rgba(255,255,255,0.5); }
     .rose-legend .rs i { width:9px; height:9px; border-radius:2px; display:inline-block; }
     .rose-legend .rs-unit { font-size:9px; color:rgba(255,255,255,0.35); }
+    .records { margin-top:18px; }
+    .records-h { font-size:11px; font-weight:700; color:rgba(255,255,255,0.7); margin-bottom:8px; }
+    .records-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; }
+    .rec { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06);
+        border-radius:10px; padding:10px 12px; }
+    .rec-k { font-size:9px; font-weight:700; letter-spacing:0.6px; text-transform:uppercase;
+        color:rgba(255,255,255,0.4); }
+    .rec-v { font-size:19px; font-weight:600; margin-top:3px; }
+    .rec-d { font-size:10px; color:rgba(255,255,255,0.4); margin-top:2px; }
 """

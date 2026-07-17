@@ -495,3 +495,98 @@ def test_public_dashboard_render_station_wind_rose_tile():
         wind_samples=[(225.0, 4.0), (230.0, 6.0), (220.0, 5.0)],
     )
     assert "Wind rose" in html and "rose-svg" in html
+
+
+def test_public_dashboard_records_strip():
+    recs = {"periods": {"all": {"fields": {
+        "tempf": {"max": 116.2, "min": 38.0, "maxAt": 1751500000000, "minAt": 1736000000000},
+        "windgustmph": {"max": 41.0, "maxAt": 1751600000000},
+    }}}}
+    html = _pdash.render_records(recs, "America/Phoenix")
+    assert "Records" in html and "Hottest" in html and "Coldest" in html
+    assert "116" in html and "Peak gust" in html and "41" in html
+
+def test_public_dashboard_records_empty():
+    assert _pdash.render_records(None, "UTC") == ""
+    assert _pdash.render_records({"periods": {}}, "UTC") == ""
+
+
+# ───────────────────── smart (derived) alert logic ─────────────────────
+
+def test_smart_condition_frost():
+    sc = alerts.smart_condition
+    kw = dict(frost_f=35.0, heat_f=105.0, drop_inhg=0.06)
+    assert sc("frost", tempf=32.0, **kw) is True
+    assert sc("frost", tempf=35.0, **kw) is True     # at threshold
+    assert sc("frost", tempf=40.0, **kw) is False
+    assert sc("frost", tempf=None, **kw) is False    # no reading → no alert
+
+def test_smart_condition_heat():
+    sc = alerts.smart_condition
+    kw = dict(frost_f=35.0, heat_f=105.0, drop_inhg=0.06)
+    assert sc("heat", feels=108.0, **kw) is True
+    assert sc("heat", feels=100.0, **kw) is False
+
+def test_smart_condition_pressure_drop():
+    sc = alerts.smart_condition
+    kw = dict(frost_f=35.0, heat_f=105.0, drop_inhg=0.06)
+    assert sc("pressure_drop", pressure_delta_3h=-0.10, **kw) is True   # fell 0.10
+    assert sc("pressure_drop", pressure_delta_3h=-0.03, **kw) is False  # small dip
+    assert sc("pressure_drop", pressure_delta_3h=+0.20, **kw) is False  # rising
+    assert sc("pressure_drop", pressure_delta_3h=None, **kw) is False
+
+def test_build_smart_message():
+    t, b = alerts.build_smart_message("frost", "Davis", tempf=31.0)
+    assert "Frost" in t and "31" in b
+    t, b = alerts.build_smart_message("heat", "Davis", feels=110.0)
+    assert "heat" in t.lower() and "110" in b
+    t, b = alerts.build_smart_message("pressure_drop", "Davis", pressure_delta_3h=-0.12)
+    assert "Pressure" in t and "0.12" in b
+
+
+# ───────────────────── Prometheus /metrics rendering ─────────────────────
+
+from app import metrics as _metrics  # noqa: E402
+
+def test_prometheus_render():
+    devices = [{"mac": "AA:BB:CC:DD:EE:FF", "name": 'Davis "Backyard"',
+                "lastSeen": 1000, "lastData": {"tempf": 88.1, "humidity": 40,
+                                               "baromrelin": 29.92}}]
+    out = _metrics.render_prometheus(devices, now_ms=6000)
+    assert "# TYPE zasder_temperature_fahrenheit gauge" in out
+    assert 'zasder_temperature_fahrenheit{mac="AA:BB:CC:DD:EE:FF",name="Davis \\"Backyard\\""} 88.1' in out
+    assert "zasder_humidity_percent" in out
+    assert "zasder_device_last_seen_seconds" in out and "} 5" in out  # (6000-1000)/1000
+
+def test_prometheus_skips_missing_and_nan():
+    devices = [{"mac": "M", "name": "N", "lastSeen": None,
+                "lastData": {"tempf": None, "uv": float("nan")}}]
+    out = _metrics.render_prometheus(devices, now_ms=1000)
+    assert "zasder_temperature" not in out   # None skipped
+    assert "zasder_uv_index" not in out       # NaN skipped
+    assert "last_seen" not in out             # no lastSeen
+
+
+# ───────────────────── MQTT / Home Assistant discovery ─────────────────────
+
+from app import mqtt_publish as _mq  # noqa: E402
+
+def test_mqtt_discovery_messages():
+    dev = {"mac": "AA:BB:CC:DD:EE:FF", "name": "Davis",
+           "lastData": {"tempf": 88.0}}
+    msgs = dict(_mq.discovery_messages(dev, "zasder", "homeassistant"))
+    topic = "homeassistant/sensor/zasder_aabbccddeeff/tempf/config"
+    assert topic in msgs
+    cfg = msgs[topic]
+    assert cfg["unique_id"] == "zasder_aabbccddeeff_tempf"
+    assert cfg["state_topic"] == "zasder/aabbccddeeff/state"
+    assert cfg["device_class"] == "temperature" and cfg["unit_of_measurement"] == "°F"
+    assert cfg["device"]["identifiers"] == ["zasder_aabbccddeeff"]
+    assert cfg["value_template"] == "{{ value_json.tempf }}"
+
+def test_mqtt_state_message_only_present_fields():
+    dev = {"mac": "AA:BB:CC:DD:EE:FF", "name": "Davis",
+           "lastData": {"tempf": 88.0, "humidity": 40, "uv": None}}
+    topic, payload = _mq.state_message(dev, "zasder")
+    assert topic == "zasder/aabbccddeeff/state"
+    assert payload == {"tempf": 88.0, "humidity": 40}   # None dropped

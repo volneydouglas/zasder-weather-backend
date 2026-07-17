@@ -228,6 +228,28 @@ class Settings(BaseSettings):
     # >0 = also re-send a reminder every N hours while it stays stale.
     alert_repeat_hours: float = 0.0
 
+    # ── Smart (derived) alerts ───────────────────────────────────────────
+    # Opt-in weather-intelligent alerts that need no per-metric threshold
+    # config: frost/freeze risk, dangerous heat index, and a rapid pressure
+    # drop (storm approaching). Edge-triggered like threshold rules; delivered
+    # over the same email/push channels. Off by default.
+    smart_alerts: bool = False
+    smart_alert_frost_f: float = 35.0          # tempf at/below → frost risk
+    smart_alert_heat_f: float = 105.0          # feelsLike at/above → heat danger
+    smart_alert_pressure_drop_inhg: float = 0.06  # baromrelin fall over 3h → storm
+
+    # ── Integrations (opt-in) ────────────────────────────────────────────
+    # Prometheus /metrics endpoint (open when enabled — same data class as the
+    # public dashboard; point Grafana/Prometheus at it for dashboards + alerts).
+    prometheus_metrics: bool = False
+    # MQTT publish (Home Assistant auto-discovery). Set MQTT_HOST to enable.
+    mqtt_host: str | None = None
+    mqtt_port: int = 1883
+    mqtt_username: str | None = None
+    mqtt_password: str | None = None
+    mqtt_topic_prefix: str = "zasder"
+    mqtt_discovery_prefix: str = "homeassistant"   # HA MQTT discovery root
+
     @field_validator("alert_stale_minutes_by_mac", mode="before")
     @classmethod
     def _parse_alert_thresholds(cls, v):

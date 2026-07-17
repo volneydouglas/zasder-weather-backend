@@ -161,6 +161,17 @@ CREATE TABLE IF NOT EXISTS alert_rule_state (
     PRIMARY KEY (rule_id, mac)
 );
 
+-- Edge-trigger state for the built-in smart alerts (frost / heat / pressure
+-- drop). kind = the smart-alert type; mirrors alert_rule_state so each fires
+-- once on clear→triggered and re-arms when the condition clears.
+CREATE TABLE IF NOT EXISTS smart_alert_state (
+    mac        TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    triggered  INTEGER NOT NULL DEFAULT 0,
+    changed_ms INTEGER,
+    PRIMARY KEY (mac, kind)
+);
+
 -- App-managed push-relay config (single row). Lets the iOS app point this
 -- backend at a hosted push relay without a redeploy: the app does the App
 -- Attest handshake with the relay, gets a token, and PUTs {url,token} here.
@@ -561,6 +572,38 @@ async def upsert_rule_state(rule_id: int, mac: str, triggered: int, changed_ms: 
             (rule_id, mac, triggered, changed_ms),
         )
         await db.commit()
+
+
+async def get_smart_alert_states() -> dict[tuple[str, str], int]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, kind, triggered FROM smart_alert_state")).fetchall()
+    return {(r["mac"], r["kind"]): r["triggered"] for r in rows}
+
+
+async def upsert_smart_alert_state(mac: str, kind: str, triggered: int,
+                                   changed_ms: int) -> None:
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO smart_alert_state (mac, kind, triggered, changed_ms)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(mac, kind) DO UPDATE SET
+                triggered = excluded.triggered, changed_ms = excluded.changed_ms
+            """,
+            (mac, kind, triggered, changed_ms),
+        )
+        await db.commit()
+
+
+async def value_at_or_before(mac: str, field: str, cutoff_ms: int) -> float | None:
+    """Latest stored value of an API field at or before a timestamp (used by
+    smart alerts for pressure tendency). Resolves the API field name to its
+    column, then reuses the rain helper's at-or-before lookup."""
+    col = {v: k for k, v in _FIELD_MAP.items()}.get(field)
+    if col is None:
+        return None
+    return await _rain_col_at_or_before(mac, col, cutoff_ms)
 
 
 async def register_push_token(token: str, platform: str, env: str | None) -> None:
@@ -1070,3 +1113,78 @@ async def aggregate(
         "minAt": lo_row["dateutc_ms"] if lo_row else None,
         "maxAt": hi_row["dateutc_ms"] if hi_row else None,
     }
+
+
+# Curated metrics for the records screen. API field names (see _FIELD_MAP).
+RECORD_FIELDS = [
+    "tempf", "feelsLike", "dewPoint", "humidity", "baromrelin",
+    "windspeedmph", "windgustmph", "uv", "solarradiation", "dailyrainin",
+]
+
+
+async def records(mac: str, tz_name: str = "UTC",
+                  fields: list[str] | None = None) -> dict[str, Any]:
+    """Per-metric high/low — and the local time each was first reached — over
+    today / this month / this year / all-time. Values come straight from the
+    stored observation history (MIN/MAX/AVG over the rows); period boundaries
+    are local-time per `tz_name`. Most metric columns live in idx_obs_chart so
+    the MIN/MAX aggregates are served index-only; the extreme-timestamp lookup
+    is a bounded equality scan. Intended to be cached by the caller — the
+    all-time window scans the whole per-mac history."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    fields = fields or RECORD_FIELDS
+    inverse = {v: k for k, v in _FIELD_MAP.items()}
+    cols = [(f, inverse[f]) for f in fields if f in inverse]
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+
+    now_local = datetime.now(tz=tz)
+    day0 = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    periods = {
+        "today": int(day0.timestamp() * 1000),
+        "month": int(day0.replace(day=1).timestamp() * 1000),
+        "year":  int(day0.replace(month=1, day=1).timestamp() * 1000),
+        "all":   0,
+    }
+    end_ms = int(now_local.timestamp() * 1000)
+
+    out: dict[str, Any] = {"mac": mac, "generated_ms": end_ms, "periods": {}}
+    async with connect() as db:
+        for pname, start_ms in periods.items():
+            pfields: dict[str, Any] = {}
+            for fname, col in cols:
+                # col is one of our own _FIELD_MAP keys — never user input —
+                # so the f-string interpolation is safe (same as aggregate()).
+                row = await (await db.execute(
+                    f"SELECT MIN({col}) AS lo, MAX({col}) AS hi, "
+                    f"AVG({col}) AS avg, COUNT({col}) AS n FROM observations "
+                    f"WHERE mac = ? AND dateutc_ms >= ? AND dateutc_ms <= ?",
+                    (mac, start_ms, end_ms),
+                )).fetchone()
+                if row is None or not row["n"]:
+                    continue
+
+                async def _at(val: Any) -> int | None:
+                    if val is None:
+                        return None
+                    r = await (await db.execute(
+                        f"SELECT dateutc_ms FROM observations WHERE mac = ? "
+                        f"AND dateutc_ms >= ? AND dateutc_ms <= ? AND {col} = ? "
+                        f"ORDER BY dateutc_ms ASC LIMIT 1",
+                        (mac, start_ms, end_ms, val),
+                    )).fetchone()
+                    return r["dateutc_ms"] if r else None
+
+                pfields[fname] = {
+                    "min": row["lo"], "max": row["hi"],
+                    "avg": round(row["avg"], 2) if row["avg"] is not None else None,
+                    "count": row["n"],
+                    "minAt": await _at(row["lo"]),
+                    "maxAt": await _at(row["hi"]),
+                }
+            out["periods"][pname] = {"start_ms": start_ms, "fields": pfields}
+    return out

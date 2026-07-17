@@ -8,6 +8,29 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.2.0] — 2026-07-17
+
+### Added
+- **Records & extremes.** New `GET /api/devices/{mac}/records` returns per-metric
+  highs & lows — with the local time each was set — over today / this month /
+  this year / all-time (temp, feels-like, dew point, humidity, pressure, wind,
+  gust, UV, solar, rain). The public dashboard gains an all-time **Records**
+  strip (hottest, coldest, peak gust, wettest day, high/low pressure).
+- **Smart alerts** (opt-in, `SMART_ALERTS=1`). Weather-intelligent alerts that
+  need no threshold config, delivered over the same email/push channels:
+  **frost/freeze risk** (`SMART_ALERT_FROST_F`, default 35°F), **dangerous heat**
+  (`SMART_ALERT_HEAT_F`, default 105°F feels-like), and a **rapid pressure drop**
+  (`SMART_ALERT_PRESSURE_DROP_INHG`, default 0.06 inHg over 3h → storm approaching).
+  Edge-triggered like threshold rules.
+- **Prometheus `/metrics`** (opt-in, `PROMETHEUS_METRICS=1`). Every device's
+  latest reading as Prometheus gauges — point Prometheus/Grafana at it for
+  dashboards and alerting.
+- **MQTT publishing with Home Assistant auto-discovery** (set `MQTT_HOST`). Each
+  reading is published to `<prefix>/<node>/state` and retained HA discovery
+  configs make every sensor appear in Home Assistant automatically, with the
+  right units/device-classes. Config: `MQTT_PORT`, `MQTT_USERNAME`,
+  `MQTT_PASSWORD`, `MQTT_TOPIC_PREFIX`, `MQTT_DISCOVERY_PREFIX`.
+
 ## [1.1.1] — 2026-07-16
 
 ### Security

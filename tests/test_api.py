@@ -1108,3 +1108,49 @@ def test_public_dashboard_explicit_mac_selects_station(client, monkeypatch):
     # page — both stations still appear in the lower device-stats table.
     assert 'class="cc-name">Davis Vantage Pro 2' in page   # pinned station rendered
     assert 'class="cc-name">Crestview SDR' not in page     # other one filtered out
+
+
+def test_records_endpoint(client):
+    """Records returns per-metric all-time/today highs & lows with timestamps."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for mins, temp, gust in ((90, 88.0, 12.0), (60, 91.5, 20.0), (30, 85.0, 8.0)):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEEFF", "name": "Davis"},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": temp, "humidity": 40},
+                          "wind": {"speed_mph": 3, "gust_mph": gust},
+                          "rain": {}, "pressure": {"relative_inhg": 29.9},
+                          "source": "test"})
+    # Auth required
+    assert client.get("/api/devices/AA:BB:CC:DD:EE:FF/records").status_code == 401
+    r = client.get("/api/devices/AA:BB:CC:DD:EE:FF/records",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    body = r.json()
+    alltime = body["periods"]["all"]["fields"]
+    assert alltime["tempf"]["max"] == 91.5 and alltime["tempf"]["min"] == 85.0
+    assert alltime["tempf"]["maxAt"] is not None      # timestamp of the record
+    assert alltime["windgustmph"]["max"] == 20.0      # peak gust tracked
+    assert body["periods"]["today"]["fields"]["tempf"]["count"] >= 1
+
+
+def test_metrics_endpoint_off_by_default(client):
+    assert client.get("/metrics").status_code == 404   # opt-in
+
+def test_metrics_endpoint_on(client, monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "prometheus_metrics", True)
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF", "name": "Davis"},
+                      "timestamp_utc": "2026-07-15T06:00:00Z",
+                      "outdoor": {"tempf": 88.0, "humidity": 40},
+                      "wind": {}, "rain": {}, "pressure": {"relative_inhg": 29.9},
+                      "source": "test"})
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "text/plain" in r.headers["content-type"]
+    assert "zasder_temperature_fahrenheit" in r.text and "88" in r.text

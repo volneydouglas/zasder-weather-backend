@@ -358,6 +358,53 @@ that one page are exposed.
 The page auto-refreshes every 2 minutes. Leave `PUBLIC_DASHBOARD` unset (or `0`)
 to keep the screenshots.
 
+## Records
+
+`GET /api/devices/{mac}/records` returns per-metric highs & lows — with the
+local time each was set — over **today / this month / this year / all-time**
+(temperature, feels-like, dew point, humidity, pressure, wind, gust, UV, solar,
+rain). Results are cached 15 minutes per device. When the public dashboard is
+on, an all-time **Records** strip (hottest, coldest, peak gust, wettest day,
+high/low pressure) is rendered under the charts.
+
+## Smart alerts (optional)
+
+Set `SMART_ALERTS=1` for weather-intelligent alerts that need no threshold
+config, delivered over the same email/push channels as the device-down and
+threshold alerts:
+
+- **Frost/freeze risk** — outdoor temp at/below `SMART_ALERT_FROST_F` (35°F).
+- **Dangerous heat** — feels-like at/above `SMART_ALERT_HEAT_F` (105°F).
+- **Rapid pressure drop** — barometer falls more than
+  `SMART_ALERT_PRESSURE_DROP_INHG` (0.06 inHg) over 3 hours → storm approaching.
+
+Each fires once when the condition starts and re-arms when it clears.
+
+## Prometheus & Grafana (optional)
+
+Set `PROMETHEUS_METRICS=1` to expose `GET /metrics` in Prometheus text format —
+every device's latest reading as gauges (`zasder_temperature_fahrenheit`,
+`zasder_pressure_inhg`, `zasder_wind_gust_mph`, …, plus
+`zasder_device_last_seen_seconds`). Point Prometheus at it and build Grafana
+dashboards / alerts. Example scrape:
+
+```yaml
+scrape_configs:
+  - job_name: zasder-weather
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["your-backend-host"]
+```
+
+## Home Assistant (MQTT, optional)
+
+Set `MQTT_HOST` (and `MQTT_USERNAME`/`MQTT_PASSWORD` if your broker needs auth)
+to publish readings to MQTT. The backend sends retained **Home Assistant MQTT
+discovery** configs, so each station's sensors appear in Home Assistant
+automatically with the right units and device classes — no YAML. State is
+published to `<MQTT_TOPIC_PREFIX>/<node>/state` every ~30 seconds. Tune with
+`MQTT_PORT`, `MQTT_TOPIC_PREFIX`, and `MQTT_DISCOVERY_PREFIX`.
+
 ## Upgrading
 
 The backend checks GitHub once a day and shows an **"update available"** banner

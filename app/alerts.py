@@ -154,6 +154,48 @@ def build_threshold_message(device_name: str, field: str, value: float,
             f"{label} is {fmt(value)} ({sym} {fmt(threshold)})")
 
 
+# ───────────────────────── smart (derived) alerts ─────────────────────────
+# Built-in weather-intelligent alerts that need no per-metric threshold: frost
+# risk, dangerous heat, and a rapid pressure drop. Edge-triggered like the
+# threshold rules (fire once on clear→triggered, re-arm when the condition
+# clears). Pure — the monitor supplies already-computed values.
+SMART_KINDS = ("frost", "heat", "pressure_drop")
+
+
+def smart_condition(kind: str, *, tempf: float | None = None,
+                    feels: float | None = None,
+                    pressure_delta_3h: float | None = None,
+                    frost_f: float, heat_f: float, drop_inhg: float) -> bool:
+    if kind == "frost":
+        return tempf is not None and tempf <= frost_f
+    if kind == "heat":
+        return feels is not None and feels >= heat_f
+    if kind == "pressure_drop":
+        return (pressure_delta_3h is not None
+                and pressure_delta_3h <= -abs(drop_inhg))
+    return False
+
+
+def build_smart_message(kind: str, device_name: str, *,
+                        tempf: float | None = None, feels: float | None = None,
+                        pressure_delta_3h: float | None = None) -> tuple[str, str]:
+    """(title, body) for a smart alert. Pure — unit-testable."""
+    if kind == "frost":
+        return (f"{device_name}: Frost/freeze risk",
+                f"Temperature is {tempf:g}°F — frost or freeze possible. "
+                f"Protect sensitive plants.")
+    if kind == "heat":
+        return (f"{device_name}: Dangerous heat",
+                f"Feels like {feels:g}°F — heat is dangerous. Limit time "
+                f"outdoors and stay hydrated.")
+    if kind == "pressure_drop":
+        drop = abs(pressure_delta_3h) if pressure_delta_3h is not None else 0.0
+        return (f"{device_name}: Pressure falling fast",
+                f"Pressure fell {drop:.2f} inHg in 3h — a storm may be "
+                f"approaching.")
+    return (f"{device_name}: alert", "")
+
+
 # ───────────────────────── effective config ─────────────────────────
 @dataclass
 class EffectiveAlertConfig:
@@ -324,6 +366,9 @@ class AlertMonitor:
 
         # ── threshold rules: fire when a device's latest reading crosses a rule
         await self._check_threshold_rules(cfg, devices, now_ms)
+        # ── smart (derived) alerts: frost / heat / rapid pressure drop
+        if settings.smart_alerts:
+            await self._check_smart_alerts(cfg, devices, now_ms)
 
     async def _check_threshold_rules(self, cfg, devices, now_ms: int) -> None:
         rules = await db.list_alert_rules(enabled_only=True)
@@ -365,6 +410,53 @@ class AlertMonitor:
                 elif not now_trig and prev:
                     # Cleared (1→0): persist so the rule re-arms. No delivery here.
                     await db.upsert_rule_state(rule["id"], d["mac"], 0, now_ms)
+
+    async def _check_smart_alerts(self, cfg, devices, now_ms: int) -> None:
+        """Frost / heat / rapid-pressure-drop alerts, edge-triggered per device."""
+        states = await db.get_smart_alert_states()
+        cutoff_ms = now_ms - 3 * 3600 * 1000   # 3h ago, for pressure tendency
+
+        def _f(v) -> float | None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        for d in devices:
+            mac = d["mac"]
+            last = d.get("lastData") or {}
+            tempf = _f(last.get("tempf"))
+            feels = _f(last.get("feelsLike"))
+            cur_p = _f(last.get("baromrelin"))
+            # Pressure change over the last 3h (needs a historical reading).
+            delta = None
+            if cur_p is not None:
+                past_p = await db.value_at_or_before(mac, "baromrelin", cutoff_ms)
+                if past_p is not None:
+                    delta = cur_p - past_p
+
+            for kind in SMART_KINDS:
+                cond = smart_condition(
+                    kind, tempf=tempf, feels=feels, pressure_delta_3h=delta,
+                    frost_f=settings.smart_alert_frost_f,
+                    heat_f=settings.smart_alert_heat_f,
+                    drop_inhg=settings.smart_alert_pressure_drop_inhg)
+                prev = states.get((mac, kind), 0)
+                if cond and not prev:
+                    dname = d.get("name") or mac
+                    title, body = build_smart_message(
+                        kind, dname, tempf=tempf, feels=feels,
+                        pressure_delta_3h=delta)
+                    # Persist triggered=1 only after delivery (same as threshold
+                    # rules) so a transport failure retries next tick.
+                    if await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body):
+                        await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
+                        log.info("smart alert fired: %s on %s", kind, dname)
+                    else:
+                        log.warning("smart alert %s delivery failed for %s; "
+                                    "will retry next tick", kind, mac)
+                elif not cond and prev:
+                    await db.upsert_smart_alert_state(mac, kind, 0, now_ms)
 
 
 def _device_threshold(mac: str, dev_prefs: dict, default_min: float) -> float | None:

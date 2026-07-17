@@ -8,7 +8,7 @@ from typing import Annotated, Any
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -91,6 +91,16 @@ async def lifespan(app: FastAPI):
     update_checker.start()
     app.state.update_checker = update_checker
 
+    # MQTT publisher (Home Assistant discovery) — only if a broker is configured.
+    mqtt_pub = None
+    if settings.mqtt_host:
+        from .mqtt_publish import MqttPublisher
+        mqtt_pub = MqttPublisher()
+        await mqtt_pub.start()
+        app.state.mqtt_pub = mqtt_pub
+        log.info("MQTT publisher started (broker %s:%s)",
+                 settings.mqtt_host, settings.mqtt_port)
+
     try:
         yield
     finally:
@@ -100,6 +110,7 @@ async def lifespan(app: FastAPI):
         if wl_client is not None: await wl_client.aclose()
         if alert_monitor is not None: await alert_monitor.stop()
         await update_checker.stop()
+        if mqtt_pub is not None: await mqtt_pub.stop()
 
 
 # /docs, /redoc, /openapi.json are exposed by default in FastAPI and
@@ -209,6 +220,20 @@ def _is_reviewer(authorization: str | None) -> bool:
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "version": __version__}
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> PlainTextResponse:
+    """Prometheus exposition of every device's latest reading. Opt-in via
+    PROMETHEUS_METRICS=1 (404 otherwise); open when enabled — same data class
+    as the public dashboard. Point Prometheus/Grafana here for dashboards +
+    alerting. See app/metrics.py."""
+    if not settings.prometheus_metrics:
+        raise HTTPException(status_code=404, detail="metrics not enabled")
+    from . import metrics as _metrics
+    devices = await db.list_devices()
+    text = _metrics.render_prometheus(devices, int(time.time() * 1000))
+    return PlainTextResponse(text, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
 @app.get("/api/version")
@@ -333,9 +358,15 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
             wd, ws = r.get("winddir"), r.get("windspeedmph")
             if wd is not None and ws is not None:
                 wind_samples.append((float(wd), float(ws)))
+        try:
+            recs = await _cached_records(mac)
+        except Exception as e:
+            log.warning("records failed for %s: %s", mac, e)
+            recs = None
         stations.append({"name": d.get("name") or mac, "obs": obs,
-                         "series": series, "wind_samples": wind_samples})
-    return pd.render_dashboard(stations, fields)
+                         "series": series, "wind_samples": wind_samples,
+                         "records": recs})
+    return pd.render_dashboard(stations, fields, tz_name=settings.timezone)
 
 
 def _humanize_age(seconds: float) -> str:
@@ -879,6 +910,30 @@ async def get_summary(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return JSONResponse(agg)
+
+
+# Records are expensive (all-time window scans the full per-mac history) and
+# barely change minute-to-minute, so cache per-mac for a while. Shared by the
+# API endpoint and the public dashboard.
+_RECORDS_CACHE: dict[str, tuple[float, dict]] = {}
+_RECORDS_TTL_S = 900  # 15 min
+
+
+async def _cached_records(mac: str) -> dict:
+    now = time.time()
+    hit = _RECORDS_CACHE.get(mac)
+    if hit and now - hit[0] < _RECORDS_TTL_S:
+        return hit[1]
+    data = await db.records(mac, settings.timezone)
+    _RECORDS_CACHE[mac] = (now, data)
+    return data
+
+
+@app.get("/api/devices/{mac}/records", dependencies=[Depends(require_token)])
+async def get_records(mac: str) -> JSONResponse:
+    """All-time / yearly / monthly / today highs & lows per metric, with the
+    local time each record was set. Cached 15 min per device."""
+    return JSONResponse(await _cached_records(mac))
 
 
 from typing import Any  # noqa: E402

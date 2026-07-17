@@ -15,3 +15,6 @@ aiosqlite==0.20.0
 # APNs push: ES256-signed JWT (token auth) + HTTP/2 to api.push.apple.com.
 PyJWT[crypto]>=2.8,<3
 h2>=4,<5
+# MQTT publishing (Home Assistant discovery). Only used when MQTT_HOST is set;
+# the publisher imports it lazily, so a stripped install still boots without it.
+paho-mqtt>=2,<3

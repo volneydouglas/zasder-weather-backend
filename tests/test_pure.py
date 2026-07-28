@@ -500,11 +500,16 @@ def test_public_dashboard_render_station_wind_rose_tile():
 def test_public_dashboard_records_strip():
     recs = {"periods": {"all": {"fields": {
         "tempf": {"max": 116.2, "min": 38.0, "maxAt": 1751500000000, "minAt": 1736000000000},
+        "feelsLike": {"max": 121.0, "min": 33.0, "maxAt": 1751500000000, "minAt": 1736000000000},
+        "dewPoint": {"max": 74.0, "min": 5.0, "maxAt": 1751500000000, "minAt": 1736000000000},
         "windgustmph": {"max": 41.0, "maxAt": 1751600000000},
     }}}}
     html = _pdash.render_records(recs, "America/Phoenix")
     assert "Records" in html and "Hottest" in html and "Coldest" in html
     assert "116" in html and "Peak gust" in html and "41" in html
+    # feels-like + dew point records
+    assert "Hottest feels" in html and "121" in html
+    assert "Highest dew pt" in html and "74" in html and "Lowest dew pt" in html
 
 def test_public_dashboard_records_empty():
     assert _pdash.render_records(None, "UTC") == ""
@@ -554,7 +559,10 @@ def test_prometheus_render():
                                                "baromrelin": 29.92}}]
     out = _metrics.render_prometheus(devices, now_ms=6000)
     assert "# TYPE zasder_temperature_fahrenheit gauge" in out
-    assert 'zasder_temperature_fahrenheit{mac="AA:BB:CC:DD:EE:FF",name="Davis \\"Backyard\\""} 88.1' in out
+    # MAC is masked to its last 2 bytes (see _mask_mac) — /metrics is open when
+    # enabled, matching the status page's privacy posture.
+    assert 'zasder_temperature_fahrenheit{mac="··:··:··:··:EE:FF",name="Davis \\"Backyard\\""} 88.1' in out
+    assert "AA:BB:CC:DD:EE:FF" not in out
     assert "zasder_humidity_percent" in out
     assert "zasder_device_last_seen_seconds" in out and "} 5" in out  # (6000-1000)/1000
 
@@ -590,3 +598,71 @@ def test_mqtt_state_message_only_present_fields():
     topic, payload = _mq.state_message(dev, "zasder")
     assert topic == "zasder/aabbccddeeff/state"
     assert payload == {"tempf": 88.0, "humidity": 40}   # None dropped
+
+
+# ───────────────────── wind-gust glitch guard ─────────────────────
+
+def test_is_gust_glitch():
+    g = ingest._is_gust_glitch
+    # The reported case: 58 mph gust with 4.56 mph sustained → glitch.
+    assert g(58.0, 4.56, min_mph=30.0, max_factor=4.0) is True
+    # Real breezy day: 30 gust / 9 sustained (factor 3.3) → kept.
+    assert g(30.0, 9.0, min_mph=30.0, max_factor=4.0) is False
+    # Below the floor is never flagged, even at a high ratio.
+    assert g(20.0, 1.0, min_mph=30.0, max_factor=4.0) is False
+    # Unknown sustained speed → can't judge → kept.
+    assert g(58.0, None, min_mph=30.0, max_factor=4.0) is False
+    # Disabled (factor 0) → never flags.
+    assert g(58.0, 4.0, min_mph=30.0, max_factor=0.0) is False
+    assert g(None, 4.0, min_mph=30.0, max_factor=4.0) is False
+
+
+def test_is_gust_glitch_zero_sustained_is_not_a_glitch():
+    """A squall front hitting a calm station reads 0 sustained with a real high
+    gust. Multiplying by zero used to discard every gust above the floor —
+    precisely when gusts matter most."""
+    g = ingest._is_gust_glitch
+    assert g(45.0, 0.0, min_mph=30.0, max_factor=4.0) is False   # real squall gust
+    assert g(58.0, 4.56, min_mph=30.0, max_factor=4.0) is True   # still a glitch
+
+
+# ───────────── AWN client must never leak credentials into errors ─────────────
+
+def test_ambient_client_error_has_no_credentials():
+    """AWN takes the keys as QUERY PARAMS and httpx's HTTPStatusError embeds the
+    full URL — log.exception on it wrote both secrets to the logs on every
+    401/429/5xx. The client must raise a scrubbed error instead."""
+    import asyncio
+    import httpx
+    from app.ambient_client import AmbientWeatherClient, AmbientWeatherError
+
+    APP, API = "SECRET_APP_KEY_123", "SECRET_API_KEY_456"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert APP in str(request.url)          # keys really are on the wire
+        return httpx.Response(429, text="rate limited")
+
+    c = AmbientWeatherClient(APP, API, min_interval=0.0)
+    c._client = httpx.AsyncClient(base_url="https://rt.ambientweather.net/v1",
+                                  transport=httpx.MockTransport(handler))
+    try:
+        asyncio.run(c.list_devices())
+        raise AssertionError("expected an error")
+    except AmbientWeatherError as e:
+        msg = str(e)
+        assert APP not in msg and API not in msg, f"credentials leaked: {msg}"
+        assert "429" in msg and "/devices" in msg      # still useful for debugging
+
+
+def test_wind_rose_survives_non_finite_samples():
+    """A NaN/inf wind direction reaching int() 500s the public status page for
+    anonymous visitors (cloud pollers write lastData through unscrubbed)."""
+    bad = [(float("nan"), 5.0), (float("inf"), 6.0), (225.0, float("nan"))]
+    assert "no wind data" in _pdash.svg_wind_rose(bad)      # all filtered, no crash
+    ok = bad + [(225.0, 4.0), (230.0, 6.0), (220.0, 5.0)]
+    assert "<svg" in _pdash.svg_wind_rose(ok)               # good samples still render
+
+def test_num_rejects_infinity():
+    assert _pdash._num(float("inf")) is None
+    assert _pdash._num(float("nan")) is None
+    assert _pdash._num("12.5") == 12.5

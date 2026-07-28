@@ -33,6 +33,18 @@ def _esc_label(s: Any) -> str:
     return (str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " "))
 
 
+def _mask_mac(mac: Any) -> str:
+    """Last two bytes only — mirrors the public status page.
+
+    /metrics is OPEN when enabled, so publishing full hardware addresses here
+    while the status page deliberately masks them was a contradictory privacy
+    posture. The masked form is still a stable, unique-in-practice label for
+    Prometheus series.
+    """
+    raw = str(mac or "")
+    return ("··:" * 4 + raw[-5:]) if len(raw) >= 5 else "··"
+
+
 def _num(v: Any) -> float | None:
     try:
         f = float(v)
@@ -50,7 +62,7 @@ def render_prometheus(devices: list[dict[str, Any]], now_ms: int) -> str:
             v = _num((d.get("lastData") or {}).get(key))
             if v is None:
                 continue
-            labels = f'mac="{_esc_label(d.get("mac", ""))}",name="{_esc_label(d.get("name") or d.get("mac", ""))}"'
+            labels = f'mac="{_esc_label(_mask_mac(d.get("mac")))}",name="{_esc_label(d.get("name") or _mask_mac(d.get("mac")))}"'
             block.append(f"{name}{{{labels}}} {v:g}")
         if block:
             lines.append(f"# HELP {name} {help_text}")
@@ -64,7 +76,7 @@ def render_prometheus(devices: list[dict[str, Any]], now_ms: int) -> str:
         if ls is None:
             continue
         age = max(0.0, (now_ms - int(ls)) / 1000.0)
-        labels = f'mac="{_esc_label(d.get("mac", ""))}",name="{_esc_label(d.get("name") or d.get("mac", ""))}"'
+        labels = f'mac="{_esc_label(_mask_mac(d.get("mac")))}",name="{_esc_label(d.get("name") or _mask_mac(d.get("mac")))}"'
         age_block.append(f"zasder_device_last_seen_seconds{{{labels}}} {age:g}")
     if age_block:
         lines.append("# HELP zasder_device_last_seen_seconds Seconds since the device last reported")

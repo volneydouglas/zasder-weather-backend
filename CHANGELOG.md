@@ -8,6 +8,46 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.2.1] — 2026-07-28
+
+A full code-review pass over the backend. All fixes — no config changes needed.
+
+### Security
+- **AmbientWeather API keys no longer reach the logs.** AWN takes the keys as
+  query params and httpx's error message embeds the full URL, which the pollers
+  logged via `log.exception` — so any AWN 401/429/5xx wrote **both credentials in
+  plaintext** to your logs. The client now raises a scrubbed error (status +
+  path only). If you run the AWN poller, consider rotating your keys.
+- **`/metrics` no longer publishes full MAC addresses.** It's open when enabled,
+  so it now masks them to the last two bytes, matching the status page.
+
+### Fixed
+- **Smart alerts never fired.** The pressure-tendency lookup hit a rain-only
+  assertion, raising on every check and taking frost + heat down with it.
+  `SMART_ALERTS=1` now works as documented.
+- **Wind roses could point the wrong way.** Wind direction is modular, so
+  averaging 355° and 5° gave 180° — due *south* for a north wind. Bucketed
+  history (>6h windows) now uses a circular mean.
+- **Real wind gusts were being discarded.** The glitch guard compared a gust
+  against `4 × sustained`, so when sustained wind read 0 — a squall front
+  hitting a calm station — every gust above the floor was dropped. The
+  maintenance cleaner had the same flaw and was deleting them permanently.
+- **`/api/devices/{mac}/records` could return an empty body.** A request landing
+  while a background computation was in flight got a 200 with `{}` (blank
+  Records screen). Unknown MACs now 404 instead of populating an unbounded cache.
+- **Charts could end early.** A short, busy window hit the row limit and dropped
+  the *newest* rows.
+- **The public status page could 500** on a non-finite wind direction.
+- **MQTT no longer blocks startup.** `connect()` ran on the event loop, so an
+  unreachable broker stalled all serving/ingest, and a failure left MQTT dead
+  until redeploy. It now connects off-loop and retries with backoff.
+- Rain rollups no longer surface a "wettest day" derived from a non-resetting
+  cumulative counter, and `bin/maintenance` can purge existing artifacts.
+
+### Internal
+- Test suite no longer reaches the network (it was falling back to `.env` and
+  polling the live AWN API): **131s → 4.5s**, 193 tests.
+
 ## [1.2.0] — 2026-07-17
 
 ### Added

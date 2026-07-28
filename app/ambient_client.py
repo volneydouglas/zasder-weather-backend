@@ -9,6 +9,17 @@ BASE_URL = "https://rt.ambientweather.net/v1"  # rt = REST + realtime endpoints
 _TIMEOUT = httpx.Timeout(20.0)
 
 
+class AmbientWeatherError(Exception):
+    """AWN request failure with the credentials stripped out.
+
+    AWN takes applicationKey + apiKey as QUERY PARAMS, and httpx's
+    HTTPStatusError message embeds the full URL. Logging that exception (the
+    pollers use log.exception) wrote BOTH secrets into the logs in plaintext on
+    every 401/429/5xx. Raising this instead keeps the useful part (status +
+    path) and drops the query string.
+    """
+
+
 class AmbientWeatherClient:
     """Thin async wrapper around the AmbientWeather REST API.
 
@@ -37,8 +48,15 @@ class AmbientWeatherClient:
                 await asyncio.sleep(self._min_interval - elapsed)
             resp = await self._client.get(path, params=merged)
             self._last_call = asyncio.get_event_loop().time()
-        resp.raise_for_status()
-        return resp.json()
+        # Never let httpx's URL-bearing error escape — it carries the keys.
+        if resp.is_error:
+            raise AmbientWeatherError(
+                f"AWN {resp.status_code} for {resp.request.url.path}")
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise AmbientWeatherError(
+                f"AWN returned non-JSON for {resp.request.url.path}") from e
 
     async def list_devices(self) -> list[dict[str, Any]]:
         """Returns devices with their most recent observation embedded as `lastData`."""

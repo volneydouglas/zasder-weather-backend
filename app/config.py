@@ -138,6 +138,18 @@ class Settings(BaseSettings):
     # 2 in/hr is well above any real rainfall rate. Set 0 to disable.
     ingest_max_rain_rate_in_per_hr: float = 2.0
 
+    # Wind-gust glitch guard. Some anemometers / the WeatherLink Live feed
+    # occasionally emit a spurious high gust (e.g. 58 mph while the sustained
+    # wind is 4 mph — a physically impossible ~13x gust factor). A gust ABOVE
+    # ingest_gust_min_mph that also exceeds ingest_gust_max_factor × the
+    # concurrent sustained wind speed is dropped (windgustmph nulled for that
+    # one reading) — it's almost certainly a sensor glitch, and dropping it
+    # stops false high-wind alerts and keeps it out of the peak-gust record.
+    # Real gusts (including desert microbursts, which carry real sustained
+    # wind) stay under these bounds. Set ingest_gust_max_factor to 0 to disable.
+    ingest_gust_max_factor: float = 4.0
+    ingest_gust_min_mph: float = 30.0
+
     # History-write throttle (seconds). Steady high-cadence sources — e.g. a
     # 10s SDR relay — flood the observations table with near-duplicate rows
     # (roughly half of a 10s Atlas feed is byte-identical to the prior row),

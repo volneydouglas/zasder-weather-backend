@@ -1,3 +1,4 @@
+import asyncio
 import html as _html
 import logging
 import os
@@ -352,17 +353,20 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
                 if t is not None and v is not None:
                     pts.append((int(t), float(v)))
             series[key] = pts
-        # Paired (direction, speed) samples for the wind rose.
+        # Paired (direction, speed) samples for the wind rose. Both values must
+        # be finite: the cloud pollers write lastData straight through, and a
+        # NaN direction reaching int() in the rose renderer 500s the public
+        # status page for anonymous visitors.
         wind_samples = []
         for r in rows:
-            wd, ws = r.get("winddir"), r.get("windspeedmph")
+            wd, ws = pd._num(r.get("winddir")), pd._num(r.get("windspeedmph"))
             if wd is not None and ws is not None:
-                wind_samples.append((float(wd), float(ws)))
-        try:
-            recs = await _cached_records(mac)
-        except Exception as e:
-            log.warning("records failed for %s: %s", mac, e)
-            recs = None
+                wind_samples.append((wd, ws))
+        # NON-blocking: never run the full-history records scan inside the
+        # status-page request. Use the cache if warm; otherwise kick off a
+        # background warm and render without the strip (it appears on a later
+        # auto-refresh). Keeps the public page fast regardless of history size.
+        recs = _records_cached_or_warm(mac)
         stations.append({"name": d.get("name") or mac, "obs": obs,
                          "series": series, "wind_samples": wind_samples,
                          "records": recs})
@@ -917,22 +921,94 @@ async def get_summary(
 # API endpoint and the public dashboard.
 _RECORDS_CACHE: dict[str, tuple[float, dict]] = {}
 _RECORDS_TTL_S = 900  # 15 min
+_RECORDS_MAX_ENTRIES = 64          # far above any real device count
+_RECORDS_LOCKS: dict[str, "asyncio.Lock"] = {}
+# Strong refs to in-flight background warms (see _records_cached_or_warm).
+_WARM_TASKS: set = set()
+
+
+async def _warm_records(mac: str) -> dict:
+    """Compute records for a device + refresh the cache.
+
+    Serialized per MAC: the all-time window scans the full per-mac history, so
+    a second caller must WAIT for the in-flight compute, not race it. The old
+    dedupe short-circuited to `{}` when a warm was already running, which
+    handed concurrent clients a 200 with an empty body (blank Records screen)
+    whenever the status page had kicked off a background warm.
+    """
+    lock = _RECORDS_LOCKS.setdefault(mac, asyncio.Lock())
+    async with lock:
+        # A caller that queued behind the compute gets its fresh result.
+        hit = _RECORDS_CACHE.get(mac)
+        if hit and time.time() - hit[0] < _RECORDS_TTL_S:
+            return hit[1]
+        data = await db.records(mac, settings.timezone)
+        _RECORDS_CACHE[mac] = (time.time(), data)
+        _prune_records_cache()
+        return data
+
+
+def _prune_records_cache() -> None:
+    """Drop expired entries and bound the cache.
+
+    `mac` is an unvalidated path param, so without this a token holder could
+    request unlimited distinct MACs and each would leave a permanent entry
+    (db.records happily returns an empty skeleton for an unknown device).
+    """
+    now = time.time()
+    for k, (ts, _) in list(_RECORDS_CACHE.items()):
+        if now - ts >= _RECORDS_TTL_S:
+            del _RECORDS_CACHE[k]
+            _RECORDS_LOCKS.pop(k, None)
+    while len(_RECORDS_CACHE) > _RECORDS_MAX_ENTRIES:      # oldest-first
+        oldest = min(_RECORDS_CACHE, key=lambda k: _RECORDS_CACHE[k][0])
+        del _RECORDS_CACHE[oldest]
+        _RECORDS_LOCKS.pop(oldest, None)
 
 
 async def _cached_records(mac: str) -> dict:
-    now = time.time()
+    """Fresh cached records, else compute synchronously. Used by the API
+    endpoint (authenticated, infrequent — OK to wait for a cold compute)."""
     hit = _RECORDS_CACHE.get(mac)
-    if hit and now - hit[0] < _RECORDS_TTL_S:
+    if hit and time.time() - hit[0] < _RECORDS_TTL_S:
         return hit[1]
-    data = await db.records(mac, settings.timezone)
-    _RECORDS_CACHE[mac] = (now, data)
-    return data
+    return await _warm_records(mac)
+
+
+def _records_cached_or_warm(mac: str) -> dict | None:
+    """NON-blocking: fresh cached records, else spawn a background warm and
+    return None. Keeps the status-page render off the full-history scan."""
+    hit = _RECORDS_CACHE.get(mac)
+    if hit and time.time() - hit[0] < _RECORDS_TTL_S:
+        return hit[1]
+    lock = _RECORDS_LOCKS.get(mac)
+    if lock is None or not lock.locked():
+        # Hold a strong reference: a bare create_task can be garbage-collected
+        # mid-flight, and without a done-callback any failure (e.g. "database
+        # is locked" during maintenance) surfaces only as a GC-time warning and
+        # the records strip silently never appears.
+        t = asyncio.create_task(_warm_records(mac))
+        _WARM_TASKS.add(t)
+        t.add_done_callback(_warm_task_done)
+    return None
+
+
+def _warm_task_done(t: "asyncio.Task") -> None:
+    _WARM_TASKS.discard(t)
+    if not t.cancelled() and t.exception() is not None:
+        log.warning("records warm failed: %s", t.exception())
 
 
 @app.get("/api/devices/{mac}/records", dependencies=[Depends(require_token)])
 async def get_records(mac: str) -> JSONResponse:
     """All-time / yearly / monthly / today highs & lows per metric, with the
     local time each record was set. Cached 15 min per device."""
+    # 404 unknown MACs: db.records() returns an empty skeleton for any string,
+    # so without this each bogus MAC burned 40 aggregate queries and left a
+    # permanent cache entry.
+    known = {d["mac"] for d in await db.list_devices()}
+    if mac not in known:
+        raise HTTPException(status_code=404, detail="unknown device")
     return JSONResponse(await _cached_records(mac))
 
 

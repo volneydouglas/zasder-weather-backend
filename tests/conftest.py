@@ -30,11 +30,21 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     monkeypatch.setenv("INGEST_TOKEN", "test-ingest-token")
     monkeypatch.setenv("CAPTURE_TOKEN", "test-capture-token")
     monkeypatch.setenv("REVIEWER_API_TOKEN", "test-reviewer-token")
-    # AWN keys intentionally LEFT UNSET — most tests don't need the poller.
-    # Also actively unset them in case the host shell has them, so the
-    # poller stays disabled (it tries to hit the real AWN API otherwise).
-    monkeypatch.delenv("AW_APPLICATION_KEY", raising=False)
-    monkeypatch.delenv("AW_API_KEY", raising=False)
+    # Disable the AWN poller. Must be setenv("") NOT delenv(): Settings reads
+    # env_file=".env", so merely deleting the process env let pydantic fall back
+    # to the developer's real .env keys — every test then booted the poller and
+    # hit the live AWN API (slow, rate-limited, flaky, and it printed the keys
+    # into pytest output on a 429). An explicit empty value overrides the file
+    # and reads as "not configured" (see Settings.aw_configured).
+    monkeypatch.setenv("AW_APPLICATION_KEY", "")
+    monkeypatch.setenv("AW_API_KEY", "")
+    # Same reasoning for the other credential-bearing pollers/integrations, so
+    # the suite never reaches the network.
+    # (WEATHERLINK_STATION_ID is typed int — blanking the key/secret is enough
+    # to disable that poller, and "" would fail Settings validation.)
+    for var in ("WEATHERLINK_API_KEY", "WEATHERLINK_API_SECRET", "MQTT_HOST",
+                "ALERT_EMAIL_TO", "SMTP_HOST"):
+        monkeypatch.setenv(var, "")
     yield db_path
     shutil.rmtree(tmpdir, ignore_errors=True)
 

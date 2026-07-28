@@ -273,6 +273,24 @@ def _auto_device_name(normalized: dict[str, Any]) -> str:
     return f"{pretty}{f' ({model})' if model and model.lower() not in pretty.lower() else ''}"
 
 
+def _is_gust_glitch(gust: float | None, speed: float | None,
+                    min_mph: float, max_factor: float) -> bool:
+    """A gust is a glitch if it's above `min_mph` AND exceeds `max_factor` ×
+    the concurrent sustained wind speed — an implausible gust factor. Pure so
+    it's unit-testable. Never flags a gust at/below the floor, or when the
+    sustained speed is unknown."""
+    if max_factor <= 0 or gust is None or gust <= min_mph:
+        return False
+    # Unknown sustained wind → can't judge the ratio, so never flag.
+    # speed == 0 is the same situation, NOT a 100%-confidence glitch: a squall
+    # front hitting a calm station legitimately reads 0 sustained with a real
+    # 45 mph gust. Multiplying by zero would discard every gust above the floor
+    # — exactly when gusts matter most — so treat 0 as unknown too.
+    if speed is None or speed <= 0:
+        return False
+    return gust > speed * max_factor
+
+
 def _require_ingest_token(token: str) -> None:
     if not tokens_match(token, settings.ingest_token):
         raise HTTPException(status_code=401, detail="invalid ingest token")
@@ -340,6 +358,15 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
                 for k in ("yearlyrainin", "hourlyrainin", "eventrainin",
                           "dailyrainin", "weeklyrainin", "monthlyrainin"):
                     flat[k] = None
+
+    # Drop a spurious wind gust (see settings.ingest_gust_*). A gust wildly
+    # higher than the concurrent sustained wind is a sensor glitch — nulling it
+    # stops false high-wind alerts and keeps it out of the peak-gust record.
+    if _is_gust_glitch(flat.get("windgustmph"), flat.get("windspeedmph"),
+                       settings.ingest_gust_min_mph, settings.ingest_gust_max_factor):
+        log.warning("gust glitch dropped for %s: %.1f mph gust vs %.1f mph "
+                    "sustained", mac, flat["windgustmph"], flat.get("windspeedmph") or 0.0)
+        flat["windgustmph"] = None
 
     explicit_name, location = _device_label(payload_obj)
     auto_name = _auto_device_name(payload_obj)

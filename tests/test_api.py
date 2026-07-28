@@ -1154,3 +1154,264 @@ def test_metrics_endpoint_on(client, monkeypatch):
     assert r.status_code == 200
     assert "text/plain" in r.headers["content-type"]
     assert "zasder_temperature_fahrenheit" in r.text and "88" in r.text
+
+
+def test_records_drops_cumulative_wettest_day(client):
+    """A non-resetting (cumulative) dailyrainin counter must NOT surface as a
+    'wettest day' record; a real resetting daily counter keeps it."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    def post(dev_id, mins, daily):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": dev_id, "name": dev_id},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": 80, "humidity": 30},
+                          "rain": {"daily_in": daily}, "source": "test"})
+
+    # Cumulative counter (never resets near 0): min 16 > floor → max dropped.
+    for mins, d in ((120, 16.0), (60, 18.0), (30, 19.8)):
+        post("AAAAAAAAAAAA", mins, d)
+    # Real resetting daily counter: min ~0 → kept.
+    for mins, d in ((120, 0.0), (60, 0.5), (30, 0.0)):
+        post("BBBBBBBBBBBB", mins, d)
+
+    hdr = {"Authorization": "Bearer test-api-token"}
+    cum = client.get("/api/devices/AA:AA:AA:AA:AA:AA/records", headers=hdr).json()
+    assert cum["periods"]["all"]["fields"]["dailyrainin"]["max"] is None   # dropped
+    real = client.get("/api/devices/BB:BB:BB:BB:BB:BB/records", headers=hdr).json()
+    assert real["periods"]["all"]["fields"]["dailyrainin"]["max"] == 0.5   # kept
+
+
+def test_maintenance_cleans_cumulative_rain(client, temp_env):
+    """clean_cumulative_rain nulls a non-resetting (cumulative) rain column and
+    leaves a real resetting counter — and the whole thing dry-runs by default."""
+    import datetime as _dt
+    import sqlite3
+    from app import maintenance
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    def post(dev_id, mins, daily):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": dev_id}, "timestamp_utc": ts,
+                          "outdoor": {"tempf": 80}, "rain": {"daily_in": daily},
+                          "source": "test"})
+
+    for mins, d in ((90, 18.0), (60, 19.0), (30, 19.8)):   # cumulative
+        post("AAAAAAAAAAAA", mins, d)
+    for mins, d in ((90, 0.0), (60, 0.4), (30, 0.0)):      # resetting
+        post("BBBBBBBBBBBB", mins, d)
+
+    dry = maintenance.clean_cumulative_rain(apply=False, db_path=temp_env)
+    assert "AA:AA:AA:AA:AA:AA:dailyrainin" in dry["findings"]
+    assert not any(k.startswith("BB:BB") for k in dry["findings"])   # resetting not flagged
+    assert dry["applied"] is False
+
+    res = maintenance.clean_cumulative_rain(apply=True, db_path=temp_env)
+    assert res["applied"] and res["cleaned"] == 3 and res["backup"]
+
+    conn = sqlite3.connect(temp_env)
+    a = conn.execute("SELECT COUNT(*) FROM observations WHERE mac='AA:AA:AA:AA:AA:AA' "
+                     "AND dailyrainin IS NOT NULL").fetchone()[0]
+    a_json = conn.execute("SELECT COUNT(*) FROM observations WHERE mac='AA:AA:AA:AA:AA:AA' "
+                          "AND json_extract(data_json, '$.dailyrainin') IS NOT NULL").fetchone()[0]
+    b = conn.execute("SELECT MAX(dailyrainin) FROM observations "
+                     "WHERE mac='BB:BB:BB:BB:BB:BB'").fetchone()[0]
+    conn.close()
+    assert a == 0 and a_json == 0     # cumulative nulled in column AND data_json
+    assert b == 0.4                   # resetting device untouched
+
+
+def test_ingest_drops_glitch_gust(client):
+    """A gust wildly above the concurrent sustained wind is nulled at ingest."""
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEEFF"},
+                          "timestamp_utc": "2026-07-18T20:34:00Z",
+                          "outdoor": {"tempf": 95},
+                          "wind": {"speed_mph": 4.56, "gust_mph": 58.0},
+                          "source": "test"})
+    assert r.status_code == 200
+    cur = client.get("/api/devices/AA:BB:CC:DD:EE:FF/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert cur["windgustmph"] is None          # glitch dropped
+    assert cur["windspeedmph"] == 4.56         # sustained wind kept
+
+def test_ingest_keeps_real_gust(client):
+    """A plausible gust (within the factor of sustained wind) is kept."""
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEE11"},
+                      "timestamp_utc": "2026-07-18T21:00:00Z",
+                      "outdoor": {"tempf": 95},
+                      "wind": {"speed_mph": 12.0, "gust_mph": 28.0},
+                      "source": "test"})
+    cur = client.get("/api/devices/AA:BB:CC:DD:EE:11/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert cur["windgustmph"] == 28.0
+
+
+def test_maintenance_cleans_glitch_gusts(client, temp_env):
+    """clean_glitch_gusts nulls a historical spurious gust, keeps real ones."""
+    import sqlite3
+    from app import maintenance
+    # NB: the ingest guard would drop the glitch on the way in, so insert the
+    # bad gust directly to simulate pre-guard historical data.
+    conn = sqlite3.connect(temp_env)
+    conn.execute("INSERT INTO observations (mac, dateutc_ms, data_json, windgustmph, windspeedmph) "
+                 "VALUES ('AA:AA:AA:AA:AA:AA', 1000, '{\"windgustmph\":58.0,\"windspeedmph\":4.5}', 58.0, 4.5)")
+    conn.execute("INSERT INTO observations (mac, dateutc_ms, data_json, windgustmph, windspeedmph) "
+                 "VALUES ('AA:AA:AA:AA:AA:AA', 2000, '{\"windgustmph\":28.0,\"windspeedmph\":12.0}', 28.0, 12.0)")
+    conn.commit(); conn.close()
+
+    dry = maintenance.clean_glitch_gusts(apply=False, db_path=temp_env)
+    assert dry["bad_rows"] == 1 and dry["applied"] is False
+    res = maintenance.clean_glitch_gusts(apply=True, db_path=temp_env)
+    assert res["applied"] and res["cleaned"] == 1 and res["backup"]
+
+    conn = sqlite3.connect(temp_env)
+    gusts = [r[0] for r in conn.execute(
+        "SELECT windgustmph FROM observations WHERE mac='AA:AA:AA:AA:AA:AA' ORDER BY dateutc_ms")]
+    conn.close()
+    assert gusts == [None, 28.0]     # glitch nulled, real gust kept
+
+
+async def _ingest(client, mac, ts, **outdoor):
+    return client.post("/ingest/custom",
+                       headers={"Authorization": "Bearer test-ingest-token"},
+                       json={"device": {"id": mac}, "timestamp_utc": ts, **outdoor})
+
+
+def test_value_at_or_before_supports_non_rain_columns(client):
+    """Regression: the smart-alert pressure lookup asserted on a rain-only
+    whitelist, so every alert tick raised and frost/heat/pressure never fired."""
+    import asyncio
+    from app import db
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF"},
+                      "timestamp_utc": "2026-07-20T00:00:00Z",
+                      "outdoor": {"tempf": 80}, "pressure": {"relative_inhg": 29.90},
+                      "source": "test"})
+    v = asyncio.run(
+        db.value_at_or_before("AA:BB:CC:DD:EE:FF", "baromrelin", 4102444800000))
+    assert v == 29.90          # previously raised AssertionError
+
+def test_smart_alerts_tick_runs_without_error(client, monkeypatch):
+    """End-to-end: the smart-alert pass must complete for a device that reports
+    pressure (the path that used to blow up every 60s)."""
+    import asyncio
+    from app.config import settings
+    from app.alerts import AlertMonitor, EffectiveAlertConfig
+    monkeypatch.setattr(settings, "smart_alerts", True)
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF", "name": "Davis"},
+                      "timestamp_utc": "2026-07-20T00:00:00Z",
+                      "outdoor": {"tempf": 30.0}, "pressure": {"relative_inhg": 29.5},
+                      "source": "test"})
+    from app import db
+    devices = asyncio.run(db.list_devices())
+    cfg = EffectiveAlertConfig(enabled=False, transport_configured=False, recipients=[],
+                               default_threshold_min=15, repeat_hours=0, smtp_host=None,
+                               smtp_port=587, smtp_username=None, smtp_password=None,
+                               smtp_from=None, smtp_tls=True, smtp_ssl=False)
+    # Must not raise (delivery is a no-op with no transport configured).
+    asyncio.run(AlertMonitor()._check_smart_alerts(cfg, devices, 1784500000000))
+
+
+def test_bucketed_winddir_uses_circular_mean(client):
+    """Direction is modular: AVG(355,5) = 180 (due SOUTH) for a north wind.
+    Bucketed history must use the vector mean instead."""
+    import asyncio, datetime as _dt
+    from app import db
+    now = _dt.datetime.now(_dt.timezone.utc)
+    # Pin BOTH readings inside the SAME 1-minute bucket (bucket = ms // 60000),
+    # otherwise each bucket holds one value and even a broken AVG looks right.
+    base = (now - _dt.timedelta(hours=1)).replace(second=0, microsecond=0)
+    for sec, wd in ((10, 355.0), (40, 5.0)):
+        ts = (base + _dt.timedelta(seconds=sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEEFF"}, "timestamp_utc": ts,
+                          "outdoor": {"tempf": 80},
+                          "wind": {"speed_mph": 10, "dir_deg": wd}, "source": "test"})
+    end = int(now.timestamp() * 1000)
+    rows = asyncio.run(db.history("AA:BB:CC:DD:EE:FF", end - 24*3600*1000, end))
+    dirs = [r["winddir"] for r in rows if r.get("winddir") is not None]
+    assert dirs, "expected a bucketed row with a direction"
+    # Circular mean of 355 and 5 is ~0/360 (north), NOT 180 (south).
+    assert any(d < 15 or d > 345 for d in dirs), f"got {dirs} — south means AVG() is back"
+
+def test_raw_history_keeps_newest_rows_when_limited(client):
+    """ASC+LIMIT dropped the NEWEST rows, so a busy short window's chart ended
+    hours early. The most recent rows must survive truncation."""
+    import asyncio, datetime as _dt
+    from app import db
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for i in range(6):                     # 6 readings, 1 min apart
+        ts = (now - _dt.timedelta(minutes=6 - i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEE22"}, "timestamp_utc": ts,
+                          "outdoor": {"tempf": 70.0 + i}, "source": "test"})
+    end = int(now.timestamp() * 1000)
+    rows = asyncio.run(db.history("AA:BB:CC:DD:EE:22", end - 3600*1000, end, limit=3))
+    temps = [r.get("tempf") for r in rows]
+    assert temps == sorted(temps), "rows must come back oldest-first"
+    assert 75.0 in temps, f"newest reading dropped: {temps}"
+
+
+def test_records_concurrent_callers_all_get_data(client):
+    """Concurrent callers must WAIT for the in-flight compute. The old dedupe
+    short-circuited to {} and handed them a 200 with an empty body."""
+    import asyncio
+    from app import main as _m
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF"},
+                      "timestamp_utc": "2026-07-20T00:00:00Z",
+                      "outdoor": {"tempf": 88.0}, "source": "test"})
+    _m._RECORDS_CACHE.clear()
+
+    async def three():
+        return await asyncio.gather(*[_m._cached_records("AA:BB:CC:DD:EE:FF")
+                                      for _ in range(3)])
+    results = asyncio.run(three())
+    assert all(r.get("periods") for r in results), \
+        f"a concurrent caller got an empty payload: {[bool(r) for r in results]}"
+
+def test_records_unknown_mac_404s_and_is_not_cached(client):
+    from app import main as _m
+    _m._RECORDS_CACHE.clear()
+    r = client.get("/api/devices/DE:AD:BE:EF:00:01/records",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 404
+    assert _m._RECORDS_CACHE == {}          # no unbounded growth on bogus MACs
+
+def test_records_cache_is_bounded(client):
+    """Even if entries are added directly, the cache must not grow forever."""
+    from app import main as _m
+    _m._RECORDS_CACHE.clear()
+    import time as _t
+    for i in range(_m._RECORDS_MAX_ENTRIES + 20):
+        _m._RECORDS_CACHE[f"MAC{i}"] = (_t.time(), {"periods": {}})
+    _m._prune_records_cache()
+    assert len(_m._RECORDS_CACHE) <= _m._RECORDS_MAX_ENTRIES
+
+def test_metrics_masks_mac(client, monkeypatch):
+    """/metrics is open when enabled — it must mask MACs like the status page."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "prometheus_metrics", True)
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF", "name": "Davis"},
+                      "timestamp_utc": "2026-07-20T00:00:00Z",
+                      "outdoor": {"tempf": 88.0}, "source": "test"})
+    body = client.get("/metrics").text
+    assert "AA:BB:CC:DD:EE:FF" not in body      # full hardware address withheld
+    assert "EE:FF" in body                       # last 2 bytes still identify it

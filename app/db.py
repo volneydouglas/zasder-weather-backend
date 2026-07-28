@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -7,6 +8,8 @@ from typing import Any, AsyncIterator
 import aiosqlite
 
 from .config import settings
+
+log = logging.getLogger("zasder.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -56,7 +59,16 @@ CREATE INDEX IF NOT EXISTS idx_obs_mac_date
 CREATE INDEX IF NOT EXISTS idx_obs_chart
     ON observations (mac, dateutc_ms, tempf, feels_like, humidity, baromrelin,
                      uv, windspeedmph, dew_point, solarradiation, hourlyrainin,
-                     winddir, yearlyrainin);
+                     winddir, yearlyrainin, windgustmph);
+
+-- Records (db.records) do MIN/MAX + first-occurrence lookups per metric over
+-- the full per-mac history. windgustmph + dailyrainin aren't in idx_obs_chart,
+-- so those two records fell to full heap scans of the fat data_json rows
+-- (~1 KB each) — 60s+ on a season of data. This covering index keeps the
+-- peak-gust / wettest-day records index-only like the rest. Additive
+-- (new name) so it builds once and doesn't disturb idx_obs_chart.
+CREATE INDEX IF NOT EXISTS idx_obs_records
+    ON observations (mac, dateutc_ms, windgustmph, dailyrainin);
 
 -- Operator-set per-device location (lat/lon), entered from the iOS app's
 -- per-device Location setting. Takes precedence over the ingest-time default
@@ -242,7 +254,32 @@ async def init_db() -> None:
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
+        # idx_obs_chart gained windgustmph so the bucketed chart query can serve
+        # wind gust index-only. SQLite won't alter an existing index, so rebuild
+        # it once if the stored definition predates the column (one-time cost at
+        # boot; the app isn't serving yet).
+        cur = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_obs_chart'")
+        row = await cur.fetchone()
+        if row and row[0] and "windgustmph" not in row[0]:
+            await db.execute("DROP INDEX idx_obs_chart")
+            await db.execute(
+                "CREATE INDEX idx_obs_chart ON observations "
+                "(mac, dateutc_ms, tempf, feels_like, humidity, baromrelin, uv, "
+                "windspeedmph, dew_point, solarradiation, hourlyrainin, winddir, "
+                "yearlyrainin, windgustmph)")
         await db.commit()
+
+        # Probe for SQLite's math functions once — they drive the circular mean
+        # used for bucketed wind direction (see _winddir_expr).
+        global _HAS_MATH_FUNCS
+        try:
+            await db.execute("SELECT DEGREES(ATAN2(1.0, 1.0))")
+            _HAS_MATH_FUNCS = True
+        except Exception:
+            _HAS_MATH_FUNCS = False
+            log.warning("SQLite lacks math functions; bucketed wind direction "
+                        "falls back to a (circularly incorrect) arithmetic mean")
 
 
 @asynccontextmanager
@@ -808,6 +845,29 @@ def _auto_bucket_ms(window_ms: int) -> int:
     return 60 * 60_000                           # 1-hour → ≤720 points for 30d
 
 
+# Does this SQLite build have the math functions (SIN/COS/ATAN2/RADIANS)?
+# Probed once in init_db. Built in by default since SQLite 3.35, but we don't
+# control every self-hoster's build, so degrade instead of 500ing.
+_HAS_MATH_FUNCS: bool = False
+
+
+def _winddir_expr() -> str:
+    """Bucket-average wind direction.
+
+    Direction is MODULAR: the arithmetic mean of 355° and 5° is 180° — due
+    SOUTH for a steady north wind. That's what AVG(winddir) did, so every wind
+    rose on a bucketed (>6h) window could point the wrong way. The circular
+    (vector) mean averages the unit vectors instead, which is correct across the
+    0/360 wrap. Falls back to the old AVG only where the math functions are
+    missing — wrong, but no worse than before and better than an error.
+    """
+    if not _HAS_MATH_FUNCS:
+        return "AVG(winddir)"
+    return ("CASE WHEN COUNT(winddir) = 0 THEN NULL ELSE "
+            "(DEGREES(ATAN2(AVG(SIN(RADIANS(winddir))), "
+            "AVG(COS(RADIANS(winddir))))) + 360.0) % 360.0 END")
+
+
 async def history(
     mac: str, start_ms: int, end_ms: int, limit: int = 5000
 ) -> list[dict[str, Any]]:
@@ -831,16 +891,20 @@ async def history(
     bucket_ms = _auto_bucket_ms(end_ms - start_ms)
     if bucket_ms == 0:
         async with connect() as db:
+            # DESC + reverse, not ASC: when a short window has more rows than
+            # `limit` (two sources at ~16s fill 2000 rows in ~6h), ASC drops the
+            # NEWEST rows, so the chart just ends hours early with no hint. Keep
+            # the most recent `limit` rows and hand them back oldest-first.
             rows = await (await db.execute(
                 """
                 SELECT data_json FROM observations
                 WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?
-                ORDER BY dateutc_ms ASC
+                ORDER BY dateutc_ms DESC
                 LIMIT ?
                 """,
                 (mac, start_ms, end_ms, limit),
             )).fetchall()
-        parsed = [json.loads(r["data_json"]) for r in rows]
+        parsed = [json.loads(r["data_json"]) for r in reversed(rows)]
         _derive_hourly_rain(parsed)
         return parsed
 
@@ -866,7 +930,8 @@ async def history(
           AVG(humidity)       AS humidity,
           AVG(baromrelin)     AS baromrelin,
           AVG(windspeedmph)   AS windspeedmph,
-          AVG(winddir)        AS winddir,
+          AVG(windgustmph)    AS windgustmph,
+          {_winddir_expr()}   AS winddir,
           AVG(hourlyrainin)   AS hourlyrainin,
           MAX(yearlyrainin)   AS yearlyrainin,
           AVG(uv)             AS uv,
@@ -883,6 +948,8 @@ async def history(
           MAX(baromrelin)     AS baromrelin_max,
           MIN(windspeedmph)   AS windspeedmph_min,
           MAX(windspeedmph)   AS windspeedmph_max,
+          MIN(windgustmph)    AS windgustmph_min,
+          MAX(windgustmph)    AS windgustmph_max,
           MIN(hourlyrainin)   AS hourlyrainin_min,
           MAX(hourlyrainin)   AS hourlyrainin_max,
           MIN(solarradiation) AS solarradiation_min,
@@ -963,9 +1030,16 @@ async def _rain_col_at_or_before(mac: str, col: str, cutoff_ms: int) -> float | 
     (so a freshly-deployed sensor still gets sensible rollups). Returns None
     only if the device has zero non-null values for the column.
 
+    Also used for non-rain columns via value_at_or_before (smart alerts read
+    baromrelin here for pressure tendency) — the whitelist is the full observation
+    column set, which is what keeps the f-string interpolation injection-safe.
+    It previously allowed only the two rain columns, so the pressure-tendency
+    lookup raised AssertionError on every alert tick and took the whole smart-alert
+    pass (frost + heat included) down with it.
+
     `col` is an INTERNAL whitelisted column name (never user input), so the
     f-string interpolation is safe."""
-    assert col in ("yearlyrainin", "monthlyrainin"), f"bad rain col: {col}"
+    assert col in _COLUMNS, f"bad column: {col}"
     async with connect() as db:
         row = await (await db.execute(
             f"SELECT {col} AS v FROM observations "
@@ -1121,6 +1195,14 @@ RECORD_FIELDS = [
     "windspeedmph", "windgustmph", "uv", "solarradiation", "dailyrainin",
 ]
 
+# "Wettest day" comes from dailyrainin.max. A real daily-rain counter resets to
+# ~0 every local midnight, so its all-time MIN is near 0. Some sources (e.g. an
+# SDR posting a sensor's lifetime cumulative counter) historically stored a
+# non-resetting value in dailyrainin — its "max" is then a lifetime total, not a
+# single-day record. If a period's MIN never drops near this floor, the counter
+# isn't resetting and its max is dropped as unreliable.
+_DAILY_RAIN_RESET_FLOOR_IN = 5.0
+
 
 async def records(mac: str, tz_name: str = "UTC",
                   fields: list[str] | None = None) -> dict[str, Any]:
@@ -1186,5 +1268,11 @@ async def records(mac: str, tz_name: str = "UTC",
                     "minAt": await _at(row["lo"]),
                     "maxAt": await _at(row["hi"]),
                 }
+            # Drop a "wettest day" that's really a non-resetting cumulative
+            # counter (see _DAILY_RAIN_RESET_FLOOR_IN).
+            dr = pfields.get("dailyrainin")
+            if dr and dr["min"] is not None and dr["min"] > _DAILY_RAIN_RESET_FLOOR_IN:
+                dr["max"] = None
+                dr["maxAt"] = None
             out["periods"][pname] = {"start_ms": start_ms, "fields": pfields}
     return out

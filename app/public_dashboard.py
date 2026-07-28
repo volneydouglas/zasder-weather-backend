@@ -26,9 +26,12 @@ CORE_FIELDS = ["tempf", "humidity", "windspeedmph", "baromrelin", "hourlyrainin"
 
 
 def _num(v: Any) -> float | None:
+    """Coerce to a FINITE float, else None. Infinity matters as much as NaN:
+    int(inf) raises OverflowError, which would 500 the public page just like
+    int(nan) raises ValueError."""
     try:
         f = float(v)
-        return f if f == f else None  # drop NaN
+        return f if math.isfinite(f) else None
     except (TypeError, ValueError):
         return None
 
@@ -120,8 +123,11 @@ _COMPASS = ["N", "E", "S", "W"]
 
 def svg_wind_rose(samples: list[tuple[float, float]], size: int = 200) -> str:
     """Inline SVG wind rose from (direction_deg, speed_mph) samples."""
-    data = [(float(d) % 360.0, float(s)) for d, s in samples
-            if d is not None and s is not None and s == s]
+    # Defence in depth: filter through _num so a non-finite direction or speed
+    # can't reach int() below and 500 the page (the caller filters too).
+    data = [(dv % 360.0, sv)
+            for dv, sv in ((_num(d), _num(s)) for d, s in samples)
+            if dv is not None and sv is not None]
     if len(data) < 3:
         return '<div class="chart-empty">no wind data in the last 24h</div>'
 
@@ -272,12 +278,16 @@ def render_station(name: str, obs: dict[str, Any] | None,
 
 # All-time record cards shown under the charts. (field, hi|lo, label, unit).
 _RECORD_CARDS = [
-    ("tempf",        "max", "Hottest",       "°F"),
-    ("tempf",        "min", "Coldest",       "°F"),
-    ("windgustmph",  "max", "Peak gust",     "mph"),
-    ("dailyrainin",  "max", "Wettest day",   "in"),
-    ("baromrelin",   "max", "High pressure", "inHg"),
-    ("baromrelin",   "min", "Low pressure",  "inHg"),
+    ("tempf",        "max", "Hottest",        "°F"),
+    ("tempf",        "min", "Coldest",        "°F"),
+    ("feelsLike",    "max", "Hottest feels",  "°F"),
+    ("feelsLike",    "min", "Coldest feels",  "°F"),
+    ("dewPoint",     "max", "Highest dew pt", "°F"),
+    ("dewPoint",     "min", "Lowest dew pt",  "°F"),
+    ("windgustmph",  "max", "Peak gust",      "mph"),
+    ("dailyrainin",  "max", "Wettest day",    "in"),
+    ("baromrelin",   "max", "High pressure",  "inHg"),
+    ("baromrelin",   "min", "Low pressure",   "inHg"),
 ]
 
 

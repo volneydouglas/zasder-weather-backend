@@ -121,12 +121,28 @@ class MqttPublisher:
         client = mqtt.Client()
         if settings.mqtt_username:
             client.username_pw_set(settings.mqtt_username, settings.mqtt_password)
-        try:
-            client.connect(settings.mqtt_host, settings.mqtt_port, keepalive=60)
-            client.loop_start()
-        except Exception as e:
-            log.warning("MQTT connect to %s:%s failed: %s",
-                        settings.mqtt_host, settings.mqtt_port, e)
+        # connect() is a BLOCKING paho call (DNS + TCP + CONNACK). Called
+        # directly on the event loop it stalls all HTTP serving, ingest and
+        # pollers for the resolver/TCP timeout when the broker is unreachable —
+        # so run it in a thread. And retry with backoff: paho's auto-reconnect
+        # only kicks in AFTER a first successful connect, so a broker that's
+        # down at boot used to mean MQTT stayed dead until the next redeploy.
+        delay = 5
+        while not self._stop.is_set():
+            try:
+                await asyncio.to_thread(
+                    client.connect, settings.mqtt_host, settings.mqtt_port, 60)
+                client.loop_start()
+                break
+            except Exception as e:
+                log.warning("MQTT connect to %s:%s failed (%s); retrying in %ds",
+                            settings.mqtt_host, settings.mqtt_port, e, delay)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                    return                      # stopped while waiting
+                except asyncio.TimeoutError:
+                    delay = min(delay * 2, 300)
+        if self._stop.is_set():
             return
         self._client = client
         log.info("MQTT publisher connected to %s:%s (prefix=%s)",

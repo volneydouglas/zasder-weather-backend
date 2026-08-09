@@ -56,6 +56,26 @@ The iOS app ([app page](https://zasder.com/weather)) is distributed separately a
 
 ## Quickstart: Fly.io (5 minutes)
 
+### On a Mac: no Terminal required
+
+If you'd rather not use the Terminal at all, you don't have to:
+
+1. Click the green **Code** button at the top of this page →
+   **Download ZIP**.
+2. Double-click the downloaded ZIP to unpack it.
+3. Inside the folder, **double-click `Zasder Weather Setup.command`**.
+
+macOS will likely say the file is *"from an unidentified developer."* That's
+expected for a script downloaded from the internet — **right-click the file
+and choose Open** instead, then confirm. You only do this once.
+
+It installs the Fly.io tool, signs you in through your browser, creates your
+server, and offers to connect a Davis WeatherLink Live at the end. It asks
+questions along the way — **type short answers and press return**; don't
+paste commands into them.
+
+### Or with the Terminal
+
 ```sh
 # 1. Install Fly CLI
 brew install flyctl

@@ -47,6 +47,12 @@ confirm() {  # confirm <prompt> — default yes
   case "$(echo "$a" | tr '[:upper:]' '[:lower:]')" in n|no) return 1 ;; *) return 0 ;; esac
 }
 
+confirm_no() {  # confirm_no <prompt> — default no
+  local a
+  ask a "$1 [y/N]: "
+  case "$(echo "$a" | tr '[:upper:]' '[:lower:]')" in y|yes) return 0 ;; *) return 1 ;; esac
+}
+
 clear
 bold "Zasder Weather — Setup"
 echo
@@ -66,6 +72,24 @@ if [ ! -f "bin/setup-fly.sh" ]; then
 fi
 ok "found the setup files"
 
+# Some people are handed a ready-made server — a friend set one up, or they're
+# on a hosted instance. They only need the local WeatherLink Live piece, and
+# running the Fly steps would create a second server they never asked for.
+echo
+bold "Do you already have a server?"
+info "If someone gave you a web address (like https://something.fly.dev) and a"
+info "token to go with it, answer yes and we'll skip straight to connecting"
+info "your weather station. If you're starting from scratch, answer no."
+echo
+if confirm_no "  Already have a server address and token?"; then
+  HAVE_SERVER=1
+  ok "skipping server creation"
+else
+  HAVE_SERVER=0
+fi
+
+if [ "$HAVE_SERVER" -eq 0 ]; then
+
 # ── Step 1: flyctl ───────────────────────────────────────────────────────
 # Fly's installer puts flyctl here; pick it up even if the user's shell
 # profile hasn't been reloaded since a previous run.
@@ -76,7 +100,7 @@ if command -v fly >/dev/null 2>&1; then
   ok "Fly.io command line tool is installed"
 else
   echo
-  bold "Step 1 of 4 — install the Fly.io tool"
+  bold "Step 1 — install the Fly.io tool"
   info "Your weather server runs on Fly.io. Their free tier is enough."
   info "This installs their official command line tool into your home folder"
   info "(no admin password needed, nothing outside your account is touched)."
@@ -112,7 +136,7 @@ fi
 
 # ── Step 2: sign in ──────────────────────────────────────────────────────
 echo
-bold "Step 2 of 4 — sign in to Fly.io"
+bold "Step 2 — sign in to Fly.io"
 if fly auth whoami >/dev/null 2>&1; then
   ok "already signed in as $(fly auth whoami 2>/dev/null)"
 else
@@ -132,7 +156,7 @@ fi
 
 # ── Step 3: the backend ──────────────────────────────────────────────────
 echo
-bold "Step 3 of 4 — create your weather server"
+bold "Step 3 — create your weather server"
 info "The next part asks a few questions of its own — an app name, a region,"
 info "and which weather stations you have."
 echo
@@ -154,9 +178,11 @@ fi
 ok "server setup finished"
 info "Your tokens were saved to zasder-install-summary.txt in this folder."
 
-# ── Step 4: local station hardware (optional) ────────────────────────────
+fi   # end HAVE_SERVER == 0
+
+# ── Final step: local station hardware (optional) ────────────────────────
 echo
-bold "Step 4 of 4 — connect a Davis WeatherLink Live (optional)"
+bold "Connect a Davis WeatherLink Live (optional)"
 info "Only needed if you have a Davis WeatherLink Live on your network and"
 info "want this Mac to feed it to your server. Stations that report to the"
 info "cloud (AmbientWeather, and Davis via WeatherLink cloud) need nothing here."
@@ -173,8 +199,13 @@ fi
 echo
 bold "All done."
 echo
-info "Next: open Zasder Weather on your iPhone, go to Settings, and enter"
-info "your backend URL and API_TOKEN — both are in the file"
-info "zasder-install-summary.txt in this folder."
-echo
-info "To open that file now, run:  open zasder-install-summary.txt"
+if [ "$HAVE_SERVER" -eq 1 ]; then
+  info "Next: open Zasder Weather on your iPhone, go to Settings, and enter"
+  info "the server address and token you were given."
+else
+  info "Next: open Zasder Weather on your iPhone, go to Settings, and enter"
+  info "your backend URL and API_TOKEN — both are in the file"
+  info "zasder-install-summary.txt in this folder."
+  echo
+  info "To open that file now, run:  open zasder-install-summary.txt"
+fi

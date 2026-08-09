@@ -100,6 +100,22 @@ normalize_sources() {  # map aliases → canonical awn|davis|lilygo, dedup
   SOURCES="$out"
 }
 
+# The backend resolves this with Python's zoneinfo, so validate the same way
+# when Python is around; otherwise fall back to the system tz database. Both
+# accept "America/New_York" and reject "EDT".
+valid_timezone() {
+  [ -n "$1" ] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" <<'PY' >/dev/null 2>&1
+import sys
+from zoneinfo import ZoneInfo
+ZoneInfo(sys.argv[1])
+PY
+    return $?
+  fi
+  [ -f "/usr/share/zoneinfo/$1" ]
+}
+
 # Fly app names: lowercase letters, digits and dashes only, starting with a
 # letter, max 63 chars. Validating here matters more than it looks — the most
 # common mistake is pasting the NEXT command from the README into this prompt,
@@ -177,7 +193,7 @@ if [ "$FORCE_CREATE" -eq 1 ]; then
   warn "--force-create set; will treat as initial create even if app exists"
   mode=create
 fi
-info "Mode: \033[1m$mode\033[0m"
+printf '  Mode: \033[1m%s\033[0m\n' "$mode"
 echo
 
 # ── --rotate-tokens guardrail (update mode only) ───────────────────────
@@ -214,7 +230,7 @@ if [ "$mode" = "create" ]; then
     warn "No sources selected. The backend will deploy but stay empty until you"
     warn "enable a source. Re-run with --sources=… or add one from the iOS app docs."
   else
-    info "Enabling: \033[1m$SOURCES\033[0m"
+    printf '  Enabling: \033[1m%s\033[0m\n' "$SOURCES"
   fi
   echo
 
@@ -264,13 +280,38 @@ if [ "$mode" = "create" ]; then
   fi
 
   # 6. Timezone (affects rain rollups regardless of source)
+  #
+  # Must be an IANA name. Abbreviations are the obvious thing to type and are
+  # NOT valid: ZoneInfo("EDT") raises, and nothing here validated it, so the
+  # value sailed into a secret and then 500'd the status page, records and
+  # rain rollups later — with no hint that setup was where it went wrong.
   echo
   bold "Local timezone (for daily/hourly/weekly/monthly rain rollups)"
+  # Offer the machine's own zone as the default; it's almost always right and
+  # saves the user guessing at a format they've never seen.
+  sys_tz="UTC"
+  if [ -L /etc/localtime ]; then
+    sys_tz="$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')"
+  fi
+  [ -n "$sys_tz" ] || sys_tz="UTC"
   tz="$TZ_FLAG"
   if [ -z "$tz" ] && [ "$NONINTERACTIVE" -eq 0 ]; then
-    read -r -p "TIMEZONE [UTC]: " tz
+    info "Use an IANA name like America/New_York or Europe/London."
+    info "Abbreviations such as EDT or PST are not valid here."
+    while :; do
+      read -r -p "TIMEZONE [$sys_tz]: " tz || tz=""
+      tz=${tz:-$sys_tz}
+      valid_timezone "$tz" && break
+      err "'$tz' isn't a timezone name this server can use."
+      info "It needs the Region/City form — America/New_York, not EDT."
+      info "Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
+      echo
+    done
   fi
-  tz=${tz:-UTC}
+  tz=${tz:-$sys_tz}
+  if ! valid_timezone "$tz"; then
+    err "--tz='$tz' isn't a valid IANA timezone (try America/New_York)."; exit 1
+  fi
 
   # 7. Fresh tokens
   api_token=$(openssl rand -hex 32)

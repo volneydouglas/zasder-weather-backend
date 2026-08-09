@@ -27,6 +27,19 @@ xml_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+# Every prompt goes through this. A bare `read` in a retry loop spins forever
+# printing errors if stdin closes (Ctrl-D, or a piped run that runs dry), so
+# EOF has to abort rather than fall through with an empty value.
+ask() {  # ask <varname> <prompt>
+  local __var="$1" __prompt="$2" __val
+  if ! read -r -p "$__prompt" __val; then
+    echo
+    bad "Input closed — nothing was installed. Re-run when you're ready."
+    exit 1
+  fi
+  printf -v "$__var" '%s' "$__val"
+}
+
 unload_agent() {
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null \
     || launchctl unload "$PLIST" 2>/dev/null || true
@@ -70,7 +83,7 @@ info "Find it in the WeatherLink app: Account → Devices → your WLL → Devic
 info "or in your router's list of connected devices. Looks like 192.168.1.42"
 echo
 while :; do
-  read -r -p "  WeatherLink Live IP address: " WLL_HOST
+  ask WLL_HOST "  WeatherLink Live IP address: "
   WLL_HOST="$(echo "$WLL_HOST" | tr -d '[:space:]')"
   [ -z "$WLL_HOST" ] && { bad "Please enter an address."; continue; }
   printf '  checking http://%s/v1/current_conditions ... ' "$WLL_HOST"
@@ -85,10 +98,13 @@ done
 # ── 2. Backend ───────────────────────────────────────────────────────────
 echo
 bold "2. Your backend"
-info "The https:// address of the backend you deployed (Fly.io or otherwise)."
+info "This is the address of the server you deployed — NOT an address on your"
+info "home network. If you used Fly.io it looks like:"
+info "    https://your-app-name.fly.dev"
+info "It's written in zasder-install-summary.txt from the backend setup."
 echo
 while :; do
-  read -r -p "  Backend URL: " BACKEND_URL
+  ask BACKEND_URL "  Backend URL: "
   BACKEND_URL="$(echo "$BACKEND_URL" | tr -d '[:space:]')"
   BACKEND_URL="${BACKEND_URL%/}"
   case "$BACKEND_URL" in
@@ -101,7 +117,23 @@ while :; do
     printf '\033[32mreached it\033[0m\n'; break
   fi
   printf '\033[31mno response\033[0m\n'
-  info "Couldn't reach that backend. Check the address and that it's deployed."
+  # A private/LAN address here is almost always the WeatherLink Live's IP or a
+  # guess, not the deployed backend — say so rather than "check the address".
+  case "$BACKEND_URL" in
+    http://10.*|http://192.168.*|http://172.1[6-9].*|http://172.2[0-9].*|\
+    http://172.3[01].*|http://localhost*|http://127.*|https://10.*|https://192.168.*)
+      bad "That's an address on your home network, not your deployed backend."
+      info "Unless you deliberately self-hosted on your own LAN, you want the"
+      info "public address from the backend setup — usually"
+      info "    https://your-app-name.fly.dev"
+      info "Find it with:  fly apps list      (the app you created)"
+      ;;
+    *)
+      info "Couldn't reach that backend. Check the address, and that the deploy"
+      info "actually finished — 'fly status -a your-app-name' should show the"
+      info "machine 'started'. If it's crash-looping, run 'fly logs -a your-app-name'."
+      ;;
+  esac
 done
 
 # ── 3. Ingest token ──────────────────────────────────────────────────────
@@ -113,7 +145,7 @@ info "inside the folder you downloaded. To see it, run:"
 info "    open \"\$(find ~ -name zasder-install-summary.txt -maxdepth 6 2>/dev/null | head -1)\""
 echo
 while :; do
-  read -r -p "  INGEST_TOKEN: " INGEST_TOKEN
+  ask INGEST_TOKEN "  INGEST_TOKEN: "
   INGEST_TOKEN="$(echo "$INGEST_TOKEN" | tr -d '[:space:]')"
   [ -n "$INGEST_TOKEN" ] && break
   bad "Please paste the token."
@@ -124,7 +156,7 @@ echo
 bold "4. Station name"
 info "What this station should be called in the app. Press return for the default."
 echo
-read -r -p "  Station name [Davis WeatherLink Live]: " WLL_DEVICE_NAME
+ask WLL_DEVICE_NAME "  Station name [Davis WeatherLink Live]: "
 WLL_DEVICE_NAME="${WLL_DEVICE_NAME:-Davis WeatherLink Live}"
 
 # Send exactly one real reading through the poller's own code path, so a bad
@@ -133,7 +165,7 @@ echo
 printf '  sending one test reading ... '
 RESULT=$(WLL_HOST="$WLL_HOST" BACKEND_URL="$BACKEND_URL" \
          INGEST_TOKEN="$INGEST_TOKEN" WLL_DEVICE_NAME="$WLL_DEVICE_NAME" \
-         python3 - "$SRC_DIR" <<'PY' 2>&1
+         "$PYBIN" - "$SRC_DIR" <<'PY' 2>&1
 import sys, urllib.error
 sys.path.insert(0, sys.argv[1])
 import poller

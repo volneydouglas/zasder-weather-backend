@@ -1,0 +1,82 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/guides/configure-coderabbit
+#
+# This is the PUBLIC backend mirror, generated from the zasder-weather
+# monorepo by bin/generate-public.sh. Edit this file in the monorepo at
+# public-template/.coderabbit.yaml — a copy made directly in the mirror is
+# wiped by the next generation run.
+#
+# Layout here differs from the monorepo: backend/ is flattened to the repo
+# root, so app/ and tests/ are top-level.
+
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill              # substantive findings, not style nits
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+
+  path_filters:
+    # Binaries / captures: no reviewable content, and they'd eat the diff budget.
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.jpeg"
+    - "!**/*.gif"
+    - "!**/*.pdf"
+
+    # Generated or vendored — not hand-authored, so review comments are noise.
+    # .pio is PlatformIO's build/deps tree; root_ca.h is a pasted CA bundle.
+    - "!lilygo-relay/.pio/**"
+    - "!lilygo-relay/**/root_ca.h"
+    - "!**/.venv/**"
+    - "!**/*.lock"
+
+  path_instructions:
+    - path: "app/**/*.py"
+      instructions: >-
+        FastAPI + aiosqlite backend, self-hosted by third parties from this
+        public repo — assume the reader is deploying it, not just reading it.
+        Prioritise: (1) SQL correctness, especially f-string interpolation into
+        SQL — flag any value that is NOT from an internal whitelist;
+        (2) timezone / local period-boundary handling in rain rollups and
+        records; (3) async issues — blocking calls on the event loop,
+        fire-and-forget tasks whose exceptions vanish, unbounded caches;
+        (4) secrets reaching logs (credentials are passed as query params to
+        some upstream APIs, and exception messages can embed the full URL);
+        (5) auth gaps on new endpoints — note that /, /healthz, /api/version
+        and /metrics are intentionally open while every /api/* route is
+        token-gated, and /ingest/custom is gated by a separate INGEST_TOKEN.
+    - path: "tests/**"
+      instructions: >-
+        pytest with asyncio_mode=auto. Flag tests that mutate shared state
+        (env vars, the on-disk SQLite file, module-level singletons) without
+        restoring it, and any test that would still pass if the behaviour it
+        names regressed.
+    - path: "wll-poller/**/*.py"
+      instructions: >-
+        Pure-stdlib Python service polling a Davis WeatherLink Live gateway on
+        the LAN and forwarding to /ingest/custom. It must stay dependency-free
+        — flag any new third-party import. Prioritise unit conversions,
+        resilience to malformed/partial gateway JSON, and retry/backoff
+        behaviour when the gateway or backend is unreachable.
+    - path: "lilygo-relay/**"
+      instructions: >-
+        ESP32 (Arduino) firmware for SDR weather-sensor capture. Prioritise
+        memory safety, blocking work in loop(), watchdog interaction, and the
+        provisioning/auth surface on its local HTTP server.
+    - path: "bin/*.sh"
+      instructions: >-
+        Setup and operations scripts that self-hosters run on their own
+        machines, often by copy-paste and sometimes as root. Prioritise:
+        unquoted expansions, missing `set -euo pipefail`, destructive commands
+        (rm -rf, docker volume prune) whose target could be empty or unset,
+        and any command that would echo a token to the terminal or into a
+        world-readable file.
+
+chat:
+  auto_reply: true

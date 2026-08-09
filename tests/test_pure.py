@@ -666,3 +666,29 @@ def test_num_rejects_infinity():
     assert _pdash._num(float("inf")) is None
     assert _pdash._num(float("nan")) is None
     assert _pdash._num("12.5") == 12.5
+
+
+def test_metrics_num_rejects_non_finite():
+    """metrics.py has its OWN _num; Infinity there emits `inf`, which is not a
+    valid Prometheus sample and breaks the whole scrape."""
+    assert _metrics._num(float("inf")) is None
+    assert _metrics._num(float("-inf")) is None
+    assert _metrics._num(float("nan")) is None
+    assert _metrics._num("29.92") == 29.92
+
+def test_metrics_render_skips_non_finite_values():
+    devices = [{"mac": "AA:BB:CC:DD:EE:FF", "name": "D", "lastSeen": 1000,
+                "lastData": {"tempf": float("inf"), "humidity": 40}}]
+    out = _metrics.render_prometheus(devices, now_ms=2000)
+    assert "inf" not in out                      # no invalid sample emitted
+    assert "zasder_humidity_percent" in out      # good values still exported
+
+def test_public_dashboard_fmt_keeps_units():
+    """_fmt output is all the reader sees (no separate unit element), so a
+    temperature must not render bare next to '30.04 inHg'."""
+    assert _pdash._fmt(115.3, "°F") == "115°F"
+    assert _pdash._fmt(26.0, "%") == "26%"
+    assert _pdash._fmt(4.6, "mph") == "5 mph"
+    assert _pdash._fmt(29.92, "inHg") == "29.92 inHg"
+    assert _pdash._fmt(66.0, "") == "66.00"      # chart axis label stays bare
+    assert _pdash._fmt(None, "°F") == "—"

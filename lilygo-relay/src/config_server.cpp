@@ -74,12 +74,21 @@ void loadFromNvs() {
   forwardAll  = prefs.getBool("forward_all", false);
   // Per-device setup key: mint + persist on first boot (or after an NVS
   // erase). Kept separate from the token so a 401 wipe never removes it.
+  bool minted = false;
   setupKey = prefs.getString("setup_key", "");
   if (setupKey.length() == 0) {
     setupKey = generateSetupKey();
     prefs.putString("setup_key", setupKey);
+    minted = true;
   }
-  Serial.printf("setup key (re-pair proof): %s\n", setupKey.c_str());
+  // Print the key only when it's actually needed: the boot that mints it, or
+  // while a re-pair is pending. It authorizes re-pairing AND /reset, so a
+  // retained/forwarded serial log would hand over control of the board.
+  if (minted || (provisioned && ingestToken.length() == 0)) {
+    Serial.printf("setup key (re-pair proof): %s\n", setupKey.c_str());
+  } else {
+    Serial.println("setup key: set (printed only when a re-pair is pending)");
+  }
   // Self-heal: if NVS lost the flag but both creds are present (e.g.
   // upgrading from a firmware build that predates the lock), treat the
   // board as already provisioned so the lock takes effect immediately
@@ -174,23 +183,31 @@ static bool secureEquals(const String &a, const String &b) {
 // /provision works without a chicken-and-egg loop.
 static bool checkAuth() {
   if (!provisioned) return true;
-  String supplied;
+
+  // Check EVERY channel independently. Collapsing them into one `supplied`
+  // slot meant a stale Authorization header masked a perfectly good setup_key
+  // sent alongside it — so a client couldn't recover after a token wipe.
+  auto matches = [](const String &candidate) -> bool {
+    if (candidate.length() == 0) return false;
+    bool tokenOk = ingestToken.length() > 0 && secureEquals(candidate, ingestToken);
+    bool keyOk   = setupKey.length()   > 0 && secureEquals(candidate, setupKey);
+    return tokenOk || keyOk;
+  };
+
   if (server.hasHeader("Authorization")) {
     String h = server.header("Authorization");
-    if (h.startsWith("Bearer ")) supplied = h.substring(7);
+    if (h.startsWith("Bearer ") && matches(h.substring(7))) return true;
   }
-  if (supplied.length() == 0 && server.hasArg("current_token")) {
-    supplied = server.arg("current_token");
-  }
-  if (supplied.length() == 0 && server.hasArg("setup_key")) {
-    supplied = server.arg("setup_key");
-  }
-  if (supplied.length() == 0) return false;
-  // secureEquals short-circuits on length mismatch; evaluate both so a
-  // non-empty token and the setup key are each accepted.
-  bool tokenOk = ingestToken.length() > 0 && secureEquals(supplied, ingestToken);
-  bool keyOk   = setupKey.length()   > 0 && secureEquals(supplied, setupKey);
-  return tokenOk || keyOk;
+  // Preferred channel for the setup key: a HEADER. Anything in a URL query
+  // string ends up in shell history, proxy logs and the browser's address bar,
+  // and this credential authorizes re-pairing and /reset.
+  if (server.hasHeader("X-Setup-Key") && matches(server.header("X-Setup-Key")))
+    return true;
+  if (server.hasArg("current_token") && matches(server.arg("current_token")))
+    return true;
+  if (server.hasArg("setup_key") && matches(server.arg("setup_key")))
+    return true;
+  return false;
 }
 
 static void handleProvision() {
@@ -359,7 +376,7 @@ void begin() {
   server.on("/reset",     HTTP_POST, handleReset);
   // ESP32 WebServer ignores headers by default; whitelist Authorization
   // so checkAuth() can read it.
-  const char *wantedHeaders[] = {"Authorization"};
+  const char *wantedHeaders[] = {"Authorization", "X-Setup-Key"};
   server.collectHeaders(wantedHeaders,
                         sizeof(wantedHeaders) / sizeof(wantedHeaders[0]));
   server.begin();

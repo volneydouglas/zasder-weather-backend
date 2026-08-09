@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
 import tempfile
 from collections.abc import Iterator
 
@@ -43,8 +44,26 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     # (WEATHERLINK_STATION_ID is typed int — blanking the key/secret is enough
     # to disable that poller, and "" would fail Settings validation.)
     for var in ("WEATHERLINK_API_KEY", "WEATHERLINK_API_SECRET", "MQTT_HOST",
-                "ALERT_EMAIL_TO", "SMTP_HOST"):
+                "ALERT_EMAIL_TO", "SMTP_HOST",
+                # Push: without these a developer .env would let a test run send
+                # REAL notifications to real devices via APNs/FCM or the relay.
+                "APNS_KEY_ID", "APNS_TEAM_ID", "APNS_KEY_P8", "APNS_TOPIC",
+                "APNS_RELAY_URL", "APNS_RELAY_TOKEN",
+                "FCM_SERVICE_ACCOUNT_JSON", "FCM_SERVICE_ACCOUNT_FILE"):
         monkeypatch.setenv(var, "")
+    # Module-level caches must not leak across tests (the public dashboard HTML
+    # and the per-MAC records cache are process-global by design). Reset only a
+    # module that is ALREADY imported: a module nobody imported yet holds no
+    # state to leak, and importing it here would bind app.main to this test's
+    # env ahead of the deliberate re-import in the `client` fixture. Deliberately
+    # unguarded — renaming a cache should fail the suite loudly, not silently
+    # stop isolating tests.
+    _m = sys.modules.get("app.main")
+    if _m is not None:
+        _m._PUBLIC_DASH_CACHE = None
+        _m._PUBLIC_DASH_LOCK = None     # rebound to each test's event loop
+        _m._RECORDS_CACHE.clear()
+        _m._RECORDS_LOCKS.clear()
     yield db_path
     shutil.rmtree(tmpdir, ignore_errors=True)
 

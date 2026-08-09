@@ -8,6 +8,7 @@ lives in main.py. No external dependency (the exposition format is trivial).
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 # (metric_name, HELP text, lastData field key). Names follow Prometheus
@@ -46,9 +47,12 @@ def _mask_mac(mac: Any) -> str:
 
 
 def _num(v: Any) -> float | None:
+    """Coerce to a FINITE float, else None. Infinity matters as much as NaN:
+    `{inf:g}` renders "inf", which is not a valid Prometheus sample value and
+    breaks the whole scrape."""
     try:
         f = float(v)
-        return f if f == f else None  # drop NaN
+        return f if math.isfinite(f) else None
     except (TypeError, ValueError):
         return None
 

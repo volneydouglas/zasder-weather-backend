@@ -306,12 +306,50 @@ async def status_page() -> HTMLResponse:
     # operator's station(s), rendered in place of the app screenshots.
     dashboard_html = ""
     if settings.public_dashboard and devices:
-        dashboard_html = await _build_public_dashboard(devices, now_ms)
+        dashboard_html = await _cached_public_dashboard(devices, now_ms)
 
     return HTMLResponse(_render_status_html(
         rows, total_obs, uptime, latest_temp, now_ms, update_info,
         dashboard_html=dashboard_html,
         app_url=settings.public_dashboard_app_url))
+
+
+# The public dashboard is rendered for ANONYMOUS requests on `/`, and the page
+# carries a 2-minute auto-refresh — so every visitor (and every refresh, and any
+# crawler) drove a fresh 24h history aggregation per device. Cache the rendered
+# HTML for slightly less than the refresh interval: the page can't show anything
+# newer than its own refresh cadence anyway, so this costs no freshness and makes
+# the only unauthenticated compute path flat under load.
+_PUBLIC_DASH_CACHE: tuple[float, str] | None = None
+_PUBLIC_DASH_TTL_S = 100
+# Serializes cache MISSES, mirroring _RECORDS_LOCKS. The TTL alone only flattens
+# load once the cache is warm: every anonymous request arriving during a cold
+# build started its own full 24h aggregation per device, so a burst on `/` (the
+# 2-minute auto-refresh syncing up, or a crawler) multiplied the one compute this
+# cache exists to avoid — on the only unauthenticated compute path.
+# Built lazily, and reset alongside the cache by the test fixture: an
+# asyncio.Lock binds to the first loop that awaits it, so a module-level
+# instance raises "bound to a different event loop" once a second loop uses it
+# (the suite runs asyncio.run() per test). Same reason _RECORDS_LOCKS is cleared.
+_PUBLIC_DASH_LOCK: asyncio.Lock | None = None
+
+
+async def _cached_public_dashboard(devices: list[dict], now_ms: int) -> str:
+    global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK
+    hit = _PUBLIC_DASH_CACHE
+    if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
+        return hit[1]
+    if _PUBLIC_DASH_LOCK is None:      # no await between test and assignment
+        _PUBLIC_DASH_LOCK = asyncio.Lock()
+    async with _PUBLIC_DASH_LOCK:
+        # Re-check under the lock: a caller that queued behind an in-flight
+        # build takes its result rather than running an identical second one.
+        hit = _PUBLIC_DASH_CACHE
+        if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
+            return hit[1]
+        html = await _build_public_dashboard(devices, now_ms)
+        _PUBLIC_DASH_CACHE = (time.time(), html)
+        return html
 
 
 async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
@@ -955,15 +993,23 @@ def _prune_records_cache() -> None:
     request unlimited distinct MACs and each would leave a permanent entry
     (db.records happily returns an empty skeleton for an unknown device).
     """
+    def _drop_lock(key: str) -> None:
+        # Never evict a HELD lock: dropping it lets the next caller build a fresh
+        # one and run a second concurrent compute for the same MAC, defeating the
+        # serialization the lock exists for.
+        lk = _RECORDS_LOCKS.get(key)
+        if lk is not None and not lk.locked():
+            del _RECORDS_LOCKS[key]
+
     now = time.time()
     for k, (ts, _) in list(_RECORDS_CACHE.items()):
         if now - ts >= _RECORDS_TTL_S:
             del _RECORDS_CACHE[k]
-            _RECORDS_LOCKS.pop(k, None)
+            _drop_lock(k)
     while len(_RECORDS_CACHE) > _RECORDS_MAX_ENTRIES:      # oldest-first
         oldest = min(_RECORDS_CACHE, key=lambda k: _RECORDS_CACHE[k][0])
         del _RECORDS_CACHE[oldest]
-        _RECORDS_LOCKS.pop(oldest, None)
+        _drop_lock(oldest)
 
 
 async def _cached_records(mac: str) -> dict:

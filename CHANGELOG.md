@@ -8,6 +8,64 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.2.2] — 2026-08-09
+
+Fixes found by a second review pass (CodeRabbit) after 1.2.1 shipped, plus a
+round of setup fixes prompted by a self-hoster who got stuck. All fixes — no
+configuration changes needed.
+
+### Added
+- **`wll-poller/bin/setup-macos.sh` — one-command WeatherLink Live setup on a
+  Mac.** You no longer need a Raspberry Pi or Docker to run the WLL poller: any
+  always-on Mac works. The script asks three questions, verifies each answer
+  (it reaches your WLL, reaches your backend, and posts one real reading so a
+  wrong token fails immediately instead of silently), then installs a launchd
+  agent that starts at login and restarts itself. `--uninstall` reverses it.
+
+### Fixed
+- **`setup-fly.sh` accepted anything as an app name.** Pasting the next command
+  from the README into the "App name:" prompt — an easy mistake, since the
+  prompt looks like an ordinary Terminal line — sent that whole string to Fly,
+  which rejected it with an unrelated-sounding *"Name blocked by abuse filter"*.
+  App names are now validated against Fly's rules, and a pasted command gets
+  told it's a command, not a name.
+- **Setup docs assumed you knew how to edit a file from the Terminal.** A bare
+  `# edit: WLL_HOST, BACKEND_URL, INGEST_TOKEN` comment was the only instruction
+  for a required step. The READMEs now say which editor to use (`open -e` on
+  macOS, `nano` on Linux), state plainly that `#` lines are comments, and say
+  where `zasder-install-summary.txt` is written — with a `find` command for when
+  it's lost.
+- The `wll-poller` README and its unit test both claimed THSW was the preferred
+  "feels like" source; the code has deliberately used heat index since it landed
+  (THSW runs 5–10°F hotter than every other source in the app). The test was
+  asserting behaviour the code doesn't have.
+- **Smart alerts could cry wolf.** The 3-hour pressure-tendency lookup fell back
+  to the earliest reading on file when nothing older than the window existed, so
+  on a young device a "3h delta" could actually span minutes and fire a bogus
+  storm alert. It now reports "not computable" instead. Rain rollups keep the
+  earliest-row fallback they legitimately want.
+- **`/metrics` could break an entire Prometheus scrape.** A non-finite reading
+  rendered as `inf`, which isn't a valid sample value. (The public dashboard's
+  copy of this guard was fixed in 1.2.1; the exporter had its own.)
+- **Indoor temperature/humidity were missing from bucketed history**, so any
+  client charting a window longer than 6 hours saw no indoor data — the iOS
+  dashboard's indoor sparkline was blank. Both fields are now selected and
+  covered by the chart index.
+- **Temperatures on the public dashboard rendered without a unit** — "115" next
+  to a "30.04 inHg" that had one.
+- **A legitimate "wettest day" could be suppressed** if every reading in the
+  period sat above the cumulative-counter threshold (a station that came online
+  mid-downpour). The counter is now judged once over all history.
+- The records cache could evict a lock that was still held, letting a duplicate
+  computation run for the same device.
+
+### Changed
+- The public status page caches its rendered dashboard for ~100s and coalesces
+  concurrent cache misses, so the one unauthenticated compute path stays flat
+  under load instead of running a full 24h aggregation per request.
+- Test suite no longer touches the network for push either (APNs/FCM/relay env
+  is blanked alongside the cloud-poller keys).
+
 ## [1.2.1] — 2026-07-28
 
 A full code-review pass over the backend. All fixes — no config changes needed.

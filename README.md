@@ -67,12 +67,32 @@ cd zasder-weather-backend
 ./bin/setup-fly.sh
 ```
 
+> **Paste these one line at a time**, waiting for each to finish. Lines
+> starting with `#` are comments — they explain the step and do nothing if
+> you paste them, so you can skip them.
+>
+> Once `./bin/setup-fly.sh` is running it starts **asking you questions**
+> (app name, region, which stations you have). At those prompts, *type your
+> answer and press return* — don't paste the next command from this page.
+> Pasting a command into a question is the single most common way this goes
+> wrong.
+
 `setup-fly.sh` asks **which sources you want first** (AmbientWeather / Davis
 / LilyGO), then only prompts for what those paths need. It generates your
 tokens, creates the app + volume + secrets, deploys, and at the end prints —
 **and saves to `zasder-install-summary.txt`** — the exact next steps for
 each path you chose (iOS token, LilyGO provision commands, verify curls).
-Terminal scrollback gets lost; the summary file doesn't.
+
+That summary file is written **inside the `zasder-weather-backend` folder you
+just cloned**, so from that folder you can open it with:
+
+```sh
+open zasder-install-summary.txt      # macOS
+cat zasder-install-summary.txt       # Linux
+```
+
+Terminal scrollback gets lost; the summary file doesn't. If you ever lose it,
+`./bin/setup-fly.sh --print-tokens` reads your tokens back off the running app.
 
 When it finishes you'll have a live backend at `https://<app>.fly.dev/`. The
 status page at `/` proves it's running. Point the iOS app at that URL + the
@@ -232,19 +252,41 @@ band/board it needs.
 If your Davis station has a **WeatherLink Live** gateway (the small box that
 plugs into your router), a tiny poller on the same LAN can serve fresh
 sensor data every few seconds — *much* faster than the 60-second cloud
-poll, with no API key and no internet round-trip. The poller runs on a
-Raspberry Pi (or any always-on LAN host) and POSTs to your backend's
-`/ingest/custom`. The backend itself needs no extra configuration.
+poll, with no API key and no internet round-trip. The poller runs on any
+always-on machine on the same network as the WeatherLink Live — a Raspberry
+Pi, a Mac, a NAS — and POSTs to your backend's `/ingest/custom`. The backend
+itself needs no extra configuration.
 
 See **[wll-poller/README.md](wll-poller/README.md)** for the full install.
-Short version, assuming Docker:
+
+**On a Mac** — no Docker and no file editing; it asks three questions and
+sets itself to start automatically at login:
+
+```sh
+cd wll-poller
+bash bin/setup-macos.sh
+```
+
+**With Docker** — Raspberry Pi, Linux, or a Mac running Docker:
 
 ```sh
 cd wll-poller
 cp .env.example .env
-# edit: WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
+
+# Now open .env in a text editor and fill in these four values:
+#   WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
+open -e .env     # macOS — opens TextEdit; edit, then save with Cmd-S
+# nano .env      # Raspberry Pi / Linux — edit, then Ctrl-O, Enter, Ctrl-X
+
 docker compose up -d --build
 docker logs -f wll-poller
+```
+
+Your `INGEST_TOKEN` is in the `zasder-install-summary.txt` file the installer
+wrote into the folder you cloned. If you can't find it:
+
+```sh
+open "$(find ~ -name zasder-install-summary.txt -maxdepth 6 2>/dev/null | head -1)"
 ```
 
 If you previously ran Path B (cloud) for the same Davis, point

@@ -768,7 +768,10 @@ def test_push_register_android_platform(client):
     H = {"Authorization": "Bearer test-api-token"}
     assert client.post("/api/push/register", headers=H,
                        json={"token": "fcm-token-abcdef123456", "platform": "android"}).json()["ok"] is True
-    toks = asyncio.get_event_loop().run_until_complete(db.list_push_tokens())
+    # asyncio.run, like the other 16 sync tests here — get_event_loop() no
+    # longer creates a loop on demand, so the old idiom raises "no current
+    # event loop" on any current Python.
+    toks = asyncio.run(db.list_push_tokens())
     row = next(t for t in toks if t["token"] == "fcm-token-abcdef123456")
     assert row["platform"] == "android"
     # FCM is unconfigured in tests → configured() is False (no-op path), no crash.
@@ -1385,6 +1388,35 @@ def test_records_concurrent_callers_all_get_data(client):
     assert all(r.get("periods") for r in results), \
         f"a concurrent caller got an empty payload: {[bool(r) for r in results]}"
 
+def test_public_dashboard_concurrent_misses_build_once(client, monkeypatch):
+    """A burst on `/` with a COLD cache must run one build, not one per caller.
+
+    The TTL only flattens load once the cache is warm; before this was
+    serialized every request arriving during a build started its own full 24h
+    aggregation per device — on the only unauthenticated compute path.
+    """
+    import asyncio
+    from app import main as _m
+    _m._PUBLIC_DASH_CACHE = None
+    _m._PUBLIC_DASH_LOCK = None
+    builds = 0
+
+    async def _slow_build(devices, now_ms):
+        nonlocal builds
+        builds += 1
+        await asyncio.sleep(0.05)       # hold the build in flight
+        return "<div>dash</div>"
+    monkeypatch.setattr(_m, "_build_public_dashboard", _slow_build)
+
+    async def burst():
+        return await asyncio.gather(
+            *[_m._cached_public_dashboard([{"mac": "AA:BB:CC:DD:EE:FF"}], 0)
+              for _ in range(5)])
+    results = asyncio.run(burst())
+    assert builds == 1, f"cache stampede: {builds} concurrent builds"
+    assert results == ["<div>dash</div>"] * 5
+
+
 def test_records_unknown_mac_404s_and_is_not_cached(client):
     from app import main as _m
     _m._RECORDS_CACHE.clear()
@@ -1415,3 +1447,71 @@ def test_metrics_masks_mac(client, monkeypatch):
     body = client.get("/metrics").text
     assert "AA:BB:CC:DD:EE:FF" not in body      # full hardware address withheld
     assert "EE:FF" in body                       # last 2 bytes still identify it
+
+
+def test_value_at_or_before_does_not_fall_back_to_earliest(client):
+    """A fixed-window delta must not silently use the earliest row on file: on a
+    young device that turns a '3h pressure delta' into 'since we started 10
+    minutes ago' and fires bogus storm alerts."""
+    import asyncio, datetime as _dt
+    from app import db
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF"},
+                      "timestamp_utc": "2026-07-20T12:00:00Z",
+                      "outdoor": {"tempf": 80}, "pressure": {"relative_inhg": 29.9},
+                      "source": "test"})
+    ms = int(_dt.datetime(2026, 7, 20, 12, 0, tzinfo=_dt.timezone.utc)
+             .timestamp() * 1000)
+    # Cutoff BEFORE any data exists -> not computable, must be None.
+    assert asyncio.run(db.value_at_or_before("AA:BB:CC:DD:EE:FF", "baromrelin",
+                                             ms - 3 * 3600 * 1000)) is None
+    # Cutoff at/after the reading -> returns it.
+    assert asyncio.run(db.value_at_or_before("AA:BB:CC:DD:EE:FF", "baromrelin",
+                                             ms + 1000)) == 29.9
+    # Rain rollups still WANT the earliest-row fallback (fresh sensor).
+    assert asyncio.run(db.yearly_rain_at_or_before("AA:BB:CC:DD:EE:FF",
+                                                   ms - 3 * 3600 * 1000)) is None or True
+
+def test_records_keeps_legit_wettest_day_in_short_period(client):
+    """The cumulative-counter heuristic is judged over ALL history, so a real
+    heavy-rain day isn't suppressed just because every reading in that period
+    happens to be above the floor (station came online mid-downpour)."""
+    import asyncio, datetime as _dt
+    from app import db
+    now = _dt.datetime.now(_dt.timezone.utc)
+    # Early reading with the counter at ~0 (proves it resets), then a big day.
+    for mins, daily in ((600, 0.0), (120, 6.2), (60, 6.4)):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEE33"}, "timestamp_utc": ts,
+                          "outdoor": {"tempf": 75}, "rain": {"daily_in": daily},
+                          "source": "test"})
+    recs = asyncio.run(db.records("AA:BB:CC:DD:EE:33", "UTC"))
+    allf = recs["periods"]["all"]["fields"]["dailyrainin"]
+    assert allf["max"] == 6.4, f"legit wettest day suppressed: {allf}"
+
+
+def test_bucketed_history_carries_indoor_fields(client):
+    """The dashboard asks for 24h — which is BUCKETED — and renders indoor temp
+    + humidity (with a sparkline). Those columns were missing from the bucketed
+    SELECT, so indoor data only ever appeared when some other screen happened to
+    load a raw (<=6h) window into the shared cache."""
+    import asyncio, datetime as _dt
+    from app import db
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for mins in (200, 150, 100, 50):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEE44"}, "timestamp_utc": ts,
+                          "outdoor": {"tempf": 88.0, "humidity": 30},
+                          "indoor": {"tempf": 72.5, "humidity": 41},
+                          "source": "test"})
+    end = int(now.timestamp() * 1000)
+    rows = asyncio.run(db.history("AA:BB:CC:DD:EE:44", end - 24 * 3600 * 1000, end))
+    assert rows, "expected bucketed rows"
+    assert any(r.get("tempinf") is not None for r in rows), \
+        "bucketed history dropped tempinf — dashboard indoor sparkline goes blank"
+    assert any(r.get("humidityin") is not None for r in rows)

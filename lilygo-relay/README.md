@@ -162,10 +162,15 @@ pending) and printed to the **serial** log at every boot — it is never
 exposed over HTTP. Read it off the device, then:
 
 ```sh
+# Send the key as a HEADER — a query string would leave this credential in
+# shell history, proxy logs and the browser address bar.
 curl -X POST http://<board>/provision \
-  --data-urlencode "setup_key=$SETUP_KEY" \
+  -H "X-Setup-Key: $SETUP_KEY" \
   --data-urlencode "ingest_token=$NEW_TOKEN"
 ```
+
+(`setup_key=` as a form field also works — that's what the board's own HTML
+form uses — but prefer the header from the command line.)
 
 If you lost **both** the token and the setup key: USB-reflash with
 `pio run -t erase` to wipe NVS, then re-flash — a fresh setup key is

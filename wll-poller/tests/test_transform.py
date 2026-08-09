@@ -50,8 +50,10 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(obs["outdoor"]["tempf"], 73.2)
         self.assertEqual(obs["outdoor"]["humidity"], 41.6)
         self.assertEqual(obs["outdoor"]["dew_point_f"], 47.8)
-        # THSW wins over heat_index / wind_chill
-        self.assertEqual(obs["outdoor"]["feels_like"], 76.4)
+        # heat_index wins. THSW (76.4 in the sample) is deliberately NOT used:
+        # it adds a direct-sun load that reads 5-10°F hotter than every other
+        # source in the app, which looks like a bug next to them.
+        self.assertEqual(obs["outdoor"]["feels_like"], 73.2)
 
     def test_wind_block(self):
         w = to_observation(_sample())["wind"]

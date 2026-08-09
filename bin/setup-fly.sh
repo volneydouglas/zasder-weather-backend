@@ -100,12 +100,53 @@ normalize_sources() {  # map aliases → canonical awn|davis|lilygo, dedup
   SOURCES="$out"
 }
 
+# Fly app names: lowercase letters, digits and dashes only, starting with a
+# letter, max 63 chars. Validating here matters more than it looks — the most
+# common mistake is pasting the NEXT command from the README into this prompt,
+# which otherwise sails through to Fly and comes back as a baffling
+# "Name blocked by abuse filter" instead of "that isn't an app name".
+valid_app_name() {
+  case "$1" in
+    ""|*[!a-z0-9-]*) return 1 ;;
+    [!a-z]*)         return 1 ;;
+    *-)              return 1 ;;
+  esac
+  [ "${#1}" -le 63 ]
+}
+
 read_app_name() {
-  if [ -n "$APP_NAME_FLAG" ]; then app_name="$APP_NAME_FLAG"; return; fi
-  local default_app="zasder-weather-$(whoami | tr -cd '[:alnum:]')"
+  if [ -n "$APP_NAME_FLAG" ]; then
+    app_name="$APP_NAME_FLAG"
+    valid_app_name "$app_name" || {
+      err "--app='$app_name' isn't a valid Fly app name."
+      err "Use lowercase letters, numbers and dashes, e.g. zasder-weather-doren"
+      exit 1
+    }
+    return
+  fi
+  local default_app="zasder-weather-$(whoami | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
   if [ "$NONINTERACTIVE" -eq 1 ]; then app_name="$default_app"; return; fi
-  read -r -p "App name [$default_app]: " app_name
-  app_name=${app_name:-$default_app}
+  while :; do
+    read -r -p "App name [$default_app]: " app_name
+    app_name=${app_name:-$default_app}
+    valid_app_name "$app_name" && break
+    echo
+    case "$app_name" in
+      git\ *|cd\ *|bash\ *|sh\ *|curl\ *|*/*|http*)
+        err "That looks like a command, not a name."
+        err "This prompt is asking you to NAME your app — it is not asking you"
+        err "to paste the next line from the instructions. Just type a name and"
+        err "press return, e.g.:  zasder-weather-doren"
+        ;;
+      *)
+        err "'$app_name' isn't a valid Fly app name."
+        err "Use only lowercase letters, numbers and dashes, starting with a"
+        err "letter — for example:  zasder-weather-doren"
+        ;;
+    esac
+    echo "  (or just press return to accept the default: $default_app)"
+    echo
+  done
 }
 
 # ── --print-tokens: short-circuit, read live values via SSH ─────────────

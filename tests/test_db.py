@@ -64,17 +64,32 @@ async def test_rain_rollups_falls_back_to_monthly_when_yearly_broken(db_module):
     rain offset clamps it to ~0 (yearly < monthly) must still report weekly
     rain — derived from the reliable monthly counter, not the broken yearly."""
     from app import db
-    import time
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
     await db.init_db()
     mac = "5D:5D:05:00:00:01"
-    HOUR = 3_600_000
-    now = int(time.time() * 1000)
-    # Start-of-week ~4 days ago with monthly=0.0, then rain brought monthly to
-    # 0.14; yearly is stuck at 0.0 (broken) the whole time.
+
+    # Anchor to the REAL week boundary rather than assuming fixed day offsets
+    # straddle it. Weeks start Sunday (db.rain_rollups), so on a Sunday
+    # "5 days ago" and "1 day ago" both land in the *previous* week and weekly
+    # rain is legitimately 0 — this test used to fail every Sunday.
+    tz = ZoneInfo("America/Phoenix")
+    now_local = datetime.now(tz)
+    start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_week = start_of_today - timedelta(days=(now_local.weekday() + 1) % 7)
+    ms = lambda d: int(d.timestamp() * 1000)
+    # Midpoint is always inside [start_of_week, now], even at 00:00 Sunday.
+    midweek = start_of_week + (now_local - start_of_week) / 2
+
+    # Baseline just before the week started with monthly=0.0, then rain brought
+    # monthly to 0.14; yearly is stuck at 0.0 (broken) the whole time.
     await db.insert_observations(mac, [
-        {"dateutc": now - 5 * 24 * HOUR, "yearlyrainin": 0.0, "monthlyrainin": 0.0, "dailyrainin": 0.0},
-        {"dateutc": now - 1 * 24 * HOUR, "yearlyrainin": 0.0, "monthlyrainin": 0.14, "dailyrainin": 0.14},
-        {"dateutc": now,                 "yearlyrainin": 0.0, "monthlyrainin": 0.14, "dailyrainin": 0.0},
+        {"dateutc": ms(start_of_week - timedelta(hours=1)),
+         "yearlyrainin": 0.0, "monthlyrainin": 0.0,  "dailyrainin": 0.0},
+        {"dateutc": ms(midweek),
+         "yearlyrainin": 0.0, "monthlyrainin": 0.14, "dailyrainin": 0.14},
+        {"dateutc": ms(now_local),
+         "yearlyrainin": 0.0, "monthlyrainin": 0.14, "dailyrainin": 0.0},
     ])
     r = await db.rain_rollups(mac, "America/Phoenix")
     assert r["monthly_in"] == 0.14           # direct from the monthly counter

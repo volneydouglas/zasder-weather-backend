@@ -23,24 +23,91 @@ over UDP). Same physical Davis VP2, ~6× lower latency, no key, no quotas.
 
 ## Requirements
 
-- Python 3.9+ (Pi OS Bookworm ships 3.11 — fine)
+- Python 3.9+ (Pi OS Bookworm ships 3.11, macOS ships 3.9 — both fine)
 - A running Zasder Weather backend with an `INGEST_TOKEN`
-- A Davis WeatherLink Live on the same LAN as the Pi
+- A Davis WeatherLink Live on the same LAN as the machine running this
 
-## Install with Docker Compose (recommended)
+You do **not** need a Raspberry Pi. Any computer that stays on and is on the
+same network as the WeatherLink Live works — including a Mac.
 
-The simplest path — a small container that restarts on boot. Needs Docker +
-the Compose plugin (`docker compose version`).
+## Install on a Mac (easiest — no Docker, no Terminal editing)
+
+If you have a Mac that stays on, this is the least fiddly option. macOS
+already includes everything needed, so there is nothing to install: the
+script asks three questions, checks each answer actually works, and sets the
+poller to start automatically at login.
 
 ```sh
-# 1. Configure
-cp .env.example .env
-# edit: WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
+bash bin/setup-macos.sh
+```
 
-# 2. Build + start (detached, auto-restarts)
+It will ask for:
+
+1. **Your WeatherLink Live's IP address** — find it in the WeatherLink app
+   under Account → Devices → your WLL → Device Info, or in your router's
+   device list. It looks like `192.168.1.42`.
+2. **Your backend URL** — the address you deployed, e.g.
+   `https://your-app.fly.dev`.
+3. **Your `INGEST_TOKEN`** — see [Where to find your
+   INGEST_TOKEN](#where-to-find-your-ingest_token) below.
+
+Before installing anything it sends one real reading, so a wrong token is
+caught immediately rather than showing up as silence hours later.
+
+```sh
+# watch it run
+tail -f ~/Library/Logs/zasder-wll-poller.log
+
+# remove it completely
+bash bin/setup-macos.sh --uninstall
+```
+
+The poller runs in the background as a launchd agent
+(`~/Library/LaunchAgents/com.zasder.wll-poller.plist`), restarts if it ever
+stops, and starts again at login. To keep it running you'll want the Mac set
+to not sleep — System Settings → Lock Screen → "Turn display off on power
+adapter when inactive", and in Battery/Energy settings enable "Prevent
+automatic sleeping on power adapter when the display is off".
+
+## Where to find your INGEST_TOKEN
+
+The backend installer generated it and saved it, along with your backend URL,
+into a file named **`zasder-install-summary.txt`** in the folder you
+downloaded/cloned. If you're not sure where that folder ended up:
+
+```sh
+open "$(find ~ -name zasder-install-summary.txt -maxdepth 6 2>/dev/null | head -1)"
+```
+
+That opens it in TextEdit so you can copy the token out. If it finds nothing,
+you can read the token straight from your deployed backend instead:
+
+```sh
+fly ssh console -a <your-app-name> -C 'printenv INGEST_TOKEN'
+```
+
+Note `INGEST_TOKEN` and `API_TOKEN` are two different values — the poller
+needs `INGEST_TOKEN`.
+
+## Install with Docker Compose
+
+A small container that restarts on boot. Needs Docker + the Compose plugin
+(`docker compose version`).
+
+```sh
+# 1. Make your own copy of the settings file
+cp .env.example .env
+
+# 2. Open it in a text editor and fill in the four values:
+#      WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
+#    On a Mac, this opens it in TextEdit — edit, then save with Cmd-S:
+open -e .env
+#    On a Pi/Linux, use nano instead:  nano .env
+
+# 3. Build + start (detached, auto-restarts)
 docker compose up -d --build
 
-# 3. Watch it run
+# 4. Watch it run
 docker logs -f wll-poller
 ```
 
@@ -113,7 +180,7 @@ WLL JSON samples; no network needed.
 | WLL field                      | Ingest field          | Notes |
 |---|---|---|
 | `temp` / `hum` / `dew_point`   | `outdoor.tempf` / `outdoor.humidity` / `outdoor.dew_point_f` | ISS |
-| `thsw_index` ‖ `heat_index` ‖ `wind_chill` | `outdoor.feels_like` | THSW preferred (sun-aware) |
+| `heat_index` ‖ `wind_chill` | `outdoor.feels_like` | THSW deliberately **not** used — it adds a direct-sun load that runs 5–10°F hotter than every other source |
 | `wind_speed_last` / `wind_dir_last` | `wind.speed_mph` / `wind.dir_deg` | |
 | `wind_speed_hi_last_10_min`    | `wind.gust_mph`       | 10-min gust |
 | `rain_rate_last × rain_size`   | `rain.hourly_in`      | counts/hr × size = in/hr |

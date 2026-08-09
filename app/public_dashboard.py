@@ -37,10 +37,24 @@ def _num(v: Any) -> float | None:
 
 
 def _fmt(v: float | None, unit: str) -> str:
+    """Value + unit for chips and record cards, which have no separate unit
+    element — so whatever this returns is all the reader sees.
+
+    The nested conditional this replaces emitted a BARE number for "°F", so
+    every temperature on the dashboard (hottest, coldest, dew point…) rendered
+    unitless next to a "30.04 inHg" that did carry one. `unit=""` still yields a
+    bare number, which is what the chart axis labels want.
+    """
     if v is None:
         return "—"
-    if unit in ("°F", "%", "mph"):
-        return f"{round(v)}{'' if unit == '°F' else ' ' + unit if unit != '%' else '%'}"
+    if unit == "":
+        return f"{v:.2f}"          # chart axis label — no unit by design
+    if unit == "°F":
+        return f"{round(v)}°F"     # degree symbol attaches with no space
+    if unit == "%":
+        return f"{round(v)}%"
+    if unit == "mph":
+        return f"{round(v)} mph"
     return f"{v:.2f} {unit}"
 
 

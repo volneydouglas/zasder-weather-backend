@@ -11,6 +11,15 @@ from .config import settings
 
 log = logging.getLogger("zasder.db")
 
+# Columns covered by idx_obs_chart. MUST stay in sync with the bucketed SELECT in
+# db.history() — a column selected there but missing here drops the query off the
+# covering index and back to fetching every fat data_json row.
+_CHART_INDEX_COLS = [
+    "mac", "dateutc_ms", "tempf", "feels_like", "humidity", "baromrelin", "uv",
+    "windspeedmph", "dew_point", "solarradiation", "hourlyrainin", "winddir",
+    "yearlyrainin", "windgustmph", "tempinf", "humidityin",
+]
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
     mac          TEXT PRIMARY KEY,
@@ -59,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_obs_mac_date
 CREATE INDEX IF NOT EXISTS idx_obs_chart
     ON observations (mac, dateutc_ms, tempf, feels_like, humidity, baromrelin,
                      uv, windspeedmph, dew_point, solarradiation, hourlyrainin,
-                     winddir, yearlyrainin, windgustmph);
+                     winddir, yearlyrainin, windgustmph, tempinf, humidityin);
 
 -- Records (db.records) do MIN/MAX + first-occurrence lookups per metric over
 -- the full per-mac history. windgustmph + dailyrainin aren't in idx_obs_chart,
@@ -261,13 +270,14 @@ async def init_db() -> None:
         cur = await db.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_obs_chart'")
         row = await cur.fetchone()
-        if row and row[0] and "windgustmph" not in row[0]:
+        # Rebuild whenever ANY expected column is missing, rather than testing one
+        # hard-coded name — the previous form would silently skip the rebuild for
+        # the next column added to the bucketed SELECT, re-introducing the
+        # full-row fetch it exists to avoid.
+        if row and row[0] and any(c not in row[0] for c in _CHART_INDEX_COLS):
             await db.execute("DROP INDEX idx_obs_chart")
-            await db.execute(
-                "CREATE INDEX idx_obs_chart ON observations "
-                "(mac, dateutc_ms, tempf, feels_like, humidity, baromrelin, uv, "
-                "windspeedmph, dew_point, solarradiation, hourlyrainin, winddir, "
-                "yearlyrainin, windgustmph)")
+            await db.execute("CREATE INDEX idx_obs_chart ON observations ("
+                             + ", ".join(_CHART_INDEX_COLS) + ")")
         await db.commit()
 
         # Probe for SQLite's math functions once — they drive the circular mean
@@ -640,7 +650,10 @@ async def value_at_or_before(mac: str, field: str, cutoff_ms: int) -> float | No
     col = {v: k for k, v in _FIELD_MAP.items()}.get(field)
     if col is None:
         return None
-    return await _rain_col_at_or_before(mac, col, cutoff_ms)
+    # Strict: no earliest-row fallback (see _rain_col_at_or_before). Smart alerts
+    # use this for a fixed-window delta, where a fallback fabricates the window.
+    return await _rain_col_at_or_before(mac, col, cutoff_ms,
+                                        fallback_earliest=False)
 
 
 async def register_push_token(token: str, platform: str, env: str | None) -> None:
@@ -925,6 +938,8 @@ async def history(
         SELECT
           (dateutc_ms / {bucket_ms}) * {bucket_ms} + {half} AS dateutc,
           AVG(tempf)          AS tempf,
+          AVG(tempinf)        AS tempinf,
+          AVG(humidityin)     AS humidityin,
           AVG(feels_like)     AS feelsLike,
           AVG(dew_point)      AS dewPoint,
           AVG(humidity)       AS humidity,
@@ -1024,7 +1039,8 @@ async def list_discoveries(since_ms: int | None = None,
     return out
 
 
-async def _rain_col_at_or_before(mac: str, col: str, cutoff_ms: int) -> float | None:
+async def _rain_col_at_or_before(mac: str, col: str, cutoff_ms: int,
+                                 fallback_earliest: bool = True) -> float | None:
     """Most recent value of a cumulative rain column at or before `cutoff_ms`.
     Falls back to the earliest value on file if no row sits before the cutoff
     (so a freshly-deployed sensor still gets sensible rollups). Returns None
@@ -1049,6 +1065,12 @@ async def _rain_col_at_or_before(mac: str, col: str, cutoff_ms: int) -> float | 
         )).fetchone()
         if row:
             return row["v"]
+        if not fallback_earliest:
+            # Callers measuring a CHANGE OVER A FIXED WINDOW must not get the
+            # earliest row on file: on a young device that turns a "3h pressure
+            # delta" into "delta since we started recording 10 minutes ago",
+            # which fires bogus storm alerts. No qualifying row = not computable.
+            return None
         row = await (await db.execute(
             f"SELECT {col} AS v FROM observations "
             f"WHERE mac = ? AND {col} IS NOT NULL ORDER BY dateutc_ms ASC LIMIT 1",
@@ -1236,6 +1258,16 @@ async def records(mac: str, tz_name: str = "UTC",
 
     out: dict[str, Any] = {"mac": mac, "generated_ms": end_ms, "periods": {}}
     async with connect() as db:
+        # Is dailyrainin a real per-day counter, or a lifetime cumulative one?
+        # Judge ONCE over ALL history: a counter that resets necessarily touches
+        # ~0 at some point. Testing each period's own MIN instead would suppress
+        # a LEGITIMATE record — a station that came online mid-downpour has every
+        # reading that day above the floor.
+        _dr = await (await db.execute(
+            "SELECT MIN(dailyrainin) AS lo FROM observations WHERE mac = ?",
+            (mac,))).fetchone()
+        daily_is_cumulative = (_dr is not None and _dr["lo"] is not None
+                               and _dr["lo"] > _DAILY_RAIN_RESET_FLOOR_IN)
         for pname, start_ms in periods.items():
             pfields: dict[str, Any] = {}
             for fname, col in cols:
@@ -1269,9 +1301,9 @@ async def records(mac: str, tz_name: str = "UTC",
                     "maxAt": await _at(row["hi"]),
                 }
             # Drop a "wettest day" that's really a non-resetting cumulative
-            # counter (see _DAILY_RAIN_RESET_FLOOR_IN).
+            # counter (verdict computed once above, not per period).
             dr = pfields.get("dailyrainin")
-            if dr and dr["min"] is not None and dr["min"] > _DAILY_RAIN_RESET_FLOOR_IN:
+            if dr and daily_is_cumulative:
                 dr["max"] = None
                 dr["maxAt"] = None
             out["periods"][pname] = {"start_ms": start_ms, "fields": pfields}

@@ -159,12 +159,40 @@ echo
 ask WLL_DEVICE_NAME "  Station name [Davis WeatherLink Live]: "
 WLL_DEVICE_NAME="${WLL_DEVICE_NAME:-Davis WeatherLink Live}"
 
+# Give this install its own device identity. poller.py's built-in default is a
+# single fixed MAC, which is fine for one person but means every install in the
+# world claims the SAME station id — on a shared/hosted backend the second user
+# to connect would collide with the first. Derived once here and pinned in the
+# LaunchAgent, so re-running setup keeps the same station rather than creating
+# a duplicate. Reuses the existing value if this Mac is already set up.
+if [ -f "$PLIST" ]; then
+  EXISTING_MAC="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:WLL_DEVICE_MAC' "$PLIST" 2>/dev/null || true)"
+  if [ -z "$EXISTING_MAC" ]; then
+    # Installed before this script pinned an id, so it has been reporting
+    # under poller.py's built-in default. Keep that: minting a fresh one on
+    # upgrade would start a SECOND station and strand the existing history.
+    EXISTING_MAC="5D:5D:05:00:00:01"
+    info "keeping the station id this Mac already reports under ($EXISTING_MAC)"
+  fi
+fi
+if [ -n "${EXISTING_MAC:-}" ]; then
+  WLL_DEVICE_MAC="$EXISTING_MAC"
+  info "keeping this Mac's existing station id ($WLL_DEVICE_MAC)"
+else
+  # 5D:5D:05 is the project's WeatherLink-Live prefix; the last three bytes
+  # are random so two installs practically never collide.
+  WLL_DEVICE_MAC="5D:5D:05:$("$PYBIN" -c '
+import secrets
+print(":".join(f"{b:02X}" for b in secrets.token_bytes(3)))')"
+fi
+
 # Send exactly one real reading through the poller's own code path, so a bad
 # token surfaces HERE instead of as silence hours from now.
 echo
 printf '  sending one test reading ... '
 RESULT=$(WLL_HOST="$WLL_HOST" BACKEND_URL="$BACKEND_URL" \
          INGEST_TOKEN="$INGEST_TOKEN" WLL_DEVICE_NAME="$WLL_DEVICE_NAME" \
+         WLL_DEVICE_MAC="$WLL_DEVICE_MAC" \
          "$PYBIN" - "$SRC_DIR" <<'PY' 2>&1
 import sys, urllib.error
 sys.path.insert(0, sys.argv[1])
@@ -225,6 +253,7 @@ cat > "$PLIST" <<PLISTEOF
     <key>BACKEND_URL</key><string>$BACKEND_URL</string>
     <key>INGEST_TOKEN</key><string>$INGEST_TOKEN</string>
     <key>WLL_DEVICE_NAME</key><string>$(xml_escape "$WLL_DEVICE_NAME")</string>
+    <key>WLL_DEVICE_MAC</key><string>$WLL_DEVICE_MAC</string>
     <key>WLL_POLL_SECONDS</key><string>10</string>
   </dict>
   <key>ProcessType</key><string>Background</string>

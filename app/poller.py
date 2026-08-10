@@ -4,6 +4,7 @@ from typing import Any
 
 from . import db
 from .ambient_client import AmbientWeatherClient
+from . import source_status
 from .config import settings
 
 log = logging.getLogger("poller")
@@ -50,6 +51,10 @@ class Poller:
             try:
                 await self._tick()
             except Exception as e:
+                # Recorded as well as logged: a self-hoster can't read our
+                # logs, and this is the failure that otherwise looks like
+                # dead hardware.
+                source_status.record_failure("ambientweather", str(e))
                 log.exception("poll tick failed: %s", e)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
@@ -58,6 +63,7 @@ class Poller:
 
     async def _tick(self) -> None:
         devices = await self.client.list_devices()
+        stored = 0
         for d in devices:
             mac = d.get("macAddress") or d.get("mac")
             if not mac:
@@ -66,5 +72,7 @@ class Poller:
             last: dict[str, Any] | None = d.get("lastData")
             if last:
                 added = await db.insert_observations(mac, [last])
+                stored += added
                 if added:
                     log.debug("stored new obs for %s @ %s", mac, last.get("dateutc"))
+        source_status.record_success("ambientweather", rows=stored)

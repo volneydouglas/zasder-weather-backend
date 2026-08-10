@@ -26,6 +26,7 @@ from typing import Any
 
 from . import ingest
 from .config import settings
+from . import source_status
 from .weatherlink_client import WeatherLinkClient
 
 
@@ -234,15 +235,26 @@ class WeatherlinkPoller:
                 current = await self._client.current(self._station_id)
                 payload = build_payload(self._station_meta or {}, current)
                 if payload is None:
+                    # The API answered, so credentials are fine — there's just
+                    # no ISS data. Distinct from a failure, and worth showing
+                    # as such rather than silent success.
+                    source_status.record_success("davis-cloud", rows=0)
                     log.debug("no ISS data in poll response — skipping ingest")
                 else:
-                    await ingest._do_ingest(payload)  # type: ignore[attr-defined]
+                    result = await ingest._do_ingest(payload)  # type: ignore[attr-defined]
+                    # rows STORED, not rows posted — the history-write throttle
+                    # legitimately rejects a reading that lands too soon, and
+                    # reporting 1 there would hide a source that has silently
+                    # stopped contributing.
+                    source_status.record_success(
+                        "davis-cloud", rows=int((result or {}).get("inserted", 0)))
                     o = payload.get("outdoor", {})
                     w = payload.get("wind", {})
                     log.info("ingested Davis cloud: tempf=%s hum=%s wind=%s@%s",
                              o.get("tempf"), o.get("humidity"),
                              w.get("windspeedmph"), w.get("winddir"))
             except Exception as e:
+                source_status.record_failure("davis-cloud", str(e))
                 log.warning("WeatherLink poll failed: %s", e)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)

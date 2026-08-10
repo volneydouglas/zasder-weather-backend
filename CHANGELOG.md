@@ -8,6 +8,39 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.3.0] — 2026-08-09
+
+Ships alongside Zasder Weather 1.3.0 for iOS, watchOS and **macOS** — from
+this release the apps and the backend share one version number.
+
+### Added
+- **`GET /api/sources`** — health of each ingest source: whether it's
+  configured, when it last succeeded, and what the last error was. A cloud
+  poller that quietly stops (expired API keys, a revoked token, an upstream
+  outage) was previously indistinguishable from dead hardware at the station
+  end. "Not configured" and "configured but failing" are reported distinctly,
+  because they need entirely different fixes.
+- **`GET /api/config/backup` and `POST /api/config/restore`** — export and
+  restore the state you configured by hand: alert recipients and thresholds,
+  per-device monitoring, threshold rules, and device locations. Everything
+  you'd otherwise rebuild from memory if the server were lost.
+
+  The backup contains **no API tokens and no SMTP password** (the latter is
+  write-only and never returned by the API). It does still list your alert
+  recipients and device coordinates, so treat it as private — just not as a
+  credential. The
+  restore response tells you the password needs re-entering rather than
+  letting you find out when an alert fails to send. Restore is write-gated,
+  replaces alert rules rather than duplicating them, skips a malformed entry
+  instead of discarding the good ones, and refuses a file that would change
+  nothing.
+
+### Changed
+- `wll-poller/bin/setup-macos.sh` now gives each install its own station ID
+  instead of the shared hardcoded default, so two machines feeding one
+  backend can't land on the same device row. Re-running setup keeps the
+  existing ID rather than creating a duplicate station.
+
 ## [1.2.2] — 2026-08-09
 
 Fixes found by a second review pass (CodeRabbit) after 1.2.1 shipped, plus a

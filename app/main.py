@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +24,8 @@ from .alerts import AlertMonitor
 from .ambient_client import AmbientWeatherClient
 from .capture import router as capture_router
 from .config import settings, tokens_match
+from . import source_status
+from . import config_backup
 from .discovery import router as discovery_router
 from .ingest import router as ingest_router
 from .poller import Poller
@@ -41,6 +43,16 @@ log = logging.getLogger("api")
 async def lifespan(app: FastAPI):
     await db.init_db()
     app.state.started_at = time.time()
+    # Declare every source up front, configured or not. "Not set up" and "set
+    # up but broken" are the two answers a self-hoster needs to tell apart,
+    # and they look identical from outside.
+    source_status.reset()
+    source_status.declare("ambientweather", settings.aw_configured)
+    source_status.declare("davis-cloud", settings.weatherlink_configured)
+    source_status.declare("custom-ingest", True,
+                          note="LilyGO boards, SDR relays and the WeatherLink "
+                               "Live poller POST here; health is per-device "
+                               "last-seen, see /api/devices")
     # AmbientWeather poller only starts when both keys are set. AcuRite-only
     # deploys leave them unset and rely entirely on /ingest/custom.
     client = None
@@ -588,6 +600,38 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
   </div>
 </body>
 </html>"""
+
+
+@app.get("/api/config/backup", dependencies=[Depends(require_token)])
+async def api_config_backup() -> dict[str, Any]:
+    """Everything the operator configured by hand, so it survives losing the
+    server. No tokens and no SMTP password — see app/config_backup.py."""
+    return await config_backup.export_config()
+
+
+@app.post("/api/config/restore", dependencies=[Depends(require_write_token)])
+async def api_config_restore(payload: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Apply a backup. Write-gated: this replaces alert rules for everyone
+    using this backend, so the read-only reviewer token must not reach it."""
+    try:
+        summary = await config_backup.import_config(payload)
+    except config_backup.RestoreError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "restored": summary,
+            "note": ("SMTP password is never included in a backup — re-enter "
+                     "it in Alerts if you use email alerts.")}
+
+
+@app.get("/api/sources", dependencies=[Depends(require_token)])
+async def api_sources() -> dict[str, Any]:
+    """Health of each ingest source.
+
+    Exists because a cloud poller that quietly stops — expired API keys, a
+    revoked token, an upstream outage — is indistinguishable from dead
+    hardware at the station end. This says which leg last worked and what the
+    last failure said.
+    """
+    return {"sources": source_status.snapshot()}
 
 
 @app.get("/api/devices", dependencies=[Depends(require_token)])

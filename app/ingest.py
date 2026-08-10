@@ -40,6 +40,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from . import db
+from . import source_status
 from .config import settings, tokens_match
 
 log = logging.getLogger("ingest")
@@ -415,6 +416,11 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
             if recent and not _adds_field(flat, last_data):
                 store = False
     inserted = await db.insert_observations(mac, [row]) if store else 0
+    # Custom ingest is a push path — nothing polls it, so without this the
+    # source reports unhealthy forever even while boards and pollers are
+    # posting successfully. A throttled write still counts as the source
+    # working; `rows` distinguishes stored from merely received.
+    source_status.record_success("custom-ingest", rows=inserted)
     return {"ok": True, "mac": mac, "inserted": inserted,
             "ts_ms": flat["dateutc"], "throttled": not store}
 

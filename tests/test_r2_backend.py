@@ -486,3 +486,136 @@ def test_rain_one_shot_spike_still_dropped(client):
     # A LATER unrelated spike must not be "confirmed" by the stale rejection.
     assert _post_rain(client, 60.0, _rain_ts(3)).status_code == 200
     assert _yearlies(client)[-1] is None
+
+
+def test_rain_duplicate_retry_does_not_confirm_itself(client):
+    """A sender retrying the identical rejected packet (same dateutc) has a
+    zero increment, which trivially passed the plausibility check — the
+    duplicate confirmed its own spike. Corroboration must be a LATER reading."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    ts_spike = _rain_ts(6)
+    assert _post_rain(client, 1.00, _rain_ts(8)).status_code == 200
+    assert _post_rain(client, 50.0, ts_spike).status_code == 200   # rejected
+    assert _post_rain(client, 50.0, ts_spike).status_code == 200   # retry, same ts
+    assert _yearlies(client)[-1] is None, "duplicate retry rebaselined itself"
+
+
+def test_rain_burst_duplicate_decodes_cannot_confirm(client):
+    """The production hole this closes: rtl_433 decodes ONE radio
+    transmission 2-3 times a few seconds apart, and a neighboring sensor on
+    a colliding ID (constant 20.22 counter vs our 17.12) landed in history
+    because its own duplicate decode arrived seconds later and 'confirmed'
+    it. Frames inside the burst gap are the same observation, not
+    corroboration."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    # Minutes apart so the +3.1 jump exceeds max_rate (2 in/hr).
+    assert _post_rain(client, 17.12, _rain_ts(10 / 60)).status_code == 200
+    assert _post_rain(client, 20.22, _rain_ts(5 / 60)).status_code == 200
+    # Duplicate decode 3 seconds later — strictly later ts, identical value.
+    assert _post_rain(client, 20.22, _rain_ts(5 / 60 - 3 / 3600)).status_code == 200
+    assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject, \
+        "burst duplicate confirmed itself"
+    ys = _yearlies(client)
+    assert 20.22 not in ys and 17.12 in ys and ys[-1] is None, ys
+
+
+def test_rain_alternating_second_source_never_lands(client):
+    """Two transmitters posting different counters under one MAC: real
+    readings between intruder sightings clear the pending rejection, so the
+    intruder never strings together the two consecutive sightings a
+    rebaseline requires."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    # Minutes apart, matching production: +3.1 inches over a few minutes is
+    # far beyond max_rate (2 in/hr) — hours apart it would read as plausible
+    # rain and never even reach the guard.
+    assert _post_rain(client, 17.12, _rain_ts(30 / 60)).status_code == 200
+    assert _post_rain(client, 20.22, _rain_ts(24 / 60)).status_code == 200  # intruder
+    assert _post_rain(client, 17.12, _rain_ts(18 / 60)).status_code == 200  # real: clears
+    assert "AA:BB:CC:DD:0A:10" not in ingest._rain_reject
+    # Next intruder sighting is >90s after the first, but the pending
+    # rejection is gone — it must start over, not confirm.
+    assert _post_rain(client, 20.22, _rain_ts(6 / 60)).status_code == 200
+    assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject
+    ys = _yearlies(client)
+    assert 20.22 not in ys and 17.12 in ys and ys[-1] is None, ys
+
+
+def test_rain_slow_cadence_level_shift_still_confirms(client):
+    """The burst gap must not break genuine shifts on a fast-posting sensor:
+    repeats of the SAME rejected level keep the FIRST-seen timestamp, so the
+    confirmation window is measured from the first sighting — otherwise a
+    sensor posting every 60s (< the 90s gap) could never rebaseline."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    assert _post_rain(client, 1.00, _rain_ts(30 / 60)).status_code == 200
+    base = 10 / 60  # hours ago; shift readings 60s apart from here
+    assert _post_rain(client, 17.12, _rain_ts(base)).status_code == 200            # rejected
+    assert _post_rain(client, 17.12, _rain_ts(base - 60 / 3600)).status_code == 200  # +60s: inside gap
+    assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject
+    # Exact boundary (gap counts from the FIRST sighting): 89s still pending,
+    # 90,000 ms exactly confirms — pins < vs <= in the gap check.
+    assert _post_rain(client, 17.12, _rain_ts(base - 89 / 3600)).status_code == 200
+    assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject
+    assert _post_rain(client, 17.12, _rain_ts(base - 90 / 3600)).status_code == 200
+    assert "AA:BB:CC:DD:0A:10" not in ingest._rain_reject, \
+        "shift never confirmed — first-seen timestamp was not preserved"
+    cur = client.get("/api/devices/AA:BB:CC:DD:0A:10/current", headers=H).json()
+    assert cur["yearlyrainin"] == 17.12
+
+
+def test_rain_reject_registry_is_bounded():
+    """Every rejection adds a MAC entry, removed only when that MAC later takes
+    a non-glitch path — a token holder spraying synthetic ids grew it without
+    bound. Oldest-evicted at the cap; the evicted device just needs one extra
+    confirming reading."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    for i in range(ingest._RAIN_REJECT_MAX + 100):
+        mac = f"AA:BB:{i >> 8:02X}:{i & 255:02X}:00:01"
+        ingest._record_rain_rejection(mac, 50.0, float(i))
+    assert len(ingest._rain_reject) == ingest._RAIN_REJECT_MAX
+    # Oldest evicted, newest kept.
+    assert "AA:BB:00:00:00:01" not in ingest._rain_reject
+    assert f"AA:BB:{(ingest._RAIN_REJECT_MAX + 99) >> 8:02X}:{(ingest._RAIN_REJECT_MAX + 99) & 255:02X}:00:01" in ingest._rain_reject
+    ingest._rain_reject.clear()
+
+
+def test_rain_out_of_order_packet_cannot_roll_rejection_back(client):
+    """An older packet arriving after a rejection must not overwrite the
+    pending entry with an earlier timestamp — lowering rej_ts would let a
+    REPLAY of the newer spike pass the strictly-later check and self-confirm."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    assert _post_rain(client, 1.00, _rain_ts(9)).status_code == 200
+    assert _post_rain(client, 50.0, _rain_ts(5)).status_code == 200   # spike, rejected
+    assert _post_rain(client, 49.9, _rain_ts(7)).status_code == 200   # OLDER spike packet
+    assert _post_rain(client, 50.0, _rain_ts(5)).status_code == 200   # replay of first
+    # History alone can't witness this: the write-throttle merges a same-
+    # timestamp replay into the existing (NULLed) row, so assert the guard's
+    # own state — confirmation POPS the entry; a still-pending entry proves
+    # the replay did not vouch for itself.
+    assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject, \
+        "replayed spike self-confirmed (rejection was popped)"
+    assert _yearlies(client)[-1] is None
+
+
+def test_rain_future_clamped_retries_cannot_self_confirm(client):
+    """The future-skew clamp rewrites dateutc to server 'now', so two retries
+    of the SAME broken-clock packet used to get fresh, increasing clamped
+    timestamps — the second 'confirmed' the first. Confirmation must key on
+    the device's claimed time, which a retry repeats verbatim."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    assert _post_rain(client, 1.00, _rain_ts(8)).status_code == 200
+    # Generated at test time so it stays future-dated forever — a fixed
+    # "2030-01-01" would silently stop exercising the clamp in 2030.
+    future = (datetime.now(timezone.utc)
+              + timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert _post_rain(client, 50.0, future).status_code == 200
+    assert _post_rain(client, 50.0, future).status_code == 200   # identical retry
+    assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject, \
+        "clamped retry self-confirmed (rejection was popped)"
+    assert _yearlies(client)[-1] is None

@@ -8,6 +8,37 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.3.2] — 2026-08-11
+
+Fast-follow to 1.3.1. If you configured the yearly-rain offset calibration
+introduced in 1.3.1, upgrade now — it corrupted rain history in production
+within an hour of release and has been removed.
+
+### Fixed — data integrity
+- **Yearly-rain offsets removed** (`INGEST_YEARLY_RAIN_OFFSETS` is now inert
+  and ignored): applied to a station whose yearly counter already is true
+  year-to-date, the offset clamped the real total to 0.0, and rows stored
+  before an offset was configured used the unshifted scale, so
+  year-over-history deltas went negative and yearly-rain records vanished.
+  Raw counter values now pass through untouched.
+- **A persistent rain-counter level shift no longer disables rain forever.**
+  The ingest glitch guard rejects impossible jumps, but a genuine level
+  shift (counter swap, station recalibration) previously kept every
+  subsequent reading nulled. One corroborating reading at the new level now
+  rebaselines the guard — and corroboration must arrive at least 90 s after
+  the rejection, so rtl_433's duplicate decodes of a single radio
+  transmission (or a neighboring sensor on a colliding radio ID) can't
+  confirm themselves.
+- **Yearly-rain history repair tool** (`app/maintenance.py`): repairs
+  history corrupted by the removed offsets, streams its pre-repair backup in
+  constant memory (the previous whole-table read could OOM small instances),
+  and handles rows from before the first counter era boundary.
+
+### Fixed
+- Writes with a **valid read-only token** now return **403 with an explicit
+  "this access token is read-only" message** instead of 401 "invalid token",
+  which misread as broken credentials. Unknown tokens still get 401.
+
 ## [1.3.1] — 2026-08-11
 
 Numbered 1.3.1 rather than 1.3.0 deliberately: a handful of early instances

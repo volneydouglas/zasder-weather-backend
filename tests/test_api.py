@@ -1298,6 +1298,214 @@ def test_maintenance_cleans_glitch_gusts(client, temp_env):
     assert gusts == [None, 28.0]     # glitch nulled, real gust kept
 
 
+def _insert_yearly(conn, mac, ts_ms, yearly):
+    conn.execute(
+        "INSERT INTO observations (mac, dateutc_ms, data_json, yearlyrainin) "
+        "VALUES (?, ?, ?, ?)",
+        (mac, ts_ms, json.dumps({"yearlyrainin": yearly}), yearly))
+
+
+def test_repair_yearly_rain_offsets(client, temp_env):
+    """Regression for the '16 inches of rain today' ghost: removing an ingest
+    yearly-rain offset stepped the stored counter up by the offset, and every
+    rollup window straddling the step reported the offset as rainfall. The
+    repair rewrites pre-cutoff history to raw-counter values (value + offset),
+    nulls values the offset had clamped to 0, and rollups stop seeing a step."""
+    import asyncio
+    import sqlite3
+    from app import db, maintenance
+    cutoff = 1786423000000
+    conn = sqlite3.connect(temp_env)
+    # Offset station (Crestview shape): clamped zero early, adjusted values,
+    # then raw values after the offset removal at `cutoff`.
+    _insert_yearly(conn, "CC:CC:CC:CC:CC:CC", cutoff - 300_000, 0.0)
+    _insert_yearly(conn, "CC:CC:CC:CC:CC:CC", cutoff - 200_000, 1.0)
+    _insert_yearly(conn, "CC:CC:CC:CC:CC:CC", cutoff - 100_000, 1.09)
+    _insert_yearly(conn, "CC:CC:CC:CC:CC:CC", cutoff + 100_000, 17.12)
+    # Fully-clamped station (Davis shape): every pre-cutoff value is 0 because
+    # the offset exceeded the raw counter — the true values are unknowable.
+    _insert_yearly(conn, "DD:DD:DD:DD:DD:DD", cutoff - 200_000, 0.0)
+    _insert_yearly(conn, "DD:DD:DD:DD:DD:DD", cutoff - 100_000, 0.0)
+    _insert_yearly(conn, "DD:DD:DD:DD:DD:DD", cutoff + 100_000, 0.34)
+    conn.commit()
+
+    spec = {"CC:CC:CC:CC:CC:CC": {"offset": 16.03, "cutoff_ms": cutoff},
+            "DD:DD:DD:DD:DD:DD": {"offset": 6.57, "cutoff_ms": cutoff}}
+
+    # The bug being repaired: rollups difference the current counter against
+    # yearly_rain_at_or_before(window start). With a window starting just
+    # before the step, that delta reports the offset itself as rainfall.
+    # (Asserted via the boundary lookup, not rain_rollups, because rollup
+    # windows come from the wall clock and would make this time-dependent.)
+    prior = asyncio.run(
+        db.yearly_rain_at_or_before("CC:CC:CC:CC:CC:CC", cutoff - 50_000))
+    assert round(17.12 - prior, 2) == 16.03
+
+    dry = maintenance.repair_yearly_rain_offsets(spec, apply=False,
+                                                 db_path=temp_env)
+    assert dry["applied"] is False
+    assert dry["macs"]["CC:CC:CC:CC:CC:CC"] == {"add_offset_rows": 2,
+                                                "null_rows": 1,
+                                                "era0_null_rows": 0}
+    vals = [r[0] for r in conn.execute(
+        "SELECT yearlyrainin FROM observations WHERE mac='CC:CC:CC:CC:CC:CC' "
+        "ORDER BY dateutc_ms")]
+    assert vals == [0.0, 1.0, 1.09, 17.12]        # dry run changed nothing
+
+    res = maintenance.repair_yearly_rain_offsets(spec, apply=True,
+                                                 db_path=temp_env)
+    assert res["applied"] and res["backup"]
+
+    vals = [tuple(r) for r in conn.execute(
+        "SELECT yearlyrainin, json_extract(data_json, '$.yearlyrainin') "
+        "FROM observations WHERE mac='CC:CC:CC:CC:CC:CC' ORDER BY dateutc_ms")]
+    # Clamped zero nulled (column AND data_json), adjusted values raised to
+    # raw, post-cutoff raw untouched.
+    assert vals == [(None, None), (17.03, 17.03), (17.12, 17.12),
+                    (17.12, 17.12)]
+    vals = [r[0] for r in conn.execute(
+        "SELECT yearlyrainin FROM observations WHERE mac='DD:DD:DD:DD:DD:DD' "
+        "ORDER BY dateutc_ms")]
+    assert vals == [None, None, 0.34]
+
+    # The ghost is gone: the same boundary lookup now returns raw-equivalent
+    # history, so the window delta is real rainfall (none), not the offset.
+    prior = asyncio.run(
+        db.yearly_rain_at_or_before("CC:CC:CC:CC:CC:CC", cutoff - 50_000))
+    assert round(17.12 - prior, 2) == 0.0
+
+    # Idempotency: a second run must refuse (repaired max would exceed the
+    # first raw value) and leave everything untouched.
+    res2 = maintenance.repair_yearly_rain_offsets(spec, apply=True,
+                                                  db_path=temp_env)
+    assert "monotonicity" in res2["macs"]["CC:CC:CC:CC:CC:CC"]["skipped"]
+    vals = [r[0] for r in conn.execute(
+        "SELECT yearlyrainin FROM observations WHERE mac='CC:CC:CC:CC:CC:CC' "
+        "ORDER BY dateutc_ms")]
+    assert vals == [None, 17.03, 17.12, 17.12]
+    conn.close()
+
+
+def test_repair_yearly_rain_offsets_refuses_bad_spec(client, temp_env):
+    """A wrong offset/cutoff pair must not corrupt history: the monotonic
+    check skips the MAC, and a MAC with no post-cutoff raw rows is skipped
+    because there is nothing to reconcile the repair against."""
+    import sqlite3
+    from app import maintenance
+    cutoff = 1786423000000
+    conn = sqlite3.connect(temp_env)
+    # Cutoff set too late: a raw row (17.12) is on the "pre" side, so adding
+    # the offset again would push history above the raw counter.
+    _insert_yearly(conn, "EE:EE:EE:EE:EE:EE", cutoff - 100_000, 17.12)
+    _insert_yearly(conn, "EE:EE:EE:EE:EE:EE", cutoff + 100_000, 17.12)
+    # No rows after the cutoff at all.
+    _insert_yearly(conn, "FF:FF:FF:FF:FF:FF", cutoff - 100_000, 1.09)
+    conn.commit()
+
+    res = maintenance.repair_yearly_rain_offsets(
+        {"EE:EE:EE:EE:EE:EE": {"offset": 16.03, "cutoff_ms": cutoff},
+         "FF:FF:FF:FF:FF:FF": {"offset": 16.03, "cutoff_ms": cutoff}},
+        apply=True, db_path=temp_env)
+    assert res["applied"] is False                 # nothing passed the checks
+    assert "monotonicity" in res["macs"]["EE:EE:EE:EE:EE:EE"]["skipped"]
+    assert "no post-cutoff" in res["macs"]["FF:FF:FF:FF:FF:FF"]["skipped"]
+
+    # A sign typo (or zero, or NaN) in the operator-typed spec would LOWER
+    # history, and the monotonicity check can't see it — sunk values stay
+    # below post_min. Must be refused up front.
+    for bad in (-16.03, 0, float("nan")):
+        res = maintenance.repair_yearly_rain_offsets(
+            {"EE:EE:EE:EE:EE:EE": {"offset": bad, "cutoff_ms": cutoff}},
+            apply=True, db_path=temp_env)
+        assert res["applied"] is False, bad
+        assert "invalid offset" in res["macs"]["EE:EE:EE:EE:EE:EE"]["skipped"], bad
+    res = maintenance.repair_yearly_rain_offsets(
+        {"EE:EE:EE:EE:EE:EE": {"offset": 16.03, "cutoff_ms": 0}},
+        apply=True, db_path=temp_env)
+    assert "invalid cutoff_ms" in res["macs"]["EE:EE:EE:EE:EE:EE"]["skipped"]
+    res = maintenance.repair_yearly_rain_offsets(
+        {"EE:EE:EE:EE:EE:EE": {"offset": 16.03, "cutoff_ms": cutoff,
+                               "null_before_ms": cutoff + 1}},
+        apply=True, db_path=temp_env)
+    assert "invalid null_before_ms" in res["macs"]["EE:EE:EE:EE:EE:EE"]["skipped"]
+
+    # A malformed entry (JSON null / non-numeric string / missing key) must
+    # skip that MAC — not abort the whole run with a traceback. The healthy
+    # MAC in the same spec must still be processed (proven by its own
+    # refusal reason, which requires the loop to have reached it).
+    for bad_entry in ({"offset": None, "cutoff_ms": cutoff},
+                      {"offset": "abc", "cutoff_ms": cutoff},
+                      {"offset": 16.03, "cutoff_ms": cutoff,
+                       "null_before_ms": "x"},
+                      {"cutoff_ms": cutoff}):
+        res = maintenance.repair_yearly_rain_offsets(
+            {"EE:EE:EE:EE:EE:EE": bad_entry,
+             "FF:FF:FF:FF:FF:FF": {"offset": 16.03, "cutoff_ms": cutoff}},
+            apply=True, db_path=temp_env)
+        assert "malformed spec entry" in res["macs"]["EE:EE:EE:EE:EE:EE"]["skipped"]
+        assert "no post-cutoff" in res["macs"]["FF:FF:FF:FF:FF:FF"]["skipped"]
+
+    vals = [r[0] for r in conn.execute(
+        "SELECT yearlyrainin FROM observations ORDER BY mac, dateutc_ms")]
+    conn.close()
+    assert vals == [17.12, 17.12, 1.09]            # untouched
+
+
+def test_repair_yearly_rain_offsets_era0_boundary(client, temp_env):
+    """The Crestview production shape: the first ~45 minutes after install
+    were recorded under a DIFFERENT (unknown) offset, so those values can't
+    be repaired by adding the final offset — without `null_before_ms` the
+    monotonic guard refuses the whole MAC; with it, the earlier-era rows are
+    NULLed (unknowable, like clamped zeros) and the main era repairs cleanly.
+    Streaming-backup content is asserted as JSON Lines."""
+    import json as _json
+    import sqlite3
+    from app import maintenance
+    cutoff = 1786421263000
+    era0_end = cutoff - 1_000_000
+    conn = sqlite3.connect(temp_env)
+    # Era 0 (install hour, unknown offset): values ABOVE the later adjusted
+    # era — these are what tripped the guard in production (3.765 + 16.03
+    # would exceed the first raw 17.12).
+    _insert_yearly(conn, "AB:AB:AB:AB:AB:AB", era0_end - 200, 3.70)
+    _insert_yearly(conn, "AB:AB:AB:AB:AB:AB", era0_end - 100, 3.765)
+    # Main offset era: adjusted values, one clamped zero.
+    _insert_yearly(conn, "AB:AB:AB:AB:AB:AB", era0_end + 100, 0.0)
+    _insert_yearly(conn, "AB:AB:AB:AB:AB:AB", era0_end + 200, 1.09)
+    # Raw era after the offset removal.
+    _insert_yearly(conn, "AB:AB:AB:AB:AB:AB", cutoff + 100, 17.12)
+    conn.commit()
+
+    # Without null_before_ms: refused (era-0 values overshoot the counter).
+    res = maintenance.repair_yearly_rain_offsets(
+        {"AB:AB:AB:AB:AB:AB": {"offset": 16.03, "cutoff_ms": cutoff}},
+        apply=True, db_path=temp_env)
+    assert "monotonicity" in res["macs"]["AB:AB:AB:AB:AB:AB"]["skipped"]
+
+    res = maintenance.repair_yearly_rain_offsets(
+        {"AB:AB:AB:AB:AB:AB": {"offset": 16.03, "cutoff_ms": cutoff,
+                               "null_before_ms": era0_end}},
+        apply=True, db_path=temp_env)
+    assert res["applied"]
+    assert res["macs"]["AB:AB:AB:AB:AB:AB"] == {
+        "add_offset_rows": 1, "null_rows": 1, "era0_null_rows": 2}
+
+    vals = [tuple(r) for r in conn.execute(
+        "SELECT yearlyrainin, json_extract(data_json, '$.yearlyrainin') "
+        "FROM observations WHERE mac='AB:AB:AB:AB:AB:AB' ORDER BY dateutc_ms")]
+    conn.close()
+    assert vals == [(None, None), (None, None),      # era 0 nulled
+                    (None, None),                    # clamped zero nulled
+                    (17.12, 17.12),                  # 1.09 + 16.03
+                    (17.12, 17.12)]                  # raw untouched
+    # Backup is JSON Lines and covers every pre-cutoff non-null row.
+    with open(res["backup"]) as backup_file:
+        lines = [_json.loads(line) for line in backup_file]
+    assert len(lines) == 4
+    assert {round(line["yearlyrainin"], 3) for line in lines} == {
+        3.70, 3.765, 0.0, 1.09}
+
+
 async def _ingest(client, mac, ts, **outdoor):
     return client.post("/ingest/custom",
                        headers={"Authorization": "Bearer test-ingest-token"},

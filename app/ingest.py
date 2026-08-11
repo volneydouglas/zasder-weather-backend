@@ -124,6 +124,7 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # so the reading itself survives. A far-PAST value (>~400 days) pollutes
     # records/aggregate windows and can't be a live reading — reject it.
     now_ms = int(time.time() * 1000)
+    raw_dateutc_ms = dateutc_ms      # pre-clamp, for rejection-confirmation identity
     if dateutc_ms > now_ms + _FUTURE_SKEW_MS:
         log.warning("timestamp %s is %.1f min in the future — clamping to "
                     "server time", ts_iso, (dateutc_ms - now_ms) / 60000)
@@ -180,6 +181,12 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
 
     return {
         "dateutc":        dateutc_ms,
+        # Popped by _do_ingest before storage. The clamp above rewrites a
+        # future dateutc to server "now", so each RETRY of the same broken-
+        # clock packet got a fresh, later timestamp — and the second retry
+        # "confirmed" the first's rejected spike. Confirmation ordering must
+        # use the device's own claimed time, which a retry repeats verbatim.
+        "_raw_dateutc":   raw_dateutc_ms,
         "tempf":          tempf,
         "feelsLike":      feels_like,
         "dewPoint":       out.get("dew_point_f"),
@@ -273,6 +280,43 @@ def _is_rain_glitch(jump_in: float, elapsed_h: float,
 # level rebaselines. Process-global like main.py's caches; single event loop,
 # lost on restart (costs one extra confirming reading — fine).
 _rain_reject: dict[str, tuple[float, float]] = {}
+# Bounded like main.py's limiter maps: every rejected reading adds a MAC entry
+# and entries are only removed when that MAC later takes a non-glitch path, so
+# an ingest-token holder spraying synthetic device ids grows it without limit.
+_RAIN_REJECT_MAX = 512
+# A confirming reading must be at least this much later than the rejection it
+# corroborates. rtl_433 frequently decodes the SAME radio transmission two or
+# three times within a few seconds, and a burst of identical decodes is one
+# observation, not two: in production a neighboring sensor on a colliding ID
+# (constant 20.22 counter vs Crestview's 17.12) got its duplicate decode
+# accepted as "confirmation" of itself. Real SDR cadence is ~60s, so 90s
+# rejects same-transmission bursts while a genuine level shift still confirms
+# on the second distinct transmission after the first rejected one.
+_RAIN_CONFIRM_MIN_GAP_MS = 90_000
+
+
+def _record_rain_rejection(mac: str, value_in: float, ts_ms: float) -> None:
+    """Register a rejected reading as a pending level-shift candidate,
+    evicting the oldest entry at the cap (losing one pending confirmation
+    costs that device a single extra confirming reading)."""
+    prev = _rain_reject.get(mac)
+    if prev is not None and ts_ms <= prev[1]:
+        # An out-of-order (or replayed) packet must not roll the pending
+        # rejection's timestamp backwards: lowering rej_ts would let a replay
+        # of the NEWER original packet pass the strictly-later check and
+        # self-confirm the spike it belongs to.
+        return
+    if prev is not None and abs(value_in - prev[0]) <= 0.05:
+        # Same level seen again but not yet confirmable (e.g. within the
+        # burst-dedup gap): keep the FIRST-SEEN timestamp. Advancing it on
+        # every repeat would push the confirmation window ahead of a sensor
+        # whose cadence is shorter than the gap, so a real level shift could
+        # never confirm.
+        return
+    if len(_rain_reject) >= _RAIN_REJECT_MAX and mac not in _rain_reject:
+        oldest = min(_rain_reject, key=lambda k: _rain_reject[k][1])
+        del _rain_reject[oldest]
+    _rain_reject[mac] = (value_in, ts_ms)
 
 
 def _confirms_rejected_level(mac: str, value_in: float, ts_ms: float,
@@ -285,6 +329,18 @@ def _confirms_rejected_level(mac: str, value_in: float, ts_ms: float,
     if prev is None:
         return False
     rej_val, rej_ts = prev
+    # Strictly LATER observation required: a sender retrying the identical
+    # rejected packet (same dateutc) has an increment of zero, which trivially
+    # passes the plausibility check — the duplicate would confirm itself.
+    # Corroboration means a NEW reading at the new level, not the same one
+    # delivered twice.
+    if ts_ms <= rej_ts:
+        return False
+    if ts_ms - rej_ts < _RAIN_CONFIRM_MIN_GAP_MS:
+        # Too soon to be a distinct observation: duplicate decodes of one
+        # radio transmission arrive seconds apart and must not corroborate
+        # each other (see _RAIN_CONFIRM_MIN_GAP_MS).
+        return False
     if value_in < rej_val - 0.05:          # fell back — it WAS a glitch
         return False
     elapsed_h = max((ts_ms - rej_ts) / 3_600_000.0, 1.0 / 3600.0)
@@ -473,6 +529,7 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     flat = _flatten(payload_obj)
     if not flat:
         raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
+    raw_dateutc = flat.pop("_raw_dateutc", flat.get("dateutc"))
 
     # Reject SDR rain-decode glitches: a sudden spike in cumulative yearly
     # rain that's physically impossible for the elapsed time. Real rain ramps
@@ -489,7 +546,7 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
             elapsed_h = (flat["dateutc"] - last_ts) / 3_600_000.0
             if _is_rain_glitch(jump, elapsed_h, max_rate):
                 if _confirms_rejected_level(mac, flat["yearlyrainin"],
-                                            flat["dateutc"], max_rate):
+                                            raw_dateutc, max_rate):
                     # Second consecutive reading at the new level: this is a
                     # level shift, not a spike. Accept and rebaseline.
                     log.warning(
@@ -498,7 +555,8 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
                         flat["yearlyrainin"])
                     _rain_reject.pop(mac, None)
                 else:
-                    _rain_reject[mac] = (flat["yearlyrainin"], flat["dateutc"])
+                    _record_rain_rejection(mac, flat["yearlyrainin"],
+                                           raw_dateutc)
                     log.warning(
                         "rain glitch dropped for %s: +%.2f in over %.3f h "
                         "— %.2f→%.2f (will accept if the next reading "

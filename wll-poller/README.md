@@ -17,6 +17,8 @@ over UDP). Same physical Davis VP2, ~6× lower latency, no key, no quotas.
 - GETs `http://<WLL_HOST>/v1/current_conditions` every `WLL_POLL_SECONDS`
 - Normalizes ISS / barometer / WLL-indoor sensor blocks into the
   `/ingest/custom` shape the backend expects
+- Reads **one** ISS transmitter (a WLL supports 8). Blank `WLL_TXID` uses the
+  lowest id reporting and warns if there are others; set it to pin one
 - POSTs to `${BACKEND_URL}/ingest/custom` with the ingest bearer token
 - Stateless — backend stores observations; the poller just translates +
   forwards and keeps going on errors
@@ -95,8 +97,10 @@ A small container that restarts on boot. Needs Docker + the Compose plugin
 (`docker compose version`).
 
 ```sh
-# 1. Make your own copy of the settings file
+# 1. Make your own copy of the settings file, readable only by you —
+#    it will hold your INGEST_TOKEN (a write credential for the backend)
 cp .env.example .env
+chmod 600 .env
 
 # 2. Open it in a text editor and fill in the four values:
 #      WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
@@ -180,7 +184,7 @@ WLL JSON samples; no network needed.
 | WLL field                      | Ingest field          | Notes |
 |---|---|---|
 | `temp` / `hum` / `dew_point`   | `outdoor.tempf` / `outdoor.humidity` / `outdoor.dew_point_f` | ISS |
-| `heat_index` ‖ `wind_chill` | `outdoor.feels_like` | THSW deliberately **not** used — it adds a direct-sun load that runs 5–10°F hotter than every other source |
+| `heat_index` / `wind_chill` | `outdoor.feels_like` | Heat index at ≥80°F, wind chill at ≤50°F, air temp in between — WLL populates *both* indices at every temperature, so the regime has to be picked here. THSW deliberately **not** used: it adds a direct-sun load that runs 5–10°F hotter than every other source |
 | `wind_speed_last` / `wind_dir_last` | `wind.speed_mph` / `wind.dir_deg` | |
 | `wind_speed_hi_last_10_min`    | `wind.gust_mph`       | 10-min gust |
 | `rain_rate_last × rain_size`   | `rain.hourly_in`      | counts/hr × size = in/hr |

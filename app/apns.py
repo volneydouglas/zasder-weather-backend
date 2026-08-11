@@ -30,8 +30,10 @@ _JWT_TTL = 50 * 60
 
 def make_jwt(team_id: str, key_id: str, key_p8: str, now: float | None = None) -> str:
     """ES256 provider JWT for APNs. Pure — unit-tested with an ephemeral key."""
+    # `now is None`, not `now or ...`: now=0 is a legitimate pinned iat (epoch)
+    # and the falsy-default form silently substituted wall-clock time for it.
     return jwt.encode(
-        {"iss": team_id, "iat": int(now or time.time())},
+        {"iss": team_id, "iat": int(time.time() if now is None else now)},
         key_p8, algorithm="ES256", headers={"kid": key_id},
     )
 
@@ -51,6 +53,20 @@ def build_payload(title: str, body: str) -> dict:
     return {"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}
 
 
+def _resolve_env(t: dict) -> tuple[str | None, bool]:
+    """(env, came_from_the_token) for one token row.
+
+    env is None when neither the token nor APNS_ENV names a host we know —
+    the caller must then refuse to send rather than default to a host."""
+    stored = (t.get("env") or "").strip()
+    if stored in _HOSTS:
+        return stored, True
+    configured = (settings.apns_env or "").strip()
+    if configured in _HOSTS:
+        return configured, False
+    return None, False
+
+
 async def _push_tokens(tokens: list[dict], title: str, body: str) -> dict:
     """Sign with the local APNs key and POST to Apple for each token. `tokens`
     is a list of {token, env?} dicts. Returns {sent, dead, failed} where `dead`
@@ -68,7 +84,19 @@ async def _push_tokens(tokens: list[dict], title: str, body: str) -> dict:
     async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
         for t in tokens:
             tok = t["token"]
-            host = _HOSTS.get(t.get("env") or settings.apns_env, _HOSTS["sandbox"])
+            env, env_from_token = _resolve_env(t)
+            if env is None:
+                # Fail loudly instead of guessing a host. Guessing used to mean
+                # sandbox, and a production token POSTed to the sandbox host
+                # comes back 400 BadDeviceToken — which this function reads as
+                # "dead" and send_to_all then DELETES. One misspelled APNS_ENV
+                # silently wiped every registered token.
+                failed += 1
+                log.error("APNS_ENV is %r — expected 'sandbox' or 'production'; "
+                          "refusing to guess a host for %s…",
+                          settings.apns_env, tok[:8])
+                continue
+            host = _HOSTS[env]
             try:
                 r = await client.post(f"{host}/3/device/{tok}", headers=headers, json=payload)
             except Exception as e:
@@ -83,7 +111,16 @@ async def _push_tokens(tokens: list[dict], title: str, body: str) -> dict:
                 reason = r.json().get("reason", "")
             except Exception:
                 pass
-            if r.status_code == 410 or reason in (
+            if reason == "BadDeviceToken" and not env_from_token:
+                # BadDeviceToken also means "right token, wrong environment".
+                # We only sent to `env` because the token didn't record its
+                # own, so we can't tell the two apart — and pruning on a guess
+                # is unrecoverable, while a failed send is retried next tick.
+                failed += 1
+                log.warning("apns BadDeviceToken for %s… on the %s host; the "
+                            "token has no stored env, so it is NOT being "
+                            "pruned — check APNS_ENV", tok[:8], env)
+            elif r.status_code == 410 or reason in (
                     "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"):
                 dead.append(tok)
                 log.info("dead token %s… (%s %s)", tok[:8], r.status_code, reason)
@@ -99,7 +136,16 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
     who don't run their own APNs key: the relay holds the key, fans out to
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
     body, env} — the relay enforces that shape."""
-    env = settings.apns_env if settings.apns_env in ("sandbox", "production") else "production"
+    env = (settings.apns_env or "").strip()
+    if env not in _HOSTS:
+        # Same refuse-to-guess semantics as _resolve_env on the own-key path:
+        # a misspelled APNS_ENV used to silently coerce to "production", the
+        # relay then stamped every token with the wrong environment, Apple
+        # answered BadDeviceToken, and send_to_all pruned them all.
+        log.error("APNS_ENV is %r — expected 'sandbox' or 'production'; "
+                  "refusing to relay-push %d token(s)",
+                  settings.apns_env, len(tokens))
+        return {"sent": 0, "dead": [], "failed": len(tokens)}
     payload = {"tokens": tokens, "title": title, "body": body, "env": env}
     headers = {"authorization": f"Bearer {token}"}
     try:
@@ -111,7 +157,13 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
     if r.status_code != 200:
         log.warning("relay push %s: %s", r.status_code, r.text[:200])
         return {"sent": 0, "dead": [], "failed": len(tokens)}
-    data = r.json()
+    try:
+        data = r.json()
+    except ValueError:
+        # A 200 with a non-JSON body (middlebox, captive portal, a broken
+        # relay) is a protocol error, not a batch of dead tokens.
+        log.warning("relay push returned 200 with a non-JSON body")
+        return {"sent": 0, "dead": [], "failed": len(tokens)}
     return {"sent": data.get("sent", 0), "dead": data.get("dead", []),
             "failed": data.get("failed", 0)}
 
@@ -158,12 +210,47 @@ async def send_to_all(title: str, body: str) -> dict:
     dead: list[str] = []
 
     # iOS
-    if ios and (own or relay):
-        res = (await _push_tokens(ios, title, body)) if own else \
-            await _push_via_relay([t["token"] for t in ios], title, body,
-                                  relay_url, relay_token)  # type: ignore[arg-type]
-        sent += res.get("sent", 0); failed += res.get("failed", 0)
+    if ios and own:
+        res = await _push_tokens(ios, title, body)
+        sent += res.get("sent", 0)
+        failed += res.get("failed", 0)
         dead += res.get("dead", [])
+    elif ios and relay:
+        # The relay call stamps ONE env onto the whole batch (APNS_ENV), so a
+        # token that recorded a DIFFERENT env at registration would be sent to
+        # the wrong Apple host, come back BadDeviceToken, and get pruned —
+        # the exact token-wipe the own-key path's _resolve_env fix closed.
+        # Skip mismatched tokens (undeliverable via this relay env anyway).
+        resolved = (settings.apns_env or "").strip()
+        sendable: list[dict] = []
+        for t in ios:
+            stored = (t.get("env") or "").strip()
+            if stored in _HOSTS and resolved in _HOSTS and stored != resolved:
+                failed += 1
+                log.warning("token %s… registered env=%s but APNS_ENV=%s — "
+                            "skipping (relay sends one env per batch); it is "
+                            "NOT being pruned", t["token"][:8], stored, resolved)
+                continue
+            sendable.append(t)
+        if sendable:
+            res = await _push_via_relay([t["token"] for t in sendable], title,
+                                        body, relay_url, relay_token)  # type: ignore[arg-type]
+            sent += res.get("sent", 0)
+            failed += res.get("failed", 0)
+            # Prune only tokens whose env was their OWN stored value. For a
+            # token with no recorded env, the batch env was a guess from
+            # APNS_ENV — "dead" may just mean "wrong environment", and pruning
+            # on a guess is unrecoverable while a failed send retries.
+            env_known = {t["token"] for t in sendable
+                         if (t.get("env") or "").strip() in _HOSTS}
+            for tok in res.get("dead", []):
+                if tok in env_known:
+                    dead.append(tok)
+                else:
+                    failed += 1
+                    log.warning("relay reported %s… dead, but its env was "
+                                "guessed from APNS_ENV — not pruning; check "
+                                "APNS_ENV", tok[:8])
 
     # Android
     if android and fcm_on:

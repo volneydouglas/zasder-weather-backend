@@ -1,6 +1,9 @@
 # Secrets
 .env
 *.env
+# setup-local.sh's backup of a previous .env — full token set in plaintext,
+# and `*.env` does NOT match `.env.bak.<timestamp>`.
+.env.bak.*
 zasder-install-summary.txt
 
 # Python
@@ -19,10 +22,6 @@ venv/
 *.db-wal
 *.db-shm
 data/
-
-# Relay-side runtime state
-relay/data/
-relay/certs/
 
 # macOS
 .DS_Store

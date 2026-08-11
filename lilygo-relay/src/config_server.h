@@ -2,13 +2,17 @@
 #include <Arduino.h>
 
 // Tiny HTTP server on port 80 exposing:
-//   GET  /              JSON status (uptime, IP, mac, last packet/post,
+//   GET  /              HTML status page + browser provisioning form
+//                       (setup-key field when unprovisioned, current-token
+//                       field once locked)
+//   GET  /status        JSON status (uptime, IP, mac, last packet/post,
 //                       which creds are set — never the token itself)
 //   POST /provision     form fields backend_url + ingest_token; saves
-//                       to NVS, replies 200 with new status. Once a board
-//                       is provisioned, changes require the current ingest
-//                       token OR the per-device setup key (see below) as
-//                       proof-of-ownership — no anonymous re-provisioning.
+//                       to NVS, replies 200 with new status. EVERY call
+//                       requires proof-of-ownership — the per-device setup
+//                       key (see below) for the first provision, and the
+//                       current ingest token OR that key thereafter. There
+//                       is no anonymous provisioning at any point.
 //   POST /identify      blinks the on-board LED for 3 s so you can pick
 //                       this board out of a row of identical-looking
 //                       LilyGOs on a shelf
@@ -38,12 +42,22 @@ extern String backendUrl;
 extern String ingestToken;
 
 // Per-device setup key: a random 8-char secret minted on first boot and
-// kept in NVS across token wipes. It's the proof-of-ownership needed to
-// re-provision a board whose token was wiped after repeated 401s (the
-// current token is gone, so the setup key is the only remaining
-// credential). Shown on the OLED + serial only when re-pairing is needed;
-// never exposed over HTTP. Lost it? Physical USB reflash with NVS erase
-// (`pio run -t erase`) mints a fresh one. See config_server.cpp.
+// kept in NVS across token wipes. It is the proof-of-ownership for BOTH
+// provisioning events:
+//   * the FIRST /provision on a fresh board — there is no ingest_token yet,
+//     so this key is the only thing that opens it. Without that requirement
+//     whoever reached an unprovisioned board first could claim it and lock
+//     the owner out, recoverable only by a physical NVS erase.
+//   * re-provisioning after repeated 401s wiped the token, when the key is
+//     again the only remaining credential.
+// Shown on the OLED + serial only while a provision is pending. It is never
+// returned by any HTTP route — /status reports `has_token` and `token_len`
+// and nothing about this key — so reading it requires physical sight of the
+// board or its serial console. Like the token and the Wi-Fi credentials it
+// sits in plaintext NVS (no flash encryption in this build), so "physical
+// access" includes a USB `esptool read_flash` — see the README's Security
+// section for that residual risk. Lost it? Physical USB reflash with NVS
+// erase (`pio run -t erase`) mints a fresh one. See config_server.cpp.
 extern String setupKey;
 
 // Opt-in: forward ANY decoded rtl_433 station that carries weather fields

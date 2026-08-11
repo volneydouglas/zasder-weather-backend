@@ -11,12 +11,44 @@
 #   --aw-app-key= --aw-api-key= --wl-key= --wl-secret= --wl-station=
 
 set -euo pipefail
+# Everything this script writes holds tokens: .env, the .env.bak.* backup of a
+# previous one, and zasder-install-summary.txt. Set the umask before the FIRST
+# of them exists — it used to sit just above the .env write, so the backup was
+# created under the user's default umask (022 → world-readable).
+umask 077
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$APP_DIR"
+
+# umask only governs files this run CREATES. On a re-run — the common case,
+# since this script is also the update path — .env and the summary already
+# exist, and an earlier run (or a hand-edit) may have left them 0644. Appending
+# to or overwriting them preserves that mode, so the tokens stay readable by
+# every other account on the machine. Tighten what is already there before we
+# write anything into it.
+# Missing file = nothing to protect, fine. Present file we CANNOT lock down =
+# stop. `|| true` here would have meant carrying on with world-readable tokens
+# while printing a success message, which is worse than refusing.
+harden() {
+  local f
+  for f in "$@"; do
+    [ -e "$f" ] || continue
+    if ! chmod 600 "$f"; then
+      err "Couldn't set permissions on $f"
+      err "It holds your tokens and is readable by other accounts on this"
+      err "machine. Fix the ownership/permissions, then re-run."
+      exit 1
+    fi
+  done
+}
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; }
+
+# Called here, AFTER err() exists — harden's failure path uses it, and a
+# not-yet-defined function would have turned a clear refusal into
+# "err: command not found". Still before anything writes to these files.
+harden "$APP_DIR/.env" "$APP_DIR/zasder-install-summary.txt"
 
 NONINTERACTIVE=0; SOURCES=""; SOURCES_SET=0; TZ_FLAG=""
 AW_APP_KEY_FLAG=""; AW_API_KEY_FLAG=""
@@ -62,13 +94,51 @@ normalize_sources() {
   SOURCES="$out"
 }
 
+# Same guard as setup-fly.sh, for the same reason: the backend resolves the
+# zone with Python's zoneinfo, so an invalid value ("EDT", a typo) doesn't
+# fail here — it 500s the status page, records and rain rollups later, with
+# no hint that setup was where it went wrong. Validate the same way when
+# Python is around; otherwise fall back to the system tz database. Both
+# accept "America/New_York" and reject "EDT".
+valid_timezone() {
+  [ -n "$1" ] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$1" <<'PY' >/dev/null 2>&1
+import sys
+from zoneinfo import ZoneInfo
+ZoneInfo(sys.argv[1])
+PY
+    return $?
+  fi
+  # Fallback when python3 is missing. Guard the path BEFORE testing it: a
+  # bare -f test accepts "../../../../etc/passwd", which exists, is not a
+  # timezone, and would be written into TIMEZONE.
+  case "$1" in
+    /*|*..*|*//*) return 1 ;;
+    *[!A-Za-z0-9_/+-]*) return 1 ;;
+  esac
+  [ -f "/usr/share/zoneinfo/$1" ]
+}
+
 bold "Zasder Weather — local Docker setup"
 echo
 
 if [ -f .env ]; then
   warn ".env already exists."
   ask_yn "Overwrite it? [y/N]" N || { err "aborted — edit .env by hand or move it aside"; exit 1; }
-  cp .env ".env.bak.$(date +%s)"; info "backed up existing .env"
+  _bak=".env.bak.$(date +%s)"
+  # Both steps checked before claiming success — the message used to print
+  # even if the copy or the chmod had failed.
+  if ! cp .env "$_bak"; then
+    err "Couldn't back up your existing .env — refusing to overwrite it."
+    exit 1
+  fi
+  if ! chmod 600 "$_bak"; then
+    err "Couldn't set permissions on $_bak, which contains your tokens."
+    err "Remove it or fix its permissions, then re-run."
+    exit 1
+  fi
+  info "backed up existing .env"
 fi
 
 # Sources
@@ -107,10 +177,25 @@ if source_enabled davis && { [ -z "$wl_key" ] || [ -z "$wl_secret" ] || [ -z "$w
   err "Davis selected but WEATHERLINK_API_KEY / _SECRET / _STATION_ID missing"; exit 1
 fi
 
-# Timezone
+# Timezone — validated up front so a bad zone can't reach .env (see
+# valid_timezone above for why it only breaks later otherwise).
 tz="$TZ_FLAG"
+if [ -n "$tz" ] && ! valid_timezone "$tz"; then
+  err "--tz='$tz' isn't a valid IANA timezone (try America/New_York)."; exit 1
+fi
 if [ -z "$tz" ] && [ "$NONINTERACTIVE" -eq 0 ]; then
-  echo; read -r -p "TIMEZONE [UTC]: " tz
+  echo
+  info "Use an IANA name like America/New_York or Europe/London."
+  info "Abbreviations such as EDT or PST are not valid here."
+  while :; do
+    read -r -p "TIMEZONE [UTC]: " tz || tz=""
+    tz=${tz:-UTC}
+    valid_timezone "$tz" && break
+    err "'$tz' isn't a timezone name this server can use."
+    info "It needs the Region/City form — America/New_York, not EDT."
+    info "Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
+    echo
+  done
 fi
 tz=${tz:-UTC}
 
@@ -118,8 +203,7 @@ tz=${tz:-UTC}
 api_token=$(openssl rand -hex 32)
 ingest_token=$(openssl rand -hex 32)
 
-# Write .env
-umask 077
+# Write .env  (umask 077 is set at the top of the script)
 {
   echo "# Generated by setup-local.sh on $(date)"
   echo "API_TOKEN=$api_token"

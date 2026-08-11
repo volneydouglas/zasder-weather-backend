@@ -73,18 +73,28 @@ def render_prometheus(devices: list[dict[str, Any]], now_ms: int) -> str:
             lines.append(f"# TYPE {name} gauge")
             lines.extend(block)
 
-    # Freshness: seconds since each device last reported.
+    # Freshness: seconds since each device last reported. Emitted under two
+    # names: `zasder_device_last_report_age_seconds` is the correct one
+    # (Prometheus convention says a `*_seconds` gauge named "last_seen" should
+    # hold a TIMESTAMP, and this value is an age); the old
+    # `zasder_device_last_seen_seconds` is kept as a deprecated alias so
+    # existing dashboards/alert rules keep working.
     age_block: list[str] = []
+    legacy_block: list[str] = []
     for d in devices:
         ls = d.get("lastSeen")
         if ls is None:
             continue
         age = max(0.0, (now_ms - int(ls)) / 1000.0)
         labels = f'mac="{_esc_label(_mask_mac(d.get("mac")))}",name="{_esc_label(d.get("name") or _mask_mac(d.get("mac")))}"'
-        age_block.append(f"zasder_device_last_seen_seconds{{{labels}}} {age:g}")
+        age_block.append(f"zasder_device_last_report_age_seconds{{{labels}}} {age:g}")
+        legacy_block.append(f"zasder_device_last_seen_seconds{{{labels}}} {age:g}")
     if age_block:
-        lines.append("# HELP zasder_device_last_seen_seconds Seconds since the device last reported")
-        lines.append("# TYPE zasder_device_last_seen_seconds gauge")
+        lines.append("# HELP zasder_device_last_report_age_seconds Seconds since the device last reported")
+        lines.append("# TYPE zasder_device_last_report_age_seconds gauge")
         lines.extend(age_block)
+        lines.append("# HELP zasder_device_last_seen_seconds DEPRECATED alias of zasder_device_last_report_age_seconds (an age, not a timestamp)")
+        lines.append("# TYPE zasder_device_last_seen_seconds gauge")
+        lines.extend(legacy_block)
 
     return "\n".join(lines) + "\n"

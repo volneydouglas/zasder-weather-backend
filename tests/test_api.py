@@ -255,16 +255,31 @@ def test_oversize_content_length_rejected(client):
 def test_oversize_streamed_body_bounded(client):
     """A large body with no oversized Content-Length still can't sail
     through — the route rejects it (bounded-memory guard did its job)."""
-    big = b'{"junk":"' + b'x' * (2 * 1024 * 1024) + b'"}'
+    # A generator body makes httpx use Transfer-Encoding: chunked and omit
+    # Content-Length. That matters: passing `content=<bytes>` sets
+    # Content-Length, which trips the middleware's fast path and returns 413
+    # WITHOUT ever running the streaming counter this test is named for. The
+    # mid-stream truncation branch had no coverage at all.
+    def _chunks():
+        yield b'{"junk":"'
+        for _ in range(32):
+            yield b'x' * (64 * 1024)
+        yield b'"}'
+
     r = client.post(
         "/ingest/custom",
         headers={"Authorization": "Bearer test-ingest-token",
                  "Content-Type": "application/json"},
-        content=big,
+        content=_chunks(),
     )
-    # 413 (our cap) or 400 (route's own size/JSON guard on the truncated
-    # body) — never a 200, never an OOM.
-    assert r.status_code in (400, 413)
+    # 400 specifically, not `in (400, 413)`: 413 is the Content-Length fast
+    # path, so accepting it would let this test pass while the streaming
+    # branch stayed unexercised — which is exactly what it did before.
+    # Verified: chunked -> 400, fixed Content-Length -> 413.
+    assert r.status_code == 400, (
+        f"expected the streaming counter to truncate the body (400), got "
+        f"{r.status_code} — a 413 means the Content-Length fast path ran "
+        f"instead and this test is not covering what it claims")
 
 
 # ─────────────────── discoveries (long-tail RF survey) ───────────────────
@@ -1469,9 +1484,24 @@ def test_value_at_or_before_does_not_fall_back_to_earliest(client):
     # Cutoff at/after the reading -> returns it.
     assert asyncio.run(db.value_at_or_before("AA:BB:CC:DD:EE:FF", "baromrelin",
                                              ms + 1000)) == 29.9
-    # Rain rollups still WANT the earliest-row fallback (fresh sensor).
-    assert asyncio.run(db.yearly_rain_at_or_before("AA:BB:CC:DD:EE:FF",
-                                                   ms - 3 * 3600 * 1000)) is None or True
+    # Rain rollups still WANT the earliest-row fallback, and that asymmetry
+    # with value_at_or_before above is the whole point of this test.
+    #
+    # This assertion used to read `... is None or True`, which is True for
+    # every possible value — and the test posted no rain data at all, so it
+    # could not have failed either way. Post rain, then pin the fallback: a
+    # cutoff BEFORE any reading exists must still return the earliest yearly
+    # total, because a fresh sensor's "rain since Jan 1" is legitimately the
+    # first number it ever reported.
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF"},
+                      "timestamp_utc": "2026-07-20T12:05:00Z",
+                      "outdoor": {"tempf": 80},
+                      "rain": {"yearly_in": 12.5},
+                      "source": "test"})
+    assert asyncio.run(db.yearly_rain_at_or_before(
+        "AA:BB:CC:DD:EE:FF", ms - 3 * 3600 * 1000)) == 12.5
 
 def test_records_keeps_legit_wettest_day_in_short_period(client):
     """The cumulative-counter heuristic is judged over ALL history, so a real
@@ -1515,3 +1545,318 @@ def test_bucketed_history_carries_indoor_fields(client):
     assert any(r.get("tempinf") is not None for r in rows), \
         "bucketed history dropped tempinf — dashboard indoor sparkline goes blank"
     assert any(r.get("humidityin") is not None for r in rows)
+
+
+# ───────────────────────── /api/forecast (R2-22) ─────────────────────────
+# The round-1 fix: 400 on bad coords, 502 (not 500) when Open-Meteo is down.
+# All upstream traffic is routed through httpx.MockTransport — the suite must
+# never hit the real API.
+
+def _mock_forecast_upstream(monkeypatch, handler):
+    """Replace httpx.AsyncClient (as used inside get_forecast) with one bound
+    to a MockTransport. TestClient itself is a sync httpx.Client — unaffected."""
+    import httpx
+    real = httpx.AsyncClient
+    def factory(*a, **kw):
+        return real(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+
+def test_forecast_rejects_out_of_range_without_upstream_call(client, monkeypatch):
+    """?lat=91 must 400 locally. Open-Meteo answers out-of-range with its own
+    400, which used to surface here as a bare 500 — and the guard must run
+    BEFORE any upstream request is made."""
+    import httpx
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("out-of-range coords must not reach the upstream")
+    _mock_forecast_upstream(monkeypatch, handler)
+    for q in ("lat=91&lon=0", "lat=0&lon=181", "lat=-90.5&lon=0"):
+        r = client.get(f"/api/forecast?{q}", headers=_H)
+        assert r.status_code == 400, f"{q} → {r.status_code}"
+        assert "out of range" in r.json()["detail"]
+
+
+def test_forecast_502_when_upstream_errors(client, monkeypatch):
+    """An Open-Meteo 500/timeout is routine, not our bug: the app needs 502
+    ("forecast unavailable"), never a bare 500 ("server error")."""
+    import httpx
+    _mock_forecast_upstream(monkeypatch,
+                            lambda req: httpx.Response(500, text="boom"))
+    r = client.get("/api/forecast?lat=33.3&lon=-111.9", headers=_H)
+    assert r.status_code == 502
+    assert r.json()["detail"] == "forecast upstream unavailable"
+
+
+def test_forecast_502_when_upstream_returns_non_json(client, monkeypatch):
+    """A CDN/maintenance HTML page with a 200 status must also map to 502."""
+    import httpx
+    _mock_forecast_upstream(monkeypatch,
+                            lambda req: httpx.Response(200, text="<html>maintenance</html>"))
+    r = client.get("/api/forecast?lat=33.3&lon=-111.9", headers=_H)
+    assert r.status_code == 502
+    assert r.json()["detail"] == "forecast upstream unavailable"
+
+
+def test_forecast_falls_back_to_first_device_coords(client, monkeypatch):
+    """No query params + no FORECAST_LAT/LON env → the first device's stored
+    info.coords must be used."""
+    import httpx
+    from app.config import settings
+    monkeypatch.setattr(settings, "forecast_lat", None)
+    monkeypatch.setattr(settings, "forecast_lon", None)
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF"},
+                      "timestamp_utc": "2026-06-01T12:00:00Z",
+                      "outdoor": {"tempf": 80},
+                      "coords": {"lat": 33.3004, "lon": -111.9378},
+                      "source": "test"})
+    seen = {}
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(dict(request.url.params))
+        return httpx.Response(200, json={"latitude": 33.3004, "daily": {}})
+    _mock_forecast_upstream(monkeypatch, handler)
+    r = client.get("/api/forecast", headers=_H)
+    assert r.status_code == 200, r.text
+    assert float(seen["latitude"]) == 33.3004
+    assert float(seen["longitude"]) == -111.9378
+
+
+def test_forecast_400_when_no_coords_anywhere(client, monkeypatch):
+    """No params, no env, no devices with coords → a clear 400, not a crash
+    or an upstream call with garbage."""
+    import httpx
+    from app.config import settings
+    monkeypatch.setattr(settings, "forecast_lat", None)
+    monkeypatch.setattr(settings, "forecast_lon", None)
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no coords → no upstream call")
+    _mock_forecast_upstream(monkeypatch, handler)
+    r = client.get("/api/forecast", headers=_H)
+    assert r.status_code == 400
+    assert "no lat/lon" in r.json()["detail"]
+
+
+# ───────────────── /api/devices/{mac}/summary (R2-23 + R2-169) ─────────────────
+
+def _seed_summary_device(client):
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for mins, temp in ((120, 70.0), (60, 90.0)):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEEFF"}, "timestamp_utc": ts,
+                          "outdoor": {"tempf": temp, "humidity": 50},
+                          "source": "test"})
+
+
+def test_summary_returns_aggregate_for_valid_field(client):
+    _seed_summary_device(client)
+    r = client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary?field=tempf&hours=24",
+                   headers=_H)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["field"] == "tempf"
+    assert body["count"] == 2
+    assert body["min"] == 70.0 and body["max"] == 90.0 and body["avg"] == 80.0
+    assert body["minAt"] is not None and body["maxAt"] is not None
+    assert body["minAt"] < body["maxAt"]       # 70 was posted before 90
+
+
+def test_summary_rejects_unknown_field(client):
+    """db.aggregate interpolates the column name into SQL guarded only by its
+    whitelist; the ValueError→400 bridge in get_summary IS the SQL-injection
+    guard for user-supplied `field` — it must hold for anything not in the map."""
+    _seed_summary_device(client)
+    for bad in ("bogus", "tempf;DROP TABLE observations", "data_json",
+                "tempf--", "mac"):
+        r = client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary",
+                       params={"field": bad}, headers=_H)
+        assert r.status_code == 400, f"field={bad!r} → {r.status_code}"
+    # ...and the table is still there.
+    assert client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary?field=tempf",
+                      headers=_H).status_code == 200
+
+
+def test_summary_validates_hours_bounds_and_auth(client):
+    _seed_summary_device(client)
+    assert client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary?hours=0",
+                      headers=_H).status_code == 422
+    assert client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary?hours=721",
+                      headers=_H).status_code == 422
+    assert client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary").status_code == 401
+
+
+# ───────────────── PUT /api/push/relay update/clear semantics (R2-163) ─────────────────
+
+def test_push_relay_partial_updates_preserve_and_empty_string_clears(client):
+    """Omitting a field must PRESERVE it; "" must CLEAR it. A regression here
+    silently breaks push delivery (e.g. every token edit wiping the URL)."""
+    H = {"Authorization": "Bearer test-api-token"}
+    U = "https://weather.zasder.com/api/relay/push"
+    # Set both.
+    assert client.put("/api/push/relay", headers=H,
+                      json={"relay_url": U, "relay_token": "s1"}).status_code == 200
+    g = client.get("/api/push/relay", headers=H).json()
+    assert g == {"relay_url": U, "relay_token_set": True, "relay_configured": True}
+    # Token-only update: URL preserved.
+    client.put("/api/push/relay", headers=H, json={"relay_token": "s2"})
+    g = client.get("/api/push/relay", headers=H).json()
+    assert g["relay_url"] == U and g["relay_token_set"] is True
+    assert g["relay_configured"] is True
+    # URL cleared with "": token STAYS set, but configured flips off.
+    client.put("/api/push/relay", headers=H, json={"relay_url": ""})
+    g = client.get("/api/push/relay", headers=H).json()
+    assert g["relay_url"] is None
+    assert g["relay_token_set"] is True
+    assert g["relay_configured"] is False
+    # URL-only update re-arms without re-sending the token.
+    client.put("/api/push/relay", headers=H, json={"relay_url": U})
+    g = client.get("/api/push/relay", headers=H).json()
+    assert g["relay_configured"] is True and g["relay_token_set"] is True
+    # Token cleared with "": URL preserved, configured off.
+    client.put("/api/push/relay", headers=H, json={"relay_token": ""})
+    g = client.get("/api/push/relay", headers=H).json()
+    assert g["relay_url"] == U
+    assert g["relay_token_set"] is False and g["relay_configured"] is False
+
+
+# ───────────── rain-glitch guard: backfill + exact post-glitch resume (R2-168) ─────────────
+
+def test_rain_glitch_guard_allows_backfill_and_resumes_after_glitch(client, monkeypatch):
+    """(a) A backfilled (older-timestamp) reading with a LOWER cumulative value
+    is legitimate history and must be stored untouched — negative deltas are
+    the counter-reset path, never a "spike". (b) After a dropped glitch the
+    next real reading resumes from the last GOOD value (the glitch was stored
+    NULL, so the guard compares 3.60 to 3.58, not to 9.58)."""
+    from datetime import datetime, timedelta, timezone
+    from app import config
+    monkeypatch.setattr(config.settings, "ingest_max_rain_rate_in_per_hr", 2.0)
+    ih = {"Authorization": "Bearer test-ingest-token"}
+    base = datetime.now(timezone.utc) - timedelta(hours=3)
+    def post(mins, yearly):
+        r = client.post("/ingest/custom", headers=ih, json={
+            "device": {"id": "5D5D0200007D"},
+            "timestamp_utc": (base + timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "outdoor": {"tempf": 70}, "rain": {"yearly_in": yearly},
+            "source": "fineoffset-wh24"})
+        assert r.status_code == 200, r.text
+    post(60, 3.58)            # good baseline
+    post(120, 9.58)           # +6" in an hour → glitch, dropped
+    post(150, 3.60)           # resumes cleanly from 3.58, must be stored
+    post(0, 2.00)             # backfill: OLDER ts, lower value → stored untouched
+    hist = client.get("/api/devices/5D:5D:02:00:00:7D/history?hours=5",
+                      headers=_H).json()["rows"]          # ≤6h → raw rows
+    ys = [r.get("yearlyrainin") for r in hist]
+    assert ys == [2.00, 3.58, None, 3.60], f"got {ys}"
+
+
+# ───────────── write-throttle exact-boundary pin (`<` not `<=`) (R2-177) ─────────────
+
+def test_history_write_throttle_exact_interval_boundary(client, monkeypatch):
+    """A reading at EXACTLY ingest_min_interval_seconds after the last stored
+    row is OUTSIDE the window and must be stored (the comparison is strict
+    `<`). An off-by-one to `<=` silently halves storage density for sources
+    posting exactly on the interval — pin the intended side."""
+    from app import config
+    ih = {"Authorization": "Bearer test-ingest-token"}
+    def post(ts, temp):
+        return client.post("/ingest/custom", headers=ih, json={
+            "device": {"id": "5D5D0200007D"}, "timestamp_utc": ts,
+            "outdoor": {"tempf": temp, "humidity": 50},
+            "source": "fineoffset-wh24"}).json()
+    monkeypatch.setattr(config.settings, "ingest_min_interval_seconds", 60)
+    assert post("2026-05-25T10:00:00Z", 70)["inserted"] == 1
+    # 59 s after the stored row: inside the window → coalesced.
+    r59 = post("2026-05-25T10:00:59Z", 71)
+    assert r59["inserted"] == 0 and r59["throttled"] is True
+    # Exactly 60 s after the stored row: NOT "recent" → stored.
+    r60 = post("2026-05-25T10:01:00Z", 72)
+    assert r60["inserted"] == 1 and r60["throttled"] is False
+
+
+# ───────── reviewer token: discovery reads + location write (R2-176) ─────────
+
+def test_reviewer_token_rejected_on_discovery_reads(client):
+    """GET /api/discoveries is gated on the PRIMARY token only — the RF survey
+    is not part of the weather views a demo/reviewer token needs. A refactor
+    to require_token (read set) would silently hand it to the demo token."""
+    ih = {"Authorization": "Bearer test-ingest-token"}
+    client.post("/ingest/discovery", headers=ih,
+                json={"model": "TPMS-Toyota", "id": 7})
+    for path in ("/api/discoveries",):
+        r = client.get(path, headers=REVIEWER)
+        assert r.status_code == 401, f"reviewer GET {path} → {r.status_code}"
+        r = client.get(path, headers=WRITER)
+        assert r.status_code == 200, f"primary GET {path} → {r.status_code}"
+
+
+def test_reviewer_token_rejected_on_location_put(client):
+    """PUT /api/devices/{mac}/location mutates stored coords (a home address
+    class of data) — the read-only reviewer token must be refused."""
+    _ingest_device(client)
+    body = {"lat": 33.3, "lon": -111.9, "label": "Home"}
+    r = client.put("/api/devices/AA:BB:CC:DD:EE:FF/location",
+                   headers=REVIEWER, json=body)
+    assert r.status_code == 401
+    assert client.put("/api/devices/AA:BB:CC:DD:EE:FF/location",
+                      headers=WRITER, json=body).status_code == 200
+
+
+# ───── device-stale alert must retry after failed delivery (R2-173, companion to R2-07) ─────
+
+def test_stale_alert_retries_when_delivery_fails(client, monkeypatch):
+    """Mirror of test_threshold_alert_retries_when_delivery_fails for the
+    device-down path: when the INITIAL ok→stale event fails on every channel,
+    the state must NOT advance to 'stale' — decide() only fires on a state
+    change, so persisting it would drop the most important alert forever."""
+    import asyncio
+    import app.alerts as alerts
+    from app.alerts import AlertMonitor
+    from app import db
+    mac = "AA:BB:CC:DD:EE:FF"
+    # A device whose last report is hours in the past (>> the 15-min default).
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF", "name": "Yard"},
+                      "timestamp_utc": "2026-06-01T12:00:00Z",
+                      "outdoor": {"tempf": 75}})
+    calls = {"n": 0}
+    async def failing_deliver(cfg, subj, body, ptitle, pbody):
+        calls["n"] += 1
+        return False
+    monkeypatch.setattr(alerts, "_deliver", failing_deliver)
+    # _tick returns early unless SOME channel exists; pretend push does.
+    async def push_on():
+        return True
+    monkeypatch.setattr(alerts.apns, "push_configured", push_on)
+
+    async def two_failing_ticks():
+        # Seed a prior 'ok' state so this tick sees the ok→stale TRANSITION
+        # (first sight only baselines and never alerts).
+        await db.upsert_alert_state(mac, "ok", None, 0, None)
+        mon = AlertMonitor()
+        await mon._tick()
+        s1 = await db.get_alert_states()
+        await mon._tick()
+        s2 = await db.get_alert_states()
+        return s1, s2
+    s1, s2 = asyncio.run(two_failing_ticks())
+    assert calls["n"] == 2, "the stale alert must be retried while delivery fails"
+    assert s1[mac]["state"] == "ok", "state advanced on a failed delivery"
+    assert s2[mac]["state"] == "ok"
+    assert s1[mac]["notified_ms"] is None
+
+    # Delivery recovers → the alert goes out once, state + notify clock advance.
+    async def good_deliver(cfg, subj, body, ptitle, pbody):
+        calls["n"] += 1
+        return True
+    monkeypatch.setattr(alerts, "_deliver", good_deliver)
+    async def one_good_tick():
+        await AlertMonitor()._tick()
+        return await db.get_alert_states()
+    s3 = asyncio.run(one_good_tick())
+    assert calls["n"] == 3
+    assert s3[mac]["state"] == "stale"
+    assert s3[mac]["notified_ms"] is not None

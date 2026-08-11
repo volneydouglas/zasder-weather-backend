@@ -14,6 +14,9 @@
 set -uo pipefail   # NOT -e: we want every check to run and report
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Absolute path to this script, resolved BEFORE the cd below — a relative
+# $0 stops resolving after cd, and --help reads the script file.
+SELF="$APP_DIR/bin/$(basename "${BASH_SOURCE[0]}")"
 cd "$APP_DIR"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -29,7 +32,9 @@ for arg in "$@"; do
     --app)   shift; APP="${1:-}" ;;
     --url=*) URL="${arg#*=}" ;;
     --url)   shift; URL="${1:-}" ;;
-    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Header comment block only, stopping at the first non-comment line — a
+    # fixed sed range overran the header and printed raw code.
+    -h|--help) awk 'NR==1 {next} !/^#/ {exit} {sub(/^# ?/, ""); print}' "$SELF"; exit 0 ;;
   esac
 done
 

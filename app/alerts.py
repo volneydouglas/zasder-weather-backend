@@ -71,9 +71,19 @@ def _fmt_ts(ms: int | None, tz_name: str) -> str:
     return datetime.fromtimestamp(ms / 1000, zi).strftime("%Y-%m-%d %H:%M %Z")
 
 
+def _clean_name(name: str) -> str:
+    """Sanitize a device name for message headers. Names arrive from ingest
+    payloads, and EmailMessage raises ValueError on a control character (esp.
+    '\\n') in a header — so one hostile/corrupt name would break EVERY email
+    alert for that device. Collapse control chars to spaces."""
+    cleaned = "".join(c if ord(c) >= 32 else " " for c in str(name))
+    return cleaned.strip() or "device"
+
+
 def build_alert(event: str, name: str, mac: str, last_seen_ms: int | None,
                 now_ms: int, threshold_min: float, tz_name: str) -> tuple[str, str]:
     """Build (subject, body) for an alert. Pure — unit-testable."""
+    name = _clean_name(name)
     last = _fmt_ts(last_seen_ms, tz_name)
     if event in ("stale", "repeat"):
         age_min = (now_ms - last_seen_ms) / 60000 if last_seen_ms else None
@@ -99,6 +109,7 @@ def build_alert(event: str, name: str, mac: str, last_seen_ms: int | None,
 def build_push(event: str, name: str, last_seen_ms: int | None,
                now_ms: int, threshold_min: float) -> tuple[str, str]:
     """Short (title, body) for an APNs alert push. Pure — unit-testable."""
+    name = _clean_name(name)
     if event in ("stale", "repeat"):
         age = (now_ms - last_seen_ms) / 60000 if last_seen_ms else None
         body = f"No data for {age:.0f} min (threshold {threshold_min:.0f})" if age is not None \
@@ -143,9 +154,37 @@ def evaluate_rule(comparator: str, threshold: float, value: float,
     return now, (now and not prev_triggered)
 
 
+# Re-arm deadband per field, in the stored API-native units (°F, mph, inHg,
+# inches — see CLAUDE.md; a margin sized for a display unit would be a bug).
+# Without hysteresis a sensor oscillating on the boundary (35.01 → 34.99 →
+# 35.01°F against a 35° rule at a 16–60s cadence) re-armed on every dip and
+# re-fired a push/email on every rise — dozens of alerts in one boundary night.
+_REARM_MARGIN: dict[str, float] = {
+    "tempf": 1.0, "feelsLike": 1.0, "dewPoint": 1.0,   # °F
+    "humidity": 2.0,                                    # %
+    "windspeedmph": 2.0, "windgustmph": 2.0,            # mph
+    "dailyrainin": 0.02, "hourlyrainin": 0.02,          # in
+    "baromrelin": 0.02,                                 # inHg
+    "uv": 0.5,
+}
+
+
+def rule_cleared(comparator: str, threshold: float, value: float,
+                 margin: float) -> bool:
+    """Re-arm test: the value must clear the threshold by at least `margin`
+    (a deadband) before the rule may fire again. Pure — unit-testable."""
+    if comparator == "above":
+        return value <= threshold - margin
+    if comparator == "below":
+        return value >= threshold + margin
+    # equalTo triggers within ±0.5; require leaving that band by the margin.
+    return abs(value - threshold) >= 0.5 + margin
+
+
 def build_threshold_message(device_name: str, field: str, value: float,
                             comparator: str, threshold: float) -> tuple[str, str]:
     """(title, body) for a tripped threshold rule. Pure — unit-testable."""
+    device_name = _clean_name(device_name)
     label = _FIELD_LABELS.get(field, field)
     unit = _FIELD_UNITS.get(field, "")
     sym = _COMPARATOR_SYM.get(comparator, comparator)
@@ -176,10 +215,34 @@ def smart_condition(kind: str, *, tempf: float | None = None,
     return False
 
 
+# Smart-alert re-arm deadbands, API-native units (°F / inHg) — same rationale
+# as _REARM_MARGIN: a temp hovering at exactly smart_alert_frost_f must not
+# re-fire the frost alert on every 0.1° wobble.
+_SMART_REARM_MARGIN_F = 1.0
+_SMART_REARM_MARGIN_INHG = 0.01
+
+
+def smart_cleared(kind: str, *, tempf: float | None = None,
+                  feels: float | None = None,
+                  pressure_delta_3h: float | None = None,
+                  frost_f: float, heat_f: float, drop_inhg: float) -> bool:
+    """Re-arm test for a smart alert: the condition must clear by a deadband
+    (None = no data = not cleared). Pure — unit-testable."""
+    if kind == "frost":
+        return tempf is not None and tempf > frost_f + _SMART_REARM_MARGIN_F
+    if kind == "heat":
+        return feels is not None and feels < heat_f - _SMART_REARM_MARGIN_F
+    if kind == "pressure_drop":
+        return (pressure_delta_3h is not None
+                and pressure_delta_3h > -abs(drop_inhg) + _SMART_REARM_MARGIN_INHG)
+    return False
+
+
 def build_smart_message(kind: str, device_name: str, *,
                         tempf: float | None = None, feels: float | None = None,
                         pressure_delta_3h: float | None = None) -> tuple[str, str]:
     """(title, body) for a smart alert. Pure — unit-testable."""
+    device_name = _clean_name(device_name)
     if kind == "frost":
         return (f"{device_name}: Frost/freeze risk",
                 f"Temperature is {tempf:g}°F — frost or freeze possible. "
@@ -356,8 +419,23 @@ class AlertMonitor:
                 subject, bodytext = build_alert(
                     dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
                 ptitle, pbody = build_push(dec.event, name, last_seen, now_ms, thr_min)
-                if await _deliver(cfg, subject, bodytext, ptitle, pbody):
+                delivered = await _deliver(cfg, subject, bodytext, ptitle, pbody)
+                if delivered:
                     notified_ms = now_ms     # advance re-notify clock only on delivery
+                elif prior is not None and dec.state != prior["state"]:
+                    # Same treatment the threshold rules got (Reviewer P2): if
+                    # the INITIAL stale/recovered event fails on every channel,
+                    # do NOT persist the new state — decide() only fires on a
+                    # state change (repeat is off by default), so persisting
+                    # here would drop the most important alert forever. Keep
+                    # the prior state so the next tick re-detects the
+                    # transition and retries the send. ('repeat' events keep
+                    # their existing retry: notified_ms simply doesn't
+                    # advance.) No duplicate risk: a successful delivery
+                    # persists the new state and re-fires nothing.
+                    log.warning("device-down alert %s delivery failed for %s; "
+                                "will retry next tick", dec.event, mac)
+                    continue
                 log.info("device-down alert %s for %s (%s)", dec.event, name, mac)
 
             if prior is None or dec.state != prior["state"] or dec.event:
@@ -408,8 +486,12 @@ class AlertMonitor:
                             "threshold alert delivery failed for rule %s on %s; "
                             "will retry next tick", rule["id"], d["mac"])
                 elif not now_trig and prev:
-                    # Cleared (1→0): persist so the rule re-arms. No delivery here.
-                    await db.upsert_rule_state(rule["id"], d["mac"], 0, now_ms)
+                    # Cleared (1→0): persist so the rule re-arms. No delivery
+                    # here. Re-arm only once the value clears the threshold by
+                    # the field's deadband — see _REARM_MARGIN.
+                    margin = _REARM_MARGIN.get(rule["field"], 0.0)
+                    if rule_cleared(rule["comparator"], rule["threshold"], val, margin):
+                        await db.upsert_rule_state(rule["id"], d["mac"], 0, now_ms)
 
     async def _check_smart_alerts(self, cfg, devices, now_ms: int) -> None:
         """Frost / heat / rapid-pressure-drop alerts, edge-triggered per device."""
@@ -455,7 +537,13 @@ class AlertMonitor:
                     else:
                         log.warning("smart alert %s delivery failed for %s; "
                                     "will retry next tick", kind, mac)
-                elif not cond and prev:
+                elif not cond and prev and smart_cleared(
+                        kind, tempf=tempf, feels=feels, pressure_delta_3h=delta,
+                        frost_f=settings.smart_alert_frost_f,
+                        heat_f=settings.smart_alert_heat_f,
+                        drop_inhg=settings.smart_alert_pressure_drop_inhg):
+                    # Re-arm only once the condition clears by a deadband, so a
+                    # value wobbling on the boundary can't re-fire every tick.
                     await db.upsert_smart_alert_state(mac, kind, 0, now_ms)
 
 

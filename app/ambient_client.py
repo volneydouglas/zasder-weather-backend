@@ -43,11 +43,13 @@ class AmbientWeatherClient:
         if params:
             merged.update(params)
         async with self._lock:
-            elapsed = asyncio.get_event_loop().time() - self._last_call
+            # get_running_loop, not the deprecated get_event_loop — we are
+            # always inside a coroutine here, so the running loop exists.
+            elapsed = asyncio.get_running_loop().time() - self._last_call
             if elapsed < self._min_interval:
                 await asyncio.sleep(self._min_interval - elapsed)
             resp = await self._client.get(path, params=merged)
-            self._last_call = asyncio.get_event_loop().time()
+            self._last_call = asyncio.get_running_loop().time()
         # Never let httpx's URL-bearing error escape — it carries the keys.
         if resp.is_error:
             raise AmbientWeatherError(

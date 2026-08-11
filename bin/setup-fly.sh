@@ -29,6 +29,10 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Absolute path to this script, resolved BEFORE the cd below — a relative
+# $0 (./bin/setup-fly.sh run from elsewhere) stops resolving after cd, and
+# --help reads the script file to print its header.
+SELF="$APP_DIR/bin/$(basename "${BASH_SOURCE[0]}")"
 cd "$APP_DIR"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
@@ -63,12 +67,19 @@ for arg in "$@"; do
     --wl-secret=*)   WL_SECRET_FLAG="${arg#*=}" ;;
     --wl-station=*)  WL_STATION_FLAG="${arg#*=}" ;;
     -h|--help)
-      sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//' ; exit 0 ;;
+      # Print the header comment block: from line 2 up to the first
+      # non-comment line. A fixed sed range overran the header and dumped
+      # raw code whenever the comment block changed length.
+      awk 'NR==1 {next} !/^#/ {exit} {sub(/^# ?/, ""); print}' "$SELF" ; exit 0 ;;
     *) err "unknown flag: $arg"; exit 2 ;;
   esac
 done
 
 command -v fly >/dev/null || { err "fly CLI not found. Install: https://fly.io/docs/install/"; exit 1; }
+# openssl mints API_TOKEN/INGEST_TOKEN much later — check for it up front so
+# a minimal system fails here with a clear message instead of dying mid-run
+# under set -e after the app and volume already exist.
+command -v openssl >/dev/null || { err "openssl not found — it's required to generate tokens. Install openssl, then re-run."; exit 1; }
 fly auth whoami >/dev/null 2>&1 || { err "not signed in. Run: fly auth login"; exit 1; }
 
 # ── helpers ─────────────────────────────────────────────────────────────
@@ -113,6 +124,13 @@ ZoneInfo(sys.argv[1])
 PY
     return $?
   fi
+  # Fallback when python3 is missing. Guard the path BEFORE testing it: the
+  # bare -f test accepted "../../../../etc/passwd", which exists, is not a
+  # timezone, and would be written into TIMEZONE and shipped to Fly.
+  case "$1" in
+    /*|*..*|*//*) return 1 ;;
+    *[!A-Za-z0-9_/+-]*) return 1 ;;
+  esac
   [ -f "/usr/share/zoneinfo/$1" ]
 }
 
@@ -122,6 +140,11 @@ PY
 # which otherwise sails through to Fly and comes back as a baffling
 # "Name blocked by abuse filter" instead of "that isn't an app name".
 valid_app_name() {
+  # Pin the C locale for the glob ranges below: under a UTF-8 collation
+  # locale (the default on macOS/Linux desktops) [a-z] can match UPPERCASE
+  # letters too (aAbB… ordering), so "Foo" slipped through to Fly and came
+  # back as Fly's own confusing rejection instead of ours.
+  local LC_ALL=C
   case "$1" in
     ""|*[!a-z0-9-]*) return 1 ;;
     [!a-z]*)         return 1 ;;
@@ -330,7 +353,12 @@ if [ "$mode" = "create" ]; then
   bold "Creating 1 GB volume weather_data in $region"
   fly volumes create weather_data --app "$app_name" --region "$region" --size 1 --yes
 
-  # 9. fly.toml
+  # 9. fly.toml — pinning the app name here is what makes bare `fly deploy`,
+  #    `fly status` and `fly logs` work from this directory. The cost is that
+  #    this TRACKED file is now permanently modified, so a plain `git pull`
+  #    will refuse to fast-forward the day a release edits it. bin/upgrade.sh
+  #    carries the pin across the pull; that's why the summary below points at
+  #    it instead of at `git pull && fly deploy`.
   tmp_toml=$(mktemp)
   sed -e "s/^app *=.*/app = \"$app_name\"/" \
       -e "s/^primary_region *=.*/primary_region = \"$region\"/" \
@@ -424,6 +452,11 @@ if [ "$mode" = "create" ]; then
   emit ""
   emit "Re-print live tokens later:  ./bin/setup-fly.sh --print-tokens"
   emit "(\`fly secrets list\` shows only digests, not the values.)"
+  emit ""
+  emit "Upgrade later with:  ./bin/upgrade.sh"
+  emit "Use that, not 'git pull' — this setup wrote your app name into"
+  emit "fly.toml, which git tracks, so a plain pull will refuse to update"
+  emit "once a release changes that file. upgrade.sh handles it."
 
   echo
   warn "zasder-install-summary.txt contains your tokens (chmod 600). It is"
@@ -441,27 +474,71 @@ info "secret beyond INGEST_TOKEN (provision the board itself)."
 echo
 
 # Allow editing: TIMEZONE, AWN + WeatherLink credentials, custom hostname.
-read -r -p "New TIMEZONE (blank to keep current): " tz
-read -r -p "New AW_APPLICATION_KEY (blank to keep, '-' to clear): " aw_app_key
-read -r -p "New AW_API_KEY         (blank to keep, '-' to clear): " aw_api_key
-read -r -p "New WEATHERLINK_API_KEY    (blank to keep, '-' to clear): " wl_key
-read -r -p "New WEATHERLINK_API_SECRET (blank to keep, '-' to clear): " wl_secret
-read -r -p "New WEATHERLINK_STATION_ID (blank to keep, '-' to clear): " wl_station
-read -r -p "Add custom hostname    (blank to skip): " custom_host
-echo
+# Seed every value from the already-parsed flags and only prompt for what
+# wasn't supplied — and never prompt under --yes. Update mode used to ignore
+# both, so the web planner's non-interactive runs blocked on stdin (or read
+# EOF garbage) as soon as the app already existed.
+#
+# Timezone: same guard as create mode, for the same reason — an unvalidated
+# zone sails into a secret here and only shows up later as a 500 on the
+# status page, records and rain rollups.
+tz="$TZ_FLAG"
+if [ -n "$tz" ] && ! valid_timezone "$tz"; then
+  err "--tz='$tz' isn't a valid IANA timezone (try America/New_York)."; exit 1
+fi
+aw_app_key="$AW_APP_KEY_FLAG"; aw_api_key="$AW_API_KEY_FLAG"
+wl_key="$WL_KEY_FLAG"; wl_secret="$WL_SECRET_FLAG"; wl_station="$WL_STATION_FLAG"
+custom_host="$HOST_FLAG"
+if [ "$NONINTERACTIVE" -eq 0 ]; then
+  if [ -z "$tz" ]; then
+    while :; do
+      read -r -p "New TIMEZONE (blank to keep current): " tz || tz=""
+      [ -z "$tz" ] && break
+      valid_timezone "$tz" && break
+      err "'$tz' isn't a timezone name this server can use."
+      info "It needs the Region/City form — America/New_York, not EDT."
+      info "Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
+    done
+  fi
+  # Secrets: -s keeps them out of the terminal scrollback and any recorded
+  # session (same reasoning as wll-poller's ask_secret). `|| val=""` turns a
+  # closed stdin into "keep current" instead of an errexit death mid-update.
+  ask_secret_keep() {  # ask_secret_keep <varname> <prompt>
+    local __var="$1" __prompt="$2" __val=""
+    read -r -s -p "$__prompt" __val || __val=""
+    echo
+    printf -v "$__var" '%s' "$__val"
+  }
+  [ -n "$aw_app_key" ] || ask_secret_keep aw_app_key "New AW_APPLICATION_KEY (blank to keep, '-' to clear): "
+  [ -n "$aw_api_key" ] || ask_secret_keep aw_api_key "New AW_API_KEY         (blank to keep, '-' to clear): "
+  [ -n "$wl_key" ]     || ask_secret_keep wl_key     "New WEATHERLINK_API_KEY    (blank to keep, '-' to clear): "
+  [ -n "$wl_secret" ]  || ask_secret_keep wl_secret  "New WEATHERLINK_API_SECRET (blank to keep, '-' to clear): "
+  [ -n "$wl_station" ] || read -r -p "New WEATHERLINK_STATION_ID (blank to keep, '-' to clear): " wl_station || wl_station=""
+  [ -n "$custom_host" ] || read -r -p "Add custom hostname    (blank to skip): " custom_host || custom_host=""
+  echo
+fi
 
-upd_args=()
-[ -n "$tz" ]         && upd_args+=(TIMEZONE="$tz")
-[ "$aw_app_key" = "-" ] && upd_args+=(AW_APPLICATION_KEY=) || \
-  [ -n "$aw_app_key" ] && upd_args+=(AW_APPLICATION_KEY="$aw_app_key")
-[ "$aw_api_key" = "-" ] && upd_args+=(AW_API_KEY=) || \
-  [ -n "$aw_api_key" ] && upd_args+=(AW_API_KEY="$aw_api_key")
-[ "$wl_key" = "-" ]     && upd_args+=(WEATHERLINK_API_KEY=) || \
-  [ -n "$wl_key" ]     && upd_args+=(WEATHERLINK_API_KEY="$wl_key")
-[ "$wl_secret" = "-" ]  && upd_args+=(WEATHERLINK_API_SECRET=) || \
-  [ -n "$wl_secret" ]  && upd_args+=(WEATHERLINK_API_SECRET="$wl_secret")
-[ "$wl_station" = "-" ] && upd_args+=(WEATHERLINK_STATION_ID=) || \
-  [ -n "$wl_station" ] && upd_args+=(WEATHERLINK_STATION_ID="$wl_station")
+# Three states per credential: blank = keep, '-' = clear, anything else =
+# set. Clearing uses `fly secrets unset`, which REMOVES the variable —
+# staging `KEY=` with `fly secrets set` leaves it set to the empty string,
+# and "present but empty" is not the same as "absent" to the backend's
+# is-this-source-configured checks. (The old && / || chains here also had
+# the classic precedence bug: typing '-' staged BOTH `KEY=` and `KEY=-`,
+# and the literal '-' won.)
+upd_args=(); unset_names=()
+stage() {  # stage SECRET_NAME VALUE
+  case "$2" in
+    "") ;;
+    -)  unset_names+=("$1") ;;
+    *)  upd_args+=("$1=$2") ;;
+  esac
+}
+[ -n "$tz" ] && upd_args+=(TIMEZONE="$tz")
+stage AW_APPLICATION_KEY     "$aw_app_key"
+stage AW_API_KEY             "$aw_api_key"
+stage WEATHERLINK_API_KEY    "$wl_key"
+stage WEATHERLINK_API_SECRET "$wl_secret"
+stage WEATHERLINK_STATION_ID "$wl_station"
 
 if [ "$ROTATE_TOKENS" -eq 1 ]; then
   new_api=$(openssl rand -hex 32)
@@ -477,7 +554,12 @@ fi
 if [ "${#upd_args[@]}" -gt 0 ]; then
   bold "Updating secrets"
   fly secrets set --app "$app_name" "${upd_args[@]}"
-else
+fi
+if [ "${#unset_names[@]}" -gt 0 ]; then
+  bold "Clearing secrets: ${unset_names[*]}"
+  fly secrets unset --app "$app_name" "${unset_names[@]}"
+fi
+if [ "${#upd_args[@]}" -eq 0 ] && [ "${#unset_names[@]}" -eq 0 ]; then
   info "No secret changes."
 fi
 

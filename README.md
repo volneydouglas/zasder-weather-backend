@@ -479,11 +479,24 @@ To upgrade, from the repo directory:
 ./bin/upgrade.sh          # auto-detects Fly.io or Docker
 ```
 
-Or by hand:
+`upgrade.sh` handles one Fly-specific wrinkle for you: `setup-fly.sh` pinned
+your app name and region into `fly.toml`, which is a tracked file, so your
+checkout is permanently "modified". The script saves that file to
+`fly.toml.bak`, fast-forwards, and re-applies your app name and region.
+
+By hand:
 
 ```sh
-# Fly.io
-git pull && fly deploy
+# Fly.io — prefer ./bin/upgrade.sh, which handles all of this for you.
+#
+# By hand: setup-fly.sh pins your app name and region into fly.toml, which is
+# tracked, so a plain `git pull` stops with "local changes" the moment a
+# release edits that file. Do NOT `git stash pop` across it — if the release
+# also changed fly.toml (precisely when you needed the stash) the pop
+# conflicts, the && chain stops, and you are left mid-conflict with no deploy.
+cp fly.toml fly.toml.bak && git checkout -- fly.toml && git pull --ff-only
+# then copy `app` and `primary_region` back from fly.toml.bak into fly.toml
+fly deploy
 
 # Docker (published image — no local rebuild)
 git pull && docker compose pull && docker compose up -d

@@ -8,14 +8,17 @@
 #include <time.h>
 
 #include "config_server.h"
+#include "post_fsm.h"
 #include "root_ca.h"
 
 // 5 consecutive 401s = the token is wrong. Wipe it from NVS; the board
 // stays on Wi-Fi and LOCKED (provisioned flag kept), serving /provision
 // so the user can re-enter a token via the setup key — no reflash, no
-// anonymous re-provisioning window.
+// anonymous re-provisioning window. The consecutive-vs-cumulative counting
+// rules live in Post401Tracker (post_fsm.h) so the native test env can pin
+// them.
 static constexpr int MAX_CONSECUTIVE_401 = 5;
-static int consecutive401 = 0;
+static Post401Tracker post401(MAX_CONSECUTIVE_401);
 
 // Whitelist of rtl_433 models we POST to the backend. The 433 dongle
 // hears everything in the band — TPMS, garage openers, neighbor weather
@@ -172,15 +175,28 @@ void zasder_post(const char *rtl433Json,
   // instead, the next WH24/WH65/WS80 outdoor post merges these values
   // into its `indoor` + `pressure` blocks.
   if (strcmp(model, "Fineoffset-WH32B") == 0) {
-    if (in["temperature_C"].is<float>())
+    bool gotField = false;
+    if (in["temperature_C"].is<float>()) {
       wh32b.tempf = c_to_f(in["temperature_C"].as<float>());
-    if (in["humidity"].is<float>())
+      gotField = true;
+    }
+    if (in["humidity"].is<float>()) {
       wh32b.humidity = in["humidity"].as<float>();
-    if (in["pressure_hPa"].is<float>())
+      gotField = true;
+    }
+    if (in["pressure_hPa"].is<float>()) {
       wh32b.pressure_inhg = hpa_to_inhg(in["pressure_hPa"].as<float>());
-    wh32b.valid = true;
-    Serial.printf("[wh32b-cache] tempf=%.1f hum=%.1f press_inhg=%.2f\n",
-                  wh32b.tempf, wh32b.humidity, wh32b.pressure_inhg);
+      gotField = true;
+    }
+    // Arm the merge only when at least one field actually decoded. A WH32B
+    // packet carrying none of the three (partial decode / battery-only
+    // frame) would otherwise flip `valid` and every subsequent outdoor
+    // post would carry an empty `indoor` block of NaN-skipped fields.
+    if (gotField) {
+      wh32b.valid = true;
+      Serial.printf("[wh32b-cache] tempf=%.1f hum=%.1f press_inhg=%.2f\n",
+                    wh32b.tempf, wh32b.humidity, wh32b.pressure_inhg);
+    }
     return;
   }
 
@@ -374,8 +390,10 @@ void zasder_post(const char *rtl433Json,
     // the ingest token from the in-flight POST.
     tls.setInsecure();
 #else
-    // Production: pin Let's Encrypt's ISRG Root X1 (covers Fly.io
-    // edge + any LE-issued custom domain like weather.zasder.com).
+    // Production: pin Let's Encrypt's ISRG Root X1 + X2 (covers Fly.io
+    // edge + any LE-issued custom domain like weather.zasder.com, on
+    // both the current RSA chain and the announced ECDSA one — see
+    // root_ca.h for why both are baked).
     tls.setCACert(ZASDER_ROOT_CA);
 #endif
     tlsConfigured = true;
@@ -393,20 +411,22 @@ void zasder_post(const char *rtl433Json,
   http.addHeader("Content-Type",  "application/json");
   http.addHeader("Authorization", "Bearer " + ingestToken);
   int rc = http.POST(body);
+  // One call per POST: the tracker resets the streak on ANY non-401 outcome
+  // (2xx, 5xx, transport rc < 0) and fires exactly at the threshold — the
+  // full rationale is on Post401Tracker in post_fsm.h.
+  bool wipeToken = post401.onResult(rc);
   if (rc >= 200 && rc < 300) {
     Serial.printf("[posted %d] %s %u\n", rc, model, (unsigned) id);
-    consecutive401 = 0;
   } else if (rc == 401) {
-    consecutive401++;
-    Serial.printf("[post-fail 401] (consecutive=%d)\n", consecutive401);
-    if (consecutive401 >= MAX_CONSECUTIVE_401) {
+    Serial.printf("[post-fail 401] (consecutive=%d)\n",
+                  wipeToken ? MAX_CONSECUTIVE_401 : post401.consecutive());
+    if (wipeToken) {
       Serial.println("Token rejected repeatedly — wiping NVS token. "
                      "Board stays LOCKED; re-pair via POST /provision "
                      "using the setup key shown on the OLED "
                      "(setup_key=<...>), not anonymously.");
       http.end();
       ZasderConfigServer::wipeIngestToken();
-      consecutive401 = 0;
       ZasderConfigServer::notePostResult(rc);
       return;
     }

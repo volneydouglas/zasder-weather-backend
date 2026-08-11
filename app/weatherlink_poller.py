@@ -218,9 +218,15 @@ class WeatherlinkPoller:
                 log.warning("station_id %s not found in account — "
                             "did you put the wrong ID?", self._station_id)
                 self._station_meta = {}
-        except Exception:
-            log.exception("WeatherLink station discovery failed; "
-                          "polling will still attempt /current/")
+        except Exception as e:
+            # Message only, never log.exception: a traceback renders the raising
+            # exception's args, so anything that escapes WeatherLinkError (an
+            # httpx error built from the full request URL) would put the
+            # api-key query param straight into the logs. redact() is the same
+            # scrub /api/sources already applies to these strings.
+            log.warning("WeatherLink station discovery failed (%s); "
+                        "polling will still attempt /current/",
+                        source_status.redact(str(e)))
             self._station_meta = {}
         self._task = asyncio.create_task(self._run(), name="wl-poller")
 
@@ -250,12 +256,17 @@ class WeatherlinkPoller:
                         "davis-cloud", rows=int((result or {}).get("inserted", 0)))
                     o = payload.get("outdoor", {})
                     w = payload.get("wind", {})
+                    # build_payload emits wind as {speed_mph, gust_mph,
+                    # direction} — the old AWN-style key names here logged
+                    # "wind=None@None" on every healthy poll, masking the
+                    # "is my source working?" signal.
                     log.info("ingested Davis cloud: tempf=%s hum=%s wind=%s@%s",
                              o.get("tempf"), o.get("humidity"),
-                             w.get("windspeedmph"), w.get("winddir"))
+                             w.get("speed_mph"), w.get("direction"))
             except Exception as e:
                 source_status.record_failure("davis-cloud", str(e))
-                log.warning("WeatherLink poll failed: %s", e)
+                log.warning("WeatherLink poll failed: %s",
+                            source_status.redact(str(e)))
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)
             except asyncio.TimeoutError:

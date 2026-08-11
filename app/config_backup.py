@@ -23,6 +23,7 @@ an SMTP username, which is why the warning still exists, just a milder one.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any
 
@@ -69,6 +70,43 @@ class RestoreError(ValueError):
     pass
 
 
+# Sentinel distinguishing "invalid, skip this key" from a legitimate None
+# (None clears the pref → env fallback).
+_INVALID = object()
+
+
+def _coerce_alert_pref(key: str, v: Any) -> Any:
+    """Coerce one alert_prefs value to the type set_alert_prefs stores, or
+    _INVALID to skip it."""
+    if v is None:
+        return None
+    if key in ("enabled", "smtp_tls", "smtp_ssl"):
+        if isinstance(v, bool) or v in (0, 1):
+            return 1 if v else 0
+        return _INVALID
+    if key in ("default_threshold_min", "repeat_hours"):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return _INVALID
+        return f if math.isfinite(f) and f >= 0 else _INVALID
+    if key == "smtp_port":
+        try:
+            p = int(v)
+        except (TypeError, ValueError):
+            return _INVALID
+        return p if 1 <= p <= 65535 else _INVALID
+    # String fields: recipients (comma-joined), smtp_host/username/from.
+    # Control characters are rejected — a \n here corrupts email headers at
+    # send time (same rule PUT /api/alerts enforces).
+    if not isinstance(v, str):
+        return _INVALID
+    s = v.strip()
+    if any(ord(c) < 32 or ord(c) == 127 for c in s):
+        return _INVALID
+    return s or None
+
+
 async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str, Any]:
     """Apply a previously exported config.
 
@@ -91,7 +129,17 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
 
     prefs = payload.get("alert_prefs")
     if isinstance(prefs, dict):
-        fields = {k: prefs[k] for k in _ALERT_PREF_KEYS if k in prefs}
+        # Coerce/validate per key — the file is hand-editable, and applying a
+        # string smtp_port or a dict recipients verbatim doesn't fail HERE, it
+        # breaks alert delivery later at send time. Invalid entries are
+        # skipped (and simply not counted) rather than failing the restore.
+        fields = {}
+        for k in _ALERT_PREF_KEYS:
+            if k not in prefs:
+                continue
+            v = _coerce_alert_pref(k, prefs[k])
+            if v is not _INVALID:
+                fields[k] = v
         if fields:
             await db.set_alert_prefs(**fields)
             summary["alert_prefs"] = len(fields)

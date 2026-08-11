@@ -36,23 +36,61 @@ _SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
 _access: tuple[str, float] | None = None
 
 
+# Parsed service-account cache: (cache_key, parsed-or-None). Keyed on the env
+# value + file path + mtime so a rotated key file or changed env re-parses,
+# while the steady state stops re-reading + re-JSON-parsing the file on every
+# alert tick AND every delivery (fcm_configured is called from both).
+_sa_cache: tuple[tuple, dict | None] | None = None
+
+
 def _service_account() -> dict | None:
-    raw = os.environ.get("FCM_SERVICE_ACCOUNT_JSON", "").strip()
-    if not raw:
-        path = os.environ.get("FCM_SERVICE_ACCOUNT_FILE", "").strip()
-        if path and os.path.exists(path):
+    global _sa_cache
+    raw_env = os.environ.get("FCM_SERVICE_ACCOUNT_JSON", "").strip()
+    path = "" if raw_env else os.environ.get("FCM_SERVICE_ACCOUNT_FILE", "").strip()
+    mtime: int | None = None
+    if path:
+        try:
+            mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            # File temporarily unreadable mid-run: fall back to the last
+            # parsed value instead of silently flipping FCM to "unconfigured".
+            if _sa_cache is not None and _sa_cache[1] is not None:
+                return _sa_cache[1]
+    cache_key = (raw_env, path, mtime)
+    if _sa_cache is not None and _sa_cache[0] == cache_key:
+        return _sa_cache[1]
+    raw = raw_env
+    if not raw and path and mtime is not None:
+        try:
             with open(path, encoding="utf-8") as f:
                 raw = f.read()
-    if not raw:
-        return None
-    try:
-        sa = json.loads(raw)
-    except json.JSONDecodeError:
-        log.error("FCM service account JSON is not valid JSON")
-        return None
-    if not (sa.get("client_email") and sa.get("private_key") and sa.get("project_id")):
-        log.error("FCM service account JSON missing client_email/private_key/project_id")
-        return None
+        except OSError:
+            raw = ""
+    sa: dict | None = None
+    if raw:
+        try:
+            sa = json.loads(raw)
+        except json.JSONDecodeError:
+            log.error("FCM service account JSON is not valid JSON")
+            sa = None
+        # json.loads happily returns lists/strings/numbers; .get on those is
+        # an AttributeError that would 500 the caller instead of degrading to
+        # "unconfigured".
+        if sa is not None and not isinstance(sa, dict):
+            log.error("FCM service account JSON is not a JSON object")
+            sa = None
+        if sa is not None and not (sa.get("client_email") and sa.get("private_key")
+                                   and sa.get("project_id")):
+            log.error("FCM service account JSON missing client_email/private_key/project_id")
+            sa = None
+    # The service account changed (rotated key file, new env value): the
+    # cached OAuth bearer was minted from the OLD key/project and would keep
+    # being reused until its expiry — up to an hour of failed deliveries after
+    # a project switch. Drop it with the stale cache entry.
+    global _access
+    if _sa_cache is not None and _sa_cache[0] != cache_key:
+        _access = None
+    _sa_cache = (cache_key, sa)
     return sa
 
 
@@ -123,19 +161,28 @@ async def push_tokens_fcm(tokens: list[str], title: str, body: str) -> dict[str,
             if resp.status_code == 200:
                 sent += 1
             elif resp.status_code in (400, 403, 404):
-                # UNREGISTERED / invalid token → prune. Other 400s (bad payload)
-                # are our bug, not a dead token, but pruning a persistently
-                # rejected token is safe since it can't receive anyway.
                 errcode = ""
+                fcm_err = ""
                 try:
-                    errcode = resp.json().get("error", {}).get("status", "")
+                    err = resp.json().get("error", {})
+                    errcode = err.get("status", "")
+                    for d in err.get("details", []) or []:
+                        if isinstance(d, dict) and d.get("errorCode"):
+                            fcm_err = d["errorCode"]
                 except Exception:  # noqa: BLE001
                     pass
-                if errcode in ("UNREGISTERED", "INVALID_ARGUMENT", "NOT_FOUND") or resp.status_code == 404:
+                # Prune ONLY on the FCM-specific "this token is gone" signal.
+                # The old check also pruned on INVALID_ARGUMENT (which FCM
+                # returns for OUR bad payloads too) and on ANY 404 — but a
+                # wrong/deleted project_id 404s every send, which would wipe
+                # every Android token on the first alert tick (same
+                # self-inflicted-wipe shape as the APNs env bug).
+                if fcm_err == "UNREGISTERED" or errcode == "UNREGISTERED":
                     dead.append(token)
                 else:
                     failed += 1
-                log.info("FCM %s for token …%s (%s)", resp.status_code, token[-8:], errcode)
+                log.info("FCM %s for token …%s (%s%s)", resp.status_code,
+                         token[-8:], errcode, f"/{fcm_err}" if fcm_err else "")
             else:
                 failed += 1
                 log.warning("FCM HTTP %s: %s", resp.status_code, resp.text[:160])

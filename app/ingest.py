@@ -30,11 +30,13 @@ don't lose source-specific bonus fields (lightning, hub battery, etc).
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 import math
 import re
 import time
+import weakref
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -46,6 +48,12 @@ from .config import settings, tokens_match
 log = logging.getLogger("ingest")
 
 router = APIRouter()
+
+# Timestamp sanity bounds (see _flatten). 15 min of forward skew tolerates a
+# sloppy source clock; 400 days back is generous for any live sensor while
+# still keeping garbage out of the records/aggregate windows.
+_FUTURE_SKEW_MS = 15 * 60 * 1000
+_PAST_HORIZON_MS = 400 * 24 * 3600 * 1000
 
 
 def _finite(v: Any) -> Any:
@@ -63,10 +71,14 @@ def _finite(v: Any) -> Any:
     return v
 
 
-def _scrub_numbers(block: dict[str, Any] | None) -> dict[str, Any]:
+def _scrub_numbers(block: Any) -> dict[str, Any]:
     """Filter all numeric values in a sub-block (outdoor/wind/etc.) through
-    _finite so non-finite values never reach the DB."""
-    if not block:
+    _finite so non-finite values never reach the DB.
+
+    Non-dict blocks are dropped rather than trusted: a buggy encoder posting
+    `"outdoor": [1, 2]` used to raise AttributeError here, i.e. a 500 on every
+    reading from that source instead of a 400 it could act on."""
+    if not isinstance(block, dict):
         return {}
     return {k: _finite(v) for k, v in block.items()}
 
@@ -74,7 +86,7 @@ def _scrub_numbers(block: dict[str, Any] | None) -> dict[str, Any]:
 def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     """Map a normalized observation → the flat-field shape db.insert_observations
     expects (same keys as AmbientWeather's REST response)."""
-    dev = normalized.get("device") or {}
+    dev = _dev_block(normalized)
     # Filter NaN/inf out of every numeric sub-block at the boundary so non-
     # finite values never reach the DB or downstream JSON serialization.
     out = _scrub_numbers(normalized.get("outdoor"))
@@ -89,17 +101,34 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     solar = _scrub_numbers(normalized.get("solar"))
 
     ts_iso = normalized.get("timestamp_utc")
-    if not ts_iso:
+    # A non-string timestamp (an epoch int, a dict) hit .endswith() below and
+    # raised AttributeError, which the except clause didn't catch — a 500
+    # instead of the 400 the caller needs.
+    if not ts_iso or not isinstance(ts_iso, str):
         return None
     # "2026-05-14T01:09:47" or "2026-05-14T01:09:47Z" → epoch ms
     try:
         from datetime import datetime, timezone
-        if ts_iso.endswith("Z"):
-            t = datetime.fromisoformat(ts_iso[:-1]).replace(tzinfo=timezone.utc)
-        else:
-            t = datetime.fromisoformat(ts_iso).replace(tzinfo=timezone.utc)
+        t = datetime.fromisoformat(ts_iso[:-1] if ts_iso.endswith("Z") else ts_iso)
+        # An offset-bearing timestamp ("...+02:00") parses AWARE, and
+        # .replace(tzinfo=utc) would re-LABEL the wall clock instead of
+        # converting it — a silent multi-hour error stored as fact.
+        t = t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)
         dateutc_ms = int(t.timestamp() * 1000)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+    # Sanity-bound the timestamp. A far-FUTURE value would be stored as fact:
+    # devices.last_seen_ms jumps ahead (silencing the staleness monitor) and
+    # the write-throttle then rejects every real reading until that moment
+    # arrives. Clamp to server time (>15 min skew is a broken clock, not data)
+    # so the reading itself survives. A far-PAST value (>~400 days) pollutes
+    # records/aggregate windows and can't be a live reading — reject it.
+    now_ms = int(time.time() * 1000)
+    if dateutc_ms > now_ms + _FUTURE_SKEW_MS:
+        log.warning("timestamp %s is %.1f min in the future — clamping to "
+                    "server time", ts_iso, (dateutc_ms - now_ms) / 60000)
+        dateutc_ms = now_ms
+    elif dateutc_ms < now_ms - _PAST_HORIZON_MS:
         return None
 
     # Indoor block is optional — historically the AcuRite hub-relay never
@@ -123,8 +152,18 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
             yearly_in = float(yearly_in)
         except (TypeError, ValueError):
             yearly_in = None
+        else:
+            # _scrub_numbers only filters values that arrive AS numbers — a
+            # STRING like "1e999" passes through and float() here turns it
+            # into inf, which then 500s every JSON response containing the
+            # row (JSONResponse serializes with allow_nan=False). Re-check
+            # finiteness after the coercion.
+            if not math.isfinite(yearly_in):
+                yearly_in = None
     if yearly_in is not None:
-        mac_for_offset = _format_mac(dev.get("id") or "").upper()
+        # str() like _do_ingest does: a numeric device.id reaches re.fullmatch
+        # inside _format_mac otherwise and raises TypeError.
+        mac_for_offset = _format_mac(str(dev.get("id") or "")).upper()
         offset = settings.ingest_yearly_rain_offsets.get(mac_for_offset)
         if offset is not None:
             yearly_in = max(0.0, yearly_in - offset)
@@ -182,9 +221,16 @@ def _compute_feels_like(tempf: Any, humidity: Any, wind_mph: Any) -> float | Non
         t = float(tempf)
     except (TypeError, ValueError):
         return None
+    # Same string-bypass as yearly_in: a STRING "1e999" sails past
+    # _scrub_numbers, float()s to inf here, and the arithmetic below would
+    # store a non-finite feels-like that breaks JSON serialization.
+    if not math.isfinite(t):
+        return None
     try:
         rh = float(humidity)
     except (TypeError, ValueError):
+        rh = None
+    if rh is not None and not math.isfinite(rh):
         rh = None
     if rh is not None and t >= 80.0:
         hi = (-42.379 + 2.04901523 * t + 10.14333127 * rh
@@ -195,6 +241,8 @@ def _compute_feels_like(tempf: Any, humidity: Any, wind_mph: Any) -> float | Non
     try:
         v = float(wind_mph)
     except (TypeError, ValueError):
+        v = None
+    if v is not None and not math.isfinite(v):
         v = None
     if v is not None and t <= 50.0 and v > 3.0:
         wc = 35.74 + 0.6215 * t - 35.75 * v**0.16 + 0.4275 * t * v**0.16
@@ -222,6 +270,14 @@ def _format_mac(raw: str) -> str:
     return raw or ""
 
 
+def _dev_block(normalized: dict[str, Any]) -> dict[str, Any]:
+    """The `device` block, or {} when a source sent something that isn't an
+    object. Every caller here does .get() on it, so a bare string or list used
+    to raise AttributeError → 500 instead of a 400."""
+    dev = normalized.get("device")
+    return dev if isinstance(dev, dict) else {}
+
+
 def _device_label(normalized: dict[str, Any]) -> tuple[str | None, str | None]:
     """Pick a friendly name + location for the devices table.
 
@@ -234,7 +290,7 @@ def _device_label(normalized: dict[str, Any]) -> tuple[str | None, str | None]:
     when row is brand new, NOT here, so a secondary source posting to an
     existing row (e.g. LilyGO posting to a row the Pi already named
     "AcuRite Atlas (SDR)") doesn't flip the name on every UPSERT."""
-    dev = normalized.get("device") or {}
+    dev = _dev_block(normalized)
     explicit_name = dev.get("name")
     location = dev.get("location")
     return explicit_name, location
@@ -245,7 +301,7 @@ def _payload_coords(normalized: dict[str, Any]) -> dict[str, Any] | None:
     (info.coords.coords.{lat,lon}), or None if the source didn't include one.
     Accepts either a flat {lat,lon} or a nested {coords:{lat,lon}} under the
     top-level or device block."""
-    dev = normalized.get("device") or {}
+    dev = _dev_block(normalized)
     raw = normalized.get("coords") or dev.get("coords") or {}
     if not isinstance(raw, dict):
         return None
@@ -262,9 +318,13 @@ def _payload_coords(normalized: dict[str, Any]) -> dict[str, Any] | None:
 
 def _auto_device_name(normalized: dict[str, Any]) -> str:
     """Auto-generated name used ONLY on first INSERT of a device row."""
-    dev = normalized.get("device") or {}
+    dev = _dev_block(normalized)
     src = normalized.get("source") or "custom"
+    if not isinstance(src, str):        # a non-string `source` broke .replace()
+        src = "custom"
     model = dev.get("model")
+    if not isinstance(model, str):      # ...and a non-string `model` broke .lower()
+        model = None
     pretty = {
         "acurite-atlas": "AcuRite Atlas",
         "acurite-access": "AcuRite Access",
@@ -292,8 +352,14 @@ def _is_gust_glitch(gust: float | None, speed: float | None,
     return gust > speed * max_factor
 
 
-def _require_ingest_token(token: str) -> None:
+def _require_ingest_token(token: str, client_host: str | None = None) -> None:
     if not tokens_match(token, settings.ingest_token):
+        # Log the rejection (rain/gust drops already log; auth failures were
+        # the one silent denial). One line per failed request is bounded by
+        # the body-size middleware + normal request handling, and gives the
+        # operator the "why is my board's data missing?" answer.
+        log.warning("ingest auth failed from %s (token %s)",
+                    client_host or "?", "present" if token else "missing")
         raise HTTPException(status_code=401, detail="invalid ingest token")
 
 
@@ -305,6 +371,47 @@ def _token_from_header(authorization: str | None,
     if authorization and authorization.startswith("Bearer "):
         return authorization.removeprefix("Bearer ").strip()
     return ""
+
+
+# Per-(event-loop, MAC) locks for the write-throttle's check-then-insert.
+# WeakKeyDictionary on the loop so locks never outlive the loop they bound to
+# (each test's asyncio.run() gets fresh locks; nothing to reset in conftest).
+# Entries are [lock, holders]: the production loop lives for the process
+# lifetime, so without eviction every MAC an ingest-token holder ever posts
+# leaves a Lock behind forever — an unbounded cache fed by request input. The
+# holder count makes eviction safe: an entry is dropped only when the LAST
+# task through it leaves, so concurrent tasks always share one lock object
+# and mutual exclusion holds (all registry mutations happen on the loop with
+# no await between read and write).
+_THROTTLE_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, list]]" = (
+    weakref.WeakKeyDictionary())
+
+
+class _throttle_lock:
+    """`async with _throttle_lock(mac):` — per-(loop, MAC) mutex whose
+    registry entry is removed once no task holds or awaits it."""
+
+    def __init__(self, mac: str) -> None:
+        self._mac = mac
+        self._entry: list | None = None
+
+    async def __aenter__(self) -> None:
+        loop = asyncio.get_running_loop()
+        per_loop = _THROTTLE_LOCKS.setdefault(loop, {})
+        entry = per_loop.get(self._mac)
+        if entry is None:
+            entry = per_loop[self._mac] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        self._entry = entry
+        self._per_loop = per_loop
+        await entry[0].acquire()
+
+    async def __aexit__(self, *exc: object) -> None:
+        entry = self._entry  # always set: `async with` pairs __aexit__ with __aenter__
+        entry[0].release()
+        entry[1] -= 1
+        if entry[1] == 0 and self._per_loop.get(self._mac) is entry:
+            del self._per_loop[self._mac]
 
 
 # Metadata keys ignored when deciding whether a throttled-window reading
@@ -329,7 +436,7 @@ def _adds_field(new: dict[str, Any], prev: dict[str, Any]) -> bool:
 async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     if not isinstance(payload_obj, dict):
         raise HTTPException(status_code=400, detail="payload must be a JSON object")
-    dev = payload_obj.get("device") or {}
+    dev = _dev_block(payload_obj)
     raw_id = dev.get("id") or ""
     mac = _format_mac(str(raw_id))
     if not mac:
@@ -406,16 +513,26 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     # unless it contributes a field that row was missing (multi-source
     # composite). See settings.ingest_min_interval_seconds.
     row = {**flat, "_source": _truncate_source(payload_obj)}
-    store = True
     min_interval_ms = settings.ingest_min_interval_seconds * 1000
     if min_interval_ms > 0:
-        last = await db.last_stored_observation(mac)
-        if last is not None:
-            last_ts, last_data = last
-            recent = 0 <= flat["dateutc"] - last_ts < min_interval_ms
-            if recent and not _adds_field(flat, last_data):
-                store = False
-    inserted = await db.insert_observations(mac, [row]) if store else 0
+        # Check-then-insert across two connections is a race: two concurrent
+        # posts for the same MAC both see the same "last stored" row, both
+        # pass the check, and both insert. Serialize per MAC. The lock map is
+        # keyed on the running event loop (an asyncio.Lock binds to the first
+        # loop that awaits it, and the test suite runs asyncio.run() per test
+        # — see the _PUBLIC_DASH_LOCK note in main.py).
+        async with _throttle_lock(mac):
+            store = True
+            last = await db.last_stored_observation(mac)
+            if last is not None:
+                last_ts, last_data = last
+                recent = 0 <= flat["dateutc"] - last_ts < min_interval_ms
+                if recent and not _adds_field(flat, last_data):
+                    store = False
+            inserted = await db.insert_observations(mac, [row]) if store else 0
+    else:
+        store = True
+        inserted = await db.insert_observations(mac, [row])
     # Custom ingest is a push path — nothing polls it, so without this the
     # source reports unhealthy forever even while boards and pollers are
     # posting successfully. A throttled write still counts as the source
@@ -490,7 +607,8 @@ async def ingest_custom_header(
     authorization: Annotated[str | None, Header()] = None,
     x_ingest_token: Annotated[str | None, Header(alias="X-Ingest-Token")] = None,
 ) -> dict[str, Any]:
-    _require_ingest_token(_token_from_header(authorization, x_ingest_token))
+    _require_ingest_token(_token_from_header(authorization, x_ingest_token),
+                          request.client.host if request.client else None)
     return await _do_ingest(await _parse_json_body(request))
 
 # (Legacy path-form `/ingest/custom/{token}` was removed 2026-05-21. The

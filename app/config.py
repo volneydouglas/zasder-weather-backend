@@ -1,9 +1,21 @@
 import json as _json
+import logging as _logging
 import secrets as _secrets
+import sys as _sys
 from typing import ClassVar, Iterable
+from zoneinfo import ZoneInfo as _ZoneInfo
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_log = _logging.getLogger("config")
+
+
+def _under_pytest() -> bool:
+    """True when running inside the test suite. Checked via sys.modules (not
+    PYTEST_CURRENT_TEST) because Settings() is instantiated at import time —
+    during test collection — before pytest sets that env var."""
+    return "pytest" in _sys.modules
 
 
 def tokens_match(presented: str, allowed: str | Iterable[str] | None) -> bool:
@@ -54,6 +66,13 @@ def _normalize_mac_map(v) -> dict[str, float]:
         key = str(raw_key).upper().replace("-", "").replace(":", "")
         if len(key) == 12 and all(c in "0123456789ABCDEF" for c in key):
             key = ":".join(key[i:i + 2] for i in range(0, 12, 2))
+        else:
+            # A key that isn't a 12-hex MAC can never match a normalized
+            # lookup MAC, so keeping it verbatim just makes the offset /
+            # threshold silently never apply. Warn-and-drop so the typo is
+            # visible in the logs instead of a mystery.
+            _log.warning("ignoring non-MAC key %r in MAC-keyed setting", raw_key)
+            continue
         out[key] = val
     return out
 
@@ -170,11 +189,15 @@ class Settings(BaseSettings):
     # Keys; key_p8 is the .p8 file's full contents, key_id is its Key ID,
     # team_id is the Apple Team ID (36HL89286N). topic = app bundle id.
     # env: "sandbox" for dev/devicectl builds, "production" for App Store.
+    # Only used for tokens that didn't record their own env at registration.
+    # Defaults to production because that's what every App Store / TestFlight
+    # install reports — defaulting to sandbox meant an operator who forgot
+    # APNS_ENV got BadDeviceToken for real users' tokens (see apns.py).
     apns_key_id: str | None = None
     apns_team_id: str | None = None
     apns_key_p8: str | None = None
     apns_topic: str = "com.zasder.weather"
-    apns_env: str = "sandbox"
+    apns_env: str = "production"
 
     @property
     def apns_configured(self) -> bool:
@@ -294,7 +317,15 @@ class Settings(BaseSettings):
             return v
         s = v.strip()
         if not s:
-            return None if info.field_name != "api_token" else v
+            if info.field_name == "api_token":
+                # A blank/whitespace api_token used to start the app fine —
+                # then valid_api_tokens filtered it out and every /api/*
+                # request 401ed with zero startup diagnostic. Fail loudly at
+                # boot instead; the operator can act on this, not on 401s.
+                raise ValueError(
+                    "api_token must not be blank. Generate one with "
+                    "`openssl rand -hex 32` and set it via env/secret.")
+            return None
         low = s.lower()
         if low in cls._PLACEHOLDER_TOKENS or "replace-with" in low:
             raise ValueError(
@@ -303,9 +334,11 @@ class Settings(BaseSettings):
                 f"and set it via env/secret.")
         # Length floor for production tokens — applies to reviewer_api_token
         # too (it's accepted on /api/* just like api_token, so a short one is
-        # a guessable backdoor). Exempt the `test-` prefix so unit tests can
-        # keep human-readable token strings.
-        if len(s) < 32 and not s.startswith("test-"):
+        # a guessable backdoor). The `test-` prefix exemption exists so unit
+        # tests can keep human-readable token strings, but it is gated on
+        # actually running under pytest — otherwise `API_TOKEN=test-x` on a
+        # live deploy is a 6-char guessable credential.
+        if len(s) < 32 and not (s.startswith("test-") and _under_pytest()):
             raise ValueError(
                 f"{info.field_name} must be at least 32 characters "
                 f"(got {len(s)}). Generate with `openssl rand -hex 32`.")
@@ -313,12 +346,35 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _reject_identical_tokens(self):
-        if (self.api_token and self.ingest_token
-                and self.api_token == self.ingest_token):
+        # Any equality among the three tokens defeats a security boundary:
+        # api==ingest → revoking write locks the app out; reviewer==api →
+        # the "read-only" reviewer token silently has full write access
+        # (write_tokens contains the same string) AND the primary token is
+        # treated as the reviewer's, serving the app PII-stripped data.
+        seen: dict[str, str] = {}
+        for name, tok in (("api_token", self.api_token),
+                          ("ingest_token", self.ingest_token),
+                          ("reviewer_api_token", self.reviewer_api_token)):
+            if not tok:
+                continue
+            if tok in seen:
+                raise ValueError(
+                    f"{name} must differ from {seen[tok]} — each token gates "
+                    f"a different privilege level, so sharing one value "
+                    f"collapses the boundary. Generate separate values.")
+            seen[tok] = name
+        return self
+
+    @model_validator(mode="after")
+    def _validate_timezone(self):
+        # A typo'd TIMEZONE used to start cleanly and only surface at runtime
+        # (500s on /records when the rollup path hit ZoneInfo). Fail at boot.
+        try:
+            _ZoneInfo(self.timezone)
+        except Exception:
             raise ValueError(
-                "api_token and ingest_token must differ. Revoking write "
-                "(ingest) would otherwise lock the iOS app out, and vice "
-                "versa. Generate two separate values.")
+                f"timezone {self.timezone!r} is not a valid IANA zone name "
+                f"(e.g. 'America/Phoenix' or 'UTC').")
         return self
 
     @property
@@ -369,7 +425,12 @@ class Settings(BaseSettings):
         def _real(v: str | None) -> bool:
             if not v: return False
             s = v.strip().lower()
-            return bool(s) and "replace-with" not in s and s != "replace_me"
+            # Same placeholder list the token validators use — the old
+            # hand-rolled check only knew "replace-with"/"replace_me", so an
+            # un-edited "change-me"/"your-token-here" template still started
+            # the poller with garbage credentials.
+            return (bool(s) and "replace-with" not in s
+                    and s not in self._PLACEHOLDER_TOKENS)
         return _real(self.aw_application_key) and _real(self.aw_api_key)
 
 

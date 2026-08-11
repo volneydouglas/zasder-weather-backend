@@ -112,3 +112,89 @@ async def test_rain_rollups_uses_yearly_for_lifetime_counter(db_module):
     ])
     r = await db.rain_rollups(mac, "America/Phoenix")
     assert r["weekly_in"] == 0.01            # 0.74 - 0.73 via the yearly counter
+
+
+@pytest.mark.asyncio
+async def test_upsert_device_out_of_order_does_not_regress(db_module):
+    """The devices-row UPDATE arm is monotonic on purpose (backend CR-18): a
+    backfilled / out-of-order post (SDR replay, a batch of history) must not
+    drag last_seen_ms BACKWARDS or overwrite lastData with older values — a
+    regressed last_seen once fired false device-down alerts and showed a stale
+    "current" reading until the next fresh post."""
+    db = db_module
+    await db.init_db()
+    mac = "AA:BB:CC:DD:EE:FF"
+
+    def info(ts, tempf, location):
+        return {"name": None, "auto_name": "Test Source",
+                "info": {"name": "Test Source", "location": location},
+                "lastData": ({"dateutc": ts, "tempf": tempf}
+                             if ts is not None else {})}
+
+    await db.upsert_device(mac, info(2000, 80.0, "newer"))
+    # Out-of-order repost with an OLDER timestamp: everything retained.
+    await db.upsert_device(mac, info(1000, 70.0, "older"))
+    d = (await db.list_devices())[0]
+    assert d["lastSeen"] == 2000, "last_seen_ms regressed on an older post"
+    assert d["lastData"]["tempf"] == 80.0, "lastData overwritten by older data"
+    assert d["location"] == "newer"
+
+
+@pytest.mark.asyncio
+async def test_upsert_device_same_timestamp_repost_merges(db_module):
+    """`>=` not `>`: a same-timestamp repost (a second source contributing to
+    the same composite reading) must still update the row."""
+    db = db_module
+    await db.init_db()
+    mac = "AA:BB:CC:DD:EE:FF"
+    base = {"name": None, "auto_name": "A", "info": {}}
+    await db.upsert_device(mac, {**base, "lastData": {"dateutc": 2000, "tempf": 80.0}})
+    await db.upsert_device(mac, {**base, "lastData": {"dateutc": 2000, "tempf": 81.5}})
+    d = (await db.list_devices())[0]
+    assert d["lastSeen"] == 2000
+    assert d["lastData"]["tempf"] == 81.5      # same-ts repost took effect
+
+
+@pytest.mark.asyncio
+async def test_upsert_device_null_last_seen_refreshes_but_never_regresses(db_module):
+    """A caller with no lastData (last_seen NULL) can't be ordered: it must
+    refresh info_json but leave the timestamp alone (the MAX/COALESCE pair)."""
+    db = db_module
+    await db.init_db()
+    mac = "AA:BB:CC:DD:EE:FF"
+    await db.upsert_device(mac, {"name": None, "auto_name": "A", "info": {},
+                                 "lastData": {"dateutc": 2000, "tempf": 80.0}})
+    await db.upsert_device(mac, {"name": "Renamed", "auto_name": "A",
+                                 "info": {"note": "fresh"}, "lastData": {}})
+    d = (await db.list_devices())[0]
+    assert d["lastSeen"] == 2000               # never regressed to NULL
+    assert d["name"] == "Renamed"              # explicit rename applied
+    assert d["info"].get("note") == "fresh"    # info_json refreshed
+
+
+@pytest.mark.asyncio
+async def test_init_db_rebuilds_stale_chart_index(db_module):
+    """init_db must rebuild idx_obs_chart whenever ANY expected column is
+    missing from the stored definition — not just one hard-coded name. The
+    stale index here deliberately CONTAINS windgustmph (the column the old
+    hard-coded check looked for) but misses others, so a regression back to
+    the single-name test skips the rebuild and this fails."""
+    import aiosqlite
+    from app.config import settings
+    db = db_module
+    await db.init_db()
+    async with aiosqlite.connect(settings.database_path) as conn:
+        await conn.execute("DROP INDEX idx_obs_chart")
+        await conn.execute(
+            "CREATE INDEX idx_obs_chart ON observations "
+            "(mac, dateutc_ms, tempf, windgustmph)")     # old/narrow definition
+        await conn.commit()
+    await db.init_db()                                   # migration runs here
+    async with aiosqlite.connect(settings.database_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        row = await (await conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' "
+            "AND name='idx_obs_chart'")).fetchone()
+    assert row is not None and row["sql"]
+    for col in db._CHART_INDEX_COLS:
+        assert col in row["sql"], f"rebuilt index is missing {col}"

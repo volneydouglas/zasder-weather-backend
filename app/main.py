@@ -2,6 +2,7 @@ import asyncio
 import html as _html
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -211,17 +212,52 @@ def _extract_bearer(authorization: str | None) -> str:
     return authorization.removeprefix("Bearer ")
 
 
-def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
+# Throttled 401 logging: one line per source IP per minute, so failed bearer
+# auth is at least VISIBLE (probes used to be completely silent) without a
+# flood turning the log itself into the problem. Process-global like the other
+# caches here; plain dict is fine (mutated only on the event loop thread).
+_AUTH_FAIL_LOG_TS: dict[str, float] = {}
+_AUTH_FAIL_LOG_INTERVAL_S = 60.0
+_AUTH_FAIL_LOG_MAX_IPS = 1024
+
+
+def _log_auth_failure(request: Request | None) -> None:
+    host = (request.client.host if request and request.client else "?")[:64]
+    now = time.monotonic()
+    last = _AUTH_FAIL_LOG_TS.get(host)
+    if last is not None and now - last < _AUTH_FAIL_LOG_INTERVAL_S:
+        return
+    if len(_AUTH_FAIL_LOG_TS) >= _AUTH_FAIL_LOG_MAX_IPS:
+        _AUTH_FAIL_LOG_TS.clear()      # cheap bound; worst case one extra line per IP
+    _AUTH_FAIL_LOG_TS[host] = now
+    log.warning("rejected bearer auth from %s (throttled: 1 line/min/IP)", host)
+
+
+def require_token(request: Request,
+                  authorization: Annotated[str | None, Header()] = None) -> None:
     """READ-allowing dep: accepts api_token OR reviewer_api_token. Use on GETs."""
-    if not tokens_match(_extract_bearer(authorization), settings.valid_api_tokens):
+    try:
+        ok = tokens_match(_extract_bearer(authorization), settings.valid_api_tokens)
+    except HTTPException:
+        _log_auth_failure(request)
+        raise
+    if not ok:
+        _log_auth_failure(request)
         raise HTTPException(status_code=401, detail="invalid token")
 
 
-def require_write_token(authorization: Annotated[str | None, Header()] = None) -> None:
+def require_write_token(request: Request,
+                        authorization: Annotated[str | None, Header()] = None) -> None:
     """MUTATING dep: only api_token. The reviewer/demo token is read-only,
     so it can't alter user state if the reviewer hits a write route. Use on
     every POST/PUT/PATCH/DELETE under /api/*."""
-    if not tokens_match(_extract_bearer(authorization), settings.write_tokens):
+    try:
+        ok = tokens_match(_extract_bearer(authorization), settings.write_tokens)
+    except HTTPException:
+        _log_auth_failure(request)
+        raise
+    if not ok:
+        _log_auth_failure(request)
         raise HTTPException(status_code=401, detail="invalid token")
 
 
@@ -602,10 +638,15 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
 </html>"""
 
 
-@app.get("/api/config/backup", dependencies=[Depends(require_token)])
+@app.get("/api/config/backup", dependencies=[Depends(require_write_token)])
 async def api_config_backup() -> dict[str, Any]:
     """Everything the operator configured by hand, so it survives losing the
-    server. No tokens and no SMTP password — see app/config_backup.py."""
+    server. No tokens and no SMTP password — see app/config_backup.py.
+
+    Write-gated despite being a GET: the export carries alert recipient email
+    addresses, SMTP host/username/from and the operator's device coordinates —
+    exactly what GET /api/alerts hides from the read-only reviewer token. A
+    read-gated backup made that redaction a one-request bypass."""
     return await config_backup.export_config()
 
 
@@ -634,9 +675,29 @@ async def api_sources() -> dict[str, Any]:
     return {"sources": source_status.snapshot()}
 
 
+def _strip_device_pii(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the operator's home location from a device list.
+
+    `location` is a free-text label that routinely names a house, and
+    `info.coords` is the precise lat/lon — the same pair the public dashboard
+    refuses to publish. The reviewer/demo token needs the weather, not the
+    address."""
+    out = []
+    for d in devices:
+        info = {k: v for k, v in (d.get("info") or {}).items()
+                if k not in ("coords", "location")}
+        out.append({**d, "location": None, "info": info})
+    return out
+
+
 @app.get("/api/devices", dependencies=[Depends(require_token)])
-async def get_devices() -> JSONResponse:
-    return JSONResponse(await db.list_devices())
+async def get_devices(
+    authorization: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    devices = await db.list_devices()
+    if _is_reviewer(authorization):
+        devices = _strip_device_pii(devices)
+    return JSONResponse(devices)
 
 
 # ───────────────────────── alert preferences (app-managed) ─────────────────────────
@@ -723,6 +784,11 @@ async def get_alerts(
     return JSONResponse(state)
 
 
+def _has_ctl(s: str) -> bool:
+    """True if the string contains an ASCII control character (incl. \\n)."""
+    return any(ord(c) < 32 or ord(c) == 127 for c in s)
+
+
 @app.put("/api/alerts", dependencies=[Depends(require_write_token)])
 async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     fields: dict[str, Any] = {}
@@ -735,16 +801,26 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     if body.recipients is not None:
         clean = [r.strip() for r in body.recipients if r.strip()]
         for r in clean:
-            if "@" not in r or " " in r:
+            # One address, no whitespace/control chars, and NO comma: the
+            # stored form is comma-joined and re-split on ",", so a recipient
+            # containing one would silently become two; a control char (\n)
+            # would corrupt every alert send's headers.
+            if not re.fullmatch(r"[^@\s,]+@[^@\s,]+", r) or _has_ctl(r):
                 raise HTTPException(status_code=400, detail=f"invalid recipient: {r!r}")
         # Empty list clears the override → falls back to env recipients.
         fields["recipients"] = ",".join(clean) if clean else None
     # SMTP transport (DB over env). Empty string clears → env fallback.
-    if body.smtp_host is not None:     fields["smtp_host"] = body.smtp_host.strip() or None
+    # Control characters are rejected on every header-bound value — a \n in
+    # smtp_from breaks EmailMessage for every subsequent alert.
+    for attr in ("smtp_host", "smtp_username", "smtp_from"):
+        val = getattr(body, attr)
+        if val is not None:
+            if _has_ctl(val):
+                raise HTTPException(status_code=400,
+                                    detail=f"{attr} must not contain control characters")
+            fields[attr] = val.strip() or None
     if body.smtp_port is not None:     fields["smtp_port"] = body.smtp_port
-    if body.smtp_username is not None: fields["smtp_username"] = body.smtp_username.strip() or None
     if body.smtp_password is not None: fields["smtp_password"] = body.smtp_password or None
-    if body.smtp_from is not None:     fields["smtp_from"] = body.smtp_from.strip() or None
     if body.smtp_tls is not None:      fields["smtp_tls"] = 1 if body.smtp_tls else 0
     if body.smtp_ssl is not None:      fields["smtp_ssl"] = 1 if body.smtp_ssl else 0
     await db.set_alert_prefs(**fields)
@@ -803,7 +879,11 @@ async def test_alert() -> JSONResponse:
 # ───────────────────────── push notifications (APNs) ─────────────────────────
 
 class PushRegisterIn(BaseModel):
-    token: str = Field(min_length=8)
+    # Real APNs tokens are 64 hex chars and FCM registration tokens are
+    # printable ASCII (base64url + ':') — but neither is multi-KB or carries
+    # whitespace/control chars. Bound + shape-check so junk can't accumulate
+    # as fake "device tokens" up to the body cap.
+    token: str = Field(min_length=8, max_length=512, pattern=r"^[\x21-\x7e]+$")
     env: str | None = None            # "sandbox" (dev build) | "production"
     platform: str = "ios"
 
@@ -1102,8 +1182,6 @@ async def get_records(mac: str) -> JSONResponse:
     return JSONResponse(await _cached_records(mac))
 
 
-from typing import Any  # noqa: E402
-
 @app.get("/api/captures/{slug}", dependencies=[Depends(require_write_token)])
 async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSONResponse:
     """Read recent capture-endpoint hits for a slug. Gated on the PRIMARY
@@ -1117,11 +1195,23 @@ async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSO
         return JSONResponse({"slug": slug, "rows": []})
     import json as _json
     from collections import deque
+
     # Read only the requested tail into memory (bounded by `tail`, not the
     # whole file) so a large append-only capture log can't be turned into a
-    # memory-exhaustion read.
-    with path.open("r", encoding="utf-8") as f:
-        last_lines = deque(f, maxlen=tail)
+    # memory-exhaustion read. Off the event loop: the deque still SCANS the
+    # whole file, and an ever-growing capture log would otherwise block every
+    # other request for the duration.
+    def _read_tail() -> deque[str]:
+        # The exists() check above ran on the event loop; log rotation or
+        # cleanup can remove the file before this thread opens it. Missing
+        # then == missing now: same empty result, not a 500.
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return deque(f, maxlen=tail)
+        except FileNotFoundError:
+            return deque()
+
+    last_lines = await asyncio.to_thread(_read_tail)
     # Tolerate corrupt/partial JSONL — older log lines from a crashed
     # write can have a truncated trailing line. Skip rather than 500.
     rows: list[dict] = []
@@ -1153,6 +1243,18 @@ async def get_forecast(
                 break
     if flat is None or flon is None:
         raise HTTPException(status_code=400, detail="no lat/lon available; pass ?lat=&lon=")
+    # The device-info fallback pulls from a JSON blob a custom ingest source
+    # controls — coords stored as STRINGS would make the range comparison
+    # below raise TypeError, i.e. a bare 500 for a bad-data condition.
+    try:
+        flat, flon = float(flat), float(flon)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="device coordinates are not numeric")
+    # Same range check as put_device_location. Open-Meteo answers an
+    # out-of-range coordinate with a 400, which used to surface here as a bare
+    # 500 — the app then showed "server error" for what is a bad request.
+    if not (-90.0 <= flat <= 90.0) or not (-180.0 <= flon <= 180.0):
+        raise HTTPException(status_code=400, detail="lat/lon out of range")
     params = {
         "latitude": flat,
         "longitude": flon,
@@ -1164,7 +1266,17 @@ async def get_forecast(
         "timezone": "auto",
         "forecast_days": 7,
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
-        r.raise_for_status()
-    return JSONResponse(r.json())
+    # A third-party API that times out, 500s or returns an HTML error page is
+    # routine, not a bug in this server — report it as an upstream failure so
+    # the app can say "forecast unavailable" instead of "server error".
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
+            r.raise_for_status()
+        return JSONResponse(r.json())
+    except httpx.HTTPError as e:
+        log.warning("forecast upstream failed: %s", e)
+        raise HTTPException(status_code=502, detail="forecast upstream unavailable")
+    except ValueError:
+        log.warning("forecast upstream returned non-JSON")
+        raise HTTPException(status_code=502, detail="forecast upstream unavailable")

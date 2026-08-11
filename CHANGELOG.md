@@ -8,38 +8,79 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
-## [1.3.0] — 2026-08-09
+## [1.3.1] — 2026-08-11
+
+Numbered 1.3.1 rather than 1.3.0 deliberately: a handful of early instances
+were deployed from pre-release 1.3.0 code that predates the fixes below, so
+the 1.3.0 string already exists in the wild attached to different code. If
+`/api/version` says 1.3.0, upgrade — you have the early build.
 
 Ships alongside Zasder Weather 1.3.0 for iOS, watchOS and **macOS** — from
-this release the apps and the backend share one version number.
+this release the apps and the backend share one version number. This release
+also absorbs three full code-review rounds (≈350 findings worked); the
+data-integrity and security items below are the ones self-hosters will feel.
+
+### Fixed — data integrity
+- **Davis wind and solar were silently discarded at ingest** when fed by the
+  bundled SDR relays: the relays sent the backend's *column* names
+  (`windspeedmph`, `winddir`, `solarradiation`) where the ingest contract
+  reads `speed_mph` / `direction` / `solar_wm2`. If you run `davis-relay` or
+  the rtl_433 Davis path, update the relay too — wind and solar start
+  appearing again.
+- **A calm reading no longer suppresses the whole post**: relays treated
+  0.0 mph (and 0 °F) as "no data" and skipped posting, stalling temperature
+  and humidity until the wind picked up.
+- **Cold-weather "feels like" was wrong end to end**: relays computed heat
+  index regardless of temperature, and the backend prefers a source-provided
+  feels_like. Heat index now applies only ≥ 80 °F, wind chill ≤ 50 °F.
+- Non-finite readings can no longer poison a station: an overflow string like
+  `"1e999"` used to ingest as `inf` and break `/current` and history JSON for
+  that row's lifetime. Scrubbed at ingest AND at the storage choke point.
+- Out-of-order posts no longer regress a device's `last_seen`/name/location
+  (no more false stale alerts after a delayed packet).
+- Timestamps get sanity bounds: far-future clamps to server time, ancient
+  posts are rejected instead of stored.
+- Deleting a device now also removes its location and alert state, so a
+  re-registered MAC no longer inherits either.
+
+### Fixed — alerts & push
+- **A device-down alert whose first delivery failed was dropped forever**
+  (state advanced before delivery). Delivery failures now retry on the next
+  tick until one succeeds.
+- Threshold alerts gained a re-arm deadband, ending flapping notifications
+  when a reading hovers at the threshold.
+- A missing or misspelled `APNS_ENV` no longer silently prunes every
+  registered push token (`BadDeviceToken` on guessed environments is treated
+  as config error, not a dead device). Same fix applied to the relay path and
+  FCM (prunes only on `UNREGISTERED`).
+
+### Security
+- The WeatherLink API key no longer appears in logs on failed polls (it
+  travels as a query parameter; error messages now carry the path only).
+- The read-only reviewer/demo token can no longer read operator PII: station
+  coordinates are stripped from `/api/devices`, and `/api/config/backup` is
+  write-gated.
+- The unauthenticated relay challenge endpoint is rate-limited per client IP
+  (keyed on the edge-provided address, not spoofable `X-Forwarded-For`) with
+  a hard cap on stored challenges.
+- App Attest verification now checks certificate validity windows and
+  requires the AT flag.
 
 ### Added
-- **`GET /api/sources`** — health of each ingest source: whether it's
-  configured, when it last succeeded, and what the last error was. A cloud
-  poller that quietly stops (expired API keys, a revoked token, an upstream
-  outage) was previously indistinguishable from dead hardware at the station
-  end. "Not configured" and "configured but failing" are reported distinctly,
-  because they need entirely different fixes.
-- **`GET /api/config/backup` and `POST /api/config/restore`** — export and
-  restore the state you configured by hand: alert recipients and thresholds,
-  per-device monitoring, threshold rules, and device locations. Everything
-  you'd otherwise rebuild from memory if the server were lost.
+- **`GET /api/sources`** — health of each ingest source: configured or not,
+  last success, last error (with credentials redacted). A poller that
+  quietly stops is now distinguishable from dead hardware.
+- **`GET /api/config/backup` / `POST /api/config/restore`** — server-side
+  configuration backup (alert rules, prefs, device locations). Tokens and
+  SMTP passwords are never included; restores validate before deleting.
+- Ingest hardening: malformed JSON types return 400 instead of 500.
 
-  The backup contains **no API tokens and no SMTP password** (the latter is
-  write-only and never returned by the API). It does still list your alert
-  recipients and device coordinates, so treat it as private — just not as a
-  credential. The
-  restore response tells you the password needs re-entering rather than
-  letting you find out when an alert fails to send. Restore is write-gated,
-  replaces alert rules rather than duplicating them, skips a malformed entry
-  instead of discarding the good ones, and refuses a file that would change
-  nothing.
+### Upgrading
+`./bin/upgrade.sh` as usual. If a release edits `fly.toml`, the script now
+carries your app/region pin across the pull and restores it even when the
+pull fails. Update any bundled relays/pollers at the same time to get the
+Davis field fix.
 
-### Changed
-- `wll-poller/bin/setup-macos.sh` now gives each install its own station ID
-  instead of the shared hardcoded default, so two machines feeding one
-  backend can't land on the same device row. Re-running setup keeps the
-  existing ID rather than creating a duplicate station.
 
 ## [1.2.2] — 2026-08-09
 

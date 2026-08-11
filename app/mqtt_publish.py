@@ -118,7 +118,20 @@ class MqttPublisher:
             log.warning("MQTT_HOST is set but paho-mqtt is not installed; "
                         "MQTT publishing disabled")
             return
-        client = mqtt.Client()
+        # paho-mqtt 2.0.x REQUIRES callback_api_version and raises ValueError
+        # without it — that killed this task at startup with an unretrieved
+        # exception, i.e. MQTT silently dead with no log line at all. 2.1+
+        # defaults it with a DeprecationWarning, so the bare call only looks
+        # fine on the version that happens to be installed today. We register
+        # no callbacks, so the API version is a formality.
+        try:
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        except AttributeError:
+            client = mqtt.Client()          # paho 1.x: no such argument
+        except Exception as e:
+            log.error("MQTT client could not be created (%s); "
+                      "MQTT publishing disabled", e)
+            return
         if settings.mqtt_username:
             client.username_pw_set(settings.mqtt_username, settings.mqtt_password)
         # connect() is a BLOCKING paho call (DNS + TCP + CONNACK). Called

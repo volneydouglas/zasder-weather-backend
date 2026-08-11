@@ -72,6 +72,21 @@ def test_backup_warns_inside_the_file(client):
     assert "token" in b["_WARNING"].lower()
 
 
+def test_backup_is_write_gated_because_it_carries_operator_pii(client):
+    """The read-only reviewer/demo token must NOT be able to read this.
+
+    The file contains home coordinates, alert recipient addresses and SMTP
+    identifiers. /api/alerts redacts those for the reviewer token; this
+    endpoint handed over the unredacted originals, so the redaction there was
+    decorative. Read-gating was the bug — a backup is not a read of weather
+    data, it is a dump of the operator's configuration.
+    """
+    r = client.get("/api/config/backup", headers=READ_ONLY)
+    assert r.status_code == 401, "reviewer token could read operator PII"
+    # ...and the primary token still can, or the feature is dead.
+    assert client.get("/api/config/backup", headers=H).status_code == 200
+
+
 def test_restore_is_write_gated(client):
     """The read-only reviewer token must not be able to reconfigure alerting
     for every client of this backend."""
@@ -218,3 +233,43 @@ def test_an_explicitly_empty_rule_list_still_clears(client):
     r = client.post("/api/config/restore", headers=H, json=payload)
     assert r.status_code == 200, r.text
     assert client.get("/api/alerts/rules", headers=H).json() == []
+
+
+def test_reviewer_token_cannot_read_station_coordinates(client):
+    """/api/devices exposed the operator's HOME coordinates to the demo token.
+
+    The reviewer credential ships in App Store Connect, so anyone reviewing the
+    app could read where the developer lives. The weather data itself is the
+    point of the demo; the location is not.
+    """
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEE09"},
+                      "timestamp_utc": "2026-08-10T12:00:00Z",
+                      "outdoor": {"tempf": 70, "humidity": 50},
+                      "wind": {}, "rain": {}, "pressure": {}, "source": "t"})
+    mac = "AA:BB:CC:DD:EE:09"
+    assert client.put(f"/api/devices/{mac}/location", headers=H,
+                      json={"lat": 33.3062, "lon": -111.8413,
+                            "label": "Home"}).status_code == 200
+
+    # The primary token still sees everything — the app needs coords for the
+    # sun dial and the forecast.
+    full = next(d for d in client.get("/api/devices", headers=H).json()
+                if d["mac"] == mac)
+    assert (full.get("info") or {}).get("coords") is not None
+
+    body = client.get("/api/devices", headers=READ_ONLY).text
+    assert "33.3062" not in body, "reviewer token could read home latitude"
+    assert "-111.8413" not in body, "reviewer token could read home longitude"
+    # The LABEL is PII too. Checking only the coordinates would pass a
+    # regression that exposed info.location ("Home") while stripping coords.
+    assert "Home" not in body, "reviewer token could read the location label"
+    redacted = client.get("/api/devices", headers=READ_ONLY).json()
+    row = next(d for d in redacted if d["mac"] == mac)
+    assert row.get("location") is None
+    info = row.get("info") or {}
+    assert info.get("coords") is None and info.get("location") is None
+    # ...but the station is still listed, or the demo shows an empty app.
+    seen = client.get("/api/devices", headers=READ_ONLY).json()
+    assert any(d["mac"] == mac for d in seen)

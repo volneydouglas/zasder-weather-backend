@@ -1,6 +1,8 @@
 import json
 import logging
+import math
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -212,6 +214,33 @@ def _ensure_dir() -> None:
     parent.mkdir(parents=True, exist_ok=True)
 
 
+def _parse_json_col(raw: Any) -> dict[str, Any]:
+    """Parse a JSON TEXT column defensively, {} on NULL/corrupt/non-object.
+    One corrupt row (manual sqlite edit, a restored/truncated backup) must
+    degrade to a skipped row, not 500 every endpoint whose window contains
+    it — the guarded pattern list_discoveries already uses."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    # json.loads accepts the NaN/Infinity literals json.dumps(allow_nan=True)
+    # wrote before _scrub_nonfinite guarded every writer — so a pre-fix row
+    # would round-trip a non-finite float straight back into a JSONResponse
+    # (allow_nan=False) and 500 it. Scrub on the way OUT too.
+    return _scrub_nonfinite(parsed) if isinstance(parsed, dict) else {}
+
+
+def _index_columns(create_sql: str) -> set[str]:
+    """Column names parsed from a stored `CREATE INDEX ... (a, b, c)`
+    statement. Used by the idx_obs_chart rebuild probe in init_db."""
+    m = re.search(r"\(([^)]*)\)", create_sql)
+    if not m:
+        return set()
+    return {c.strip().strip('"`[]') for c in m.group(1).split(",") if c.strip()}
+
+
 # Map our DB column -> AmbientWeather JSON field (handles camelCase fields).
 _FIELD_MAP: dict[str, str] = {
     "tempf": "tempf",
@@ -273,8 +302,10 @@ async def init_db() -> None:
         # Rebuild whenever ANY expected column is missing, rather than testing one
         # hard-coded name — the previous form would silently skip the rebuild for
         # the next column added to the bucketed SELECT, re-introducing the
-        # full-row fetch it exists to avoid.
-        if row and row[0] and any(c not in row[0] for c in _CHART_INDEX_COLS):
+        # full-row fetch it exists to avoid. Compare PARSED column names, not
+        # substrings: "tempf" is a substring of "tempinf" (and "humidity" of
+        # "humidityin"), so a stale index missing tempf passed the probe.
+        if row and row[0] and not set(_CHART_INDEX_COLS) <= _index_columns(row[0]):
             await db.execute("DROP INDEX idx_obs_chart")
             await db.execute("CREATE INDEX idx_obs_chart ON observations ("
                              + ", ".join(_CHART_INDEX_COLS) + ")")
@@ -316,21 +347,67 @@ async def upsert_device(mac: str, info: dict[str, Any]) -> None:
     # device.name doesn't flip the friendly name the operator (or first
     # source) set.
     insert_name = explicit_name or auto_name
+    # The UPDATE arm below is monotonic on purpose. A backfilled or
+    # out-of-order reading (SDR replay, a source posting history in a batch)
+    # used to drag devices.last_seen_ms *backwards* and rewrite lastData with
+    # older values — the device list then showed a stale "current" reading and
+    # the regressed last_seen_ms could fire a false device-down alert until the
+    # next fresh post. Observations are already protected by their (mac,
+    # dateutc_ms) primary key; the device row wasn't. `>=` not `>` so a
+    # same-timestamp repost from a second source still merges. A NULL incoming
+    # last_seen (a caller with no lastData) can't be ordered, so it refreshes
+    # the row but never regresses the timestamp — hence the MAX/COALESCE pair.
+    # `name` sits behind the same guard: an out-of-order post carrying an
+    # explicit device.name used to rename the device even while its older
+    # location/info were correctly rejected.
     async with connect() as db:
         await db.execute(
             """
             INSERT INTO devices (mac, name, location, info_json, last_seen_ms)
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(mac) DO UPDATE SET
-                name = COALESCE(?, devices.name, excluded.name),
-                location = excluded.location,
-                info_json = excluded.info_json,
-                last_seen_ms = excluded.last_seen_ms
+                name = CASE
+                    WHEN excluded.last_seen_ms IS NULL
+                      OR devices.last_seen_ms IS NULL
+                      OR excluded.last_seen_ms >= devices.last_seen_ms
+                    THEN COALESCE(?, devices.name, excluded.name)
+                    ELSE devices.name END,
+                location = CASE
+                    WHEN excluded.last_seen_ms IS NULL
+                      OR devices.last_seen_ms IS NULL
+                      OR excluded.last_seen_ms >= devices.last_seen_ms
+                    THEN excluded.location ELSE devices.location END,
+                info_json = CASE
+                    WHEN excluded.last_seen_ms IS NULL
+                      OR devices.last_seen_ms IS NULL
+                      OR excluded.last_seen_ms >= devices.last_seen_ms
+                    THEN excluded.info_json ELSE devices.info_json END,
+                last_seen_ms = MAX(
+                    COALESCE(devices.last_seen_ms, excluded.last_seen_ms),
+                    COALESCE(excluded.last_seen_ms, devices.last_seen_ms))
             """,
             (mac, insert_name, location, json.dumps(info), last_seen_ms,
              explicit_name),
         )
         await db.commit()
+
+
+def _scrub_nonfinite(v: Any) -> Any:
+    """Recursively replace NaN/±inf floats with None. Single choke point for
+    every writer (AWN poller, WeatherLink poller, /ingest): ingest scrubs its
+    own numeric blocks, but the pollers insert upstream JSON verbatim, and a
+    non-finite float survives into data_json as an invalid-JSON literal
+    (json.dumps defaults to allow_nan=True) that later 500s every response
+    containing the row (JSONResponse serializes with allow_nan=False)."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
+    if isinstance(v, dict):
+        return {k: _scrub_nonfinite(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_scrub_nonfinite(x) for x in v]
+    return v
 
 
 async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
@@ -339,6 +416,10 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
         return 0
     payload = []
     for r in rows:
+        # Scrub BEFORE reading dateutc: a poller row with dateutc=NaN would
+        # otherwise bind a non-finite timestamp into SQLite; scrubbed first it
+        # becomes None and the row is skipped like any other timestamp-less row.
+        r = _scrub_nonfinite(r)
         ts = r.get("dateutc")
         if ts is None:
             continue
@@ -418,7 +499,7 @@ async def list_devices() -> list[dict[str, Any]]:
     overrides = await device_locations()
     out: list[dict[str, Any]] = []
     for r in rows:
-        info = json.loads(r["info_json"]) if r["info_json"] else {}
+        info = _parse_json_col(r["info_json"])
         inner = info.get("info") or {}
         # Operator-set location wins over whatever the ingest path stamped.
         loc = overrides.get(r["mac"])
@@ -450,10 +531,18 @@ async def delete_device(mac: str) -> dict[str, int]:
         n_pref  = await _del("DELETE FROM device_alert_prefs WHERE mac = ?")
         n_state = await _del("DELETE FROM device_alert_state WHERE mac = ?")
         n_rule  = await _del("DELETE FROM alert_rule_state   WHERE mac = ?")
+        # device_location + smart_alert_state are keyed by MAC too. Leaving
+        # them meant a re-registered MAC silently inherited the old operator-
+        # set location, and a stale smart_alert_state.triggered=1 suppressed
+        # the "new" device's first frost/heat alert (the edge-trigger never
+        # sees a clear→triggered transition).
+        n_loc   = await _del("DELETE FROM device_location     WHERE mac = ?")
+        n_smart = await _del("DELETE FROM smart_alert_state   WHERE mac = ?")
         await db.commit()
     return {"devices": n_devs, "observations": n_obs,
             "alert_prefs": n_pref, "alert_state": n_state,
-            "rule_state": n_rule}
+            "rule_state": n_rule, "location": n_loc,
+            "smart_alert_state": n_smart}
 
 
 async def get_alert_states() -> dict[str, dict[str, Any]]:
@@ -770,9 +859,13 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
         )).fetchall()
     # Start from freshest row (preserves dateutc + any fields it has),
     # then fill in nulls from older rows in the lookback window.
-    out: dict[str, Any] = dict(json.loads(freshest_row["data_json"]))
+    out: dict[str, Any] = _parse_json_col(freshest_row["data_json"])
+    if not out:
+        # Corrupt freshest row — still expose its timestamp so the composite
+        # fill below has an anchor and the caller sees SOMETHING, not a 500.
+        out = {"dateutc": freshest_row["dateutc_ms"]}
     for r in recent_rows[1:]:
-        older = json.loads(r["data_json"])
+        older = _parse_json_col(r["data_json"])
         for k, v in older.items():
             if v is not None and out.get(k) is None:
                 out[k] = v
@@ -787,7 +880,6 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
     src_mac = settings.shared_barometer_source_mac
     needs_pressure = out.get("baromrelin") is None
     if src_mac and needs_pressure and src_mac != mac:
-        from . import config  # avoid circular at module import
         async with connect() as db:
             src_row = await (await db.execute(
                 "SELECT data_json FROM observations WHERE mac = ? "
@@ -795,7 +887,7 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
                 (src_mac,),
             )).fetchone()
         if src_row:
-            src = json.loads(src_row["data_json"])
+            src = _parse_json_col(src_row["data_json"])
             for k in ("baromrelin", "baromabsin"):
                 if out.get(k) is None and src.get(k) is not None:
                     out[k] = src[k]
@@ -836,7 +928,13 @@ def _derive_hourly_rain(rows: list[dict[str, Any]]) -> None:
         ref = ref_row.get("yearlyrainin")
         if ref is None:
             continue
-        val = round(max(0.0, float(yr) - float(ref)), 3)
+        try:
+            # data_json is source-controlled: a non-numeric yearlyrainin (the
+            # poller path stores upstream JSON verbatim) must skip this row,
+            # not 500 every chart window containing it.
+            val = round(max(0.0, float(yr) - float(ref)), 3)
+        except (TypeError, ValueError):
+            continue
         r["hourlyrainin"] = val
         # Rain has no meaningful hi/lo band; flatten it to the derived value so
         # the chart's band renders as the line rather than a stale zero.
@@ -917,7 +1015,8 @@ async def history(
                 """,
                 (mac, start_ms, end_ms, limit),
             )).fetchall()
-        parsed = [json.loads(r["data_json"]) for r in reversed(rows)]
+        parsed = [p for r in reversed(rows)
+                  if (p := _parse_json_col(r["data_json"]))]
         _derive_hourly_rain(parsed)
         return parsed
 

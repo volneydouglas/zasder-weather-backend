@@ -21,7 +21,11 @@
 #   ./bin/set-rain-offset.sh 5D:5D:01:00:02:C7 3.58 --ytd=0.73   # → offset 2.85
 
 set -euo pipefail
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$APP_DIR"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Absolute path to this script, resolved BEFORE the cd — a relative $0 stops
+# resolving after cd, and --help / the usage snippet read the script file.
+SELF="$APP_DIR/bin/$(basename "${BASH_SOURCE[0]}")"
+cd "$APP_DIR"
 err() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; }
 bold(){ printf '\033[1m%s\033[0m\n' "$*"; }
 
@@ -33,12 +37,14 @@ for arg in "$@"; do
   case "$arg" in
     --ytd=*) YTD="${arg#*=}" ;;
     --app=*) APP="${arg#*=}" ;;
-    -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Header comment block only, stopping at the first non-comment line — a
+    # fixed sed range overran the header and printed raw code.
+    -h|--help) awk 'NR==1 {next} !/^#/ {exit} {sub(/^# ?/, ""); print}' "$SELF"; exit 0 ;;
     --*) err "unknown flag: $arg"; exit 2 ;;
     *) if [ -z "$MAC" ]; then MAC="$arg"; elif [ -z "$LIFETIME" ]; then LIFETIME="$arg"; fi ;;
   esac
 done
-[ -n "$MAC" ] && [ -n "$LIFETIME" ] || { err "need <MAC> and <current-lifetime-rain-in>"; sed -n '11,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+[ -n "$MAC" ] && [ -n "$LIFETIME" ] || { err "need <MAC> and <current-lifetime-rain-in>"; sed -n '11,13p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2; }
 
 if [ -z "$APP" ] && [ -f fly.toml ]; then
   APP=$(grep -E '^app[[:space:]]*=' fly.toml | head -1 | sed -E 's/.*=[[:space:]]*"?([^"]+)"?.*/\1/')
@@ -53,7 +59,30 @@ else
   err "MAC '$MAC' is not 12 hex digits"; exit 1
 fi
 
-offset=$(python3 -c "print(round(float('$LIFETIME') - float('$YTD'), 4))")
+# Validate both numbers BEFORE they go anywhere near Python. They used to be
+# interpolated straight into Python source, so a stray quote was code
+# injection and plain garbage was a bare traceback instead of a message.
+for pair in "lifetime-rain:$LIFETIME" "--ytd:$YTD"; do
+  val="${pair#*:}"
+  if ! printf '%s' "$val" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+    err "${pair%%:*} value '$val' isn't a plain number (like 3.58)"; exit 2
+  fi
+done
+
+offset=$(python3 -c 'import sys; print(round(float(sys.argv[1]) - float(sys.argv[2]), 4))' "$LIFETIME" "$YTD")
+
+# offset = lifetime - ytd must not be negative: the backend computes
+# yearly_in = max(0, posted - offset), so a negative offset (from a --ytd
+# LARGER than the lifetime counter) would silently INFLATE yearly rain on
+# every post from now on.
+case "$offset" in
+  -*)
+    err "--ytd ($YTD) is larger than the lifetime counter ($LIFETIME) — that can't be right."
+    err "The lifetime value must be what the board is posting NOW (read it:"
+    err "curl .../api/devices/<MAC>/current) and --ytd your real year-to-date rain."
+    exit 2
+    ;;
+esac
 bold "Calibrating $mac_norm:  lifetime $LIFETIME - YTD $YTD  →  offset $offset"
 
 current=$(fly ssh console -a "$APP" -C 'printenv INGEST_YEARLY_RAIN_OFFSETS' 2>/dev/null | tr -d '\r' | tail -1 || true)

@@ -8,7 +8,12 @@
 #   bash bin/setup-macos.sh
 #
 # Undo everything:  bash bin/setup-macos.sh --uninstall
-set -uo pipefail
+#
+# -e as well as -u/pipefail: a failed cp/mkdir/plist-write/chmod used to
+# print its error and then march on to "Done." — a broken install reported
+# as success. Steps that are ALLOWED to fail are marked `|| true` (or run
+# inside if/&&/|| where -e doesn't apply).
+set -euo pipefail
 
 LABEL="com.zasder.wll-poller"
 SUPPORT_DIR="$HOME/Library/Application Support/ZasderWeather"
@@ -40,10 +45,111 @@ ask() {  # ask <varname> <prompt>
   printf -v "$__var" '%s' "$__val"
 }
 
+# Secrets go through this instead: -s stops the token from being echoed to
+# the terminal, scrollback, and any session recording. The trailing echo
+# restores the newline that -s swallows.
+ask_secret() {  # ask_secret <varname> <prompt>
+  local __var="$1" __prompt="$2" __val
+  if ! read -r -s -p "$__prompt" __val; then
+    echo
+    bad "Input closed — nothing was installed. Re-run when you're ready."
+    exit 1
+  fi
+  echo
+  printf -v "$__var" '%s' "$__val"
+}
+
+# ── Backend-URL validation ────────────────────────────────────────────────
+# Normalizes the scheme, strips a trailing slash, and refuses cleartext
+# http:// to anything that isn't a private/LAN address (the poller sends
+# "Authorization: Bearer <INGEST_TOKEN>" on every tick — over public http
+# that write credential is readable by anyone on the path).
+#
+# A function (not inline in the prompt loop) so `--check-url` below can
+# drive it from tests. Sets VALIDATED_URL on success; on failure sets
+# URL_FAIL_REASON (empty|scheme|userinfo|cleartext) and URL_FAIL_HOST.
+validate_backend_url() {  # validate_backend_url <url>
+  local url="$1" url_auth url_host o1 o2 rest lan_ok
+  VALIDATED_URL=""; URL_FAIL_REASON=""; URL_FAIL_HOST=""
+  url="${url%/}"
+  # Normalise the scheme's case before anything inspects it. "HTTP://host"
+  # otherwise fell through to the catch-all below and became
+  # "https://HTTP://host" — nonsense that then skipped the cleartext check.
+  case "$url" in
+    [Hh][Tt][Tt][Pp]://*)
+      url="http://${url#*://}" ;;
+    [Hh][Tt][Tt][Pp][Ss]://*)
+      url="https://${url#*://}" ;;
+    "") URL_FAIL_REASON="empty"; return 1 ;;
+    *://*)
+      URL_FAIL_REASON="scheme"; return 1 ;;
+    *) url="https://$url" ;;
+  esac
+  if [ "${url#http://}" != "$url" ]; then
+    # Resolve the AUTHORITY down to a bare host before judging it. Matching
+    # the authority string directly let two public hosts through:
+    #   10.attacker.example        — matched the old "10.*" glob, but "10."
+    #                                here is a DNS label, not an octet
+    #   10.0.0.1@attacker.example  — userinfo; the real host is after the "@"
+    url_auth="${url#http://}"; url_auth="${url_auth%%/*}"
+    case "$url_auth" in
+      *@*) URL_FAIL_REASON="userinfo"; return 1 ;;
+    esac
+    # Strip the port. Bracketed IPv6 keeps its brackets.
+    case "$url_auth" in
+      \[*\]*) url_host="${url_auth%%\]*}]" ;;
+      *)       url_host="${url_auth%%:*}" ;;
+    esac
+
+    lan_ok=0
+    # A dotted quad is checked NUMERICALLY, so "10.attacker.example" — which
+    # is not four numeric octets — can never pass as 10.0.0.0/8.
+    if printf '%s' "$url_host" | /usr/bin/grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+      o1="${url_host%%.*}"; rest="${url_host#*.}"
+      o2="${rest%%.*}"
+      case "$o1" in
+        10)  lan_ok=1 ;;
+        127) lan_ok=1 ;;
+        192) [ "$o2" = "168" ] && lan_ok=1 ;;
+        172) { [ "$o2" -ge 16 ] && [ "$o2" -le 31 ]; } 2>/dev/null && lan_ok=1 ;;
+      esac
+    else
+      case "$url_host" in
+        localhost|\[::1\]|::1)   lan_ok=1 ;;
+        *.local)                 lan_ok=1 ;;   # mDNS, link-local by definition
+        # Private IPv6: ULA fc00::/7 ([fcxx:...], [fdxx:...]) and link-local
+        # fe80::/10. These are LAN by definition, same as the IPv4 ranges
+        # above — the original allowlist covered only v4 and rejected every
+        # v6 LAN backend as "not private".
+        \[[Ff][CcDd]*)           lan_ok=1 ;;
+        \[[Ff][Ee]8*|\[[Ff][Ee]9*|\[[Ff][Ee][AaBb]*) lan_ok=1 ;;
+      esac
+    fi
+
+    if [ "$lan_ok" -ne 1 ]; then
+      URL_FAIL_REASON="cleartext"; URL_FAIL_HOST="$url_host"; return 1
+    fi
+  fi
+  VALIDATED_URL="$url"
+  return 0
+}
+
 unload_agent() {
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null \
     || launchctl unload "$PLIST" 2>/dev/null || true
 }
+
+# Hidden test seam: validate one URL and exit. Prints the normalized URL on
+# success; prints the failure reason (empty|scheme|userinfo|cleartext) on
+# failure. Lets the test suite exercise the cleartext allowlist without
+# driving the interactive prompts.
+if [ "${1:-}" = "--check-url" ]; then
+  if validate_backend_url "${2:-}"; then
+    echo "$VALIDATED_URL"; exit 0
+  else
+    echo "$URL_FAIL_REASON"; exit 1
+  fi
+fi
 
 if [ "${1:-}" = "--uninstall" ]; then
   bold "Removing the WeatherLink Live poller"
@@ -87,7 +193,12 @@ while :; do
   WLL_HOST="$(echo "$WLL_HOST" | tr -d '[:space:]')"
   [ -z "$WLL_HOST" ] && { bad "Please enter an address."; continue; }
   printf '  checking http://%s/v1/current_conditions ... ' "$WLL_HOST"
-  if curl -fsS -m 8 "http://$WLL_HOST/v1/current_conditions" 2>/dev/null | grep -q '"data"'; then
+  # Match WLL-specific response keys, not the bare substring "data" — any
+  # router/captive-portal page containing the word "data" used to pass as a
+  # WeatherLink Live. "did" (device id) is present even when no sensors have
+  # reported yet; "data_structure_type" appears once conditions exist.
+  if curl -fsS -m 8 "http://$WLL_HOST/v1/current_conditions" 2>/dev/null \
+      | grep -qE '"data_structure_type"|"did"'; then
     printf '\033[32mreached it\033[0m\n'; break
   fi
   printf '\033[31mno response\033[0m\n'
@@ -106,12 +217,25 @@ echo
 while :; do
   ask BACKEND_URL "  Backend URL: "
   BACKEND_URL="$(echo "$BACKEND_URL" | tr -d '[:space:]')"
-  BACKEND_URL="${BACKEND_URL%/}"
-  case "$BACKEND_URL" in
-    http://*|https://*) : ;;
-    "") bad "Please enter a URL."; continue ;;
-    *) BACKEND_URL="https://$BACKEND_URL"; info "assuming https:// → $BACKEND_URL" ;;
-  esac
+  HAD_SCHEME=1
+  case "$BACKEND_URL" in *://*) : ;; "") : ;; *) HAD_SCHEME=0 ;; esac
+  if ! validate_backend_url "$BACKEND_URL"; then
+    case "$URL_FAIL_REASON" in
+      empty)  bad "Please enter a URL." ;;
+      scheme) bad "Only http:// and https:// are supported." ;;
+      userinfo)
+        bad "That address has a username in it (the part before \"@\")."
+        info "Enter just the host, like http://192.168.1.50:8080" ;;
+      cleartext)
+        bad "http:// would send your ingest token in cleartext on every reading."
+        info "Only private/LAN addresses may use http:// — this one ($URL_FAIL_HOST) is"
+        info "not one. Use the https:// address instead; Fly.io backends serve https:"
+        info "    https://$URL_FAIL_HOST" ;;
+    esac
+    continue
+  fi
+  BACKEND_URL="$VALIDATED_URL"
+  [ "$HAD_SCHEME" = 0 ] && info "assuming https:// → $BACKEND_URL"
   printf '  checking %s/healthz ... ' "$BACKEND_URL"
   if curl -fsS -m 12 "$BACKEND_URL/healthz" >/dev/null 2>&1; then
     printf '\033[32mreached it\033[0m\n'; break
@@ -145,7 +269,9 @@ info "inside the folder you downloaded. To see it, run:"
 info "    open \"\$(find ~ -name zasder-install-summary.txt -maxdepth 6 2>/dev/null | head -1)\""
 echo
 while :; do
-  ask INGEST_TOKEN "  INGEST_TOKEN: "
+  # ask_secret: the token is a write credential — don't echo it into the
+  # terminal, scrollback, or a recorded session.
+  ask_secret INGEST_TOKEN "  INGEST_TOKEN (input hidden): "
   INGEST_TOKEN="$(echo "$INGEST_TOKEN" | tr -d '[:space:]')"
   [ -n "$INGEST_TOKEN" ] && break
   bad "Please paste the token."
@@ -188,12 +314,20 @@ fi
 
 # Send exactly one real reading through the poller's own code path, so a bad
 # token surfaces HERE instead of as silence hours from now.
+#
+# Capture STDOUT ONLY. The old `2>&1` merged the poller's log lines (which go
+# to stderr — e.g. the multi-transmitter warning that fires on the first
+# to_observation() call) into RESULT ahead of the status token, so the exact-
+# match case below stopped recognising "HTTP 401" and a bad token installed
+# silently. Stderr now passes through to the terminal, where a warning is
+# useful anyway. The status token is printed on the LAST stdout line, and the
+# patterns match anywhere in RESULT as a second line of defence.
 echo
 printf '  sending one test reading ... '
 RESULT=$(WLL_HOST="$WLL_HOST" BACKEND_URL="$BACKEND_URL" \
          INGEST_TOKEN="$INGEST_TOKEN" WLL_DEVICE_NAME="$WLL_DEVICE_NAME" \
          WLL_DEVICE_MAC="$WLL_DEVICE_MAC" \
-         "$PYBIN" - "$SRC_DIR" <<'PY' 2>&1
+         "$PYBIN" - "$SRC_DIR" <<'PY'
 import sys, urllib.error
 sys.path.insert(0, sys.argv[1])
 import poller
@@ -203,21 +337,26 @@ try:
         print("NODATA"); raise SystemExit
     poller.post_observation(obs)
     t = (obs.get("outdoor") or {}).get("tempf")
-    print(f"OK {t}")
+    # OKDATA = accepted but the ISS hasn't reported a temperature yet.
+    # Printing "OK None" here read as "it read None°F".
+    print(f"OK {t}" if t is not None else "OKDATA")
 except urllib.error.HTTPError as e:
     print(f"HTTP {e.code}")
 except Exception as e:
     print(f"ERR {e}")
 PY
-)
+) || true
 case "$RESULT" in
-  OK*)      printf '\033[32maccepted\033[0m — it read %s°F\n' "${RESULT#OK }" ;;
-  "HTTP 401"|"HTTP 403")
+  *"HTTP 401"*|*"HTTP 403"*)
             printf '\033[31mrejected\033[0m\n'
             bad "The backend refused that token."
             info "Check you used INGEST_TOKEN (not API_TOKEN — they're different)."
             exit 1 ;;
-  NODATA)   printf '\033[33mno sensor data yet\033[0m\n'
+  *OKDATA*) printf '\033[32maccepted\033[0m — no temperature reading yet\n'
+            info "The backend accepted the post; the station hasn't reported a"
+            info "temperature yet. Continuing — it'll fill in as sensors report." ;;
+  "OK "*)   printf '\033[32maccepted\033[0m — it read %s°F\n' "${RESULT#OK }" ;;
+  *NODATA*) printf '\033[33mno sensor data yet\033[0m\n'
             info "The WeatherLink Live answered but hasn't heard from the weather"
             info "station yet. Continuing — it'll start posting once it does." ;;
   *)        printf '\033[33m%s\033[0m\n' "$RESULT"
@@ -249,11 +388,11 @@ cat > "$PLIST" <<PLISTEOF
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>WLL_HOST</key><string>$WLL_HOST</string>
-    <key>BACKEND_URL</key><string>$BACKEND_URL</string>
-    <key>INGEST_TOKEN</key><string>$INGEST_TOKEN</string>
+    <key>WLL_HOST</key><string>$(xml_escape "$WLL_HOST")</string>
+    <key>BACKEND_URL</key><string>$(xml_escape "$BACKEND_URL")</string>
+    <key>INGEST_TOKEN</key><string>$(xml_escape "$INGEST_TOKEN")</string>
     <key>WLL_DEVICE_NAME</key><string>$(xml_escape "$WLL_DEVICE_NAME")</string>
-    <key>WLL_DEVICE_MAC</key><string>$WLL_DEVICE_MAC</string>
+    <key>WLL_DEVICE_MAC</key><string>$(xml_escape "$WLL_DEVICE_MAC")</string>
     <key>WLL_POLL_SECONDS</key><string>10</string>
   </dict>
   <key>ProcessType</key><string>Background</string>
@@ -267,8 +406,11 @@ PLISTEOF
 chmod 600 "$PLIST"          # it holds your token
 ok "created the startup entry"
 
+# `|| true` matters under set -e: if BOTH bootstrap and load fail we still
+# want to reach the diagnostics below ("poller didn't start — see the log")
+# rather than dying silently between them.
 launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null \
-  || launchctl load -w "$PLIST" 2>/dev/null
+  || launchctl load -w "$PLIST" 2>/dev/null || true
 sleep 3
 if launchctl list 2>/dev/null | grep -q "$LABEL"; then
   ok "poller is running"

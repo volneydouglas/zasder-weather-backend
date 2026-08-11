@@ -73,9 +73,7 @@ simple and avoids the field-loss bug we hit with WiFiManager params.
 ### Step 1 — Wi-Fi
 
 After flashing, the board comes up as a Wi-Fi access point named
-**`ZasderLilyGO`** (WPA2 password: **`zasder-setup`** — it's a fixed,
-publicly-documented password; its job is only to keep your home Wi-Fi
-credentials off an open network while you type them). Join it from a
+**`ZasderLilyGO`** (WPA2 password: **`zasder-setup`**). Join it from a
 phone or laptop — a captive portal
 opens automatically (or browse to `http://192.168.4.1`). Fill in your
 home Wi-Fi SSID + password and hit Save. The board reboots, joins your
@@ -88,6 +86,7 @@ From any device on the same LAN:
 
 ```sh
 curl -X POST http://<board-ip-or-mdns>/provision \
+  -H "X-Setup-Key: $SETUP_KEY" \
   --data-urlencode "backend_url=https://your-backend.example.com" \
   --data-urlencode "ingest_token=$INGEST_TOKEN"
 ```
@@ -95,6 +94,18 @@ curl -X POST http://<board-ip-or-mdns>/provision \
 Replace `$INGEST_TOKEN` with the value of `INGEST_TOKEN` from your
 backend's environment. The board immediately starts POSTing
 observations every time it decodes a packet.
+
+`backend_url` must be a full `https://` URL (the firmware always posts
+over TLS; a plain-http backend needs a `TLS_INSECURE` build — see
+Security below). Trailing slashes are stripped automatically.
+
+`$SETUP_KEY` is the 8-character key on the board's **OLED** (and in the
+serial boot log) while it is unprovisioned — see [Setup key](#setup-key-required-for-provisioning).
+**The first provision requires it.** It used to be anonymous, which meant
+whoever on the LAN reached a fresh board first could point it at their own
+backend and lock you out of your own hardware: once provisioned, `/reset`
+needs *their* token, so recovery was a physical USB NVS erase. Requiring the
+key means only somebody who can see the board can claim it.
 
 The status page at `http://<board>/status` returns JSON: IP, uptime,
 packet counts, last-RX info, last-POST result, and the `forward_all`
@@ -121,12 +132,52 @@ of the rtl_433 model name folded into the sensor id) and are named
 transmissions (garage doors, TPMS, …) are filtered by field shape. The
 flag persists in NVS across reboots.
 
+### Security of the config plane
+
+Worth stating plainly, because the code can't fix it:
+
+* **The config server is plain HTTP on port 80.** The ingest token and the
+  setup key cross your LAN unencrypted every time you use them — in the
+  `Authorization` / `X-Setup-Key` headers and in the `ingest_token` form
+  field. Anyone passively watching that Wi-Fi can capture them and then fully
+  control the board. Provision from a network you trust, and treat a
+  provisioning session on a shared or public network as a token disclosure.
+  (A TLS server is possible on an ESP32 but is heavy, and a self-signed cert
+  turns every `curl` into a `-k` — deliberately not done.)
+* **The setup AP password (`zasder-setup`) is fixed and published.** WPA2-PSK
+  session keys derive from the PSK plus the handshake, so anyone in RF range
+  who has read this README can decrypt what you type into the captive portal,
+  including your home Wi-Fi password. It keeps the portal off the open-network
+  list and stops the casual passer-by; it is not a secret. The window is small
+  — but note the window is wider than "first boot only": `autoConnect()` raises
+  the portal whenever it cannot get onto the saved network, not just when no
+  credentials are stored. A wrong password, a router that is down or out of
+  range, or a transient association failure all bring the AP up for the 300s
+  timeout before the board gives up and reboots. These boards have been seen
+  logging `AUTH_FAIL (reason 202)` on an otherwise healthy network, so treat
+  it as something that can happen unattended, not only while you are setting
+  the board up.
+* **`GET /status` is deliberately unauthenticated.** It's the first thing an
+  operator reaches for when a board misbehaves — often from a phone with no
+  way to attach an auth header — so it stays open. It never returns the token
+  or the setup key (it reports `has_token` and `token_len` only), but it does
+  disclose the backend URL, the board's MAC, and packet counters to anyone on
+  the LAN. Accepted for a home-LAN device; if the board lives on a shared
+  network, treat that metadata as visible.
+
 ### Re-provisioning
 
-The first successful `/provision` **locks** the board. Subsequent
-changes (rotate token, repoint backend URL, `/reset`, `/identify`)
-require proof-of-ownership by re-presenting the **current** ingest
-token. Two ways:
+Every `/provision` needs proof-of-ownership — there is no anonymous window
+at any point:
+
+* **No ingest token on the board** (fresh, or just wiped by the 401
+  auto-recovery): the **setup key** is the only credential that works, since
+  there is no token to present. See [Setup key](#setup-key-required-for-provisioning).
+* **Token present**: either the **current ingest token** or the setup key.
+
+The first successful `/provision` also **locks** the board, so subsequent
+changes (rotate token, repoint backend URL, `/reset`, `/identify`) need the
+same proof. Two ways to present the current token:
 
 ```sh
 # Header form (curl / automation):
@@ -146,19 +197,28 @@ that doesn't know the current token can't repoint the board to a
 malicious backend and capture the next post. `/status` stays open
 (read-only diagnostic; reports `provisioned: true|false`).
 
-### Setup key (re-pair after a token wipe)
+### Setup key (required for provisioning)
 
 Each board mints a random 8-char **setup key** on first boot, stored in
 NVS separately from the token so it survives a token wipe. It's a second
 proof-of-ownership credential: any `/provision` call accepts **either**
-the current ingest token **or** the setup key. Its job is recovery — if
-the token gets wiped (see auto-wipe below) the current token is gone, so
-the setup key is the only thing that re-opens `/provision`. The board
-stays **locked** the whole time; there is no anonymous re-provisioning
-window.
+the current ingest token **or** the setup key.
 
-The setup key is shown on the board's **OLED** (only while a re-pair is
-pending) and printed to the **serial** log at every boot — it is never
+It is required for **both** provisioning events:
+
+* **The first provision on a fresh board.** There is no ingest token yet, so
+  this key is the only thing that opens it. This used to be anonymous, which
+  meant whoever reached an unprovisioned board first could claim it.
+* **Re-pairing after a token wipe** (see auto-wipe below). The token is gone,
+  so the key is again the only credential left.
+
+The board is never anonymously provisionable, at any point in its life.
+
+The setup key is shown on the board's **OLED** and printed to the **serial**
+log *while a provision is pending* — the boot that mints it, an unprovisioned
+board, or immediately after a 401 wipe. It is deliberately silent during
+normal operation, because it authorizes provisioning AND `/reset`, so a
+retained or forwarded log would hand over control of the board. It is never
 exposed over HTTP. Read it off the device, then:
 
 ```sh
@@ -170,7 +230,10 @@ curl -X POST http://<board>/provision \
 ```
 
 (`setup_key=` as a form field also works — that's what the board's own HTML
-form uses — but prefer the header from the command line.)
+form uses — but prefer the header from the command line. Note the ESP32
+`WebServer` can't tell a POST-body field from a URL `?query=` parameter, so
+a key in the query string is technically accepted too — never send it that
+way; a URL-borne credential lingers in shell history and proxy logs.)
 
 If you lost **both** the token and the setup key: USB-reflash with
 `pio run -t erase` to wipe NVS, then re-flash — a fresh setup key is
@@ -185,6 +248,20 @@ curl -H "Authorization: Bearer $API_TOKEN" "$BACKEND_URL/api/devices"
 Look for `5D:5D:01:...` (Atlas) or `5D:5D:02:...` (Fineoffset outdoor).
 The synthetic-MAC scheme means the same physical sensor lands on the
 same device row no matter which receiver(s) catch it.
+
+## Tests
+
+```sh
+pio test -e native        # host-side, no board or serial port needed
+```
+
+The security-critical pure logic is extracted into Arduino-free headers
+so it can be pinned off-device: the `/provision` credential matrix
+(`src/auth_logic.h` — first-provision setup-key requirement, token-or-key
+acceptance, post-wipe re-pair, empty-candidate rejection) and the
+401-token-wipe state machine (`src/post_fsm.h` — five *consecutive* 401s
+wipe; 2xx/5xx/transport errors break the streak). Tests live in
+`test/test_native/`.
 
 ## OLED status display
 
@@ -239,14 +316,22 @@ it lives somewhere you don't routinely check:
 
 ## Security
 
-- **TLS cert pinning** — ISRG Root X1 (Let's Encrypt's anchor) is
-  baked into `src/root_ca.h`. The firmware calls
+- **TLS cert pinning** — ISRG Root X1 **and** X2 (Let's Encrypt's RSA
+  and ECDSA anchors) are baked into `src/root_ca.h`. The firmware calls
   `setCACert(ZASDER_ROOT_CA)`, so the backend's cert chain must
-  validate to that root. Fly.io edge + any custom domain provisioned
-  via `fly certs` qualifies (LE-issued). If you're running a
-  self-signed dev backend, set `-DTLS_INSECURE=1` in
-  `platformio.ini`'s `build_flags` — opt-in only; insecure TLS
-  exposes the ingest token to anyone on the Wi-Fi path.
+  validate to one of those roots. Fly.io edge + any custom domain
+  provisioned via `fly certs` qualifies (LE-issued). Both roots are
+  pinned because there is no OTA path: a chain change on the backend
+  host would otherwise brick posting until a physical USB reflash, so
+  the pin set covers LE's announced ECDSA migration too. A backend that
+  moves off Let's Encrypt entirely still requires a reflash with its
+  root added. If you're running a self-signed dev backend, set
+  `-DTLS_INSECURE=1` in `platformio.ini`'s `build_flags` — opt-in only;
+  insecure TLS exposes the ingest token to anyone on the Wi-Fi path.
+- **`backend_url` must be `https://`** — `/provision` rejects other
+  schemes (unless built with `TLS_INSECURE`), so a typo'd plain-http
+  URL fails loudly at provision time instead of failing the TLS
+  handshake hours later when nobody is watching.
 - **Provisioning lock** — first successful `/provision` flips an NVS
   flag; from then on `/provision`, `/reset`, and `/identify` require
   the current ingest token as Bearer auth (or `current_token=` form
@@ -254,13 +339,17 @@ it lives somewhere you don't routinely check:
   secret minted on first boot for recovery after a token wipe. The lock
   is never dropped, so there's no anonymous re-provisioning window on the
   LAN. `/status` stays open.
-- **Token in NVS** — secrets live in the ESP32's NVS partition via
-  Arduino `Preferences`. NVS is **not encrypted by default** — this
-  build does not enable ESP-IDF flash encryption. A physical-access
-  attacker can desolder + read the flash and recover the token. If
-  that's in your threat model, enable flash encryption + secure boot
-  per Espressif's flash-encryption guide and rebuild; the firmware
-  doesn't depend on either being on or off.
+- **Secrets in NVS are plaintext** — the ingest token, the home Wi-Fi
+  credentials, **and the setup key** all live in the ESP32's NVS
+  partition via Arduino `Preferences`, and NVS is **not encrypted by
+  default** — this build enables neither ESP-IDF flash encryption nor
+  secure boot. Anyone with brief USB access can `esptool.py read_flash`
+  and recover all three (no desoldering needed). That also bounds the
+  setup key's "physical-access secret" claim: it proves the caller can
+  *see* the board (OLED/serial), but an attacker who can *plug into*
+  the board gets everything anyway. If that's in your threat model,
+  enable flash encryption + secure boot per Espressif's guide and
+  rebuild; the firmware doesn't depend on either being on or off.
 - **Auto-wipe on 5x 401** — if the backend rejects 5 consecutive posts
   with 401, the firmware wipes the stale token from NVS but keeps the
   board **locked** (the `provisioned` flag stays set). It re-pairs via

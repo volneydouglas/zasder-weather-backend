@@ -692,3 +692,326 @@ def test_public_dashboard_fmt_keeps_units():
     assert _pdash._fmt(29.92, "inHg") == "29.92 inHg"
     assert _pdash._fmt(66.0, "") == "66.00"      # chart axis label stays bare
     assert _pdash._fmt(None, "°F") == "—"
+
+
+# ───────────────── _flatten offset-bearing timestamps (R2-25) ─────────────────
+
+def test_flatten_converts_numeric_offset_to_utc():
+    """An offset-bearing ISO timestamp ("+02:00") parses AWARE; the fix
+    converts it with .astimezone(utc). A regression to .replace(tzinfo=utc)
+    would re-LABEL the wall clock instead of converting — a silent 2-hour
+    stored-timestamp error the naive/Z-suffix tests can't catch."""
+    flat = ingest._flatten({**_payload(tempf=70),
+                            "timestamp_utc": "2026-05-14T03:09:47+02:00"})
+    # Same instant as 2026-05-14T01:09:47Z.
+    assert flat["dateutc"] == 1778720987000
+
+
+# ───────────────── tokens_match truth table + token validators (R2-162) ─────────────────
+# tokens_match sits at EVERY auth gate; a regression here is an auth bypass.
+
+def test_tokens_match_truth_table():
+    from app.config import tokens_match
+    # Empty/None on either side must never authenticate.
+    assert tokens_match("", "secret") is False
+    assert tokens_match("secret", None) is False
+    assert tokens_match("secret", "") is False
+    assert tokens_match("", "") is False
+    # str vs str.
+    assert tokens_match("secret", "secret") is True
+    assert tokens_match("secret", "other") is False
+    # Iterable membership (the valid_api_tokens set shape).
+    assert tokens_match("secret", ("other", "secret")) is True
+    assert tokens_match("secret", ("a", "b")) is False
+    # Empty-string candidates in the set are skipped, not matched.
+    assert tokens_match("secret", ("", "secret")) is True
+    # Deliberate no-early-exit: a match FOLLOWED by non-matches still wins
+    # (the loop checks every candidate; result must not be clobbered).
+    assert tokens_match("secret", ("secret", "zzz")) is True
+
+
+def test_token_validator_rejects_placeholders():
+    """A deploy that never edited .env.example must refuse to start, not run
+    live with 'change-me' as the API credential."""
+    import pytest
+    from pydantic import ValidationError
+    from app.config import Settings
+    for bad in ("change-me", "generate-a-long-random-string",
+                "replace-with-anything-here", "your-token-here"):
+        with pytest.raises(ValidationError):
+            Settings(api_token=bad)
+    with pytest.raises(ValidationError):
+        Settings(api_token="a" * 32, ingest_token="Change-Me")   # case-insensitive
+    # A LONG placeholder (>= 32 chars) isolates the placeholder check from the
+    # length floor — without this case, deleting the placeholder branch passes
+    # because every short placeholder also trips the length check.
+    with pytest.raises(ValidationError, match="placeholder"):
+        Settings(api_token="replace-with-your-own-long-random-token")
+
+
+def test_token_validator_enforces_length_floor_with_test_exemption():
+    import pytest
+    from pydantic import ValidationError
+    from app.config import Settings
+    with pytest.raises(ValidationError):
+        Settings(api_token="a" * 31)                 # 31 chars: too short
+    assert Settings(api_token="a" * 32).api_token == "a" * 32
+    with pytest.raises(ValidationError):
+        Settings(api_token="a" * 32, ingest_token="b" * 20)
+    # `test-` prefix is exempt so unit tests keep readable tokens.
+    assert Settings(api_token="test-short").api_token == "test-short"
+
+
+def test_token_validator_rejects_identical_api_and_ingest_tokens():
+    """api_token == ingest_token would make revoking one revoke both —
+    the model validator must refuse the config outright."""
+    import pytest
+    from pydantic import ValidationError
+    from app.config import Settings
+    with pytest.raises(ValidationError):
+        Settings(api_token="a" * 32, ingest_token="a" * 32)
+    s = Settings(api_token="a" * 32, ingest_token="b" * 32)
+    assert s.ingest_token == "b" * 32
+
+
+def test_token_validator_blank_handling():
+    """Blank secondary tokens coerce to None (feature off); a blank api_token
+    must fail loudly at boot — it used to start the app fine and then 401
+    every /api/* request with zero startup diagnostic."""
+    import pytest
+    from pydantic import ValidationError
+    from app.config import Settings
+    s = Settings(api_token="a" * 32, ingest_token="", reviewer_api_token="  ")
+    assert s.ingest_token is None and s.reviewer_api_token is None
+    with pytest.raises(ValidationError):
+        Settings(api_token="")
+    with pytest.raises(ValidationError):
+        Settings(api_token="   ")
+
+
+# ───────── WeatherLink client must never leak credentials into errors (R2-24) ─────────
+
+def test_weatherlink_client_error_has_no_credentials():
+    """Mirror of test_ambient_client_error_has_no_credentials: the WL api-key
+    travels as a QUERY PARAM, and httpx's HTTPStatusError message embeds the
+    full URL — a refactor back to r.raise_for_status() would write
+    WEATHERLINK_API_KEY into the poller logs on every 401/5xx."""
+    import asyncio
+    import httpx
+    from app.weatherlink_client import WeatherLinkClient, WeatherLinkError
+
+    KEY, SECRET = "SECRET_WL_KEY_123", "SECRET_WL_SECRET_456"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert KEY in str(request.url)          # the key really is on the wire
+        return httpx.Response(401, text="unauthorized")
+
+    c = WeatherLinkClient(KEY, SECRET)
+    c._http = httpx.AsyncClient(base_url="https://api.weatherlink.com/v2",
+                                transport=httpx.MockTransport(handler))
+    try:
+        asyncio.run(c.list_stations())
+        raise AssertionError("expected WeatherLinkError")
+    except WeatherLinkError as e:
+        msg = str(e)
+        assert KEY not in msg and SECRET not in msg, f"credentials leaked: {msg}"
+        assert "401" in msg and "/stations" in msg   # still useful for debugging
+
+
+def test_weatherlink_client_non_json_error_has_no_credentials():
+    """The non-JSON branch raises too — and must be equally scrubbed."""
+    import asyncio
+    import httpx
+    from app.weatherlink_client import WeatherLinkClient, WeatherLinkError
+
+    KEY = "SECRET_WL_KEY_123"
+    c = WeatherLinkClient(KEY, "sec")
+    c._http = httpx.AsyncClient(
+        base_url="https://api.weatherlink.com/v2",
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, text="<html>")))
+    try:
+        asyncio.run(c.list_stations())
+        raise AssertionError("expected WeatherLinkError")
+    except WeatherLinkError as e:
+        assert KEY not in str(e) and "/stations" in str(e)
+
+
+# ───────────────── APNs env resolution + BadDeviceToken pruning (R2-174) ─────────────────
+
+def test_resolve_env_stored_wins_and_refuses_to_guess(monkeypatch):
+    """The token's own recorded env always wins; when neither the token nor
+    APNS_ENV names a known host the caller must get (None, False) and refuse
+    to send — guessing sandbox once wiped every production token (CR-19)."""
+    monkeypatch.setattr(apns.settings, "apns_env", "production")
+    assert apns._resolve_env({"env": "sandbox"}) == ("sandbox", True)
+    assert apns._resolve_env({"env": ""}) == ("production", False)
+    assert apns._resolve_env({}) == ("production", False)
+    monkeypatch.setattr(apns.settings, "apns_env", "staging")   # typo'd env
+    assert apns._resolve_env({}) == (None, False)
+    assert apns._resolve_env({"env": "sandbox"}) == ("sandbox", True)
+
+
+def _mock_apns_transport(monkeypatch, handler):
+    """Route apns._push_tokens' AsyncClient through an httpx.MockTransport."""
+    import httpx
+    real = httpx.AsyncClient
+    def factory(*a, **kw):
+        return real(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(apns.httpx, "AsyncClient", factory)
+    monkeypatch.setattr(apns, "_provider_jwt", lambda: "test-jwt")
+
+
+def test_push_tokens_refuses_to_guess_host(monkeypatch):
+    """With an unresolvable env the send is counted failed WITHOUT any HTTP
+    call — not defaulted to some host."""
+    import asyncio
+    import httpx
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not contact any APNs host on a guessed env")
+    _mock_apns_transport(monkeypatch, handler)
+    monkeypatch.setattr(apns.settings, "apns_env", "staging")
+    res = asyncio.run(apns._push_tokens([{"token": "a" * 64, "env": ""}], "T", "B"))
+    assert res == {"sent": 0, "dead": [], "failed": 1}
+
+
+def test_push_tokens_bad_device_token_not_pruned_on_guessed_env(monkeypatch):
+    """400 BadDeviceToken also means "right token, wrong environment". When the
+    env was GUESSED from APNS_ENV (not recorded by the token itself) the token
+    must land in `failed` (retried), never in `dead` (send_to_all deletes those
+    — unrecoverable on a guess)."""
+    import asyncio
+    import httpx
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"reason": "BadDeviceToken"})
+    _mock_apns_transport(monkeypatch, handler)
+    monkeypatch.setattr(apns.settings, "apns_env", "production")
+    res = asyncio.run(apns._push_tokens([{"token": "a" * 64, "env": ""}], "T", "B"))
+    assert res["failed"] == 1 and res["dead"] == []          # kept for retry
+
+
+def test_push_tokens_bad_device_token_pruned_when_env_from_token(monkeypatch):
+    """Same 400 — but when the token recorded its OWN env there is no
+    ambiguity, so it is legitimately dead and returned for pruning."""
+    import asyncio
+    import httpx
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "api.push.apple.com" in str(request.url)      # production host
+        return httpx.Response(400, json={"reason": "BadDeviceToken"})
+    _mock_apns_transport(monkeypatch, handler)
+    monkeypatch.setattr(apns.settings, "apns_env", "production")
+    res = asyncio.run(apns._push_tokens(
+        [{"token": "b" * 64, "env": "production"}], "T", "B"))
+    assert res["dead"] == ["b" * 64] and res["failed"] == 0
+
+
+# ───────────────── weatherlink_poller.build_payload contract (R2-175) ─────────────────
+# Exactly the bug class backend CR-02/CR-03 were: a silently mis-named key
+# means the backend stores None and the iOS tile goes blank.
+
+from app import weatherlink_poller as _wp  # noqa: E402
+
+
+def _wl_current(iss_extra=None, sensor_type=43):
+    iss = {"ts": 1778720987, "tx_id": 2, "temp": 88.4, "hum": 40.2,
+           "dew_point": 60.1, "heat_index": 90.2, "uv_index": 5.5,
+           "solar_rad": 812,
+           "wind_speed_avg_last_2_min": 4.2, "wind_speed_last": 0.0,
+           "wind_speed_hi_last_2_min": 9.0,
+           "wind_dir_scalar_avg_last_2_min": 247.6, "wind_dir_last": 10,
+           "rainfall_year_in": 1.02, "rainfall_day_in": 0.04,
+           "rainfall_last_60_min_in": 0.01}
+    iss.update(iss_extra or {})
+    return {"sensors": [
+        {"sensor_type": sensor_type, "data": [iss]},
+        {"sensor_type": 365, "data": [{"temp_in": 75.1, "hum_in": 41.0}]},
+        {"sensor_type": 242, "data": [{"bar_sea_level": 29.92}]},
+    ]}
+
+
+def test_wl_build_payload_flattens_to_non_null_row():
+    """The emitted payload, fed through the real ingest flattener, must yield a
+    non-null value for every mapped column — the end-to-end contract."""
+    p = _wp.build_payload({"station_name": "Davis"}, _wl_current())
+    assert p is not None
+    assert p["device"]["id"] == "5D5D05000002"      # synthetic-MAC scheme, tx_id=2
+    assert p["source"] == "davis-vp2-cloud"
+    flat = ingest._flatten(p)
+    for k, want in (("tempf", 88.4), ("humidity", 40), ("dewPoint", 60.1),
+                    ("feelsLike", 90.2), ("uv", 5.5), ("solarradiation", 812.0),
+                    ("windspeedmph", 4.2), ("windgustmph", 9.0), ("winddir", 248),
+                    ("yearlyrainin", 1.02), ("dailyrainin", 0.04),
+                    ("hourlyrainin", 0.01), ("tempinf", 75.1), ("humidityin", 41),
+                    ("baromrelin", 29.92)):
+        assert flat[k] == want, f"{k}: {flat[k]!r} != {want!r}"
+    assert flat["dateutc"] == 1778720987000
+
+
+def test_wl_build_payload_accepts_both_iss_sensor_types():
+    """Davis rotates the VP2 ISS between sensor_type 43 and 46; dropping either
+    silently loses 700+ observations a day (seen live 2026-05-22)."""
+    for stype in (43, 46):
+        p = _wp.build_payload({}, _wl_current(sensor_type=stype))
+        assert p is not None and p["outdoor"]["tempf"] == 88.4
+
+
+def test_wl_build_payload_adds_yearly_rain_baseline(monkeypatch):
+    """A mid-year-installed ISS starts its yearly counter at 0; the configured
+    baseline must be ADDED so the stored value is actual YTD rain."""
+    monkeypatch.setattr(_wp.settings, "weatherlink_yearly_rain_baseline_in", 3.0)
+    p = _wp.build_payload({}, _wl_current())
+    assert p["rain"]["yearly_in"] == 1.02 + 3.0
+
+
+def test_wl_build_payload_prefers_2min_averages_and_keeps_zero_wind():
+    """2-min avg wind (4.2) wins over the single-sample wind_speed_last (0.0);
+    without the averages, wind_speed_last is used even at 0.0 — a calm reading
+    must survive, not vanish (the zero-value bug class fixed twice already)."""
+    p = _wp.build_payload({}, _wl_current())
+    assert p["wind"]["speed_mph"] == 4.2 and p["wind"]["direction"] == 248
+    p0 = _wp.build_payload({}, _wl_current(
+        {"wind_speed_avg_last_2_min": None, "wind_dir_scalar_avg_last_2_min": None}))
+    assert p0["wind"]["speed_mph"] == 0.0        # zero kept, not dropped
+    assert p0["wind"]["direction"] == 10          # falls back to wind_dir_last
+
+
+def test_wl_build_payload_none_without_iss_or_timestamp():
+    """No ISS sensor (or no ts) → no usable observation → None, not a bogus
+    half-payload."""
+    assert _wp.build_payload({}, {"sensors": [
+        {"sensor_type": 365, "data": [{"temp_in": 1}]}]}) is None
+    assert _wp.build_payload({}, {"sensors": [
+        {"sensor_type": 43, "data": [{"temp": 70.0}]}]}) is None    # no ts
+    assert _wp.build_payload({}, {"sensors": []}) is None
+
+
+# ───────────── _flatten yearly_in overflow-string coercion (R2-164 / CR-61) ─────────────
+
+def test_flatten_yearly_in_overflow_string_becomes_none():
+    """_scrub_numbers only filters values that arrive AS numbers; the string
+    "1e999" passes through and float() turns it into inf — which Starlette's
+    JSONResponse (allow_nan=False) then 500s on every /current read containing
+    the row. The post-coercion finiteness check must null it instead."""
+    payload = {
+        "device":        {"id": "5D5D010002C7"},
+        "timestamp_utc": "2026-05-24T07:40:15Z",
+        "rain":          {"yearly_in": "1e999"},
+    }
+    out = ingest._flatten(payload)
+    assert out is not None
+    assert out["yearlyrainin"] is None
+
+
+def test_flatten_yearly_in_overflow_string_with_offset_configured(monkeypatch):
+    """Same vector with a per-MAC rain offset configured: the offset math
+    (max(0, inf - offset) == inf) must never resurrect the non-finite value."""
+    from app import config
+    monkeypatch.setattr(config.settings, "ingest_yearly_rain_offsets",
+                        {"5D:5D:01:00:02:C7": 2.85})
+    payload = {
+        "device":        {"id": "5D5D010002C7"},
+        "timestamp_utc": "2026-05-24T07:40:15Z",
+        "rain":          {"yearly_in": "1e999"},
+    }
+    out = ingest._flatten(payload)
+    assert out is not None
+    assert out["yearlyrainin"] is None

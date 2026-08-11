@@ -207,11 +207,35 @@ void setup() {
   // (Save button doesn't always persist params).
   WiFiManager wm;
   wm.setConfigPortalTimeout(300);
-  // WPA2 password on the setup AP: without it the portal is an OPEN
-  // network, and the home Wi-Fi credentials the user types into it
-  // transit in cleartext — sniffable by anyone in RF range. A fixed,
-  // README-documented password defeats passive capture (an evil-twin AP
-  // remains inherent to the captive-portal pattern; documented in README).
+  // WPA2 password on the setup AP. Without one the portal is an OPEN network
+  // and the home Wi-Fi credentials typed into it cross the air in cleartext.
+  //
+  // This password is FIXED and published (here, in the README and in
+  // platformio.ini), so be honest about what it buys. WPA2-PSK session keys
+  // derive from the PSK plus the 4-way handshake nonces, so anyone in RF range
+  // who knows the PSK — i.e. anyone who has read this repo — can capture the
+  // handshake and decrypt the portal traffic, including the home Wi-Fi
+  // password. An earlier version of this comment claimed it "defeats passive
+  // capture"; that is simply wrong, and it mattered because it made the
+  // residual risk invisible to anyone reading the code.
+  //
+  // What it actually buys: it keeps the portal off the list of open networks
+  // that phones and laptops auto-join and probe, and it stops the fully
+  // casual passer-by. The real mitigation is that the backend token is
+  // provisioned over the LAN afterwards rather than through this portal, so
+  // the worst case here is the home Wi-Fi password, not the ingest token.
+  //
+  // Do NOT read this as "first boot only". autoConnect() raises the portal
+  // whenever it cannot join the saved network — a wrong password, a router
+  // down or out of range, or a transient association failure (these boards
+  // have logged AUTH_FAIL reason 202 on a healthy network) all bring the AP
+  // up for the 300s timeout below before the board reboots. So it can appear
+  // unattended, not just while someone is standing there setting it up.
+  //
+  // A per-device random password shown on the OLED would close the gap, and
+  // was considered and rejected: a board whose display has failed would then
+  // be impossible to set up at all, which is a worse failure than the risk it
+  // removes. Revisit if the portal ever carries the ingest token.
   Serial.println("Wi-Fi: trying saved creds, AP=ZasderLilyGO (pw zasder-setup) if none");
   if (!wm.autoConnect("ZasderLilyGO", "zasder-setup")) {
     Serial.println("WiFi setup timed out — restarting");
@@ -242,9 +266,22 @@ void setup() {
   // someone provisions them via /provision over HTTP).
   ZasderConfigServer::loadFromNvs();
   ZasderConfigServer::begin();
-  Serial.printf("provision with: curl -X POST "
-                "http://%s/provision -d 'backend_url=...&ingest_token=...'\n",
-                WiFi.localIP().toString().c_str());
+  // Every /provision needs proof-of-ownership — an anonymous curl always
+  // 403s, so the example command must name the right credential for the
+  // board's state. Fresh or 401-wiped board: the setup key loadFromNvs()
+  // just printed above. Provisioned board: the current ingest token as a
+  // Bearer header (the setup key also works but isn't in this log then).
+  if (ZasderConfigServer::ingestToken.length() == 0) {
+    Serial.printf("provision with: curl -X POST http://%s/provision "
+                  "-H 'X-Setup-Key: <key printed above>' "
+                  "-d 'backend_url=...&ingest_token=...'\n",
+                  WiFi.localIP().toString().c_str());
+  } else {
+    Serial.printf("re-provision with: curl -X POST http://%s/provision "
+                  "-H 'Authorization: Bearer <current ingest token>' "
+                  "-d 'backend_url=...&ingest_token=...'\n",
+                  WiFi.localIP().toString().c_str());
+  }
 
   rtl_433.initReceiver(RF_MODULE_RECEIVER_GPIO, RF_MODULE_FREQUENCY);
   rtl_433.setCallback(rtl_433_Callback, messageBuffer, JSON_MSG_BUFFER);

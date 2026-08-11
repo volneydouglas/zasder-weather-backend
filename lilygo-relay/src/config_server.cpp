@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <esp_random.h>
 
+#include "auth_logic.h"
 #include "display.h"
 
 namespace ZasderConfigServer {
@@ -66,6 +67,15 @@ static String generateSetupKey() {
   return k;
 }
 
+// Print the setup key to serial. Only called when a provision is actually
+// pending: the boot that mints it, a never-provisioned board, or a token
+// wiped after repeated 401s. It authorizes provisioning AND /reset, so a
+// retained or forwarded serial log would hand over control of the board —
+// it stays out of the log during normal operation.
+static void announceSetupKey() {
+  Serial.printf("setup key (provision/re-pair proof): %s\n", setupKey.c_str());
+}
+
 void loadFromNvs() {
   prefs.begin("zasder", /*readOnly=*/false);
   backendUrl  = prefs.getString("backend_url",  "");
@@ -81,11 +91,8 @@ void loadFromNvs() {
     prefs.putString("setup_key", setupKey);
     minted = true;
   }
-  // Print the key only when it's actually needed: the boot that mints it, or
-  // while a re-pair is pending. It authorizes re-pairing AND /reset, so a
-  // retained/forwarded serial log would hand over control of the board.
-  if (minted || (provisioned && ingestToken.length() == 0)) {
-    Serial.printf("setup key (re-pair proof): %s\n", setupKey.c_str());
+  if (minted || ingestToken.length() == 0) {
+    announceSetupKey();
   } else {
     Serial.println("setup key: set (printed only when a re-pair is pending)");
   }
@@ -107,6 +114,11 @@ void wipeIngestToken() {
   // operator re-pairs with the setup key shown on the device.
   prefs.remove("ingest_token");
   ingestToken = "";
+  // Re-announce on serial. loadFromNvs() only runs at boot, so an operator
+  // watching the serial console during a live 401 wipe would otherwise see
+  // the board lock itself and never learn the key needed to re-pair it —
+  // the OLED shows it, but a headless board has no OLED to read.
+  announceSetupKey();
 }
 
 // ── handlers ──────────────────────────────────────────────────────────
@@ -135,6 +147,14 @@ static String escapeJson(const String &s) {
   return out;
 }
 
+// Deliberately unauthenticated: this is the read-only diagnostic an
+// operator hits first when a board misbehaves, often from a phone with no
+// way to attach a Bearer header. It never returns the token or the setup
+// key — only `has_token`/`token_len`. It DOES disclose the backend URL and
+// the board's MAC to anyone on the LAN; for a home-LAN device that's an
+// accepted trade against losing the zero-friction diagnostic. If the board
+// ever lives on a shared/untrusted network, gate the sensitive fields
+// behind checkAuth() and keep only uptime/IP public.
 static void handleStatus() {
   uint32_t uptimeS = (millis() - bootMs) / 1000;
   String mac = WiFi.macAddress();
@@ -162,36 +182,49 @@ static void handleStatus() {
   server.send(200, "application/json", body);
 }
 
-// Constant-time string compare. Avoids leaking the token length /
-// prefix via timing analysis from a LAN attacker spraying guesses.
-static bool secureEquals(const String &a, const String &b) {
-  if (a.length() != b.length()) return false;
-  uint8_t diff = 0;
-  for (size_t i = 0; i < a.length(); i++) {
-    diff |= ((uint8_t) a[i]) ^ ((uint8_t) b[i]);
-  }
-  return diff == 0;
-}
-
 // Returns true if the caller proved ownership of this board — by knowing
 // EITHER the current ingest_token OR the per-device setup key. Three
 // delivery channels accepted, checked against both credentials:
 //   * Authorization: Bearer <secret>   (preferred — curl friendly)
 //   * current_token form field         (browser-form friendly)
 //   * setup_key form field             (explicit re-pair after a wipe)
-// On an unprovisioned board, every request is authorized so the first
-// /provision works without a chicken-and-egg loop.
+// There is NO anonymous path. An unprovisioned board has no ingest_token
+// yet, so the setup key is the only credential that opens the first
+// /provision — it is on the OLED and in the serial banner for whoever can
+// physically see the board.
 static bool checkAuth() {
-  if (!provisioned) return true;
-
+  // An unprovisioned board used to accept ANY caller. Whoever reached it first
+  // won: they could set their own backend_url + ingest_token, which flips
+  // `provisioned` and locks the board under their credentials — after which
+  // the actual owner can't even /reset it, because that now requires the
+  // squatter's token. Recovery is a physical USB NVS erase.
+  //
+  // The per-device setup key already exists for exactly this kind of proof;
+  // it was simply not required for the FIRST provision. Now it always is.
+  // The key is on the OLED and the serial banner while the board is
+  // unprovisioned, so the person standing at it can read it and nobody else
+  // can. `matches` below still accepts the ingest token as well, but there
+  // isn't one yet in this state, so first provision is setup-key-only.
+  //
   // Check EVERY channel independently. Collapsing them into one `supplied`
   // slot meant a stale Authorization header masked a perfectly good setup_key
   // sent alongside it — so a client couldn't recover after a token wipe.
+  //
+  // The matching decision itself (constant-time compare, empty-candidate /
+  // empty-credential rules) lives in auth_logic.h so the native test env
+  // can pin the whole matrix without the Arduino framework.
+  //
+  // The ingest token only counts once `provisioned` is true. handleProvision
+  // accepts ingest_token WITHOUT backend_url (token rotation), so a partial
+  // first provision can leave a stored token while provisioned stays false —
+  // and this check would then accept a credential that the unprovisioned 403
+  // guidance and the setup form never mention. The documented contract is
+  // that first provisioning takes the setup key only; passing "" for the
+  // token reuses authMatches's pinned "empty credential never matches" rule.
   auto matches = [](const String &candidate) -> bool {
-    if (candidate.length() == 0) return false;
-    bool tokenOk = ingestToken.length() > 0 && secureEquals(candidate, ingestToken);
-    bool keyOk   = setupKey.length()   > 0 && secureEquals(candidate, setupKey);
-    return tokenOk || keyOk;
+    return ZasderAuth::authMatches(candidate.c_str(),
+                                   provisioned ? ingestToken.c_str() : "",
+                                   setupKey.c_str());
   };
 
   if (server.hasHeader("Authorization")) {
@@ -201,6 +234,14 @@ static bool checkAuth() {
   // Preferred channel for the setup key: a HEADER. Anything in a URL query
   // string ends up in shell history, proxy logs and the browser's address bar,
   // and this credential authorizes re-pairing and /reset.
+  //
+  // Known, deliberate gap: the two form-field channels below also accept the
+  // credential as a URL ?query= parameter. ESP32 WebServer merges query-string
+  // and POST-body parameters into one arg list with no way to tell them apart,
+  // so rejecting query delivery would also reject the body field the board's
+  // own HTML form submits. Closing it would mean parsing the raw request line
+  // ourselves; instead the README and the serial banner steer every documented
+  // flow to the header or the form body.
   if (server.hasHeader("X-Setup-Key") && matches(server.header("X-Setup-Key")))
     return true;
   if (server.hasArg("current_token") && matches(server.arg("current_token")))
@@ -212,12 +253,25 @@ static bool checkAuth() {
 
 static void handleProvision() {
   if (!checkAuth()) {
-    server.send(403, "text/plain",
-                "forbidden: this board is already provisioned. Re-send "
-                "with Authorization: Bearer <current_ingest_token>, or "
-                "include current_token=<...> as a form field. If the "
-                "token was wiped (repeated 401s), use the setup key shown "
-                "on the board's screen: setup_key=<...>.\n");
+    // Two different states reach here and they need different instructions.
+    // A single "already provisioned" message was actively misleading on a
+    // fresh board — it named a credential that does not exist yet and never
+    // mentioned the setup key the first provision actually requires.
+    if (provisioned) {
+      server.send(403, "text/plain",
+                  "forbidden: this board is already provisioned. Re-send "
+                  "with Authorization: Bearer <current_ingest_token>, or "
+                  "include current_token=<...> as a form field. If the "
+                  "token was wiped (repeated 401s), use the setup key shown "
+                  "on the board's screen: setup_key=<...>.\n");
+    } else {
+      server.send(403, "text/plain",
+                  "forbidden: first provisioning needs this board's setup "
+                  "key, shown on its OLED and in the serial boot log. "
+                  "Re-send with the X-Setup-Key header, or include "
+                  "setup_key=<...> as a form field. The web form on / has a "
+                  "field for it.\n");
+    }
     return;
   }
   // Accept both form-encoded and ?query=string. backend_url is
@@ -227,7 +281,42 @@ static void handleProvision() {
   if (server.hasArg("backend_url")) {
     String v = server.arg("backend_url");
     v.trim();
+    // Normalize away trailing slashes: the poster appends "/ingest/custom",
+    // so "https://host/" would silently become "https://host//ingest/custom".
+    while (v.endsWith("/")) v.remove(v.length() - 1);
     if (v.length() > 0) {
+      // Require an https:// URL (http:// too only in a TLS_INSECURE dev
+      // build). The poster always connects through WiFiClientSecure, so a
+      // plain-http URL can never work in production — but it would only
+      // fail hours later at POST time with an opaque TLS error, long after
+      // the operator stopped watching. Reject it now, while they are.
+#if defined(TLS_INSECURE) && TLS_INSECURE
+      bool schemeOk = v.startsWith("https://") || v.startsWith("http://");
+#else
+      bool schemeOk = v.startsWith("https://");
+#endif
+      // "https://" alone (no host) passes startsWith, and a bare length
+      // check still admits host-less shapes like "https:///path",
+      // "https://?q" and "https://#f" — which persist fine and then fail
+      // hours later at POST time. Parse the authority out and require a
+      // non-empty host (one-shot config path, so the String work is fine).
+      String authority = v.substring(v.startsWith("https://") ? 8 : 7);
+      int authorityEnd = authority.length();
+      for (char delimiter : {'/', '?', '#'}) {
+        int index = authority.indexOf(delimiter);
+        if (index >= 0 && index < authorityEnd) authorityEnd = index;
+      }
+      String hostPort = authority.substring(0, authorityEnd);
+      // Skip any userinfo@ prefix; what's left must start with a host, not
+      // a bare :port.
+      String host = hostPort.substring(hostPort.lastIndexOf('@') + 1);
+      if (!schemeOk || host.length() == 0 || host[0] == ':') {
+        server.send(400, "text/plain",
+                    "backend_url must be a full https://host URL (the "
+                    "firmware posts over TLS; a plain-http backend needs a "
+                    "TLS_INSECURE build)\n");
+        return;
+      }
       backendUrl = v;
       prefs.putString("backend_url", backendUrl);
       changed = true;
@@ -337,7 +426,11 @@ static void handleRoot() {
   } else {
     body +=
       "<p><b>Unprovisioned.</b> First provisioning locks the board.</p>"
+      "<p>Enter the <b>setup key</b> shown on the board's OLED (and in the "
+      "serial boot log). It proves you can physically see this board, so "
+      "nobody else on the network can claim it first.</p>"
       "<form method='POST' action='/provision'>"
+      "Setup key: <input name='setup_key' size='16'><br>"
       "Backend URL: <input name='backend_url' size='40'><br>"
       "Ingest token: <input name='ingest_token' size='40'><br>"
       "<button>Provision</button>"
@@ -406,8 +499,12 @@ static void cycleDiagLine() {
   // so the operator standing at the board can read it and re-provision.
   // Only shown in this state — hidden during normal operation so the
   // recovery secret isn't left on-screen permanently.
-  if (provisioned && ingestToken.length() == 0) {
-    snprintf(buf, sizeof(buf), "re-pair key: %s", setupKey.c_str());
+  // Two states need the key on screen: awaiting re-pair after a token wipe,
+  // and never-provisioned. First provision now REQUIRES this key (see
+  // checkAuth), so without showing it here a fresh board is unsetupable.
+  if (ingestToken.length() == 0) {
+    snprintf(buf, sizeof(buf), "%s: %s",
+             provisioned ? "re-pair key" : "setup key", setupKey.c_str());
     ZasderDisplay::update(nullptr, nullptr, buf, nullptr, nullptr);
     return;
   }

@@ -424,3 +424,65 @@ def test_throttle_lock_registry_evicts_idle_macs():
         assert ingest._THROTTLE_LOCKS.get(loop, {}) == {}
 
     asyncio.run(run())
+
+
+# ───────────────── rain glitch guard: level shifts rebaseline ─────────────────
+
+def _rain_ts(hours_ago: float) -> str:
+    """Timestamps must be in the PAST: the R2-56 sanity clamp pulls
+    future-dated posts to server time, which collapsed fixed 2026 dates into
+    one bucket and made these assertions read a single row."""
+    import datetime as _dt
+    t = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours_ago)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _post_rain(client, yearly, ts):
+    return client.post("/ingest/custom", headers=IH,
+                       json={"device": {"id": "AABBCCDD0A10"},
+                             "timestamp_utc": ts,
+                             "outdoor": {"tempf": 70},
+                             "rain": {"yearly_in": yearly}, "source": "t"})
+
+
+def _yearlies(client):
+    rows = client.get("/api/devices/AA:BB:CC:DD:0A:10/history?hours=24",
+                      headers=H).json()["rows"]
+    return [r.get("yearlyrainin") for r in rows]
+
+
+def test_rain_level_shift_rebaselines_after_confirmation(client):
+    """The lockout this exists for: removing the yearly-rain offsets moved a
+    device's reported level up ~16 inches in one step. The guard rejected it —
+    correctly indistinguishable from a spike on the first reading — but
+    rejected rows store NULL, so the baseline never advanced and EVERY later
+    reading was nulled too. Rain never recovered without hand-editing the DB.
+    One confirming reading at the new level must rebaseline."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    assert _post_rain(client, 1.09, _rain_ts(8)).status_code == 200
+    # +16" in 2 h (history buckets are coarse — spaced so each
+    # reading lands in its own bucket): rejected (spike or shift — can't tell yet), stored NULL.
+    assert _post_rain(client, 17.1, _rain_ts(6)).status_code == 200
+    # Same level two hours later: confirmed shift, accepted.
+    assert _post_rain(client, 17.12, _rain_ts(4)).status_code == 200
+    ys = _yearlies(client)
+    assert ys[-3:] == [1.09, None, 17.12], ys
+    # ...and the counter keeps working from the new baseline.
+    assert _post_rain(client, 17.15, _rain_ts(2)).status_code == 200
+    assert _yearlies(client)[-1] == 17.15
+
+
+def test_rain_one_shot_spike_still_dropped(client):
+    """The behaviour the guard originally shipped for must survive the
+    rebaseline: a decode glitch spikes ONCE and the next reading returns to
+    the true level, so nothing confirms and nothing rebaselines."""
+    from app import ingest
+    ingest._rain_reject.clear()
+    assert _post_rain(client, 2.00, _rain_ts(9)).status_code == 200
+    assert _post_rain(client, 55.0, _rain_ts(7)).status_code == 200
+    assert _post_rain(client, 2.01, _rain_ts(5)).status_code == 200
+    assert _yearlies(client)[-3:] == [2.00, None, 2.01]
+    # A LATER unrelated spike must not be "confirmed" by the stale rejection.
+    assert _post_rain(client, 60.0, _rain_ts(3)).status_code == 200
+    assert _yearlies(client)[-1] is None

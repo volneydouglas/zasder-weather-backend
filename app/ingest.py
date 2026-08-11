@@ -160,13 +160,14 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
             # finiteness after the coercion.
             if not math.isfinite(yearly_in):
                 yearly_in = None
-    if yearly_in is not None:
-        # str() like _do_ingest does: a numeric device.id reaches re.fullmatch
-        # inside _format_mac otherwise and raises TypeError.
-        mac_for_offset = _format_mac(str(dev.get("id") or "")).upper()
-        offset = settings.ingest_yearly_rain_offsets.get(mac_for_offset)
-        if offset is not None:
-            yearly_in = max(0.0, yearly_in - offset)
+    # Yearly-rain offsets REMOVED (2026-08-11). The per-MAC calibration
+    # subtracted an operator-set constant so lifetime counters read as YTD —
+    # but it broke more than it fixed in production: applied to Davis (whose
+    # yearly is already true YTD) it clamped the real total to 0.0, and for
+    # offset sensors every reading stored before the offset was configured
+    # used the unshifted scale, so year-over-history deltas (records,
+    # rollups) went negative and the yearly rain records vanished. Raw
+    # values now pass through untouched; INGEST_YEARLY_RAIN_OFFSETS is inert.
 
     # Feels-like: pass through the source's own value if present (AWN +
     # Davis provide it); otherwise derive it so SDR/custom sources that only
@@ -260,6 +261,34 @@ def _is_rain_glitch(jump_in: float, elapsed_h: float,
         return False
     allowance = max_rate_in_per_hr * max(elapsed_h, 1.0 / 3600.0) + 0.25
     return jump_in > allowance
+
+
+# Pending rain-level rejections: mac -> (rejected_value_in, dateutc_ms).
+# A true decode glitch is one-shot — the next reading returns to the old level.
+# A LEVEL SHIFT (counter swap, calibration change, the 2026-08-11 removal of
+# the yearly-rain offsets) persists: every subsequent reading agrees with the
+# "glitch". Without this, the guard nulls rain forever after a shift, because
+# rejected rows store NULL and the comparison baseline never advances — the
+# exact lockout that re-broke Crestview. One confirming reading at the new
+# level rebaselines. Process-global like main.py's caches; single event loop,
+# lost on restart (costs one extra confirming reading — fine).
+_rain_reject: dict[str, tuple[float, float]] = {}
+
+
+def _confirms_rejected_level(mac: str, value_in: float, ts_ms: float,
+                             max_rate_in_per_hr: float) -> bool:
+    """True when `value_in` corroborates the previously REJECTED reading for
+    this mac: at or above that level, and the increment since the rejection is
+    itself plausible rain for the elapsed time. A one-shot spike fails this
+    (the next reading falls back below the rejected level)."""
+    prev = _rain_reject.get(mac)
+    if prev is None:
+        return False
+    rej_val, rej_ts = prev
+    if value_in < rej_val - 0.05:          # fell back — it WAS a glitch
+        return False
+    elapsed_h = max((ts_ms - rej_ts) / 3_600_000.0, 1.0 / 3600.0)
+    return (value_in - rej_val) <= max_rate_in_per_hr * elapsed_h + 0.25
 
 
 def _format_mac(raw: str) -> str:
@@ -459,13 +488,27 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
             jump = flat["yearlyrainin"] - last_val
             elapsed_h = (flat["dateutc"] - last_ts) / 3_600_000.0
             if _is_rain_glitch(jump, elapsed_h, max_rate):
-                log.warning(
-                    "rain glitch dropped for %s: +%.2f in over %.3f h "
-                    "— %.2f→%.2f", mac, jump, elapsed_h, last_val,
-                    flat["yearlyrainin"])
-                for k in ("yearlyrainin", "hourlyrainin", "eventrainin",
-                          "dailyrainin", "weeklyrainin", "monthlyrainin"):
-                    flat[k] = None
+                if _confirms_rejected_level(mac, flat["yearlyrainin"],
+                                            flat["dateutc"], max_rate):
+                    # Second consecutive reading at the new level: this is a
+                    # level shift, not a spike. Accept and rebaseline.
+                    log.warning(
+                        "rain level shift ACCEPTED for %s: %.2f→%.2f in "
+                        "(confirmed by consecutive readings)", mac, last_val,
+                        flat["yearlyrainin"])
+                    _rain_reject.pop(mac, None)
+                else:
+                    _rain_reject[mac] = (flat["yearlyrainin"], flat["dateutc"])
+                    log.warning(
+                        "rain glitch dropped for %s: +%.2f in over %.3f h "
+                        "— %.2f→%.2f (will accept if the next reading "
+                        "confirms)", mac, jump, elapsed_h, last_val,
+                        flat["yearlyrainin"])
+                    for k in ("yearlyrainin", "hourlyrainin", "eventrainin",
+                              "dailyrainin", "weeklyrainin", "monthlyrainin"):
+                        flat[k] = None
+            else:
+                _rain_reject.pop(mac, None)
 
     # Drop a spurious wind gust (see settings.ingest_gust_*). A gust wildly
     # higher than the concurrent sustained wind is a sensor glitch — nulling it

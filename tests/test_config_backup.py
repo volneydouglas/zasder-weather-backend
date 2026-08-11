@@ -82,7 +82,7 @@ def test_backup_is_write_gated_because_it_carries_operator_pii(client):
     data, it is a dump of the operator's configuration.
     """
     r = client.get("/api/config/backup", headers=READ_ONLY)
-    assert r.status_code == 401, "reviewer token could read operator PII"
+    assert r.status_code == 403, "reviewer token could read operator PII"
     # ...and the primary token still can, or the feature is dead.
     assert client.get("/api/config/backup", headers=H).status_code == 200
 
@@ -91,7 +91,7 @@ def test_restore_is_write_gated(client):
     """The read-only reviewer token must not be able to reconfigure alerting
     for every client of this backend."""
     r = client.post("/api/config/restore", headers=READ_ONLY, json={"version": 1})
-    assert r.status_code == 401
+    assert r.status_code == 403
 
 
 def test_restore_rejects_a_foreign_file(client):
@@ -273,3 +273,17 @@ def test_reviewer_token_cannot_read_station_coordinates(client):
     # ...but the station is still listed, or the demo shows an empty app.
     seen = client.get("/api/devices", headers=READ_ONLY).json()
     assert any(d["mac"] == mac for d in seen)
+
+
+def test_readonly_token_gets_a_permission_message_not_invalid_token(client):
+    """The reviewer token is VALID — a 401 "invalid token" on a write route
+    reads as broken demo credentials during App Review (a documented
+    rejection trigger) and tells a genuine read-only user nothing. It must be
+    a 403 that names the permission gap; a genuinely wrong token stays 401."""
+    r = client.get("/api/config/backup", headers=READ_ONLY)
+    assert r.status_code == 403
+    assert "read-only" in r.json()["detail"]
+    r = client.post("/api/config/restore", headers=READ_ONLY, json={"version": 1})
+    assert r.status_code == 403
+    bad = {"Authorization": "Bearer " + "f" * 64}
+    assert client.get("/api/config/backup", headers=bad).status_code == 401

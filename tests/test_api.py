@@ -232,7 +232,7 @@ def test_captures_reject_reviewer_token(client, temp_env):
     # reviewer token → rejected
     r = client.get("/api/captures/reviewer-test",
                    headers={"Authorization": "Bearer test-reviewer-token"})
-    assert r.status_code == 401
+    assert r.status_code == 403
     # primary api token → allowed
     r = client.get("/api/captures/reviewer-test",
                    headers={"Authorization": "Bearer test-api-token"})
@@ -1039,8 +1039,8 @@ def test_reviewer_token_rejected_on_writes(client):
         kwargs = {"headers": REVIEWER}
         if body is not None: kwargs["json"] = body
         r = client.request(method, path, **kwargs)
-        assert r.status_code == 401, (
-            f"reviewer {method} {path} should be 401, got {r.status_code} {r.text[:80]}")
+        assert r.status_code == 403, (
+            f"reviewer {method} {path} should be 403, got {r.status_code} {r.text[:80]}")
 
 def test_primary_token_still_can_write(client):
     """Sanity — the primary api_token writes are not collateral damage."""
@@ -1787,6 +1787,9 @@ def test_reviewer_token_rejected_on_discovery_reads(client):
                 json={"model": "TPMS-Toyota", "id": 7})
     for path in ("/api/discoveries",):
         r = client.get(path, headers=REVIEWER)
+        # 401 here, not 403: meter/discovery reads gate on the primary token via
+        # a dep that does not special-case the reviewer token (by design —
+        # these routes are invisible to it, not "insufficient permission").
         assert r.status_code == 401, f"reviewer GET {path} → {r.status_code}"
         r = client.get(path, headers=WRITER)
         assert r.status_code == 200, f"primary GET {path} → {r.status_code}"
@@ -1799,7 +1802,7 @@ def test_reviewer_token_rejected_on_location_put(client):
     body = {"lat": 33.3, "lon": -111.9, "label": "Home"}
     r = client.put("/api/devices/AA:BB:CC:DD:EE:FF/location",
                    headers=REVIEWER, json=body)
-    assert r.status_code == 401
+    assert r.status_code == 403
     assert client.put("/api/devices/AA:BB:CC:DD:EE:FF/location",
                       headers=WRITER, json=body).status_code == 200
 

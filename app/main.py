@@ -257,6 +257,17 @@ def require_write_token(request: Request,
         _log_auth_failure(request)
         raise
     if not ok:
+        # Distinguish "wrong token" from "valid but read-only". The reviewer
+        # token IS valid — telling its holder "invalid token" is factually
+        # wrong, reads like broken demo credentials during App Review, and
+        # gives a real read-only user no clue that a fuller token exists.
+        # 403 (authenticated, not permitted) vs 401 (not authenticated).
+        token = _extract_bearer(authorization)
+        if tokens_match(token, settings.valid_api_tokens):
+            raise HTTPException(
+                status_code=403,
+                detail="this access token is read-only — backups, restores and "
+                       "other changes need the server's full-access API token")
         _log_auth_failure(request)
         raise HTTPException(status_code=401, detail="invalid token")
 

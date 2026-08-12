@@ -49,14 +49,28 @@ static uint8_t modelTypeTag(const char *model) {
 // Cached WH32B reading — populated whenever the 915 dongle hears a
 // WH32B packet, merged into every outdoor (WH24/WH65/WS80) post.
 // `valid` flips true on first capture; outdoor posts include the
-// indoor + pressure blocks only when this is true.
+// indoor + pressure blocks only when this is true AND the cache is
+// fresh (see WH32B_MAX_AGE_MS below).
 struct WH32BCache {
   bool   valid = false;
   float  tempf = NAN;
   float  humidity = NAN;
   float  pressure_inhg = NAN;
+  unsigned long ms = 0;   // millis() of the last capture — age bound
 };
 static WH32BCache wh32b;
+
+// Age bound on the merge. Without one, a WH32B that dies (battery, RF
+// fault) keeps having its LAST reading merged into every outdoor post
+// forever — and because those values ride the outdoor device's row, the
+// backend's per-device staleness detection never fires: the iOS indoor +
+// pressure tiles show days-old numbers as live. The WH32B broadcasts
+// roughly once a minute, so 10 minutes tolerates plenty of missed
+// packets while still going quiet fast when the sensor actually dies
+// (the tiles then age out via normal backend staleness).
+// millis() wraps at ~49.7 days; the unsigned subtraction below stays
+// correct across the wrap.
+static constexpr unsigned long WH32B_MAX_AGE_MS = 10UL * 60UL * 1000UL;
 
 // Generic type tag for models forwarded via the opt-in forward_all path
 // (any decoded rtl_433 station that isn't on the whitelist). The synthetic
@@ -194,6 +208,7 @@ void zasder_post(const char *rtl433Json,
     // post would carry an empty `indoor` block of NaN-skipped fields.
     if (gotField) {
       wh32b.valid = true;
+      wh32b.ms = millis();
       Serial.printf("[wh32b-cache] tempf=%.1f hum=%.1f press_inhg=%.2f\n",
                     wh32b.tempf, wh32b.humidity, wh32b.pressure_inhg);
     }
@@ -358,7 +373,11 @@ void zasder_post(const char *rtl433Json,
   // handle_wh24() does with WH32B_ID. typeTag 0x02 = Fineoffset
   // outdoor (WH24/WH65/WS80); Atlas (0x01) doesn't get the merge
   // because Atlas + WH32B aren't typically deployed together.
-  if (typeTag == 0x02 && wh32b.valid) {
+  // Skipped once the cache is older than WH32B_MAX_AGE_MS so a dead
+  // WH32B's readings can't be re-posted as live forever (see above);
+  // `valid` is kept so the merge resumes on the sensor's next packet.
+  if (typeTag == 0x02 && wh32b.valid &&
+      (millis() - wh32b.ms) <= WH32B_MAX_AGE_MS) {
     auto indoor = out["indoor"].to<JsonObject>();
     if (!isnan(wh32b.tempf))         indoor["tempf"]         = wh32b.tempf;
     if (!isnan(wh32b.humidity))      indoor["humidity"]      = wh32b.humidity;

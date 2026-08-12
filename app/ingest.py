@@ -83,6 +83,35 @@ def _scrub_numbers(block: Any) -> dict[str, Any]:
     return {k: _finite(v) for k, v in block.items()}
 
 
+def _coerce_num(v: Any) -> Any:
+    """Final numeric coercion for the flat metric fields. Real numbers pass
+    through (already scrubbed by _scrub_numbers); a numeric STRING coerces
+    ("75.5" → 75.5, a buggy decoder's stringified reading); anything else —
+    including "1e999", which float()s to inf — becomes None. Without this,
+    an overflow string bound into a REAL column is coerced to Inf by
+    SQLite's affinity rules at insert, and AVG()/MIN()/MAX() over it 500
+    /records, /summary and bucketed /history permanently (JSONResponse
+    serializes with allow_nan=False). Same bug class the yearly_in path
+    fixed for itself; this closes it for every metric field."""
+    if v is None or isinstance(v, (int, float)):
+        return v
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _battery_flag(v: Any) -> int | None:
+    """Relay battery state → AWN's battout/battin convention (1 = ok,
+    0 = low). Anything unrecognized stays None rather than guessing."""
+    if v == "normal":
+        return 1
+    if v == "low":
+        return 0
+    return None
+
+
 def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     """Map a normalized observation → the flat-field shape db.insert_observations
     expects (same keys as AmbientWeather's REST response)."""
@@ -179,7 +208,7 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         feels_like = _compute_feels_like(tempf, out.get("humidity"),
                                          wind.get("speed_mph"))
 
-    return {
+    flat = {
         "dateutc":        dateutc_ms,
         # Popped by _do_ingest before storage. The clamp above rewrites a
         # future dateutc to server "now", so each RETRY of the same broken-
@@ -216,7 +245,20 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
                           else solar.get("uv"),
         "solarradiation": out.get("solar_wm2") if out.get("solar_wm2") is not None
                           else solar.get("radiation_wm2"),
+        # Relay battery state (sdr-relay posts device.battery_outdoor, davis-
+        # relay maps battery_low → battery_outdoor, the AcuRite hub path sent
+        # battery_hub). Mapped to the battout/battin keys the iOS Observation
+        # decodes — without this the relay-side battery reporting was inert
+        # end to end (no header battery icon, battery-low notable never fired).
+        "battout":        _battery_flag(dev.get("battery_outdoor")),
+        "battin":         _battery_flag(dev.get("battery_hub")),
     }
+    # One choke point for every metric field (timestamps excluded — they were
+    # validated above and must stay ints).
+    for k, v in flat.items():
+        if k not in ("dateutc", "_raw_dateutc"):
+            flat[k] = _coerce_num(v)
+    return flat
 
 
 def _compute_feels_like(tempf: Any, humidity: Any, wind_mph: Any) -> float | None:
@@ -349,9 +391,14 @@ def _confirms_rejected_level(mac: str, value_in: float, ts_ms: float,
 
 def _format_mac(raw: str) -> str:
     """Normalize a hub identifier to AA:BB:CC:DD:EE:FF if it looks like a
-    12-hex MAC. Pass through anything else unchanged."""
+    12-hex MAC — compact OR already-colonized in any letter case (storage
+    keys are the uppercase colonized form, so `aa:bb:...` must not slip
+    through as a distinct device key). Pass through anything else
+    unchanged."""
     if raw and re.fullmatch(r"[0-9A-Fa-f]{12}", raw):
         return ":".join(raw[i:i+2].upper() for i in range(0, 12, 2))
+    if raw and re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}", raw):
+        return raw.upper()
     return raw or ""
 
 
@@ -489,7 +536,20 @@ class _throttle_lock:
         entry[1] += 1
         self._entry = entry
         self._per_loop = per_loop
-        await entry[0].acquire()
+        try:
+            await entry[0].acquire()
+        except BaseException:
+            # The awaiting task can be CANCELLED while blocked on acquire()
+            # (client disconnect, shutdown mid-ingest). `async with` never
+            # runs __aexit__ when __aenter__ raises, so without this the
+            # holder count incremented above leaks and the registry entry
+            # for this MAC is never evicted — an unbounded, request-fed
+            # leak on the process-lifetime production loop.
+            entry[1] -= 1
+            if entry[1] == 0 and per_loop.get(self._mac) is entry:
+                del per_loop[self._mac]
+            self._entry = None
+            raise
 
     async def __aexit__(self, *exc: object) -> None:
         entry = self._entry  # always set: `async with` pairs __aexit__ with __aenter__
@@ -682,6 +742,10 @@ async def _parse_json_body(request: Request) -> Any:
         return _json.loads(body, parse_constant=lambda _: None)
     except _json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {e.msg}")
+    except RecursionError:
+        # "[[[[…" raises RecursionError, not JSONDecodeError — still a 400.
+        raise HTTPException(status_code=400,
+                            detail="invalid JSON: too deeply nested")
 
 
 def _truncate_source(payload_obj: dict[str, Any]) -> dict[str, Any]:

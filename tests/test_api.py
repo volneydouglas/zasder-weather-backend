@@ -324,8 +324,12 @@ def test_discovery_rejects_missing_model(client):
                     json={"id": 1})
     assert r.status_code == 400
 
-def test_discovery_since_hours_filter(client):
-    """since_hours=0 returns everything; positive value filters by recency."""
+def test_discovery_since_hours_filter(client, temp_env):
+    """since_hours=0 returns everything; positive value filters by recency.
+    Includes an EXCLUSION case (R3-139): the old inclusion-only assertions
+    stayed green with the since_ms filter deleted outright."""
+    import sqlite3
+    import time as _time
     client.post("/ingest/discovery",
                 headers={"Authorization": "Bearer test-ingest-token"},
                 json={"model": "Garage-Remote", "id": 99})
@@ -336,6 +340,17 @@ def test_discovery_since_hours_filter(client):
     # Just posted ⇒ both should include it
     for d in (everything, last_hour):
         assert any(r["model"] == "Garage-Remote" for r in d["rows"])
+    # Backdate it 48h: still present unfiltered, EXCLUDED from the last hour.
+    con = sqlite3.connect(temp_env)
+    con.execute("UPDATE discoveries SET last_seen_ms = ?",
+                (int(_time.time() * 1000) - 48 * 3600 * 1000,))
+    con.commit(); con.close()
+    everything = client.get("/api/discoveries?since_hours=0",
+                            headers={"Authorization": "Bearer test-api-token"}).json()
+    last_hour = client.get("/api/discoveries?since_hours=1",
+                            headers={"Authorization": "Bearer test-api-token"}).json()
+    assert any(r["model"] == "Garage-Remote" for r in everything["rows"])
+    assert not any(r["model"] == "Garage-Remote" for r in last_hour["rows"])
 
 
 # ─────────────── rain rollups (SDR-style cumulative-only data) ───────────────
@@ -364,7 +379,6 @@ def test_rain_rollups_compute_from_yearly_deltas(client):
     """Two observations: 0.50 at "midnight", 0.85 now. Daily should = 0.35."""
     from datetime import datetime, timedelta, timezone
     now = datetime.now(tz=timezone.utc).replace(microsecond=0)
-    # An observation tagged 14 hours ago (safely before any local midnight)
     # 36 hours ago guarantees we're past today's midnight UTC regardless
     # of what wall-clock hour the test runs at.
     earlier = (now - timedelta(hours=36)).isoformat().replace("+00:00", "Z")
@@ -398,14 +412,14 @@ def test_rain_rollups_handles_no_prior_data(client):
     r = client.get(f"/api/devices/{mac}/current",
                    headers={"Authorization": "Bearer test-api-token"})
     obs = r.json()
-    # No row exists before "today's midnight" — yearly_rain_at_or_before
-    # returns None and we leave the rollup as None (don't lie about 0).
-    # The query is "≤ boundary_ms" so the current observation itself counts
-    # only if its timestamp is ≤ the boundary. now > boundary so it doesn't
-    # → None.
-    # Actually: if "now" is < 1 hour into the day, hourly might find a row
-    # (the now-observation), making hourly = 0. So we only assert daily.
-    assert obs["dailyrainin"] is None or obs["dailyrainin"] == 0.0
+    # No row exists before "today's midnight", so yearly_rain_at_or_before
+    # falls back to the EARLIEST row on file — the observation itself — and
+    # the delta is exactly 0.0 (a fresh deploy shows "no rain since install",
+    # not the lifetime counter). Pinned exactly (R3-140): the old hedged
+    # `is None or == 0.0` also accepted the "lie about a huge value as 0"
+    # outcome AND the never-computed outcome, so it couldn't catch either
+    # regression.
+    assert obs["dailyrainin"] == 0.0
 
 def test_rain_rollups_skipped_when_buckets_already_present(client):
     """AWN-style payload that already has dailyrainin etc. should not be
@@ -630,6 +644,56 @@ def test_alerts_put_rejects_bad_recipient(client):
 def test_alerts_put_validates_threshold_range(client):
     assert client.put("/api/alerts", headers=_H,
                       json={"default_threshold_minutes": 0}).status_code == 422
+
+def test_alerts_email_scope_roundtrip(client):
+    # Default is 'all' and it never comes back null.
+    assert client.get("/api/alerts", headers=_H).json()["email_scope"] == "all"
+    r = client.put("/api/alerts", headers=_H, json={"email_scope": "device_down"})
+    assert r.status_code == 200
+    assert r.json()["email_scope"] == "device_down"
+    # Persisted across a fresh GET, and settable back.
+    assert client.get("/api/alerts", headers=_H).json()["email_scope"] == "device_down"
+    assert client.put("/api/alerts", headers=_H,
+                      json={"email_scope": "all"}).json()["email_scope"] == "all"
+
+def test_alerts_email_scope_rejects_unknown(client):
+    r = client.put("/api/alerts", headers=_H, json={"email_scope": "push_only"})
+    assert r.status_code == 400
+
+def test_deliver_email_scope_gates_email_not_push(client, monkeypatch):
+    """email_ok=False must skip SMTP entirely while the push path still runs.
+    Mutation check: flipping the gate to `if cfg.enabled:` fails this test."""
+    import asyncio
+    from app import alerts as alerts_mod
+    from app.alerts import EffectiveAlertConfig, _deliver
+
+    sent_emails = []
+    pushed = []
+    monkeypatch.setattr(alerts_mod, "_send_sync",
+                        lambda *a, **k: sent_emails.append(a))
+    async def fake_push(title, body):
+        pushed.append(title)
+        return {"sent": 1, "pruned": 0, "total": 1}
+    from app import apns
+    monkeypatch.setattr(apns, "send_to_all", fake_push)
+    async def push_on():
+        return True
+    monkeypatch.setattr(apns, "push_configured", push_on)
+
+    cfg = EffectiveAlertConfig(
+        True, True, ["x@example.com"], 15.0, 0.0,
+        "smtp.example.com", 587, None, None, "from@example.com",
+        True, False, "device_down")
+
+    # Threshold-style call: email gated off, push still delivers.
+    ok = asyncio.run(_deliver(cfg, "s", "b", "t", "p", email_ok=False))
+    assert ok is True
+    assert sent_emails == []
+    assert pushed == ["t"]
+
+    # Device-down-style call: email allowed.
+    asyncio.run(_deliver(cfg, "s", "b", "t", "p", email_ok=True))
+    assert len(sent_emails) == 1
 
 def test_device_alert_pref_roundtrip(client):
     _ingest_device(client)
@@ -898,7 +962,7 @@ def test_threshold_alert_retries_when_delivery_fails(client, monkeypatch):
     client.post("/api/alerts/rules", headers=H,
                 json={"field": "tempf", "comparator": "above", "threshold": 100})
     calls = {"n": 0}
-    async def fake_deliver(cfg, subj, body, ptitle, pbody):
+    async def fake_deliver(cfg, subj, body, ptitle, pbody, **kw):
         calls["n"] += 1
         return False                      # delivery always fails
     monkeypatch.setattr(alerts, "_deliver", fake_deliver)
@@ -1014,9 +1078,9 @@ REVIEWER = {"Authorization": "Bearer test-reviewer-token"}
 WRITER   = {"Authorization": "Bearer test-api-token"}
 
 def test_reviewer_token_allowed_on_reads(client):
-    # the core read surface a reviewer would walk
+    # the core read surface a reviewer would walk (import/wu/status is 1.4)
     for path in ("/api/devices", "/api/alerts", "/api/alerts/rules",
-                 "/api/push/relay"):
+                 "/api/push/relay", "/api/import/wu/status"):
         r = client.get(path, headers=REVIEWER)
         assert r.status_code == 200, f"reviewer GET {path} → {r.status_code}: {r.text[:80]}"
 
@@ -1034,6 +1098,16 @@ def test_reviewer_token_rejected_on_writes(client):
         ("POST",   "/api/push/register",               {"token": "a" * 64}),
         ("PUT",    "/api/push/relay",                  {"relay_token": "x"}),
         ("DELETE", "/api/devices/AA:BB:CC:DD:EE:FF",   None),
+        # 1.4 write surface (R3-127) — the WU key one matters most: a
+        # reviewer/demo token must never be able to plant an attacker-chosen
+        # key that later TWC fetches would use.
+        ("PUT",    "/api/config/wu-key",               {"api_key": "k" * 32}),
+        ("PUT",    "/api/devices/AA:BB:CC:DD:EE:FF/wu-station",
+                   {"wu_station_id": "KAZCHAND1"}),
+        ("POST",   "/api/insights/rebuild",            {}),
+        ("POST",   "/api/import/wu",
+                   {"mac": "AA:BB:CC:DD:EE:FF", "start_date": "2024-01-01"}),
+        ("POST",   "/api/import/wu/cancel",            {}),
     ]
     for method, path, body in cases:
         kwargs = {"headers": REVIEWER}
@@ -1132,7 +1206,8 @@ def test_records_endpoint(client):
     """Records returns per-metric all-time/today highs & lows with timestamps."""
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc)
-    for mins, temp, gust in ((90, 88.0, 12.0), (60, 91.5, 20.0), (30, 85.0, 8.0)):
+    for mins, temp, gust in ((90, 88.0, 12.0), (60, 91.5, 20.0), (30, 85.0, 8.0),
+                             (0, 86.0, 9.0)):
         ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
         client.post("/ingest/custom",
                     headers={"Authorization": "Bearer test-ingest-token"},
@@ -1154,6 +1229,59 @@ def test_records_endpoint(client):
     assert alltime["windgustmph"]["max"] == 20.0      # peak gust tracked
     assert body["periods"]["today"]["fields"]["tempf"]["count"] >= 1
 
+
+def test_wu_station_association_roundtrip(client):
+    _ingest_device(client)
+    mac = "AA:BB:CC:DD:EE:FF"
+    # Default: no association.
+    r = client.get(f"/api/devices/{mac}/wu-station", headers=_H)
+    assert r.status_code == 200 and r.json()["wu_station_id"] is None
+    # Set (lowercased input normalizes to upper), read back, then clear.
+    r = client.put(f"/api/devices/{mac}/wu-station", headers=_H,
+                   json={"wu_station_id": "kazchand802"})
+    assert r.status_code == 200 and r.json()["wu_station_id"] == "KAZCHAND802"
+    assert client.get(f"/api/devices/{mac}/wu-station",
+                      headers=_H).json()["wu_station_id"] == "KAZCHAND802"
+    r = client.put(f"/api/devices/{mac}/wu-station", headers=_H,
+                   json={"wu_station_id": ""})
+    assert r.status_code == 200 and r.json()["wu_station_id"] is None
+    # Shape-checked: separators/spaces rejected by the model.
+    assert client.put(f"/api/devices/{mac}/wu-station", headers=_H,
+                      json={"wu_station_id": "KAZ CHAND"}).status_code == 422
+    # Writes are write-token-gated.
+    assert client.put(f"/api/devices/{mac}/wu-station",
+                      json={"wu_station_id": "X"}).status_code == 401
+
+def test_history_end_ms_pages_into_the_past(client):
+    """end_ms turns /history from a trailing window into an arbitrary range —
+    the History/Explore browser pages through past months with it."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    old_ts = now - _dt.timedelta(days=10)
+    for dt, temp in ((old_ts, 55.0), (now, 99.0)):
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDDEEFF", "name": "Davis"},
+                          "timestamp_utc": dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                          "outdoor": {"tempf": temp, "humidity": 40},
+                          "wind": {}, "rain": {},
+                          "pressure": {"relative_inhg": 29.9},
+                          "source": "test"})
+    mac = "AA:BB:CC:DD:EE:FF"
+    # Trailing 24h window sees only the fresh row.
+    rows = client.get(f"/api/devices/{mac}/history?hours=24",
+                      headers=_H).json()["rows"]
+    assert [r["tempf"] for r in rows if r.get("tempf")] == [99.0]
+    # A 24h window ENDING 10 days ago (+1h slack) sees only the old row.
+    end = int((old_ts + _dt.timedelta(hours=1)).timestamp() * 1000)
+    body = client.get(f"/api/devices/{mac}/history?hours=24&end_ms={end}",
+                      headers=_H).json()
+    assert body["end"] == end
+    assert [r["tempf"] for r in body["rows"] if r.get("tempf")] == [55.0]
+    # A full 31-day month (744h) must be requestable — July/August 422'd
+    # under the old 720 cap.
+    assert client.get(f"/api/devices/{mac}/history?hours=744",
+                      headers=_H).status_code == 200
 
 def test_metrics_endpoint_off_by_default(client):
     assert client.get("/metrics").status_code == 404   # opt-in

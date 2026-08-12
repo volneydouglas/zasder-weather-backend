@@ -43,7 +43,7 @@ WARNING = ("This file contains your alert recipients and server settings. "
 _ALERT_PREF_KEYS = (
     "enabled", "default_threshold_min", "repeat_hours", "recipients",
     "smtp_host", "smtp_port", "smtp_username", "smtp_from",
-    "smtp_tls", "smtp_ssl",
+    "smtp_tls", "smtp_ssl", "email_scope",
 )
 
 
@@ -96,6 +96,10 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
         except (TypeError, ValueError):
             return _INVALID
         return p if 1 <= p <= 65535 else _INVALID
+    if key == "email_scope":
+        # Same closed set PUT /api/alerts enforces; None (handled above)
+        # clears back to the "all" default.
+        return v if v in ("all", "device_down") else _INVALID
     # String fields: recipients (comma-joined), smtp_host/username/from.
     # Control characters are rejected — a \n here corrupts email headers at
     # send time (same rule PUT /api/alerts enforces).
@@ -163,12 +167,25 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
         for r in rules:
             if not isinstance(r, dict):
                 continue
+            # target_mac must be a string or None: a hand-edited dict/list
+            # here survived staging and blew up INSIDE create_alert_rule
+            # (sqlite3.InterfaceError → 500) AFTER the existing rules were
+            # deleted — exactly the delete-before-validate failure the
+            # staging pass exists to prevent. Same for a NaN/Inf threshold,
+            # which additionally 500s every later GET of the rules
+            # (JSONResponse serializes with allow_nan=False).
+            target_mac = r.get("target_mac")
+            if target_mac is not None and not isinstance(target_mac, str):
+                continue
             try:
-                staged.append((r.get("target_mac"), str(r["field"]),
-                               str(r["comparator"]), float(r["threshold"]),
-                               bool(r.get("enabled", True))))
+                threshold = float(r["threshold"])
+                field, comparator = str(r["field"]), str(r["comparator"])
             except (KeyError, TypeError, ValueError):
                 continue          # skip a malformed rule, keep the rest
+            if not math.isfinite(threshold):
+                continue
+            staged.append((target_mac, field, comparator, threshold,
+                           bool(r.get("enabled", True))))
         # An explicitly empty list is a legitimate "clear my rules"; a list
         # that had entries but none survived validation is not.
         if staged or not rules:

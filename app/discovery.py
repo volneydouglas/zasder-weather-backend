@@ -56,6 +56,10 @@ async def _parse_json_body(request: Request) -> Any:
         return _json.loads(body, parse_constant=lambda _: None)
     except _json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"invalid JSON: {e.msg}")
+    except RecursionError:
+        # "[[[[…" raises RecursionError, not JSONDecodeError — still a 400.
+        raise HTTPException(status_code=400,
+                            detail="invalid JSON: too deeply nested")
 
 
 def _truncate_sample(payload: dict[str, Any]) -> dict[str, Any]:

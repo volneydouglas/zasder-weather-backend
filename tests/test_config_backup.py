@@ -225,6 +225,73 @@ def test_all_rules_malformed_does_not_wipe_existing_rules(client):
         "existing rules were destroyed by an unusable payload"
 
 
+def test_dict_target_mac_does_not_500_after_wiping_rules(client):
+    """R3-14: a hand-edited target_mac of the wrong TYPE survived staging and
+    blew up inside create_alert_rule (sqlite3.InterfaceError → 500) AFTER the
+    existing rules were deleted — the delete-before-validate failure again."""
+    client.post("/api/alerts/rules", headers=H,
+                json={"field": "tempf", "comparator": "above", "threshold": 90.0})
+    bad = {"version": 1,
+           "alert_rules": [{"target_mac": {"x": 1}, "field": "tempf",
+                            "comparator": "above", "threshold": 80.0}]}
+    r = client.post("/api/config/restore", headers=H, json=bad)
+    assert r.status_code == 400          # nothing usable in the file
+    assert len(client.get("/api/alerts/rules", headers=H).json()) == 1, \
+        "existing rules were destroyed by an unusable payload"
+    # A mixed file keeps the good entry and skips the bad one.
+    mixed = {"version": 1,
+             "alert_rules": [{"target_mac": ["nope"], "field": "tempf",
+                              "comparator": "above", "threshold": 80.0},
+                             {"field": "humidity", "comparator": "below",
+                              "threshold": 20.0}]}
+    r = client.post("/api/config/restore", headers=H, json=mixed)
+    assert r.status_code == 200, r.text
+    assert r.json()["restored"]["alert_rules"] == 1
+    rules = client.get("/api/alerts/rules", headers=H).json()
+    assert len(rules) == 1 and rules[0]["field"] == "humidity"
+
+
+def test_nonfinite_threshold_rules_are_skipped(client):
+    """R3-14: float("nan")/float("inf") passed staging, creating rules that
+    can never fire AND 500 every later GET of the rule list (JSONResponse
+    serializes with allow_nan=False)."""
+    payload = {"version": 1,
+               "alert_rules": [{"field": "tempf", "comparator": "above",
+                                "threshold": "inf"},
+                               {"field": "tempf", "comparator": "above",
+                                "threshold": "nan"},
+                               {"field": "tempf", "comparator": "above",
+                                "threshold": 100.0}]}
+    r = client.post("/api/config/restore", headers=H, json=payload)
+    assert r.status_code == 200, r.text
+    assert r.json()["restored"]["alert_rules"] == 1
+    r = client.get("/api/alerts/rules", headers=H)
+    assert r.status_code == 200
+    assert len(r.json()) == 1 and r.json()[0]["threshold"] == 100.0
+
+
+def test_email_scope_round_trips_through_backup(client):
+    """R3-56: email_scope was missing from _ALERT_PREF_KEYS — a server
+    rebuild silently reset a device-down-only email scope back to 'all',
+    and the user got threshold emails again with no warning."""
+    assert client.put("/api/alerts", headers=H,
+                      json={"email_scope": "device_down"}).status_code in (200, 204)
+    backup = client.get("/api/config/backup", headers=H).json()
+    assert backup["alert_prefs"]["email_scope"] == "device_down"
+
+    assert client.put("/api/alerts", headers=H,
+                      json={"email_scope": "all"}).status_code in (200, 204)
+    r = client.post("/api/config/restore", headers=H, json=backup)
+    assert r.status_code == 200, r.text
+    assert client.get("/api/alerts", headers=H).json()["email_scope"] == "device_down"
+    # An invalid value in a hand-edited file is skipped, not stored.
+    bad = {"version": 1, "alert_prefs": {"email_scope": "everything",
+                                         "repeat_hours": 4}}
+    assert client.post("/api/config/restore", headers=H,
+                       json=bad).status_code == 200
+    assert client.get("/api/alerts", headers=H).json()["email_scope"] == "device_down"
+
+
 def test_an_explicitly_empty_rule_list_still_clears(client):
     """...but "I have no rules" must remain a legitimate thing to restore."""
     client.post("/api/alerts/rules", headers=H,

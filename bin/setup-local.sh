@@ -16,7 +16,12 @@ set -euo pipefail
 # of them exists — it used to sit just above the .env write, so the backup was
 # created under the user's default umask (022 → world-readable).
 umask 077
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$APP_DIR"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Absolute path to this script, resolved BEFORE the cd below — a relative
+# $0 (./bin/setup-local.sh run from elsewhere) stops resolving after cd,
+# and --help reads the script file to print its header.
+SELF="$APP_DIR/bin/$(basename "${BASH_SOURCE[0]}")"
+cd "$APP_DIR"
 
 # umask only governs files this run CREATES. On a re-run — the common case,
 # since this script is also the update path — .env and the summary already
@@ -63,7 +68,11 @@ for arg in "$@"; do
     --wl-key=*)     WL_KEY_FLAG="${arg#*=}" ;;
     --wl-secret=*)  WL_SECRET_FLAG="${arg#*=}" ;;
     --wl-station=*) WL_STATION_FLAG="${arg#*=}" ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # Print the header comment block: from line 2 up to the first
+    # non-comment line, via $SELF (absolute — $0 may be relative and we
+    # already cd'd). A fixed sed range over $0 died under set -e when
+    # invoked from another directory, and overran when the header grew.
+    -h|--help) awk 'NR==1 {next} !/^#/ {exit} {sub(/^# ?/, ""); print}' "$SELF"; exit 0 ;;
     *) err "unknown flag: $arg"; exit 2 ;;
   esac
 done
@@ -79,6 +88,15 @@ ask_yn() {
   case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
 source_enabled() { case ",$SOURCES," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
+# Read a credential without echoing it (same helper as setup-fly.sh) —
+# `-s` keeps API keys out of the terminal scrollback and any recorded
+# session; a closed stdin yields "" instead of an errexit death.
+ask_secret() {  # ask_secret <varname> <prompt>
+  local __var="$1" __prompt="$2" __val=""
+  read -r -s -p "$__prompt" __val || __val=""
+  echo
+  printf -v "$__var" '%s' "$__val"
+}
 normalize_sources() {
   local out="" tok norm
   for tok in ${SOURCES//,/ }; do
@@ -157,14 +175,14 @@ info "Enabling: ${SOURCES:-none}"
 aw_app_key="$AW_APP_KEY_FLAG"; aw_api_key="$AW_API_KEY_FLAG"
 if source_enabled awn && [ "$NONINTERACTIVE" -eq 0 ]; then
   echo; bold "AmbientWeather credentials (https://ambientweather.net/account)"
-  [ -n "$aw_app_key" ] || read -r -p "AW_APPLICATION_KEY: " aw_app_key
-  [ -n "$aw_api_key" ] || read -r -p "AW_API_KEY: " aw_api_key
+  [ -n "$aw_app_key" ] || ask_secret aw_app_key "AW_APPLICATION_KEY (input hidden): "
+  [ -n "$aw_api_key" ] || ask_secret aw_api_key "AW_API_KEY (input hidden): "
 fi
 wl_key="$WL_KEY_FLAG"; wl_secret="$WL_SECRET_FLAG"; wl_station="$WL_STATION_FLAG"
 if source_enabled davis && [ "$NONINTERACTIVE" -eq 0 ]; then
   echo; bold "Davis WeatherLink v2 credentials (https://www.weatherlink.com/account)"
-  [ -n "$wl_key" ]     || read -r -p "WEATHERLINK_API_KEY: " wl_key
-  [ -n "$wl_secret" ]  || read -r -p "WEATHERLINK_API_SECRET: " wl_secret
+  [ -n "$wl_key" ]     || ask_secret wl_key    "WEATHERLINK_API_KEY (input hidden): "
+  [ -n "$wl_secret" ]  || ask_secret wl_secret "WEATHERLINK_API_SECRET (input hidden): "
   [ -n "$wl_station" ] || read -r -p "WEATHERLINK_STATION_ID: " wl_station
 fi
 
@@ -220,12 +238,6 @@ ingest_token=$(openssl rand -hex 32)
     echo "WEATHERLINK_API_SECRET=$wl_secret"
     echo "WEATHERLINK_STATION_ID=$wl_station"
     echo "WEATHERLINK_NAME=Davis Vantage Pro2 (Cloud)"
-  fi
-  if source_enabled lilygo; then
-    echo "# LilyGO posts the sensor's lifetime rain counter. Calibrate per-MAC:"
-    echo "#   curl .../api/devices/<MAC>/current  (read yearlyrainin) then"
-    echo "#   INGEST_YEARLY_RAIN_OFFSETS={\"<MAC>\":<lifetime-minus-actualYTD>}"
-    echo "# INGEST_YEARLY_RAIN_OFFSETS={}"
   fi
 } > .env
 info "wrote .env (chmod 600)"

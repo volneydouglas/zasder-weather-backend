@@ -52,10 +52,16 @@ def decide(prior: dict | None, last_seen_ms: int | None, now_ms: int,
     if cur != prior["state"]:
         return AlertDecision(cur, "stale" if cur == "stale" else "recovered", now_ms)
 
-    # State unchanged. Optionally re-remind while still stale.
+    # State unchanged. Optionally re-remind while still stale. Repeats key
+    # off notified_ms ONLY: a device that was already dead at first sight is
+    # baselined 'stale' with notified_ms=None (per the promise above, no
+    # alert), and the old `or changed_ms` fallback made the repeat branch
+    # fire "still not reporting" for it anyway once repeat_hours elapsed.
+    # notified_ms is set exactly when a stale notification delivered, so a
+    # never-notified device never "re"-notifies.
     if cur == "stale" and repeat_ms > 0:
-        last_notified = prior.get("notified_ms") or prior.get("changed_ms") or 0
-        if now_ms - last_notified >= repeat_ms:
+        last_notified = prior.get("notified_ms")
+        if last_notified is not None and now_ms - last_notified >= repeat_ms:
             return AlertDecision("stale", "repeat", prior["changed_ms"])
 
     return AlertDecision(cur, None, prior["changed_ms"])
@@ -275,6 +281,9 @@ class EffectiveAlertConfig:
     smtp_from: str | None
     smtp_tls: bool
     smtp_ssl: bool
+    # 'all' | 'device_down' — which alert kinds may EMAIL. Push is always
+    # unscoped. Defaulted so positional construction elsewhere stays valid.
+    email_scope: str = "all"
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -306,10 +315,12 @@ async def effective_config() -> EffectiveAlertConfig:
     repeat = (p["repeat_hours"] if p["repeat_hours"] is not None
               else settings.alert_repeat_hours)
     enabled = transport and bool(recipients) and (p["enabled"] != 0)
+    scope = p.get("email_scope")
+    email_scope = scope if scope in ("all", "device_down") else "all"
     return EffectiveAlertConfig(
         enabled, transport, recipients, float(default_thr), float(repeat),
         smtp_host, smtp_port, smtp_username, smtp_password, smtp_from,
-        smtp_tls, smtp_ssl)
+        smtp_tls, smtp_ssl, email_scope)
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -344,11 +355,27 @@ def _send_sync(subject: str, body: str, to_list: list[str],
 
 # ───────────────────────── delivery ─────────────────────────
 async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
-                   push_title: str, push_body: str) -> bool:
+                   push_title: str, push_body: str,
+                   email_ok: bool = True) -> bool:
     """Send an alert through every configured channel (email + push). Returns
-    True if at least one channel delivered. Shared by device-down + threshold."""
+    True when the alert is HANDLED: at least one channel delivered, or no
+    channel had anything to attempt. Shared by device-down + threshold.
+
+    `email_ok` scopes the EMAIL channel only (cfg.email_scope='device_down'
+    keeps rule/smart alerts out of the inbox); push always goes out.
+
+    "Nothing to deliver" must NOT read as a transient failure: with
+    email_scope='device_down' and push unconfigured (or push configured but
+    zero registered tokens matching a live channel), a fired threshold/smart
+    rule used to come back False every tick — state never persisted, a
+    retry-WARNING logged every tick forever, and the long-past crossing
+    fired as fresh if push was enabled weeks later. Muted is handled, not
+    failed; only an ATTEMPTED channel that failed should trigger the
+    caller's retry-next-tick path."""
     delivered = False
-    if cfg.enabled:
+    attempted = False
+    if cfg.enabled and email_ok:
+        attempted = True
         try:
             await asyncio.to_thread(_send_sync, subject, body, cfg.recipients, cfg)
             delivered = True
@@ -359,9 +386,19 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
             res = await apns.send_to_all(push_title, push_body)
             if res.get("sent"):
                 delivered = True
+            elif res.get("failed"):
+                # There were recipients and the send failed — retriable.
+                attempted = True
+            # sent == 0 with nothing failed: no registered token matched a
+            # live channel ({"sent": 0, "skipped": ...} / {"total": 0}) —
+            # nothing to deliver on this channel, not a failure.
         except Exception as e:
+            attempted = True
             log.exception("alert push send failed: %s", e)
-    return delivered
+    if not attempted and not delivered:
+        log.info("alert had no willing channel (muted by scope / no "
+                 "recipients) — treating as handled: %s", push_title)
+    return delivered or not attempted
 
 
 # ───────────────────────── monitor task ─────────────────────────
@@ -476,7 +513,8 @@ class AlertMonitor:
                     title, body = build_threshold_message(
                         dname, rule["field"], val, rule["comparator"], rule["threshold"])
                     delivered = await _deliver(
-                        cfg, f"[Zasder Weather] {title}", body, title, body)
+                        cfg, f"[Zasder Weather] {title}", body, title, body,
+                        email_ok=cfg.email_scope == "all")
                     if delivered:
                         await db.upsert_rule_state(rule["id"], d["mac"], 1, now_ms)
                         log.info("threshold alert fired: rule %s (%s) on %s value=%.3f",
@@ -531,7 +569,9 @@ class AlertMonitor:
                         pressure_delta_3h=delta)
                     # Persist triggered=1 only after delivery (same as threshold
                     # rules) so a transport failure retries next tick.
-                    if await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body):
+                    if await _deliver(cfg, f"[Zasder Weather] {title}", body,
+                                      title, body,
+                                      email_ok=cfg.email_scope == "all"):
                         await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
                         log.info("smart alert fired: %s on %s", kind, dname)
                     else:

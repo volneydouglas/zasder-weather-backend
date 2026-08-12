@@ -1,9 +1,12 @@
 # Secrets
 .env
 *.env
-# setup-local.sh's backup of a previous .env — full token set in plaintext,
-# and `*.env` does NOT match `.env.bak.<timestamp>`.
-.env.bak.*
+# dot-env VARIANTS too — `*.env` does NOT match `.env.local`,
+# `.env.production`, or setup-local.sh's `.env.bak.<timestamp>` backup
+# (full token set in plaintext). `.env.example` is a template, keep it.
+.env.*
+*.env.*
+!.env.example
 zasder-install-summary.txt
 
 # Python

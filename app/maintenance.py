@@ -149,16 +149,23 @@ def clean_glitch_gusts(apply: bool = False, db_path: str | None = None,
             print("DRY RUN — re-run with --apply to back up + null these gusts.")
             return summary
 
-        stamp = int(time.time())
-        backup = f"{path}.gustfix-backup-{stamp}.json"
-        dump = [{"mac": r[0], "dateutc_ms": r[1], "windgustmph": r[2],
-                 "windspeedmph": r[3]}
-                for r in conn.execute(
-                    f"SELECT mac, dateutc_ms, windgustmph, windspeedmph "
-                    f"FROM observations WHERE {where}", params)]
+        # STREAMED, one JSON line per row — accumulating the rows in a Python
+        # list first is the exact pattern that OOM-killed
+        # repair_yearly_rain_offsets at ~236k rows beside uvicorn on a small
+        # Fly machine (see its docstring). Nanosecond stamp for the same
+        # two-runs-in-one-second reason as the yearly repair.
+        stamp = time.time_ns()
+        backup = f"{path}.gustfix-backup-{stamp}.jsonl"
+        n_backed = 0
         with open(backup, "w") as f:
-            json.dump(dump, f)
-        print(f"Backed up {len(dump)} gust value(s) to {backup}")
+            for r in conn.execute(
+                    f"SELECT mac, dateutc_ms, windgustmph, windspeedmph "
+                    f"FROM observations WHERE {where}", params):
+                f.write(json.dumps({"mac": r[0], "dateutc_ms": r[1],
+                                    "windgustmph": r[2],
+                                    "windspeedmph": r[3]}) + "\n")
+                n_backed += 1
+        print(f"Backed up {n_backed} gust value(s) to {backup}")
 
         cur = conn.execute(
             f"UPDATE observations SET windgustmph = NULL, "

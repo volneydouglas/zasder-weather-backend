@@ -86,17 +86,34 @@ def test_overflow_string_rain_does_not_500_current(client):
 
 # ───────────── R2-06: delete_device cascade covers location + smart state ─────────────
 
-def test_delete_device_removes_location_and_smart_alert_state(client):
+def test_delete_device_removes_location_and_smart_alert_state(client, monkeypatch):
     from app import db
+    from app.config import settings
+    # Insights on, so the ingest below folds rollup rows we can then assert
+    # are cascaded away (R3-08: 1.4 reintroduced the orphaned-table pattern).
+    monkeypatch.setattr(settings, "insights", True)
     assert _post_obs(client, "2026-08-01T12:00:00Z").status_code == 200
     client.put(f"/api/devices/{MAC}/location", headers=H,
                json={"lat": 33.3, "lon": -111.9, "label": "Home"})
     asyncio.run(db.upsert_smart_alert_state(MAC, "frost", 1, 123))
+    # 1.4 MAC-keyed state: WU station association + insights rollups.
+    assert client.put(f"/api/devices/{MAC}/wu-station", headers=H,
+                      json={"wu_station_id": "KAZCHAND668"}).status_code == 200
     body = client.delete(f"/api/devices/{MAC}", headers=H).json()
     assert body["location"] == 1
     assert body["smart_alert_state"] == 1
+    assert body["wu_station"] == 1
+    assert body["daily_rollups"] == 1
+    assert body["hour_rollups"] == 1
     assert asyncio.run(db.device_locations()) == {}
     assert asyncio.run(db.get_smart_alert_states()) == {}
+    # A re-registered MAC must not inherit the old WU station association
+    # (the Import screen defaults to it — an import would pull the OLD
+    # station's archive into the new device)...
+    assert asyncio.run(db.get_wu_station(MAC)) is None
+    # ...nor serve the deleted device's statistics / fold onto stale sums.
+    from app import insights
+    assert asyncio.run(insights.assemble(MAC))["day_count"] == 0
     # A re-registered MAC must not inherit the old location.
     assert _post_obs(client, "2026-08-01T13:00:00Z").status_code == 200
     devs = client.get("/api/devices", headers=H).json()
@@ -345,13 +362,18 @@ def test_stale_chart_index_missing_tempf_is_rebuilt(client):
 # ───────────────── R2-62: control chars in device names ─────────────────
 
 def test_device_name_control_chars_are_sanitized_in_messages():
-    subject, _ = alerts.build_alert("stale", "Bad\nName", MAC, 0,
-                                    11 * 60_000, 10, "UTC")
-    assert "\n" not in subject and "BadName".replace("", "")  # subject intact
+    subject, body = alerts.build_alert("stale", "Bad\nName", MAC, 0,
+                                       11 * 60_000, 10, "UTC")
+    assert "\n" not in subject and "\r" not in subject
     assert "Bad Name" in subject
-    title, _ = alerts.build_threshold_message("Evil\r\nDevice", "tempf",
-                                              101.0, "above", 100.0)
+    # The BODY carries the name too (R3-142: it was never asserted — and the
+    # old second clause was a no-op `"BadName".replace("", "")`). The body
+    # legitimately contains newlines of its own; the NAME inside it must not.
+    assert "Bad\nName" not in body and "Bad Name" in body
+    title, tbody = alerts.build_threshold_message("Evil\r\nDevice", "tempf",
+                                                  101.0, "above", 100.0)
     assert "\n" not in title and "\r" not in title
+    assert "Evil\r\nDevice" not in tbody
     t2, _ = alerts.build_smart_message("frost", "X\nY", tempf=30.0)
     assert "\n" not in t2
 
@@ -362,11 +384,13 @@ def test_make_jwt_treats_zero_now_as_epoch():
     import jwt as _jwt
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
-    pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption()).decode()
     tok = apns.make_jwt("TEAM", "KEY", pem, now=0)
-    assert _jwt.decode(tok, options={"verify_signature": False})["iat"] == 0
+    # Signature verified (R3-141) — see test_apns_make_jwt_structure.
+    assert _jwt.decode(tok, key.public_key(), algorithms=["ES256"])["iat"] == 0
 
 
 # ───────────────── R2-68: insert_observations scrubs non-finite ─────────────────

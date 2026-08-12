@@ -57,16 +57,33 @@ def _num(v: Any) -> float | None:
         return None
 
 
+def _device_labels(d: dict[str, Any]) -> str:
+    return (f'mac="{_esc_label(_mask_mac(d.get("mac")))}",'
+            f'name="{_esc_label(d.get("name") or _mask_mac(d.get("mac")))}"')
+
+
 def render_prometheus(devices: list[dict[str, Any]], now_ms: int) -> str:
     """Prometheus text-format exposition for all devices' latest readings."""
+    # Dedupe by label set up front: the MAC mask keeps only the last two
+    # bytes and names are free-form, so two devices CAN collide on
+    # (mac, name) — and a duplicate sample fails the ENTIRE scrape. The
+    # first device wins; one dropped series beats a dead /metrics.
+    labelled: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for d in devices:
+        labels = _device_labels(d)
+        if labels in seen:
+            continue
+        seen.add(labels)
+        labelled.append((labels, d))
+
     lines: list[str] = []
     for name, help_text, key in _METRICS:
         block: list[str] = []
-        for d in devices:
+        for labels, d in labelled:
             v = _num((d.get("lastData") or {}).get(key))
             if v is None:
                 continue
-            labels = f'mac="{_esc_label(_mask_mac(d.get("mac")))}",name="{_esc_label(d.get("name") or _mask_mac(d.get("mac")))}"'
             block.append(f"{name}{{{labels}}} {v:g}")
         if block:
             lines.append(f"# HELP {name} {help_text}")
@@ -81,12 +98,11 @@ def render_prometheus(devices: list[dict[str, Any]], now_ms: int) -> str:
     # existing dashboards/alert rules keep working.
     age_block: list[str] = []
     legacy_block: list[str] = []
-    for d in devices:
+    for labels, d in labelled:
         ls = d.get("lastSeen")
         if ls is None:
             continue
         age = max(0.0, (now_ms - int(ls)) / 1000.0)
-        labels = f'mac="{_esc_label(_mask_mac(d.get("mac")))}",name="{_esc_label(d.get("name") or _mask_mac(d.get("mac")))}"'
         age_block.append(f"zasder_device_last_report_age_seconds{{{labels}}} {age:g}")
         legacy_block.append(f"zasder_device_last_seen_seconds{{{labels}}} {age:g}")
     if age_block:

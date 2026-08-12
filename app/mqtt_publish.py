@@ -93,6 +93,20 @@ def state_message(device: dict[str, Any], topic_prefix: str = "zasder"
     return state_topic(topic_prefix, device["mac"]), payload
 
 
+def retraction_topics(node: str, topic_prefix: str = "zasder",
+                      disc_prefix: str = "homeassistant") -> list[str]:
+    """Every retained topic _publish creates for a node. Publishing an EMPTY
+    retained message to each deletes it from the broker — without this, a
+    deleted device's discovery configs + state stay retained forever and HA
+    shows ghost sensors. Pure — unit-testable. Reconstructible from the node
+    id alone (the config topics are keyed by node + field), so no device
+    dict is needed after deletion."""
+    return ([f"{disc_prefix}/sensor/zasder_{node}/{field}/config"
+             for field, *_ in _SENSORS]
+            + [f"{topic_prefix}/{node}/status",
+               f"{topic_prefix}/{node}/state"])
+
+
 class MqttPublisher:
     """Background task: connects to MQTT and republishes state every 30s +
     retained HA discovery once per device. No-op if paho-mqtt is missing."""
@@ -178,7 +192,18 @@ class MqttPublisher:
     async def _publish(self, client: Any) -> None:
         prefix = settings.mqtt_topic_prefix
         disc = settings.mqtt_discovery_prefix
-        for d in await db.list_devices():
+        devices = await db.list_devices()
+        # Retract retained messages for nodes announced THIS run that no
+        # longer exist (device deleted) — see retraction_topics. Restart
+        # forgets _announced, so pre-restart ghosts still need a manual
+        # broker sweep; deletes while running clean up automatically.
+        current = {_node(d["mac"]) for d in devices}
+        for node in self._announced - current:
+            for topic in retraction_topics(node, prefix, disc):
+                client.publish(topic, "", retain=True)
+            self._announced.discard(node)
+            log.info("retracted retained MQTT topics for removed device %s", node)
+        for d in devices:
             node = _node(d["mac"])
             if node not in self._announced:
                 for topic, cfg in discovery_messages(d, prefix, disc):

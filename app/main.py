@@ -27,6 +27,7 @@ from .capture import router as capture_router
 from .config import settings, tokens_match
 from . import source_status
 from . import config_backup
+from . import public_dashboard as _pd
 from .discovery import router as discovery_router
 from .ingest import router as ingest_router
 from .poller import Poller
@@ -37,6 +38,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+# httpx logs every request at INFO with the FULL URL — and the WU import,
+# TWC forecast, AWN and WeatherLink clients all carry their API keys as
+# query parameters (those APIs accept them nowhere else). Left at INFO,
+# every forecast refresh and each of the ~1400 calls of a WU import writes
+# the plaintext key into the server logs / Fly log drain. The modules scrub
+# their own exception messages; this closes httpx's channel too.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("api")
 
 
@@ -335,12 +344,17 @@ async def status_page() -> HTMLResponse:
             last_seen_label = _humanize_age(age)
             last_seen_class = "fresh" if age < 600 else ("warm" if age < 3600 else "stale")
         # Latest observation may or may not include tempf — pick best.
+        # Coerce through pd._num, never bare float(): stored values are not
+        # guaranteed numeric (rows written before the ingest-boundary scrub
+        # can hold strings), and a ValueError here 500s the ANONYMOUS `/`
+        # page — same hardening the wind-rose loop already has.
         obs = await db.latest_observation(d["mac"])
-        if obs and obs.get("tempf") is not None:
+        tval = _pd._num(obs.get("tempf")) if obs else None
+        if tval is not None:
             obs_ms = obs.get("dateutc")
             if obs_ms and (latest_temp is None or obs_ms > latest_temp["ts_ms"]):
                 latest_temp = {
-                    "tempf": float(obs["tempf"]),
+                    "tempf": tval,
                     "ts_ms": obs_ms,
                     "device": d.get("name") or d["mac"],
                 }
@@ -446,9 +460,13 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
             pts = []
             for r in rows:
                 t = r.get("dateutc")
-                v = r.get(key)
+                # pd._num, not bare float(): raw-window rows come from
+                # data_json and can carry non-numeric junk stored before the
+                # ingest scrub — a ValueError here 500s the anonymous `/`
+                # page (same guard as the wind-samples loop below).
+                v = pd._num(r.get(key))
                 if t is not None and v is not None:
-                    pts.append((int(t), float(v)))
+                    pts.append((int(t), v))
             series[key] = pts
         # Paired (direction, speed) samples for the wind rose. Both values must
         # be finite: the cloud pollers write lastData straight through, and a
@@ -730,6 +748,8 @@ class AlertPrefsIn(BaseModel):
     smtp_from: str | None = None
     smtp_tls: bool | None = None
     smtp_ssl: bool | None = None
+    # 'all' | 'device_down' — which alert kinds may email (push is unscoped).
+    email_scope: str | None = None
 
 
 class DeviceAlertIn(BaseModel):
@@ -776,6 +796,7 @@ async def _alerts_state() -> dict[str, Any]:
         "smtp_ssl": cfg.smtp_ssl,
         "smtp_password_set": bool(cfg.smtp_password),
         "smtp_source": "app" if prefs["smtp_host"] else ("env" if cfg.smtp_host else "none"),
+        "email_scope": cfg.email_scope,
         "devices": dev_list,
     }
 
@@ -809,6 +830,11 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
         fields["default_threshold_min"] = body.default_threshold_minutes
     if body.repeat_hours is not None:
         fields["repeat_hours"] = body.repeat_hours
+    if body.email_scope is not None:
+        if body.email_scope not in ("all", "device_down"):
+            raise HTTPException(status_code=400,
+                                detail="email_scope must be 'all' or 'device_down'")
+        fields["email_scope"] = body.email_scope
     if body.recipients is not None:
         clean = [r.strip() for r in body.recipients if r.strip()]
         for r in clean:
@@ -865,18 +891,194 @@ async def put_device_location(mac: str, body: DeviceLocationIn) -> JSONResponse:
                          "lon": body.lon, "label": body.label})
 
 
+class WUStationIn(BaseModel):
+    # Empty string clears the association. WU IDs are short uppercase
+    # alphanumerics (KAZCHAND802); bound + shape-check so junk can't land.
+    wu_station_id: str = Field(max_length=32, pattern=r"^[A-Za-z0-9]*$")
+
+
+@app.get("/api/devices/{mac}/wu-station", dependencies=[Depends(require_token)])
+async def get_wu_station(mac: str) -> JSONResponse:
+    from .ingest import _format_mac
+    norm = _format_mac(mac)
+    return JSONResponse({"mac": norm, "wu_station_id": await db.get_wu_station(norm)})
+
+
+@app.put("/api/devices/{mac}/wu-station", dependencies=[Depends(require_write_token)])
+async def put_wu_station(mac: str, body: WUStationIn) -> JSONResponse:
+    """Associate a Weather Underground station ID with a device — the WU
+    importer's target mapping (send "" to clear)."""
+    from .ingest import _format_mac
+    norm = _format_mac(mac)
+    # Known devices only (same check as start_wu_import): a typo'd MAC would
+    # otherwise create a wu_station_map row for a nonexistent device that
+    # silently attaches to whatever registers under that MAC later.
+    if not any(d["mac"] == norm for d in await db.list_devices()):
+        raise HTTPException(status_code=404, detail=f"unknown device {norm}")
+    sid = body.wu_station_id.strip().upper() or None
+    await db.set_wu_station(norm, sid, int(time.time() * 1000))
+    return JSONResponse({"ok": True, "mac": norm, "wu_station_id": sid})
+
+
+class WUKeyIn(BaseModel):
+    # Write-only, like the SMTP password: never returned by any endpoint.
+    # "" clears back to the WU_API_KEY env fallback.
+    api_key: str = Field(max_length=128, pattern=r"^[A-Za-z0-9]*$")
+
+
+async def effective_wu_key() -> str | None:
+    """App-managed key over env secret — the SMTP resolution pattern."""
+    return await db.get_kv("wu_api_key") or settings.wu_api_key
+
+
+@app.get("/api/config/wu-key", dependencies=[Depends(require_token)])
+async def get_wu_key_status() -> JSONResponse:
+    stored = await db.get_kv("wu_api_key")
+    return JSONResponse({
+        "configured": bool(stored or settings.wu_api_key),
+        "source": "app" if stored else ("env" if settings.wu_api_key else "none"),
+    })
+
+
+@app.put("/api/config/wu-key", dependencies=[Depends(require_write_token)])
+async def put_wu_key(body: WUKeyIn) -> JSONResponse:
+    """Store the Weather Underground API key server-side (powers the TWC
+    forecast source; the app's Import History screen syncs it here)."""
+    key = body.api_key.strip() or None
+    if key is not None and len(key) < 8:
+        raise HTTPException(status_code=400, detail="api_key too short")
+    await db.set_kv("wu_api_key", key)
+    stored = await db.get_kv("wu_api_key")
+    return JSONResponse({
+        "ok": True,
+        "configured": bool(stored or settings.wu_api_key),
+        "source": "app" if stored else ("env" if settings.wu_api_key else "none"),
+    })
+
+
+@app.get("/api/insights", dependencies=[Depends(require_token)])
+async def get_insights(mac: str = Query(...)) -> JSONResponse:
+    """Station statistics over the rollup tables (heat ledger, rain seasons,
+    normals/anomalies, diurnal grid, calendar). Opt-in: INSIGHTS=1."""
+    from . import insights
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    from .ingest import _format_mac
+    norm = _format_mac(mac)
+    payload = await insights.assemble(norm)
+    if payload["day_count"] == 0:
+        # Distinguish "no data" from "flag enabled after data existed".
+        payload["hint"] = ("no rollups yet — if this station has history, "
+                           "POST /api/insights/rebuild once")
+    return JSONResponse(payload)
+
+
+@app.post("/api/insights/rebuild", dependencies=[Depends(require_write_token)])
+async def rebuild_insights(mac: str | None = Query(None)) -> JSONResponse:
+    """Recompute rollups from raw history — run once after enabling INSIGHTS
+    on existing data, or after importing history while it was disabled."""
+    from . import insights
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    from .ingest import _format_mac
+    return JSONResponse(await insights.rebuild(_format_mac(mac) if mac else None))
+
+
+class WUImportIn(BaseModel):
+    mac: str
+    # Falls back to the device's stored wu_station_map association.
+    wu_station_id: str | None = Field(default=None, max_length=32,
+                                      pattern=r"^[A-Za-z0-9]+$")
+    # Never persisted or logged; lives only in the import task's closure.
+    # Optional: when omitted, the server-stored key (PUT /api/config/wu-key,
+    # or the WU_API_KEY env var) is used — a LAN user who followed the app's
+    # own cleartext-safety advice and configured the key server-side must
+    # not be forced to POST it in the body to start an import.
+    api_key: str | None = Field(default=None, min_length=8, max_length=128,
+                                pattern=r"^[A-Za-z0-9]+$")
+    start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    end_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    dry_run: bool = False
+
+
+@app.post("/api/import/wu", dependencies=[Depends(require_write_token)])
+async def start_wu_import(body: WUImportIn) -> JSONResponse:
+    """Begin a day-by-day WU history import into an existing device. One at a
+    time; poll GET /api/import/wu/status. dry_run counts without inserting."""
+    from datetime import date as _date
+    from . import wu_import
+    from .ingest import _format_mac
+    mac = _format_mac(body.mac)
+    if not any(d["mac"] == mac for d in await db.list_devices()):
+        raise HTTPException(status_code=404, detail=f"unknown device {mac}")
+    station = (body.wu_station_id or "").strip().upper() or await db.get_wu_station(mac)
+    if not station:
+        raise HTTPException(status_code=400,
+                            detail="no wu_station_id given and none associated "
+                                   "with this device (PUT .../wu-station first)")
+    try:
+        start = _date.fromisoformat(body.start_date)
+        end = _date.fromisoformat(body.end_date) if body.end_date else _date.today()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"bad date: {e}")
+    if start > end:
+        raise HTTPException(status_code=400, detail="start_date is after end_date")
+    api_key = body.api_key or await effective_wu_key()
+    if not api_key:
+        raise HTTPException(status_code=400,
+                            detail="no api_key given and no server-stored WU "
+                                   "key (PUT /api/config/wu-key first)")
+    if not wu_import.start_import(mac, station, api_key, start, end,
+                                  body.dry_run):
+        raise HTTPException(status_code=409, detail="an import is already running")
+    return JSONResponse({"ok": True, "mac": mac, "wu_station_id": station,
+                         "days": (end - start).days + 1, "dry_run": body.dry_run})
+
+
+@app.get("/api/import/wu/status", dependencies=[Depends(require_token)])
+async def wu_import_status() -> JSONResponse:
+    from . import wu_import
+    return JSONResponse(wu_import.status())
+
+
+@app.post("/api/import/wu/cancel", dependencies=[Depends(require_write_token)])
+async def wu_import_cancel() -> JSONResponse:
+    from . import wu_import
+    return JSONResponse({"ok": wu_import.cancel()})
+
+
+# Test-email throttle (R2-111 second half): /api/alerts/test is a real SMTP
+# send to every configured recipient, so an unthrottled write-token holder
+# could pump unlimited email through the operator's SMTP account (and trip
+# provider abuse lockouts with failed logins). One send attempt per process
+# per minute is plenty for the app's setup screen. Process-global like
+# _AUTH_FAIL_LOG_TS.
+_TEST_ALERT_TS: float | None = None
+_TEST_ALERT_MIN_INTERVAL_S = 60.0
+
+
 @app.post("/api/alerts/test", dependencies=[Depends(require_write_token)])
 async def test_alert() -> JSONResponse:
     """Send a one-off test email to the current recipients — lets the app's
-    setup screen verify delivery end to end."""
+    setup screen verify delivery end to end. Throttled to one attempt per
+    minute (429 on repeats)."""
     import asyncio as _asyncio
     from .alerts import effective_config, _send_sync
+    global _TEST_ALERT_TS
     cfg = await effective_config()
     if not cfg.transport_configured:
         raise HTTPException(status_code=400,
                             detail="SMTP transport not configured (set SMTP_HOST + creds as secrets)")
     if not cfg.recipients:
         raise HTTPException(status_code=400, detail="no recipients configured")
+    now = time.monotonic()
+    if _TEST_ALERT_TS is not None and now - _TEST_ALERT_TS < _TEST_ALERT_MIN_INTERVAL_S:
+        raise HTTPException(status_code=429,
+                            detail="a test email was just sent — wait a "
+                                   "minute before sending another")
+    # Marked before the attempt: a FAILED send still hit the SMTP server
+    # (repeated bad logins can lock the operator's account), so it counts.
+    _TEST_ALERT_TS = now
     try:
         await _asyncio.to_thread(
             _send_sync, "[Zasder Weather] Test alert",
@@ -1036,6 +1238,11 @@ async def delete_device(mac: str) -> JSONResponse:
 
 @app.get("/api/devices/{mac}/current", dependencies=[Depends(require_token)])
 async def get_current(mac: str) -> JSONResponse:
+    # Read-side MAC normalization: storage keys are the uppercase colonized
+    # form. Write endpoints already normalize; without the same here a
+    # lowercase/compact MAC from a script 404s while the uppercase works.
+    from .ingest import _format_mac
+    mac = _format_mac(mac)
     obs = await db.latest_observation(mac)
     if not obs:
         raise HTTPException(status_code=404, detail="no data for device")
@@ -1065,10 +1272,21 @@ async def get_current(mac: str) -> JSONResponse:
 @app.get("/api/devices/{mac}/history", dependencies=[Depends(require_token)])
 async def get_history(
     mac: str,
-    hours: int = Query(24, ge=1, le=24 * 30),
+    # 31 days + 1 h, not 30: Explore requests whole calendar months and July
+    # is 744 hours — the 720 cap 422'd every 31-day month. The extra hour is
+    # for a 31-day month spanning a DST fall-back transition (US November,
+    # EU October), which is 745 ABSOLUTE hours; at exactly 744 the app's
+    # whole-month request 422'd every year in those zones.
+    hours: int = Query(24, ge=1, le=24 * 31 + 1),
     limit: int = Query(2000, ge=1, le=10_000),
+    # Optional window END (epoch ms). Default = now, preserving the original
+    # trailing-window behavior; the History/Explore browser passes a past
+    # month's end to page through imported archives.
+    end_ms: int | None = Query(None, ge=0),
 ) -> JSONResponse:
-    end = int(time.time() * 1000)
+    from .ingest import _format_mac
+    mac = _format_mac(mac)              # read-side key normalization
+    end = end_ms if end_ms is not None else int(time.time() * 1000)
     start = end - hours * 3600 * 1000
     rows = await db.history(mac, start, end, limit=limit)
     return JSONResponse({"start": start, "end": end, "count": len(rows), "rows": rows})
@@ -1080,6 +1298,8 @@ async def get_summary(
     field: str = Query("tempf"),
     hours: int = Query(24, ge=1, le=24 * 30),
 ) -> JSONResponse:
+    from .ingest import _format_mac
+    mac = _format_mac(mac)              # read-side key normalization
     end = int(time.time() * 1000)
     start = end - hours * 3600 * 1000
     try:
@@ -1184,6 +1404,8 @@ def _warm_task_done(t: "asyncio.Task") -> None:
 async def get_records(mac: str) -> JSONResponse:
     """All-time / yearly / monthly / today highs & lows per metric, with the
     local time each record was set. Cached 15 min per device."""
+    from .ingest import _format_mac
+    mac = _format_mac(mac)              # read-side key normalization
     # 404 unknown MACs: db.records() returns an empty skeleton for any string,
     # so without this each bogus MAC burned 40 aggregate queries and left a
     # permanent cache entry.
@@ -1238,9 +1460,14 @@ async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSO
 
 @app.get("/api/forecast", dependencies=[Depends(require_token)])
 async def get_forecast(
-    lat: float | None = None, lon: float | None = None
+    lat: float | None = None, lon: float | None = None,
+    source: str | None = Query(None, pattern="^(open-meteo|twc)$"),
 ) -> JSONResponse:
-    """7-day forecast via Open-Meteo (free, no key)."""
+    """Forecast. Default: 7-day Open-Meteo (free, no key). source=twc asks
+    for The Weather Company's 5-day (needs the WU_API_KEY secret — free for
+    PWS owners); ANY TWC failure falls back to Open-Meteo for this response
+    only, marked with fallback_from so the app can label the strip. The
+    preference itself lives in the app and is never flipped here."""
     flat = lat if lat is not None else settings.forecast_lat
     flon = lon if lon is not None else settings.forecast_lon
     if flat is None or flon is None:
@@ -1277,6 +1504,23 @@ async def get_forecast(
         "timezone": "auto",
         "forecast_days": 7,
     }
+    fallback_from: str | None = None
+    if source == "twc":
+        from . import forecast_twc
+        wu_key = await effective_wu_key()
+        if wu_key:
+            try:
+                return JSONResponse(await forecast_twc.fetch(
+                    flat, flon, wu_key))
+            except Exception as e:
+                # Dead key (WU deactivates them when a station stops
+                # uploading), WU outage, transform surprise — all routine.
+                # Never log the exception repr: the key rides the URL.
+                log.warning("TWC forecast failed (%s); falling back to "
+                            "Open-Meteo", type(e).__name__)
+                fallback_from = "twc"
+        else:
+            fallback_from = "twc"          # asked for TWC, no key configured
     # A third-party API that times out, 500s or returns an HTML error page is
     # routine, not a bug in this server — report it as an upstream failure so
     # the app can say "forecast unavailable" instead of "server error".
@@ -1284,7 +1528,11 @@ async def get_forecast(
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
             r.raise_for_status()
-        return JSONResponse(r.json())
+        body = r.json()
+        body["source"] = "open-meteo"
+        if fallback_from:
+            body["fallback_from"] = fallback_from
+        return JSONResponse(body)
     except httpx.HTTPError as e:
         log.warning("forecast upstream failed: %s", e)
         raise HTTPException(status_code=502, detail="forecast upstream unavailable")

@@ -129,15 +129,12 @@ class Settings(BaseSettings):
     # (AWN, Atlas) have the right total; we baseline Davis here.
     weatherlink_yearly_rain_baseline_in: float = 0.0
 
-    # Per-MAC yearly-rain offset applied at ingest. Use case: LilyGO
-    # firmware posts the sensor's raw lifetime cumulative counter as
-    # rain.yearly_in (no firmware-side baselining), so each receiver
-    # needs an offset that calibrates the stored value to actual YTD
-    # rain. Env format is JSON: {"MAC1":offset1,"MAC2":offset2}.
-    # Stored yearly_in = max(0, posted_yearly_in - offset[mac]).
-    # Keys are case-insensitive and accept either colonized
-    # (AA:BB:CC:DD:EE:FF) or compact (AABBCCDDEEFF) form — the
-    # validator normalizes both.
+    # INERT since v1.3.2 — the offset calibration was removed after it
+    # corrupted rain history in production (ingest.py stores counters
+    # raw; period rain derives from deltas, so no calibration is
+    # needed). The setting is still parsed so old .env files don't
+    # crash Settings on boot, but nothing reads it. Do not re-wire
+    # without reading the 1.3.2 incident notes.
     ingest_yearly_rain_offsets: dict[str, float] = {}
 
     @field_validator("ingest_yearly_rain_offsets", mode="before")
@@ -224,6 +221,16 @@ class Settings(BaseSettings):
     # screenshots are replaced with an App Store link. OFF by default — a
     # public page that shows your live weather data should be a deliberate
     # choice. Set PUBLIC_DASHBOARD=1 to enable.
+    # Weather Underground PWS-owner API key (free for uploading stations).
+    # Powers the optional TWC forecast source. Server-side because the
+    # forecast is fetched here; the app's import key stays per-request.
+    wu_api_key: str | None = None
+
+    # Opt-in server-side Insights (statistics rollups + /api/insights).
+    # Gates BOTH rollup maintenance and the endpoint; enabling on existing
+    # data needs POST /api/insights/rebuild (see app/insights.py).
+    insights: bool = False
+
     public_dashboard: bool = False
     # Which stations to show. Empty/unset = the primary (first) device only.
     # A comma-separated MAC list pins specific stations; "all" shows every one.

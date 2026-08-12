@@ -251,6 +251,20 @@ def to_observation(
     }
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow redirects on the ingest POST. The default opener
+    replays the request headers — including `Authorization: Bearer
+    <INGEST_TOKEN>` — verbatim to whatever host a 3xx names, so a
+    misconfigured BACKEND_URL (or an interposed proxy) would hand the
+    write token to an arbitrary third party. Returning None makes urlopen
+    raise HTTPError instead, which main() logs like any other bad status."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_INGEST_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def post_observation(obs: dict, *, backend: str = BACKEND_URL,
                      token: str = INGEST_TOKEN) -> None:
     """POST a normalized observation to /ingest/custom. Raises on HTTP error."""
@@ -260,10 +274,10 @@ def post_observation(obs: dict, *, backend: str = BACKEND_URL,
         data=body, method="POST",
         headers={"Authorization": f"Bearer {token}",
                  "Content-Type": "application/json"})
-    # urlopen itself raises HTTPError for 4xx/5xx and follows 3xx, so a
-    # status check inside the `with` was dead code. Drain the body so the
-    # connection can be reused/closed cleanly.
-    with urllib.request.urlopen(req, timeout=10) as r:
+    # The opener raises HTTPError for 4xx/5xx AND for 3xx (see _NoRedirect),
+    # so a status check inside the `with` was dead code. Drain the body so
+    # the connection can be reused/closed cleanly.
+    with _INGEST_OPENER.open(req, timeout=10) as r:
         r.read()
 
 

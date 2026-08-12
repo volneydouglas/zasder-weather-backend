@@ -42,6 +42,11 @@ app/                         FastAPI source (the Python package)
   weatherlink_*.py           Davis WeatherLink cloud poller
   discovery.py               /ingest/discovery + /api/discoveries
   capture.py                 Optional raw-POST capture for debugging
+  insights.py                Opt-in statistics rollups + /api/insights (INSIGHTS=1)
+  wu_import.py               Weather Underground history import (/api/import/wu)
+  forecast_twc.py            TWC forecast source (needs a WU key)
+  config_backup.py           /api/config/backup + /api/config/restore
+  source_status.py           Per-ingest-source health for /api/sources
   static/                    Status page HTML
 tests/                       pytest suite — run with `pytest -q`
 Dockerfile                   python:3.12-slim → uvicorn
@@ -67,7 +72,6 @@ lilygo-relay/                ESP32 firmware (PlatformIO)
 bin/setup-fly.sh             Path-based Fly setup (asks sources first; create | update | --rotate-tokens | --print-tokens; non-interactive via --sources= --tz= --yes)
 bin/setup-local.sh           Guided local Docker setup (generates tokens, writes .env, docker compose up)
 bin/doctor.sh                Health checklist (fly auth, /healthz, both tokens, volume, pollers, recent data)
-bin/set-rain-offset.sh       Calibrate a LilyGO device's yearly rain (merges INGEST_YEARLY_RAIN_OFFSETS)
 docker-compose.yml           Backend-only compose for local deploy
 .env.example                 Annotated environment template
 README.md                    Human-facing setup guide
@@ -126,6 +130,11 @@ Q: Where do they want the backend?
 | `WEATHERLINK_POLL_INTERVAL_SECONDS` | Optional | Default 60. Min 15. |
 | `WEATHERLINK_YEARLY_RAIN_BASELINE_IN` | Optional | Inches to add to Davis's reported yearly rain (mid-year install). |
 | `SHARED_BAROMETER_SOURCE_MAC` | Optional | For cross-device pressure tile fallback. |
+| `WU_API_KEY` | Optional | Weather Underground PWS-owner key (free for uploading stations). Powers the TWC forecast source + the WU history import (`/api/import/wu`). An app-stored key (`PUT /api/config/wu-key`) takes precedence. |
+| `INSIGHTS` | Optional | `1` enables server-side statistics rollups + `GET /api/insights`. On existing data, run `POST /api/insights/rebuild` once to backfill. Default off (endpoint 404s). |
+| `INGEST_MAX_RAIN_RATE_IN_PER_HR` | Optional | Rain-glitch guard on `/ingest/custom`: drop a reading whose cumulative rain jumps faster than this (default 2.0 in/hr; 0 disables). |
+| `INGEST_GUST_MAX_FACTOR` + `INGEST_GUST_MIN_MPH` | Optional | Gust-glitch guard on `/ingest/custom`: null a gust above `_MIN_MPH` (default 30) that exceeds `_MAX_FACTOR` × sustained wind (default 4.0; 0 disables). |
+| `INGEST_MIN_INTERVAL_SECONDS` | Optional | History-write throttle for high-cadence sources; readings within N s of the last stored row skip history (live view unaffected; new-field posts always stored). Default 0 = store everything. |
 | `ALERT_EMAIL_TO` + `SMTP_HOST` | Optional | Both set = device-down email alerts on. SMTP_USERNAME/PASSWORD/PORT/SSL for transport (Gmail App Password works). |
 | `ALERT_STALE_MINUTES` (+ `_BY_MAC`) | Optional | Minutes offline before alerting; per-MAC override map, `0` disables a device. Default 15. |
 | `ALLOWED_HOSTS` | Recommended in prod | Comma-separated allow-list for Host header. Defaults `*`. |

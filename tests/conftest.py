@@ -31,6 +31,10 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     monkeypatch.setenv("INGEST_TOKEN", "test-ingest-token")
     monkeypatch.setenv("CAPTURE_TOKEN", "test-capture-token")
     monkeypatch.setenv("REVIEWER_API_TOKEN", "test-reviewer-token")
+    # Deterministic local-time math (insights rollups, records periods):
+    # without this a developer's .env TIMEZONE leaks in and moves values
+    # across day/hour boundaries between machines.
+    monkeypatch.setenv("TIMEZONE", "UTC")
     # Disable the AWN poller. Must be setenv("") NOT delenv(): Settings reads
     # env_file=".env", so merely deleting the process env let pydantic fall back
     # to the developer's real .env keys — every test then booted the poller and
@@ -72,8 +76,13 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
 def client(temp_env: str):
     """FastAPI TestClient with a freshly-imported app + isolated DB."""
     # Force re-import so settings + app pick up the env we just set.
-    for mod in ["app.config", "app.db", "app.capture", "app.ingest",
-                "app.discovery", "app.alerts", "app.main"]:
+    # app.apns and app.relay hold `from .config import settings` at import
+    # time — leaving them out kept them bound to the FIRST test's Settings
+    # instance (a stale-object trap that only passed because every test uses
+    # identical tokens). app.fcm reads env at call time and needs no reload.
+    for mod in ["app.config", "app.db", "app.insights", "app.capture",
+                "app.ingest", "app.discovery", "app.alerts",
+                "app.apns", "app.relay", "app.main"]:
         if mod in importlib.sys.modules: importlib.reload(importlib.sys.modules[mod])
     from fastapi.testclient import TestClient
     from app.main import app

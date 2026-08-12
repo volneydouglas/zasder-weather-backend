@@ -149,6 +149,12 @@ def svg_wind_rose(samples: list[tuple[float, float]], size: int = 200) -> str:
     nb = len(_ROSE_SPEED_BINS)
     counts = [[0] * nb for _ in range(_ROSE_SECTORS)]
     for d, s in data:
+        if s < 0:
+            # Ingest guarantees finiteness, not non-negativity: a negative
+            # speed matches no (lo <= s < hi) bin and the next(..., nb-1)
+            # default filed it into the STRONGEST petal — a glitch reading
+            # plotted as extreme wind on the public page.
+            continue
         si = int(((d + sec / 2) % 360.0) // sec)   # sector 0 centred on N
         bi = next((k for k, (lo, hi) in enumerate(_ROSE_SPEED_BINS) if lo <= s < hi), nb - 1)
         counts[si][bi] += 1

@@ -95,6 +95,18 @@ ask_yn() {  # ask_yn "Prompt" default(Y|N) → 0 if yes
 
 source_enabled() { case ",$SOURCES," in *,"$1",*) return 0 ;; *) return 1 ;; esac; }
 
+# Read a credential without echoing it — `-s` keeps API keys out of the
+# terminal scrollback and any recorded session (same reasoning as the
+# wll-poller's ask_secret). `|| val=""` turns a closed stdin into "empty"
+# instead of an errexit death mid-run; callers decide whether empty is
+# "keep current" (update mode) or an error (create mode).
+ask_secret() {  # ask_secret <varname> <prompt>
+  local __var="$1" __prompt="$2" __val=""
+  read -r -s -p "$__prompt" __val || __val=""
+  echo
+  printf -v "$__var" '%s' "$__val"
+}
+
 normalize_sources() {  # map aliases → canonical awn|davis|lilygo, dedup
   local out="" tok norm
   for tok in ${SOURCES//,/ }; do
@@ -278,8 +290,8 @@ if [ "$mode" = "create" ]; then
     echo
     bold "AmbientWeather credentials (https://ambientweather.net/account)"
     if [ "$NONINTERACTIVE" -eq 0 ]; then
-      [ -n "$aw_app_key" ] || read -r -p "AW_APPLICATION_KEY: " aw_app_key
-      [ -n "$aw_api_key" ] || read -r -p "AW_API_KEY: " aw_api_key
+      [ -n "$aw_app_key" ] || ask_secret aw_app_key "AW_APPLICATION_KEY (input hidden): "
+      [ -n "$aw_api_key" ] || ask_secret aw_api_key "AW_API_KEY (input hidden): "
     fi
     if [ -z "$aw_app_key" ] || [ -z "$aw_api_key" ]; then
       err "AmbientWeather selected but AW_APPLICATION_KEY / AW_API_KEY missing"; exit 1
@@ -293,8 +305,8 @@ if [ "$mode" = "create" ]; then
     bold "Davis WeatherLink v2 credentials (https://www.weatherlink.com/account)"
     info "The 'API Key v2' section is at the BOTTOM-LEFT of the account page."
     if [ "$NONINTERACTIVE" -eq 0 ]; then
-      [ -n "$wl_key" ]     || read -r -p "WEATHERLINK_API_KEY: " wl_key
-      [ -n "$wl_secret" ]  || read -r -p "WEATHERLINK_API_SECRET: " wl_secret
+      [ -n "$wl_key" ]     || ask_secret wl_key    "WEATHERLINK_API_KEY (input hidden): "
+      [ -n "$wl_secret" ]  || ask_secret wl_secret "WEATHERLINK_API_SECRET (input hidden): "
       [ -n "$wl_station" ] || read -r -p "WEATHERLINK_STATION_ID (find via /v2/stations): " wl_station
     fi
     if [ -z "$wl_key" ] || [ -z "$wl_secret" ] || [ -z "$wl_station" ]; then
@@ -439,9 +451,6 @@ if [ "$mode" = "create" ]; then
     emit "  curl -X POST \"http://zasder-lilygo-YYYY.local/provision\" \\"
     emit "    --data-urlencode \"backend_url=\$BACKEND_URL\" \\"
     emit "    --data-urlencode \"ingest_token=\$INGEST_TOKEN\""
-    emit ""
-    emit "After data flows, calibrate yearly-rain (lifetime counter → real YTD):"
-    emit "  ./bin/set-rain-offset.sh <MAC> <current-lifetime-rain-in> [--ytd=ACTUAL]"
   fi
 
   emit ""
@@ -500,19 +509,13 @@ if [ "$NONINTERACTIVE" -eq 0 ]; then
       info "Full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones"
     done
   fi
-  # Secrets: -s keeps them out of the terminal scrollback and any recorded
-  # session (same reasoning as wll-poller's ask_secret). `|| val=""` turns a
-  # closed stdin into "keep current" instead of an errexit death mid-update.
-  ask_secret_keep() {  # ask_secret_keep <varname> <prompt>
-    local __var="$1" __prompt="$2" __val=""
-    read -r -s -p "$__prompt" __val || __val=""
-    echo
-    printf -v "$__var" '%s' "$__val"
-  }
-  [ -n "$aw_app_key" ] || ask_secret_keep aw_app_key "New AW_APPLICATION_KEY (blank to keep, '-' to clear): "
-  [ -n "$aw_api_key" ] || ask_secret_keep aw_api_key "New AW_API_KEY         (blank to keep, '-' to clear): "
-  [ -n "$wl_key" ]     || ask_secret_keep wl_key     "New WEATHERLINK_API_KEY    (blank to keep, '-' to clear): "
-  [ -n "$wl_secret" ]  || ask_secret_keep wl_secret  "New WEATHERLINK_API_SECRET (blank to keep, '-' to clear): "
+  # Secrets: the shared ask_secret helper (top of file) reads with -s, so
+  # values stay out of the terminal scrollback; a closed stdin becomes
+  # "keep current" instead of an errexit death mid-update.
+  [ -n "$aw_app_key" ] || ask_secret aw_app_key "New AW_APPLICATION_KEY (input hidden; blank to keep, '-' to clear): "
+  [ -n "$aw_api_key" ] || ask_secret aw_api_key "New AW_API_KEY         (input hidden; blank to keep, '-' to clear): "
+  [ -n "$wl_key" ]     || ask_secret wl_key     "New WEATHERLINK_API_KEY    (input hidden; blank to keep, '-' to clear): "
+  [ -n "$wl_secret" ]  || ask_secret wl_secret  "New WEATHERLINK_API_SECRET (input hidden; blank to keep, '-' to clear): "
   [ -n "$wl_station" ] || read -r -p "New WEATHERLINK_STATION_ID (blank to keep, '-' to clear): " wl_station || wl_station=""
   [ -n "$custom_host" ] || read -r -p "Add custom hostname    (blank to skip): " custom_host || custom_host=""
   echo

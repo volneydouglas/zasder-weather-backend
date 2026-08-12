@@ -359,6 +359,13 @@ static void handleProvision() {
   handleStatus();  // reply with the fresh status
 }
 
+// Non-blocking identify blink, driven from loop(). The handler only arms
+// the deadline: the old delay(250)×12 stalled loop() — and with it
+// rtl_433.loop() + handleClient() — for a full 3 s, dropping any packets
+// decoded during the blink.
+static bool          identifyActive  = false;
+static unsigned long identifyUntilMs = 0;
+
 static void handleIdentify() {
   if (!checkAuth()) {
     server.send(403, "text/plain", "forbidden\n");
@@ -369,11 +376,22 @@ static void handleIdentify() {
   // -H "Authorization: Bearer $INGEST_TOKEN"
   // http://zasder-lilygo.local/identify` and watch which LED dances.
   server.send(200, "text/plain", "blinking 3s\n");
-  for (int i = 0; i < 12; i++) {
-    digitalWrite(LED_BUILTIN_RX, i & 1);
-    delay(250);
+  identifyActive  = true;
+  identifyUntilMs = millis() + 3000;
+}
+
+// Called every pass through loop() below. Overwrites whatever the RX-flash
+// path last did to the LED while active (cosmetic — RX itself is not
+// affected), and leaves the LED LOW when done.
+static void serviceIdentifyBlink() {
+  if (!identifyActive) return;
+  unsigned long now = millis();
+  if ((long) (now - identifyUntilMs) < 0) {   // wrap-safe "now < until"
+    digitalWrite(LED_BUILTIN_RX, (now / 250) & 1);
+  } else {
+    digitalWrite(LED_BUILTIN_RX, LOW);
+    identifyActive = false;
   }
-  digitalWrite(LED_BUILTIN_RX, LOW);
 }
 
 static void handleReset() {
@@ -549,6 +567,7 @@ static void cycleDiagLine() {
 
 void loop() {
   server.handleClient();
+  serviceIdentifyBlink();
   unsigned long now = millis();
   if (now - _lastDiagMs >= DIAG_CYCLE_MS) {
     _lastDiagMs = now;

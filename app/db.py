@@ -19,7 +19,7 @@ log = logging.getLogger("zasder.db")
 _CHART_INDEX_COLS = [
     "mac", "dateutc_ms", "tempf", "feels_like", "humidity", "baromrelin", "uv",
     "windspeedmph", "dew_point", "solarradiation", "hourlyrainin", "winddir",
-    "yearlyrainin", "windgustmph", "tempinf", "humidityin",
+    "yearlyrainin", "windgustmph", "tempinf", "humidityin", "dailyrainin",
 ]
 
 SCHEMA = """
@@ -70,7 +70,8 @@ CREATE INDEX IF NOT EXISTS idx_obs_mac_date
 CREATE INDEX IF NOT EXISTS idx_obs_chart
     ON observations (mac, dateutc_ms, tempf, feels_like, humidity, baromrelin,
                      uv, windspeedmph, dew_point, solarradiation, hourlyrainin,
-                     winddir, yearlyrainin, windgustmph, tempinf, humidityin);
+                     winddir, yearlyrainin, windgustmph, tempinf, humidityin,
+                     dailyrainin);
 
 -- Records (db.records) do MIN/MAX + first-occurrence lookups per metric over
 -- the full per-mac history. windgustmph + dailyrainin aren't in idx_obs_chart,
@@ -92,6 +93,22 @@ CREATE TABLE IF NOT EXISTS device_location (
     lon         REAL NOT NULL,
     label       TEXT,
     updated_ms  INTEGER
+);
+
+-- Weather Underground station association: which WU station ID holds this
+-- device's history. Drives the WU historical importer (and names its import
+-- target); one WU station per device.
+CREATE TABLE IF NOT EXISTS wu_station_map (
+    mac           TEXT PRIMARY KEY,
+    wu_station_id TEXT NOT NULL,
+    updated_ms    INTEGER
+);
+
+-- Small app-managed server config (write-only secrets like the WU API
+-- key). DB value wins over the matching env var; NULL/absent = env.
+CREATE TABLE IF NOT EXISTS server_kv (
+    k TEXT PRIMARY KEY,
+    v TEXT
 );
 
 -- "discoveries" = the long-tail of RF devices the SDR happens to hear that
@@ -142,7 +159,11 @@ CREATE TABLE IF NOT EXISTS alert_prefs (
     smtp_password         TEXT,
     smtp_from             TEXT,
     smtp_tls              INTEGER,
-    smtp_ssl              INTEGER
+    smtp_ssl              INTEGER,
+    -- 'all' (default, NULL = all) or 'device_down': which alert kinds may
+    -- EMAIL. Push always delivers everything — this only scopes the email
+    -- channel (user ask: device-down emails without threshold-rule emails).
+    email_scope           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS device_alert_prefs (
@@ -214,11 +235,24 @@ def _ensure_dir() -> None:
     parent.mkdir(parents=True, exist_ok=True)
 
 
+def _tolerant_float(v: Any) -> float | None:
+    """float(v) if it converts to a finite number, else None. REAL-affinity
+    columns can hold TEXT (the poller path stores upstream JSON verbatim,
+    with no coercion) — one junk row must degrade to "no value", not raise
+    out of a read path. A ValueError escaping last_yearly_rain, for example,
+    500'd every subsequent /ingest/custom for that MAC."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _parse_json_col(raw: Any) -> dict[str, Any]:
     """Parse a JSON TEXT column defensively, {} on NULL/corrupt/non-object.
     One corrupt row (manual sqlite edit, a restored/truncated backup) must
     degrade to a skipped row, not 500 every endpoint whose window contains
-    it — the guarded pattern list_discoveries already uses."""
+    it — the guarded pattern list_discoveries shares."""
     if not raw:
         return {}
     try:
@@ -280,6 +314,11 @@ async def init_db() -> None:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.executescript(SCHEMA)
+        # Insights rollup tables (see app/insights.py). Created even when
+        # the INSIGHTS flag is off — empty tables cost nothing and let the
+        # flag flip on without a schema step.
+        from .insights import SCHEMA as INSIGHTS_SCHEMA
+        await db.executescript(INSIGHTS_SCHEMA)
         # Migrate older DBs: add any alert_prefs columns the schema gained
         # after the table was first created (SQLite CREATE IF NOT EXISTS
         # won't add columns to an existing table).
@@ -289,9 +328,21 @@ async def init_db() -> None:
             ("smtp_host", "TEXT"), ("smtp_port", "INTEGER"),
             ("smtp_username", "TEXT"), ("smtp_password", "TEXT"),
             ("smtp_from", "TEXT"), ("smtp_tls", "INTEGER"), ("smtp_ssl", "INTEGER"),
+            ("email_scope", "TEXT"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
+        # Same migration for hour_rollups: feels_* came after the table
+        # shipped. Existing rows get 0/0 (= "no data"), so the feels-like
+        # diurnal grid stays empty until a rebuild folds history in.
+        cur = await db.execute("PRAGMA table_info(hour_rollups)")
+        existing = {r[1] for r in await cur.fetchall()}
+        for col, decl in (
+            ("feels_sum", "REAL NOT NULL DEFAULT 0"),
+            ("feels_n", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in existing:
+                await db.execute(f"ALTER TABLE hour_rollups ADD COLUMN {col} {decl}")
         # idx_obs_chart gained windgustmph so the bucketed chart query can serve
         # wind gust index-only. SQLite won't alter an existing index, so rebuild
         # it once if the stored definition predates the column (one-time cost at
@@ -327,6 +378,13 @@ async def init_db() -> None:
 async def connect() -> AsyncIterator[aiosqlite.Connection]:
     async with aiosqlite.connect(settings.database_path) as db:
         db.row_factory = aiosqlite.Row
+        # Writers WAIT for the lock instead of failing instantly. Zero
+        # timeout survived while every write was one fast statement; the
+        # insights transactions (BEGIN IMMEDIATE spans check+insert+rollup)
+        # hold the write lock long enough that a second writer used to get
+        # an immediate "database is locked" 500 (seen in production the
+        # night INSIGHTS=1 first went live).
+        await db.execute("PRAGMA busy_timeout = 10000")
         yield db
 
 
@@ -415,6 +473,7 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
     payload = []
+    scrubbed_by_ts: dict[Any, dict[str, Any]] = {}
     for r in rows:
         # Scrub BEFORE reading dateutc: a poller row with dateutc=NaN would
         # otherwise bind a non-finite timestamp into SQLite; scrubbed first it
@@ -423,9 +482,40 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
         ts = r.get("dateutc")
         if ts is None:
             continue
+        # In-batch duplicate timestamps: SQLite keeps the FIRST under
+        # INSERT OR IGNORE; mirror that here so the rollups below fold each
+        # stored row exactly once (CodeRabbit: double-counted sums).
+        if ts in scrubbed_by_ts:
+            continue
+        scrubbed_by_ts[ts] = r
         values = [r.get(_FIELD_MAP[c]) for c in _COLUMNS]
         payload.append((mac, ts, json.dumps(r), *values))
     async with connect() as db:
+        # Which timestamps are actually NEW? INSERT OR IGNORE silently skips
+        # duplicates, and the insights rollups must not double-count a
+        # re-delivered row's values — so diff against what exists first.
+        # (Chunked IN() well under SQLite's default 999-variable limit.)
+        new_ts: set[int] | None = None
+        from .insights import update_rollups
+        from .config import settings as _settings
+        if _settings.insights:
+            # Take the WRITE lock before the existence check: two concurrent
+            # deliveries of the same timestamp could otherwise both classify
+            # it as new — the loser's INSERT is ignored but its rollup fold
+            # would double-count (CodeRabbit). BEGIN IMMEDIATE serializes
+            # check+insert+rollup; the commit below (or connection teardown
+            # on error) releases it.
+            await db.execute("BEGIN IMMEDIATE")
+            new_ts = set()
+            ts_list = [p[1] for p in payload]
+            for i in range(0, len(ts_list), 500):
+                chunk = ts_list[i:i + 500]
+                cur = await db.execute(
+                    f"SELECT dateutc_ms FROM observations WHERE mac = ? "
+                    f"AND dateutc_ms IN ({','.join('?' * len(chunk))})",
+                    [mac, *chunk])
+                existing = {r[0] for r in await cur.fetchall()}
+                new_ts |= set(chunk) - existing
         cur = await db.executemany(
             f"""
             INSERT OR IGNORE INTO observations
@@ -434,6 +524,10 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
             """,
             payload,
         )
+        if new_ts is not None:
+            # Scrubbed + batch-deduped rows only — exactly what SQLite stored.
+            fresh = [scrubbed_by_ts[ts] for ts in new_ts if ts in scrubbed_by_ts]
+            await update_rollups(db, mac, fresh)
         await db.commit()
         return cur.rowcount or 0
 
@@ -474,6 +568,49 @@ async def set_device_location(mac: str, lat: float, lon: float,
             """,
             (mac, lat, lon, label, now_ms),
         )
+        await db.commit()
+
+
+async def get_kv(key: str) -> str | None:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT v FROM server_kv WHERE k = ?", (key,))).fetchone()
+    return row[0] if row else None
+
+
+async def set_kv(key: str, value: str | None) -> None:
+    """Set (or with None, clear back to env fallback) a server config value."""
+    async with connect() as db:
+        if value is None:
+            await db.execute("DELETE FROM server_kv WHERE k = ?", (key,))
+        else:
+            await db.execute(
+                "INSERT INTO server_kv (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, value))
+        await db.commit()
+
+
+async def get_wu_station(mac: str) -> str | None:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT wu_station_id FROM wu_station_map WHERE mac = ?", (mac,)
+        )).fetchone()
+    return row[0] if row else None
+
+
+async def set_wu_station(mac: str, station_id: str | None, now_ms: int) -> None:
+    """Associate (or with None, clear) the WU station for a device."""
+    async with connect() as db:
+        if station_id is None:
+            await db.execute("DELETE FROM wu_station_map WHERE mac = ?", (mac,))
+        else:
+            await db.execute(
+                """INSERT INTO wu_station_map (mac, wu_station_id, updated_ms)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(mac) DO UPDATE SET
+                     wu_station_id = excluded.wu_station_id,
+                     updated_ms    = excluded.updated_ms""",
+                (mac, station_id, now_ms))
         await db.commit()
 
 
@@ -538,11 +675,21 @@ async def delete_device(mac: str) -> dict[str, int]:
         # sees a clear→triggered transition).
         n_loc   = await _del("DELETE FROM device_location     WHERE mac = ?")
         n_smart = await _del("DELETE FROM smart_alert_state   WHERE mac = ?")
+        # 1.4's MAC-keyed tables — same inheritance bug class: a leftover
+        # wu_station_map row makes a re-registered MAC default to the OLD
+        # station's WU association (an import then pulls the wrong archive),
+        # and surviving rollup rows keep serving /api/insights for a deleted
+        # device, then UPSERT-fold the new device's readings onto the stale
+        # additive sums. init_db always creates these tables.
+        n_wu    = await _del("DELETE FROM wu_station_map      WHERE mac = ?")
+        n_daily = await _del("DELETE FROM daily_rollups       WHERE mac = ?")
+        n_hour  = await _del("DELETE FROM hour_rollups        WHERE mac = ?")
         await db.commit()
     return {"devices": n_devs, "observations": n_obs,
             "alert_prefs": n_pref, "alert_state": n_state,
             "rule_state": n_rule, "location": n_loc,
-            "smart_alert_state": n_smart}
+            "smart_alert_state": n_smart, "wu_station": n_wu,
+            "daily_rollups": n_daily, "hour_rollups": n_hour}
 
 
 async def get_alert_states() -> dict[str, dict[str, Any]]:
@@ -583,7 +730,7 @@ async def upsert_alert_state(mac: str, state: str, last_seen_ms: int | None,
 
 _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipients",
                     "smtp_host", "smtp_port", "smtp_username", "smtp_password",
-                    "smtp_from", "smtp_tls", "smtp_ssl")
+                    "smtp_from", "smtp_tls", "smtp_ssl", "email_scope")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -815,7 +962,12 @@ async def last_yearly_rain(mac: str) -> tuple[float, int] | None:
         )).fetchone()
     if not row or row["yearlyrainin"] is None:
         return None
-    return (float(row["yearlyrainin"]), int(row["dateutc_ms"]))
+    # TEXT-in-REAL tolerance: a junk stored value must read as "no prior",
+    # not ValueError out of the ingest glitch guard (see _tolerant_float).
+    val = _tolerant_float(row["yearlyrainin"])
+    if val is None:
+        return None
+    return (val, int(row["dateutc_ms"]))
 
 
 async def observation_count(mac: str) -> int:
@@ -974,9 +1126,15 @@ def _winddir_expr() -> str:
     """
     if not _HAS_MATH_FUNCS:
         return "AVG(winddir)"
-    return ("CASE WHEN COUNT(winddir) = 0 THEN NULL ELSE "
-            "(DEGREES(ATAN2(AVG(SIN(RADIANS(winddir))), "
-            "AVG(COS(RADIANS(winddir))))) + 360.0) % 360.0 END")
+    # NOT `(... + 360.0) % 360.0`: SQLite's % casts its operands to INTEGER
+    # (224.7 % 360.0 → 224.0), which truncated the circular mean to whole
+    # degrees. ATAN2's output is in (−180, 180], so one conditional +360 is
+    # a fraction-preserving mod.
+    vec = ("DEGREES(ATAN2(AVG(SIN(RADIANS(winddir))), "
+           "AVG(COS(RADIANS(winddir)))))")
+    return (f"CASE WHEN COUNT(winddir) = 0 THEN NULL "
+            f"WHEN {vec} < 0.0 THEN {vec} + 360.0 "
+            f"ELSE {vec} END")
 
 
 async def history(
@@ -1048,6 +1206,7 @@ async def history(
           {_winddir_expr()}   AS winddir,
           AVG(hourlyrainin)   AS hourlyrainin,
           MAX(yearlyrainin)   AS yearlyrainin,
+          MAX(dailyrainin)    AS dailyrainin,
           AVG(uv)             AS uv,
           AVG(solarradiation) AS solarradiation,
           MIN(tempf)          AS tempf_min,
@@ -1123,10 +1282,11 @@ async def list_discoveries(since_ms: int | None = None,
         )).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
-        sample = None
-        if r["sample_json"]:
-            try: sample = json.loads(r["sample_json"])
-            except json.JSONDecodeError: pass
+        # _parse_json_col, not bare json.loads: upsert_discovery stores with
+        # json.dumps(allow_nan=True), so a payload carrying 1e999 persists as
+        # an `Infinity` literal that round-trips to inf — surviving today only
+        # because Pydantic's serializer emits null. Scrub on the way out.
+        sample = _parse_json_col(r["sample_json"]) or None
         out.append({
             "model": r["model"],
             "id": r["sensor_id"],
@@ -1205,8 +1365,10 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
     if not row:
         return {"hourly_in": None, "daily_in": None,
                 "weekly_in": None, "monthly_in": None}
-    cur_year = None if row["yearlyrainin"] is None else float(row["yearlyrainin"])
-    cur_month = None if row["monthlyrainin"] is None else float(row["monthlyrainin"])
+    # _tolerant_float: TEXT stored in these REAL columns must degrade to
+    # "not computable" (all-None skeleton below), not raise.
+    cur_year = _tolerant_float(row["yearlyrainin"])
+    cur_month = _tolerant_float(row["monthlyrainin"])
 
     now_local = datetime.now(tz=tz)
     top_of_hour    = now_local.replace(minute=0, second=0, microsecond=0)
@@ -1234,7 +1396,7 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
                             ("monthly_in", start_of_month)):
         boundary_ms = int(boundary.timestamp() * 1000)
         if yearly_ok:
-            prior = await yearly_rain_at_or_before(mac, boundary_ms)
+            prior = _tolerant_float(await yearly_rain_at_or_before(mac, boundary_ms))
             out[name] = None if prior is None else round(max(0.0, cur_year - prior), 3)
         else:
             out[name] = await _rollup_from_monthly(
@@ -1259,11 +1421,14 @@ async def _rollup_from_monthly(mac: str, name: str, boundary_ms: int,
     if name == "monthly_in":
         return round(max(0.0, cur_month), 3)
     if boundary_ms >= start_of_month_ms:
-        prior = await _rain_col_at_or_before(mac, "monthlyrainin", boundary_ms)
+        prior = _tolerant_float(
+            await _rain_col_at_or_before(mac, "monthlyrainin", boundary_ms))
         return None if prior is None else round(max(0.0, cur_month - prior), 3)
     # Straddles the month boundary: this month's rain + last month's tail.
-    prev_final = await _rain_col_at_or_before(mac, "monthlyrainin", start_of_month_ms - 1)
-    prior = await _rain_col_at_or_before(mac, "monthlyrainin", boundary_ms)
+    prev_final = _tolerant_float(
+        await _rain_col_at_or_before(mac, "monthlyrainin", start_of_month_ms - 1))
+    prior = _tolerant_float(
+        await _rain_col_at_or_before(mac, "monthlyrainin", boundary_ms))
     if prev_final is None or prior is None:
         return round(max(0.0, cur_month), 3)  # best effort: at least this month
     return round(max(0.0, cur_month + max(0.0, prev_final - prior)), 3)

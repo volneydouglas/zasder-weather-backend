@@ -64,6 +64,15 @@ tail -f ~/Library/Logs/zasder-wll-poller.log
 bash bin/setup-macos.sh --uninstall
 ```
 
+Nothing rotates that log automatically. In normal operation it grows very
+slowly, but a persistently failing setup (backend unreachable, revoked
+token) warns every poll (~50 MB/yr at the default cadence). If it ever gets
+big, truncate it any time — the poller just keeps appending:
+
+```sh
+: > ~/Library/Logs/zasder-wll-poller.log
+```
+
 The poller runs in the background as a launchd agent
 (`~/Library/LaunchAgents/com.zasder.wll-poller.plist`), restarts if it ever
 stops, and starts again at login. To keep it running you'll want the Mac set
@@ -102,8 +111,11 @@ A small container that restarts on boot. Needs Docker + the Compose plugin
 cp .env.example .env
 chmod 600 .env
 
-# 2. Open it in a text editor and fill in the four values:
-#      WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME
+# 2. Open it in a text editor and fill in the five values:
+#      WLL_HOST, BACKEND_URL, INGEST_TOKEN, WLL_DEVICE_NAME, WLL_DEVICE_MAC
+#    (WLL_DEVICE_MAC: change the last three bytes to your own values —
+#    keeping the example's default collides with any other install
+#    posting to the same/hosted backend)
 #    On a Mac, this opens it in TextEdit — edit, then save with Cmd-S:
 open -e .env
 #    On a Pi/Linux, use nano instead:  nano .env
@@ -150,8 +162,9 @@ journalctl -fu wll-poller
 curl -s http://<wll-host>/v1/current_conditions | python3 -m json.tool | head -40
 
 # Backend should be receiving — recent observations on the device MAC
+# (use the WLL_DEVICE_MAC you configured)
 curl -s -H "Authorization: Bearer $API_TOKEN" \
-  https://<your-backend>/api/devices | jq '.[] | select(.mac == "5D:5D:05:00:00:01")'
+  https://<your-backend>/api/devices | jq '.[] | select(.mac == "<your WLL_DEVICE_MAC>")'
 ```
 
 If the dashboard's Davis card starts updating every ~10s instead of every
@@ -187,9 +200,10 @@ WLL JSON samples; no network needed.
 | `heat_index` / `wind_chill` | `outdoor.feels_like` | Heat index at ≥80°F, wind chill at ≤50°F, air temp in between — WLL populates *both* indices at every temperature, so the regime has to be picked here. THSW deliberately **not** used: it adds a direct-sun load that runs 5–10°F hotter than every other source |
 | `wind_speed_last` / `wind_dir_last` | `wind.speed_mph` / `wind.dir_deg` | |
 | `wind_speed_hi_last_10_min`    | `wind.gust_mph`       | 10-min gust |
-| `rain_rate_last × rain_size`   | `rain.hourly_in`      | counts/hr × size = in/hr |
+| `rainfall_last_60_min × rain_size` | `rain.hourly_in`  | last-hour ACCUMULATION (counts → inches), matching what the WeatherLink cloud poller writes to the same field. Deliberately NOT `rain_rate_last` — that's an instantaneous rate that spikes on bursts and reads ~0 in steady light rain |
 | `rainfall_daily × rain_size`   | `rain.daily_in`       | counts → inches |
-| `rainfall_year × rain_size`    | `rain.yearly_in`      | apply `INGEST_YEARLY_RAIN_OFFSETS` on backend if needed |
+| `rainfall_monthly × rain_size` | `rain.monthly_in`     | counts → inches |
+| `rainfall_year × rain_size`    | `rain.yearly_in`      | counts → inches |
 | `solar_rad` / `uv_index`       | `solar.radiation_wm2` / `solar.uv` | |
 | `temp_in` / `hum_in` (struct 4) | `indoor.tempf` / `indoor.humidity` | WLL itself (LSS Temp/Hum) |
 | `bar_sea_level` / `bar_absolute` (struct 3) | `pressure.relative_inhg` / `pressure.absolute_inhg` | LSS BAR — backend treats relative as rel + abs |

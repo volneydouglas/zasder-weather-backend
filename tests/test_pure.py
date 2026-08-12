@@ -308,10 +308,13 @@ def test_rain_glitch_disabled_when_rate_zero():
 
 def test_reviewer_token_must_meet_length_floor():
     # [P3] reviewer_api_token is accepted on /api/*, so a short one is a
-    # guessable backdoor — it must meet the same 32-char floor.
+    # guessable backdoor — it must meet the same 32-char floor. Pinned to
+    # ValidationError NAMING the field (R3-121): a bare raises(Exception)
+    # passed for any unrelated failure inside Settings(...).
     import pytest
+    from pydantic import ValidationError
     from app.config import Settings
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError, match="reviewer_api_token"):
         Settings(api_token="a" * 32, reviewer_api_token="123")
 
 
@@ -326,12 +329,15 @@ def test_apns_make_jwt_structure():
     import jwt as _jwt
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.hazmat.primitives import serialization
-    pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption()).decode()
     tok = apns.make_jwt("TEAMID1234", "KEYID5678", pem, now=1000)
     assert _jwt.get_unverified_header(tok)["kid"] == "KEYID5678"
-    claims = _jwt.decode(tok, options={"verify_signature": False})
+    # VERIFY the ES256 signature (R3-141): with verify_signature=False a
+    # broken signing call emitting a well-formed-but-unsigned token passed.
+    claims = _jwt.decode(tok, key.public_key(), algorithms=["ES256"])
     assert claims["iss"] == "TEAMID1234" and claims["iat"] == 1000
 
 def test_build_push_offline_and_recovered():

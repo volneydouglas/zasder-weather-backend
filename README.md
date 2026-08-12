@@ -321,30 +321,18 @@ fly secrets unset -a <app> \
   WEATHERLINK_POLL_INTERVAL_SECONDS
 ```
 
-If Path B had a `WEATHERLINK_YEARLY_RAIN_BASELINE_IN` set, move the
-equivalent offset to `INGEST_YEARLY_RAIN_OFFSETS` (next section) — same
-calibration mechanic, different polarity (`baseline = -offset`).
+(`WEATHERLINK_YEARLY_RAIN_BASELINE_IN` applies only to the Path B cloud
+poller. The WLL local path and LilyGO boards post lifetime counters raw.)
 
-### Calibrating yearly rain (LilyGO + WLL)
+### A note on yearly rain (LilyGO + WLL)
 
-LilyGO boards (and WLL local) POST the sensor's **raw lifetime rain counter**
-(an Atlas or Davis that's been running for years might report 30+ inches).
-Without calibration the iOS app shows that lifetime total as "yearly rain."
-Fix it with a per-MAC offset so the stored value = `lifetime − offset`:
-
-```sh
-# 1. Read what the board is currently posting:
-curl -H "Authorization: Bearer $API_TOKEN" \
-  "$BACKEND_URL/api/devices/5D:5D:01:00:02:C7/current" | grep -i yearlyrain
-
-# 2. Set the offset (subtracts the sensor's lifetime so YTD starts ~real).
-#    --ytd is your true year-to-date inches (default 0 = "count from zero now"):
-./bin/set-rain-offset.sh 5D:5D:01:00:02:C7 3.58 --ytd=0.73     # offset → 2.85
-```
-
-The helper merges into the `INGEST_YEARLY_RAIN_OFFSETS` Fly secret without
-disturbing other MACs. Local Docker users: set the same JSON map in `.env`
-(see `.env.example`).
+LilyGO boards (and WLL local) POST the sensor's **raw lifetime rain
+counter**, and that's fine: daily/weekly/monthly/yearly rain shown in the
+app is computed from the *changes* in that counter over stored history,
+not from its absolute value, so no calibration is needed. The old
+`INGEST_YEARLY_RAIN_OFFSETS` mechanism was removed in v1.3.2 (it could
+corrupt rain history) — if an old config still sets it, it is ignored;
+remove it.
 
 ## Device-down email alerts (optional)
 
@@ -519,7 +507,6 @@ wll-poller/             Davis WeatherLink Live LAN poller (Path E)
 bin/setup-fly.sh        Path-based Fly.io setup (sources → app, volume, secrets, summary)
 bin/setup-local.sh      Guided local Docker setup (tokens, .env, docker compose up)
 bin/doctor.sh           Health checklist (auth, /healthz, tokens, volume, pollers, data)
-bin/set-rain-offset.sh  Calibrate a LilyGO device's yearly rain (lifetime → real YTD)
 docker-compose.yml      Local-deployment compose file
 README.md               (this file — human-oriented)
 AGENTS.md               LLM-friendly deployment guide
@@ -539,8 +526,17 @@ calls these. Public-readable status page at `/`.
 | GET | `/api/devices` | All devices + latest reading |
 | DELETE | `/api/devices/{mac}` | Remove a retired device + all its observations + alert state (token-gated) |
 | GET | `/api/devices/{mac}/current` | Composite latest-non-null per field |
-| GET | `/api/devices/{mac}/history?hours=24` | Time series, auto-bucketed for 3d/7d/30d |
+| GET | `/api/devices/{mac}/history?hours=24` | Time series, auto-bucketed for 3d/7d/30d. Optional `end_ms=` sets the window END (epoch ms) to page back through older/imported history |
 | GET | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg/median + when |
+| GET | `/api/devices/{mac}/records` | All-time / yearly / monthly / today highs & lows per metric, with when each was set |
+| GET | `/api/sources` | Health of each ingest source (last success, last error) — tells a dead API key from dead hardware |
+| GET | `/api/insights?mac=` | Server-side statistics rollups. Needs `INSIGHTS=1`; on existing data run the rebuild below once |
+| POST | `/api/insights/rebuild` | One-time rollup backfill after enabling `INSIGHTS` (optional `?mac=`) |
+| POST | `/api/import/wu` | Start a Weather Underground history import into a device (`dry_run` supported); progress at GET `/api/import/wu/status` |
+| GET/PUT | `/api/config/wu-key` | Server-stored WU API key (write-only — GET reports only configured/source; falls back to the `WU_API_KEY` env var) |
+| GET/PUT | `/api/devices/{mac}/wu-station` | WU station ID associated with a device — the import target mapping |
+| GET | `/api/config/backup` | Export of operator config (alerts, rules, names…) — no tokens, no SMTP password |
+| POST | `/api/config/restore` | Restore a config export onto a fresh instance |
 | GET | `/api/forecast?lat=&lon=` | 7-day forecast (Open-Meteo) |
 | GET/PUT | `/api/alerts` | Device-down alert prefs (app-managed; SMTP password write-only) |
 | PUT | `/api/devices/{mac}/alert` | Per-device monitor toggle + threshold |

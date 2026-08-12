@@ -8,6 +8,45 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.4.0] — 2026-08-12
+
+The history release: import your Weather Underground archive, explore it,
+and get server-side statistics — plus a TWC forecast option and a deep
+security/robustness pass (99 review findings fixed).
+
+### Added
+- **Weather Underground history import** (`POST /api/import/wu` + status/
+  cancel): day-by-day backfill of a station's WU archive into your own
+  database. Idempotent, quota-aware (~1,400 calls/day with resume), dry-run
+  mode, per-device station mapping (`PUT /api/devices/{mac}/wu-station`).
+- **Insights** (opt-in `INSIGHTS=1`): daily/hourly rollups maintained at
+  ingest + `GET /api/insights` — heat and cold ledgers (incl. frost-free
+  season), rain year-over-year, monthly anomalies, temperature and
+  feels-like month×hour grids, degree days. `POST /api/insights/rebuild`
+  backfills rollups for existing data.
+- **TWC forecast source** (`GET /api/forecast?source=twc`): 5-day forecast
+  via a free WU PWS-owner key; automatic marked fallback to Open-Meteo on
+  any failure. App-managed key storage (`PUT /api/config/wu-key`,
+  write-only like the SMTP password) or `WU_API_KEY` env.
+- **Email alert scope**: `email_scope=device_down` limits email to
+  device-down alerts while push keeps everything.
+- Ranged history (`end_ms`) for month browsing; battery status from relay
+  sources now mapped end-to-end.
+
+### Fixed
+- 99 findings from a deep code review, including: API keys no longer
+  leak into server logs via HTTP client logging; overflow/junk metric
+  values can no longer permanently break `/records`/`/summary`; restore
+  validates input before touching existing data; imports resume after
+  transient network failures instead of re-burning quota; `database is
+  locked` errors under concurrent writes (busy_timeout + batched
+  rebuilds); many hardening and correctness fixes across ingest, alerts,
+  relay, and the public dashboard.
+
+### Changed
+- `/history` accepts up to 745 hours (DST-long months).
+- Setup scripts hide credential prompts; docs cover all new settings.
+
 ## [1.3.2] — 2026-08-11
 
 Fast-follow to 1.3.1. If you configured the yearly-rain offset calibration

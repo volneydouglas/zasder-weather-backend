@@ -251,13 +251,15 @@ class TransformTests(unittest.TestCase):
 
 
 class PostObservationTests(unittest.TestCase):
-    """post_observation drives urllib — mock urlopen, assert the request."""
+    """post_observation drives the module's no-redirect opener — mock its
+    open(), assert the request. (It deliberately does NOT use bare
+    urllib.request.urlopen: see _NoRedirect / R3-39.)"""
 
     def test_posts_to_ingest_custom_with_bearer_and_json(self):
         from unittest import mock
         seen = {}
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             seen["url"] = req.full_url
             seen["auth"] = req.get_header("Authorization")
             seen["ctype"] = req.get_header("Content-type")
@@ -268,7 +270,7 @@ class PostObservationTests(unittest.TestCase):
             return m
 
         obs = {"device": {"id": "AA"}, "source": "davis-wll-local"}
-        with mock.patch.object(poller.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(poller._INGEST_OPENER, "open", fake_open):
             poller.post_observation(obs, backend="https://b.example",
                                     token="sekrit")
         self.assertEqual(seen["url"], "https://b.example/ingest/custom")
@@ -281,15 +283,59 @@ class PostObservationTests(unittest.TestCase):
         import urllib.error
         from unittest import mock
 
-        def fake_urlopen(req, timeout=None):
+        def fake_open(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized",
                                          hdrs=None, fp=None)
 
-        with mock.patch.object(poller.urllib.request, "urlopen", fake_urlopen):
+        with mock.patch.object(poller._INGEST_OPENER, "open", fake_open):
             with self.assertRaises(urllib.error.HTTPError):
                 poller.post_observation({"device": {"id": "AA"}},
                                         backend="https://b.example",
                                         token="wrong")
+
+    def test_redirect_is_refused_not_followed(self):
+        """R3-39 regression, against a REAL local HTTP server: a 3xx from
+        the backend must raise, not be followed — the default opener
+        replays `Authorization: Bearer <INGEST_TOKEN>` verbatim to
+        whatever host the redirect names."""
+        import http.server
+        import threading
+        import urllib.error
+
+        hits: list[str] = []
+
+        class RedirectingHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.path)
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"http://127.0.0.1:{self.server.server_address[1]}/steal-token")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):  # where a followed 302 (POST→GET) would land
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectingHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                poller.post_observation({"device": {"id": "AA"}},
+                                        backend=base, token="sekrit")
+            self.assertEqual(ctx.exception.code, 302)
+            # Exactly one request — the redirect target was never fetched.
+            self.assertEqual(hits, ["/ingest/custom"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 class ConfigValidationTests(unittest.TestCase):

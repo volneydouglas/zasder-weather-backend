@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -41,6 +41,11 @@ DEGREE_DAY_BASE_F = 65.0
 # the same Seattle-vs-Chandler reason as the heat ledger's p90.
 COLD_TIERS = (45.0, 36.0, 32.0, 28.0, 25.0)
 FREEZE_F = 32.0
+
+# Rain gap: a day "rained" when it recorded at least one bucket tip. Fixed
+# line, no location-specific threshold — same generalization stance as the
+# ledgers (a trace day counts the same in Seattle as in Chandler).
+RAIN_DAY_MIN_IN = 0.01
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_rollups (
@@ -348,6 +353,10 @@ async def assemble(mac: str) -> dict[str, Any]:
         return 0.0
 
     years: dict[str, dict[str, Any]] = {}
+    # Rain gap: days iterate in date order, so the last assignment in the
+    # loop below IS the most recent rain day.
+    last_rain_day: str | None = None
+    last_rain_amount: float | None = None
     for d in days:
         y = d[0][:4]
         yr = years.setdefault(y, {
@@ -358,6 +367,7 @@ async def assemble(mac: str) -> dict[str, Any]:
             "days_p90": 0, "longest_p90_streak": 0, "_streak": 0,
             "hottest": None, "coldest": None,
             "rain_total": 0.0, "rain_series": [],
+            "longest_dry_streak": 0, "_dry_streak": 0,
             "cdd": 0.0, "hdd": 0.0,
         })
         yr["days"] += 1
@@ -390,6 +400,15 @@ async def assemble(mac: str) -> dict[str, Any]:
         rain = day_rain(d)
         yr["rain_total"] += rain
         yr["rain_series"].append([d[0], round(yr["rain_total"], 3)])
+        # Rain gap. Streaks count consecutive ROLLUP rows (one per day with
+        # data), like the p90 streak — a coverage gap doesn't inflate them.
+        if rain >= RAIN_DAY_MIN_IN:
+            last_rain_day, last_rain_amount = d[0], round(rain, 3)
+            yr["_dry_streak"] = 0
+        else:
+            yr["_dry_streak"] += 1
+            yr["longest_dry_streak"] = max(yr["longest_dry_streak"],
+                                           yr["_dry_streak"])
         if hi is not None and lo is not None:
             mean = (hi + lo) / 2
             yr["cdd"] += max(0.0, mean - DEGREE_DAY_BASE_F)
@@ -397,6 +416,7 @@ async def assemble(mac: str) -> dict[str, Any]:
 
     for yr in years.values():
         yr.pop("_streak", None)
+        yr.pop("_dry_streak", None)
         yr["rain_total"] = round(yr["rain_total"], 3)
         yr["cdd"] = round(yr["cdd"], 1)
         yr["hdd"] = round(yr["hdd"], 1)
@@ -415,6 +435,20 @@ async def assemble(mac: str) -> dict[str, Any]:
          "anomaly": round(sum(v) / len(v) - normals[my[5:7]], 2)}
         for my, v in sorted(per_my.items())
     ]
+
+    # Days-since-last-rain, in CALENDAR days (unlike the per-year streaks,
+    # which count rollup rows): "how long has it been dry" must not shrink
+    # because the station was offline for a week of it. 0 = it rained on the
+    # newest rollup day; a record with no rain at all spans the whole record.
+    dry_streak_days: int | None = None
+    if days:
+        last_day_date = date.fromisoformat(days[-1][0])
+        if last_rain_day is not None:
+            dry_streak_days = (last_day_date
+                               - date.fromisoformat(last_rain_day)).days
+        else:
+            dry_streak_days = (last_day_date
+                               - date.fromisoformat(days[0][0])).days + 1
 
     grid = [[None] * 24 for _ in range(12)]
     feels_grid = [[None] * 24 for _ in range(12)]
@@ -435,6 +469,10 @@ async def assemble(mac: str) -> dict[str, Any]:
         "p10_low": p10_low,
         "ledger_tiers": [int(t) for t in LEDGER_TIERS],
         "cold_tiers": [int(t) for t in COLD_TIERS],
+        # Rain gap (client renders the dry-streak card only when present).
+        "last_rain_day": last_rain_day,
+        "last_rain_amount": last_rain_amount,
+        "dry_streak_days": dry_streak_days,
         "years": [years[y] for y in sorted(years)],
         "monthly_normals": normals,
         "monthly_anomalies": anomalies,

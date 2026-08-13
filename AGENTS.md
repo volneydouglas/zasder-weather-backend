@@ -44,6 +44,9 @@ app/                         FastAPI source (the Python package)
   capture.py                 Optional raw-POST capture for debugging
   insights.py                Opt-in statistics rollups + /api/insights (INSIGHTS=1)
   wu_import.py               Weather Underground history import (/api/import/wu)
+  wu_upload.py               Live WU forwarding — re-posts ingested readings
+                             to wunderground.com per device (app-managed via
+                             PUT /api/devices/{mac}/wu-station)
   forecast_twc.py            TWC forecast source (needs a WU key)
   config_backup.py           /api/config/backup + /api/config/restore
   source_status.py           Per-ingest-source health for /api/sources

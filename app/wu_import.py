@@ -47,6 +47,12 @@ log = logging.getLogger("zasder.wu_import")
 WU_BASE = "https://api.weather.com/v2/pws/history/all"
 WU_CALL_GAP_S = 2.5          # ~24/min, under the 30/min free-key cap
 _RETRY_429_SLEEP_S = 65      # one polite retry after a rate-limit response
+# One retry of the SAME day after a transient transport error (ConnectError,
+# ReadTimeout, a dropped connection). A single network blip mid-way through a
+# multi-year import otherwise parks the whole run with resume state and waits
+# for a manual resume; one short-fuse retry rides it out. A second failure
+# still takes the resume-state path.
+_RETRY_TRANSPORT_SLEEP_S = 5
 # The free PWS key allows ~1500 calls/day, one call per day of history.
 # Stop cleanly a bit under the cap (probes and other tools share the quota)
 # and record where to resume — a multi-year import is a multi-day job by
@@ -86,6 +92,13 @@ def transform_observation(o: dict[str, Any], station_id: str) -> dict[str, Any] 
     epoch = o.get("epoch")
     if not isinstance(epoch, (int, float)) or epoch <= 0:
         return None
+    # WU's pre-~2019 archive returns epoch in MILLISECONDS (13 digits;
+    # seen live on 2015 data) while the modern API returns seconds.
+    # Unnormalized, the seconds path lands in year ~47000 and every day
+    # of an old import dies with ValueError. 1e11 seconds is year 5138 —
+    # anything above it can only be milliseconds.
+    if epoch > 1e11:
+        epoch /= 1000.0
     imp = o.get("imperial") or {}
 
     def num(src: dict[str, Any], key: str) -> float | None:
@@ -195,8 +208,22 @@ async def _run(mac: str, station_id: str, api_key: str,
                 _state["current_day"] = day.isoformat()
                 _state["calls_made"] += 1
                 try:
-                    obs = await _fetch_day(client, station_id,
-                                           day.strftime("%Y%m%d"), api_key)
+                    try:
+                        obs = await _fetch_day(client, station_id,
+                                               day.strftime("%Y%m%d"), api_key)
+                    except httpx.TransportError as e:
+                        # Type-and-day only, like the outer handler — httpx
+                        # exception reprs embed the request URL, which carries
+                        # the API key as a query parameter.
+                        log.warning("WU transient %s on %s; retrying once in "
+                                    "%ss", type(e).__name__, day.isoformat(),
+                                    _RETRY_TRANSPORT_SLEEP_S)
+                        await asyncio.sleep(_RETRY_TRANSPORT_SLEEP_S)
+                        _state["calls_made"] += 1
+                        # A second failure propagates to the outer handler,
+                        # which parks the run with resume_from as before.
+                        obs = await _fetch_day(client, station_id,
+                                               day.strftime("%Y%m%d"), api_key)
                 except _QuotaExhausted:
                     _state["resume_from"] = day.isoformat()
                     log.warning("WU quota exhausted at %s; import paused for "

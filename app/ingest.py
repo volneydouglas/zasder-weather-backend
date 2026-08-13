@@ -43,6 +43,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 
 from . import db
 from . import source_status
+from . import wu_upload
 from .config import settings, tokens_match
 
 log = logging.getLogger("ingest")
@@ -466,6 +467,33 @@ def _auto_device_name(normalized: dict[str, Any]) -> str:
     return f"{pretty}{f' ({model})' if model and model.lower() not in pretty.lower() else ''}"
 
 
+def _sea_level_pressure(abs_inhg: float, elevation_ft: float) -> float | None:
+    """Absolute (station) pressure → sea-level equivalent via the standard-
+    atmosphere barometric formula: slp = p · (1 − 0.0065·h/288.15)^−5.257,
+    h in meters. Physics from the operator's actual elevation, not a raw
+    additive offset — see settings.station_elevation_ft (the 1.3.2 rain-
+    offset incident is why hand-tuned per-MAC constants are off the table).
+    None when the result isn't a finite positive number (absurd elevation or
+    a garbage reading must not store a poisoned value)."""
+    try:
+        base = 1.0 - 0.0065 * (elevation_ft * 0.3048) / 288.15
+        if base <= 0:           # ~145k ft — not a weather station
+            return None
+        slp = abs_inhg * base ** -5.257
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return round(slp, 3) if math.isfinite(slp) and slp > 0 else None
+
+
+def _pressure_absolute_macs() -> set[str]:
+    """PRESSURE_ABSOLUTE_MACS (csv) → normalized colonized MACs. Parsed per
+    call like main.py's PUBLIC_DASHBOARD_MACS handling — a non-MAC entry
+    passes through _format_mac unchanged and simply never matches a
+    normalized device key."""
+    raw = settings.pressure_absolute_macs or ""
+    return {_format_mac(p.strip()) for p in raw.split(",") if p.strip()}
+
+
 def _is_gust_glitch(gust: float | None, speed: float | None,
                     min_mph: float, max_factor: float) -> bool:
     """A gust is a glitch if it's above `min_mph` AND exceeds `max_factor` ×
@@ -637,6 +665,20 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
                     "sustained", mac, flat["windgustmph"], flat.get("windspeedmph") or 0.0)
         flat["windgustmph"] = None
 
+    # Elevation-based sea-level correction for devices that post ABSOLUTE
+    # station pressure (a WH32B over SDR knows nothing about elevation, so
+    # its barometer reads ~1.2 inHg low at 1200 ft next to the sea-level-
+    # relative AWN/Davis sources). Physics-based from the operator's real
+    # elevation — see settings.station_elevation_ft for why this is not a
+    # raw fudge offset. baromabsin keeps the true absolute reading.
+    elev_ft = settings.station_elevation_ft
+    if (elev_ft > 0 and flat.get("baromrelin") is not None
+            and mac in _pressure_absolute_macs()):
+        slp = _sea_level_pressure(flat["baromrelin"], elev_ft)
+        if slp is not None:
+            flat["baromabsin"] = flat["baromrelin"]
+            flat["baromrelin"] = slp
+
     explicit_name, location = _device_label(payload_obj)
     auto_name = _auto_device_name(payload_obj)
     inner_info: dict[str, Any] = {
@@ -699,6 +741,13 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     # posting successfully. A throttled write still counts as the source
     # working; `rows` distinguishes stored from merely received.
     source_status.record_success("custom-ingest", rows=inserted)
+    # Forward to Weather Underground (1.5) — scheduled only AFTER every DB
+    # write above has committed, as a fire-and-forget task, so a slow or
+    # failing WU call can never block or fail this request. No-ops unless the
+    # device has upload enabled + station + key configured, and wu_upload
+    # throttles per mac (so even history-throttled readings may schedule —
+    # they're still fresh data). Copy `flat`: the task runs after we return.
+    wu_upload.schedule(mac, dict(flat))
     return {"ok": True, "mac": mac, "inserted": inserted,
             "ts_ms": flat["dateutc"], "throttled": not store}
 

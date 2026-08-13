@@ -80,9 +80,12 @@ def client(temp_env: str):
     # time — leaving them out kept them bound to the FIRST test's Settings
     # instance (a stale-object trap that only passed because every test uses
     # identical tokens). app.fcm reads env at call time and needs no reload.
-    for mod in ["app.config", "app.db", "app.insights", "app.capture",
-                "app.ingest", "app.discovery", "app.alerts",
-                "app.apns", "app.relay", "app.main"]:
+    # app.wu_upload holds process-global throttle/health dicts (and must be
+    # reloaded BEFORE app.ingest, which imports it at module top) — the
+    # app.insights precedent for modules with per-test state.
+    for mod in ["app.config", "app.db", "app.insights", "app.wu_upload",
+                "app.capture", "app.ingest", "app.discovery",
+                "app.alerts", "app.apns", "app.relay", "app.main"]:
         if mod in importlib.sys.modules: importlib.reload(importlib.sys.modules[mod])
     from fastapi.testclient import TestClient
     from app.main import app

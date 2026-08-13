@@ -700,8 +700,23 @@ async def api_sources() -> dict[str, Any]:
     revoked token, an upstream outage — is indistinguishable from dead
     hardware at the station end. This says which leg last worked and what the
     last failure said.
+
+    `wu_upload` mirrors that for the OUTBOUND leg (1.5 WU forwarding): per
+    enabled mac, when the last accepted upload happened and what the last
+    failure was (status/type only — never the key or URL, see wu_upload.py).
     """
-    return {"sources": source_status.snapshot()}
+    from . import wu_upload
+    uploads: dict[str, Any] = {}
+    for assoc in await db.list_wu_stations():
+        if not assoc["upload_enabled"]:
+            continue
+        uploads[assoc["mac"]] = {
+            "enabled": True,
+            "station_id": assoc["station_id"],
+            "configured": bool(assoc["station_id"] and assoc["upload_key"]),
+            **wu_upload.stats(assoc["mac"]),
+        }
+    return {"sources": source_status.snapshot(), "wu_upload": uploads}
 
 
 def _strip_device_pii(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -892,22 +907,43 @@ async def put_device_location(mac: str, body: DeviceLocationIn) -> JSONResponse:
 
 
 class WUStationIn(BaseModel):
-    # Empty string clears the association. WU IDs are short uppercase
-    # alphanumerics (KAZCHAND802); bound + shape-check so junk can't land.
-    wu_station_id: str = Field(max_length=32, pattern=r"^[A-Za-z0-9]*$")
+    # All fields optional = "leave unchanged", so the app can flip the upload
+    # toggle without re-sending the station ID (and 1.4 clients that only
+    # ever send wu_station_id keep their exact semantics). Empty string
+    # clears. WU IDs are short uppercase alphanumerics (KAZCHAND802);
+    # bound + shape-check so junk can't land.
+    wu_station_id: str | None = Field(default=None, max_length=32,
+                                      pattern=r"^[A-Za-z0-9]*$")
+    # WU *station* key for live upload — write-only, like /api/config/wu-key:
+    # "" clears, and no endpoint ever returns it (GET reports upload_key_set).
+    upload_key: str | None = Field(default=None, max_length=64,
+                                   pattern=r"^[A-Za-z0-9]*$")
+    # Turn live forwarding on/off (app/wu_upload.py).
+    upload_enabled: bool | None = None
+
+
+def _wu_station_view(norm: str, row: dict[str, Any] | None) -> dict[str, Any]:
+    """API shape for a WU association: the key itself NEVER leaves the
+    server — only whether one is set."""
+    return {"mac": norm,
+            "wu_station_id": row["station_id"] if row else None,
+            "upload_enabled": bool(row and row["upload_enabled"]),
+            "upload_key_set": bool(row and row["upload_key"])}
 
 
 @app.get("/api/devices/{mac}/wu-station", dependencies=[Depends(require_token)])
 async def get_wu_station(mac: str) -> JSONResponse:
     from .ingest import _format_mac
     norm = _format_mac(mac)
-    return JSONResponse({"mac": norm, "wu_station_id": await db.get_wu_station(norm)})
+    return JSONResponse(_wu_station_view(norm, await db.get_wu_station(norm)))
 
 
 @app.put("/api/devices/{mac}/wu-station", dependencies=[Depends(require_write_token)])
 async def put_wu_station(mac: str, body: WUStationIn) -> JSONResponse:
     """Associate a Weather Underground station ID with a device — the WU
-    importer's target mapping (send "" to clear)."""
+    importer's target mapping and (1.5) the live-upload config. Omitted
+    fields are left unchanged; "" clears. Clearing the station ID drops the
+    upload key + toggle with it (see db.set_wu_station)."""
     from .ingest import _format_mac
     norm = _format_mac(mac)
     # Known devices only (same check as start_wu_import): a typo'd MAC would
@@ -915,9 +951,27 @@ async def put_wu_station(mac: str, body: WUStationIn) -> JSONResponse:
     # silently attaches to whatever registers under that MAC later.
     if not any(d["mac"] == norm for d in await db.list_devices()):
         raise HTTPException(status_code=404, detail=f"unknown device {norm}")
-    sid = body.wu_station_id.strip().upper() or None
-    await db.set_wu_station(norm, sid, int(time.time() * 1000))
-    return JSONResponse({"ok": True, "mac": norm, "wu_station_id": sid})
+    kwargs: dict[str, Any] = {}
+    if body.wu_station_id is not None:
+        kwargs["station_id"] = body.wu_station_id.strip().upper() or None
+    if body.upload_key is not None:
+        kwargs["upload_key"] = body.upload_key.strip() or None
+    if body.upload_enabled is not None:
+        kwargs["upload_enabled"] = body.upload_enabled
+    # Upload config without a station to upload to would be silently dropped
+    # by the row-deletion semantics — refuse it loudly instead.
+    existing = await db.get_wu_station(norm)
+    effective_sid = kwargs.get("station_id",
+                               existing["station_id"] if existing else None)
+    if effective_sid is None and (kwargs.get("upload_key")
+                                  or kwargs.get("upload_enabled")):
+        raise HTTPException(status_code=400,
+                            detail="set a wu_station_id before configuring "
+                                   "the WU upload key or enabling forwarding")
+    if kwargs:
+        await db.set_wu_station(norm, now_ms=int(time.time() * 1000), **kwargs)
+    row = await db.get_wu_station(norm)
+    return JSONResponse({"ok": True, **_wu_station_view(norm, row)})
 
 
 class WUKeyIn(BaseModel):
@@ -1011,7 +1065,9 @@ async def start_wu_import(body: WUImportIn) -> JSONResponse:
     mac = _format_mac(body.mac)
     if not any(d["mac"] == mac for d in await db.list_devices()):
         raise HTTPException(status_code=404, detail=f"unknown device {mac}")
-    station = (body.wu_station_id or "").strip().upper() or await db.get_wu_station(mac)
+    assoc = await db.get_wu_station(mac)
+    station = ((body.wu_station_id or "").strip().upper()
+               or (assoc["station_id"] if assoc else None))
     if not station:
         raise HTTPException(status_code=400,
                             detail="no wu_station_id given and none associated "

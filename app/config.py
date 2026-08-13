@@ -179,6 +179,25 @@ class Settings(BaseSettings):
     # reading (default — no behavior change for existing deployments).
     ingest_min_interval_seconds: int = 0
 
+    # ── Sea-level pressure correction at ingest (opt-in) ─────────────────
+    # Some /ingest/custom sensors post ABSOLUTE station pressure (a WH32B
+    # decoded over SDR has no elevation knowledge), which reads low by a
+    # fixed physical factor at altitude (~1.2 inHg at 1200 ft) next to the
+    # sea-level-relative values every other source reports. When
+    # station_elevation_ft > 0, readings from the MACs listed in
+    # pressure_absolute_macs are converted absolute → sea-level at ingest
+    # using the standard-atmosphere barometric formula. Deliberately
+    # physics-based from the operator's real elevation, NOT a raw additive
+    # fudge offset — the 1.3.2 rain-offset incident is what a hand-tuned
+    # per-MAC constant does to stored history when it's set or removed
+    # mid-stream. 0 (default) disables the correction entirely.
+    station_elevation_ft: float = 0.0
+    # Comma-separated MAC list (colonized or compact, any case — same
+    # tolerance as PUBLIC_DASHBOARD_MACS); parsed at the ingest call site.
+    # Only the listed devices are corrected: sources that already report
+    # sea-level-relative pressure (AWN, Davis) must pass through untouched.
+    pressure_absolute_macs: str | None = None
+
     # ── APNs push (token-based) ──────────────────────────────────────────
     # Server-side push for alerts, alongside email. Enabled when key_id +
     # team_id + key_p8 are set (set them as Fly secrets). Create an "Apple

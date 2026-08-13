@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 
 # ───────────────────────── liveness + read auth ─────────────────────────
 
@@ -1102,8 +1104,12 @@ def test_reviewer_token_rejected_on_writes(client):
         # reviewer/demo token must never be able to plant an attacker-chosen
         # key that later TWC fetches would use.
         ("PUT",    "/api/config/wu-key",               {"api_key": "k" * 32}),
+        # 1.5: the same PUT now also carries the write-only WU upload key +
+        # forwarding toggle — a reviewer token must not be able to point the
+        # upload at an attacker-chosen station/key either.
         ("PUT",    "/api/devices/AA:BB:CC:DD:EE:FF/wu-station",
-                   {"wu_station_id": "KAZCHAND1"}),
+                   {"wu_station_id": "KAZCHAND1", "upload_key": "k" * 8,
+                    "upload_enabled": True}),
         ("POST",   "/api/insights/rebuild",            {}),
         ("POST",   "/api/import/wu",
                    {"mac": "AA:BB:CC:DD:EE:FF", "start_date": "2024-01-01"}),
@@ -1399,6 +1405,61 @@ def test_ingest_keeps_real_gust(client):
     cur = client.get("/api/devices/AA:BB:CC:DD:EE:11/current",
                      headers={"Authorization": "Bearer test-api-token"}).json()
     assert cur["windgustmph"] == 28.0
+
+
+# ───────────── elevation-based sea-level pressure correction ─────────────
+
+def _post_pressure(client, mac_compact: str, inhg: float) -> None:
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": mac_compact},
+                          "timestamp_utc": "2026-08-01T12:00:00Z",
+                          "outdoor": {"tempf": 90},
+                          "pressure": {"relative_inhg": inhg},
+                          "source": "fineoffset-wh24"})
+    assert r.status_code == 200, r.text
+
+
+def test_ingest_pressure_elevation_correction_for_listed_mac(client, monkeypatch):
+    """A listed absolute-pressure device gets the standard-atmosphere
+    sea-level conversion; baromabsin keeps the true absolute reading."""
+    from app import config
+    monkeypatch.setattr(config.settings, "station_elevation_ft", 1200.0)
+    # Compact + lowercase in the setting, colonized device key — the parse
+    # must normalize both sides.
+    monkeypatch.setattr(config.settings, "pressure_absolute_macs", "5d5d0200007d")
+    _post_pressure(client, "5D5D0200007D", 28.60)
+    cur = client.get("/api/devices/5D:5D:02:00:00:7D/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    expected = 28.60 * (1 - 0.0065 * (1200 * 0.3048) / 288.15) ** -5.257
+    assert cur["baromrelin"] == pytest.approx(expected, abs=1e-3)   # ~29.9
+    assert cur["baromabsin"] == 28.60
+
+
+def test_ingest_pressure_untouched_for_unlisted_mac(client, monkeypatch):
+    """Elevation set, but the posting device is NOT in the list (it already
+    reports sea-level-relative pressure) → stored exactly as posted."""
+    from app import config
+    monkeypatch.setattr(config.settings, "station_elevation_ft", 1200.0)
+    monkeypatch.setattr(config.settings, "pressure_absolute_macs",
+                        "AA:BB:CC:DD:EE:99")
+    _post_pressure(client, "5D5D0200007D", 29.90)
+    cur = client.get("/api/devices/5D:5D:02:00:00:7D/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert cur["baromrelin"] == 29.90
+    assert cur["baromabsin"] == 29.90
+
+
+def test_ingest_pressure_correction_off_by_default(client, monkeypatch):
+    """station_elevation_ft defaults to 0 = off: even a listed MAC stores
+    its pressure untouched."""
+    from app import config
+    monkeypatch.setattr(config.settings, "pressure_absolute_macs",
+                        "5D:5D:02:00:00:7D")
+    _post_pressure(client, "5D5D0200007D", 28.60)
+    cur = client.get("/api/devices/5D:5D:02:00:00:7D/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert cur["baromrelin"] == 28.60
 
 
 def test_maintenance_cleans_glitch_gusts(client, temp_env):

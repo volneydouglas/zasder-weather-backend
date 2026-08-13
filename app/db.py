@@ -97,11 +97,18 @@ CREATE TABLE IF NOT EXISTS device_location (
 
 -- Weather Underground station association: which WU station ID holds this
 -- device's history. Drives the WU historical importer (and names its import
--- target); one WU station per device.
+-- target); one WU station per device. 1.5 adds live upload (app/wu_upload.py):
+-- upload_key is the WU *station* key (write-only over the API, like the WU
+-- API key and the SMTP password — never returned by any endpoint), and
+-- upload_enabled turns forwarding on. Stored on the volume rather than a
+-- secret store for the same reason as alert_prefs.smtp_password: revocable,
+-- single-tenant, and app-managed without a redeploy.
 CREATE TABLE IF NOT EXISTS wu_station_map (
-    mac           TEXT PRIMARY KEY,
-    wu_station_id TEXT NOT NULL,
-    updated_ms    INTEGER
+    mac            TEXT PRIMARY KEY,
+    wu_station_id  TEXT NOT NULL,
+    updated_ms     INTEGER,
+    upload_key     TEXT,
+    upload_enabled INTEGER
 );
 
 -- Small app-managed server config (write-only secrets like the WU API
@@ -343,6 +350,18 @@ async def init_db() -> None:
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE hour_rollups ADD COLUMN {col} {decl}")
+        # Same migration for wu_station_map: the 1.5 live-upload columns came
+        # after the table shipped in 1.4. NULL upload_key / upload_enabled read
+        # as "forwarding not configured", so existing associations keep their
+        # import-only behavior.
+        cur = await db.execute("PRAGMA table_info(wu_station_map)")
+        existing = {r[1] for r in await cur.fetchall()}
+        for col, decl in (
+            ("upload_key", "TEXT"),
+            ("upload_enabled", "INTEGER"),
+        ):
+            if col not in existing:
+                await db.execute(f"ALTER TABLE wu_station_map ADD COLUMN {col} {decl}")
         # idx_obs_chart gained windgustmph so the bucketed chart query can serve
         # wind gust index-only. SQLite won't alter an existing index, so rebuild
         # it once if the stored definition predates the column (one-time cost at
@@ -590,27 +609,74 @@ async def set_kv(key: str, value: str | None) -> None:
         await db.commit()
 
 
-async def get_wu_station(mac: str) -> str | None:
+# "Leave this column unchanged" sentinel for set_wu_station's partial
+# updates — None already means "clear", so it can't double as "unchanged".
+_WU_UNSET: Any = object()
+
+
+async def get_wu_station(mac: str) -> dict[str, Any] | None:
+    """The device's WU association, or None if there is none. upload_key is
+    the raw stored station key — INTERNAL callers only (the uploader); API
+    responses must surface upload_key_set, never the key itself."""
     async with connect() as db:
         row = await (await db.execute(
-            "SELECT wu_station_id FROM wu_station_map WHERE mac = ?", (mac,)
+            "SELECT wu_station_id, upload_key, upload_enabled "
+            "FROM wu_station_map WHERE mac = ?", (mac,)
         )).fetchone()
-    return row[0] if row else None
+    if row is None:
+        return None
+    return {"station_id": row["wu_station_id"],
+            "upload_key": row["upload_key"],
+            "upload_enabled": bool(row["upload_enabled"])}
 
 
-async def set_wu_station(mac: str, station_id: str | None, now_ms: int) -> None:
-    """Associate (or with None, clear) the WU station for a device."""
+async def list_wu_stations() -> list[dict[str, Any]]:
+    """Every WU association (same shape as get_wu_station, plus mac). Feeds
+    the /api/sources wu_upload health block; upload_key stays internal."""
     async with connect() as db:
-        if station_id is None:
+        rows = await (await db.execute(
+            "SELECT mac, wu_station_id, upload_key, upload_enabled "
+            "FROM wu_station_map")).fetchall()
+    return [{"mac": r["mac"], "station_id": r["wu_station_id"],
+             "upload_key": r["upload_key"],
+             "upload_enabled": bool(r["upload_enabled"])} for r in rows]
+
+
+async def set_wu_station(mac: str, station_id: Any = _WU_UNSET,
+                         now_ms: int = 0, *,
+                         upload_key: Any = _WU_UNSET,
+                         upload_enabled: Any = _WU_UNSET) -> None:
+    """Partial-update the WU association. Each argument: _WU_UNSET = leave
+    unchanged, None = clear, value = set. Clearing the station ID deletes the
+    whole row — the upload key and enabled flag are meaningless without a
+    station, and a leftover key for a re-associated station would silently
+    upload to the wrong place."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT wu_station_id, upload_key, upload_enabled "
+            "FROM wu_station_map WHERE mac = ?", (mac,))).fetchone()
+        new_sid = row["wu_station_id"] if row else None
+        new_key = row["upload_key"] if row else None
+        new_en = bool(row["upload_enabled"]) if row else False
+        if station_id is not _WU_UNSET:
+            new_sid = station_id
+        if upload_key is not _WU_UNSET:
+            new_key = upload_key
+        if upload_enabled is not _WU_UNSET:
+            new_en = bool(upload_enabled)
+        if new_sid is None:
             await db.execute("DELETE FROM wu_station_map WHERE mac = ?", (mac,))
         else:
             await db.execute(
-                """INSERT INTO wu_station_map (mac, wu_station_id, updated_ms)
-                   VALUES (?, ?, ?)
+                """INSERT INTO wu_station_map
+                     (mac, wu_station_id, updated_ms, upload_key, upload_enabled)
+                   VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(mac) DO UPDATE SET
-                     wu_station_id = excluded.wu_station_id,
-                     updated_ms    = excluded.updated_ms""",
-                (mac, station_id, now_ms))
+                     wu_station_id  = excluded.wu_station_id,
+                     updated_ms     = excluded.updated_ms,
+                     upload_key     = excluded.upload_key,
+                     upload_enabled = excluded.upload_enabled""",
+                (mac, new_sid, now_ms, new_key, 1 if new_en else 0))
         await db.commit()
 
 

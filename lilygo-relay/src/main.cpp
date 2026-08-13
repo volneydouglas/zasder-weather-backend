@@ -93,6 +93,22 @@ static volatile bool g_wifiReconnect = false;
 #define RX_STALL_MS (5UL * 60UL * 1000UL)   // 5 minutes
 #endif
 
+// Deaf-boot recovery: the stall check above only arms after the FIRST
+// packet, so a board whose radio comes up dead (seen 2026-07-30 and
+// 2026-08-12 on the 433: RX wedge → watchdog restart → SX1276 boots
+// deaf) sat at pkts_decoded=0 forever looking healthy. If nothing has
+// been heard this long after boot, restart — but only a bounded number
+// of times, tracked in RTC memory (survives esp_restart, cleared on
+// power-on and on any successful RX), because a genuinely dead radio
+// must not boot-loop the board out of /status reachability.
+#ifndef RX_DEAF_BOOT_MS
+#define RX_DEAF_BOOT_MS (10UL * 60UL * 1000UL)  // 10 minutes
+#endif
+#ifndef RX_DEAF_MAX_RESTARTS
+#define RX_DEAF_MAX_RESTARTS 2
+#endif
+RTC_NOINIT_ATTR static uint32_t g_deafRestarts;
+
 // ── scheduled nightly restart ──────────────────────────────────────────
 // Symptom we're chasing: after a few days of 24/7 uptime the OLED can
 // desync into garbage (SSD1306 controller losing I2C sync on the shared
@@ -158,6 +174,21 @@ static void watchdogTask(void *) {
       Serial.flush();
       esp_restart();
     }
+    if (lastRx != 0) {
+      g_deafRestarts = 0;               // radio works — reset the deaf budget
+    } else if (millis() > RX_DEAF_BOOT_MS) {
+      if (g_deafRestarts < RX_DEAF_MAX_RESTARTS) {
+        g_deafRestarts++;
+        Serial.printf("[watchdog] deaf since boot (>%lus) — restart %lu/%u\n",
+                      (unsigned long) (RX_DEAF_BOOT_MS / 1000),
+                      (unsigned long) g_deafRestarts,
+                      (unsigned) RX_DEAF_MAX_RESTARTS);
+        Serial.flush();
+        esp_restart();
+      }
+      // Budget exhausted: stay up (reachable for /status + reflash) rather
+      // than boot-looping on a radio a warm reset can't fix.
+    }
     // Runs on core 0 alongside the stall check, so the nightly reboot fires
     // even if loop() (core 1) is wedged.
     maybeNightlyRestart();
@@ -186,6 +217,9 @@ void setup() {
   // Why did we (re)boot? After the watchdog lands, this line tells us
   // whether the last boot was a power-on, a panic, or a watchdog reset.
   Serial.printf("  reset_reason=%d\n", (int) esp_reset_reason());
+  // RTC memory is garbage on a cold boot — the deaf-restart budget only
+  // carries across SOFTWARE resets (that's the boot-loop it bounds).
+  if (esp_reset_reason() == ESP_RST_POWERON) g_deafRestarts = 0;
   // Register the Wi-Fi event handler before connecting so reconnects are
   // handled from first boot.
   WiFi.onEvent(onWifiEvent);

@@ -26,6 +26,7 @@ def _reset_state(monkeypatch, client):
     wu_import._state.clear()
     wu_import._state["running"] = False
     monkeypatch.setattr(wu_import, "WU_CALL_GAP_S", 0)
+    monkeypatch.setattr(wu_import, "_RETRY_TRANSPORT_SLEEP_S", 0)
     yield
     wu_import._state.clear()
     wu_import._state["running"] = False
@@ -189,15 +190,16 @@ def test_import_stops_at_daily_budget_with_resume_point(client, monkeypatch):
 
 
 def test_transient_failure_sets_resume_point(client, monkeypatch):
-    """R3-13: one ConnectError mid-run must leave the same clean resume state
-    quota exhaustion does — re-running a multi-year import from the start
-    re-burns hundreds of quota calls just to reach the day that failed."""
+    """R3-13: a PERSISTENT ConnectError mid-run (first try AND the single
+    retry) must leave the same clean resume state quota exhaustion does —
+    re-running a multi-year import from the start re-burns hundreds of quota
+    calls just to reach the day that failed."""
     import httpx
     _seed_device(client)
     calls = {"n": 0}
     async def flaky(client_, station_id, day, api_key):
         calls["n"] += 1
-        if calls["n"] == 2:
+        if calls["n"] in (2, 3):        # day 2: original call AND its retry
             raise httpx.ConnectError("boom https://api.weather.com?apiKey=" + api_key)
         return [_wu_obs(1_680_912_294 + calls["n"])]
     monkeypatch.setattr(wu_import, "_fetch_day", flaky)
@@ -217,6 +219,29 @@ def test_transient_failure_sets_resume_point(client, monkeypatch):
     st2 = _run_import(monkeypatch, days, start="2023-04-09", end="2023-04-10")
     assert st2["error"] is None and st2["done_days"] == 2
     assert st2["resume_from"] is None
+
+
+def test_transient_failure_retries_once_and_continues(client, monkeypatch):
+    """A single network blip must NOT park a multi-year import: the same day
+    is retried once (after a short sleep) and the run continues. The state
+    snapshot stays free of the key and the URL."""
+    import httpx
+    _seed_device(client)
+    calls = {"n": 0}
+    async def flaky_once(client_, station_id, day, api_key):
+        calls["n"] += 1
+        if calls["n"] == 2:             # day 2, first attempt only
+            raise httpx.ReadTimeout("boom https://api.weather.com?apiKey=" + api_key)
+        return [_wu_obs(1_680_912_294 + calls["n"])]
+    monkeypatch.setattr(wu_import, "_fetch_day", flaky_once)
+    asyncio.run(wu_import._run("AA:BB:CC:DD:EE:FF", "KAZCHAND668", "k" * 16,
+                               dt.date(2023, 4, 8), dt.date(2023, 4, 10), False))
+    st = wu_import.status()
+    assert st["error"] is None and st["resume_from"] is None
+    assert st["done_days"] == 3
+    assert st["calls_made"] == 4        # 3 days + the one retry
+    assert st["rows_inserted"] == 3
+    assert "k" * 16 not in str(st)
 
 
 def test_cancel_sets_resume_point(client, monkeypatch):
@@ -337,3 +362,18 @@ def test_import_api_conflict_while_running(client):
     assert r.status_code == 409
     assert client.post("/api/import/wu/cancel", headers=_H).json()["ok"] is True
     assert wu_import._state["cancelled"] is True
+
+
+def test_millisecond_epoch_normalized():
+    """WU's pre-2019 archive sends epoch in MILLISECONDS (seen live on 2015
+    data); unnormalized it produced year-47000 timestamps and a ValueError
+    for every day of an old import."""
+    from app import wu_import as wi
+    row = wi.transform_observation({
+        "epoch": 1427860860000,          # 2015-04-01T04:01:00Z, in ms
+        "humidityAvg": 80.0,
+        "imperial": {"tempAvg": 34.7},
+    }, "KPAIRWIN10")
+    assert row is not None
+    assert row["dateutc"] == 1427860860000
+    assert row["tempf"] == 34.7

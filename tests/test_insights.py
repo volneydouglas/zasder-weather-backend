@@ -129,6 +129,60 @@ def test_cold_ledger_tiers_and_freeze_dates(insights_on):
     assert y_spring["first_fall_freeze"] is None
 
 
+def test_rain_gap_and_dry_streaks(insights_on):
+    client = insights_on
+    # Anchored just before the most recent Jan 1 (see _recent_jan1) so every
+    # date is inside the ingest horizon, safely in the past, and the whole
+    # window stays inside ONE calendar year (a now-relative base splits the
+    # per-year streak assertion across years in early January).
+    base = _recent_jan1() - dt.timedelta(days=15)
+    rains = {0: 0.5, 3: 0.2}                 # rain days; the rest are dry
+    for i in range(10):
+        _post(client, base + dt.timedelta(days=i), 70.0,
+              rain_daily=rains.get(i))
+    body = client.get("/api/insights?mac=" + MAC, headers=_H).json()
+    assert body["last_rain_day"] == \
+        (base + dt.timedelta(days=3)).strftime("%Y-%m-%d")
+    assert body["last_rain_amount"] == pytest.approx(0.2)
+    # Days 4..9 are dry: 6 calendar days since the last rain day.
+    assert body["dry_streak_days"] == 6
+    assert len(body["years"]) == 1
+    # Two dry runs — days 1-2 (len 2) and days 4-9 (len 6): longest is 6.
+    assert body["years"][0]["longest_dry_streak"] == 6
+    assert "_dry_streak" not in body["years"][0]
+
+
+def test_rain_gap_rain_on_last_day_and_no_rain(insights_on):
+    client = insights_on
+    base = _recent_jan1() - dt.timedelta(days=10)
+    # Dry, dry, then rain on the newest day → streak is over (0 days).
+    _post(client, base, 70.0)
+    _post(client, base + dt.timedelta(days=1), 70.0)
+    _post(client, base + dt.timedelta(days=2), 70.0, rain_daily=0.3)
+    body = client.get("/api/insights?mac=" + MAC, headers=_H).json()
+    assert body["dry_streak_days"] == 0
+    assert body["last_rain_day"] == \
+        (base + dt.timedelta(days=2)).strftime("%Y-%m-%d")
+    assert body["years"][0]["longest_dry_streak"] == 2
+
+    # A record with NO rain at all: last_rain_* stay None and the streak
+    # spans the whole record (3 calendar days here).
+    other = "11:22:33:44:55:66"
+    for i in range(3):
+        b = {"device": {"id": "112233445566"},
+             "timestamp_utc": (base + dt.timedelta(days=i))
+                 .strftime("%Y-%m-%dT%H:%M:%SZ"),
+             "outdoor": {"tempf": 70.0, "humidity": 40},
+             "wind": {}, "rain": {},
+             "pressure": {"relative_inhg": 29.9}, "source": "test"}
+        assert client.post("/ingest/custom", headers=_ING,
+                           json=b).status_code == 200
+    body = client.get("/api/insights?mac=" + other, headers=_H).json()
+    assert body["last_rain_day"] is None
+    assert body["last_rain_amount"] is None
+    assert body["dry_streak_days"] == 3
+
+
 def test_rebuild_matches_incremental(insights_on):
     client = insights_on
     base = dt.datetime(2026, 5, 1, 8, 0, tzinfo=dt.timezone.utc)

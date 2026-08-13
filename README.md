@@ -534,7 +534,7 @@ calls these. Public-readable status page at `/`.
 | POST | `/api/insights/rebuild` | One-time rollup backfill after enabling `INSIGHTS` (optional `?mac=`) |
 | POST | `/api/import/wu` | Start a Weather Underground history import into a device (`dry_run` supported); progress at GET `/api/import/wu/status` |
 | GET/PUT | `/api/config/wu-key` | Server-stored WU API key (write-only — GET reports only configured/source; falls back to the `WU_API_KEY` env var) |
-| GET/PUT | `/api/devices/{mac}/wu-station` | WU station ID associated with a device — the import target mapping |
+| GET/PUT | `/api/devices/{mac}/wu-station` | WU station ID associated with a device — the import target mapping, plus live WU forwarding: `upload_key` (the WU *station* key, write-only — GET reports only `upload_key_set`) and `upload_enabled` turn on per-reading uploads to wunderground.com, keeping a WU station alive when MyAcurite/other forwarding shuts down. Upload health appears in `/api/sources` (`wu_upload` block) |
 | GET | `/api/config/backup` | Export of operator config (alerts, rules, names…) — no tokens, no SMTP password |
 | POST | `/api/config/restore` | Restore a config export onto a fresh instance |
 | GET | `/api/forecast?lat=&lon=` | 7-day forecast (Open-Meteo) |

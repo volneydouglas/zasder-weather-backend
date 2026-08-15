@@ -212,6 +212,13 @@ async def _run(mac: str, station_id: str, api_key: str,
                         obs = await _fetch_day(client, station_id,
                                                day.strftime("%Y%m%d"), api_key)
                     except httpx.TransportError as e:
+                        # The retry is a real upstream call and must respect
+                        # the same budget as the first attempt: when the
+                        # failed call consumed the final slot, park the run
+                        # (this day stays unprocessed → resume_from) instead
+                        # of exceeding WU_DAILY_CALL_BUDGET by one.
+                        if _state["calls_made"] >= WU_DAILY_CALL_BUDGET:
+                            raise _QuotaExhausted() from None
                         # Type-and-day only, like the outer handler — httpx
                         # exception reprs embed the request URL, which carries
                         # the API key as a query parameter.

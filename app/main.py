@@ -10,6 +10,8 @@ from typing import Annotated, Any
 
 import httpx
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
@@ -150,6 +152,20 @@ app = FastAPI(
     redoc_url="/redoc" if _DEBUG else None,
     openapi_url="/openapi.json" if _DEBUG else None,
 )
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_no_echo(request: Request,
+                                    exc: RequestValidationError) -> JSONResponse:
+    """422 bodies minus the "input" echo. Pydantic's default includes the
+    rejected value verbatim — for credential-carrying routes (wu-station
+    upload_key, the WU api key) the app renders that body in a persistent
+    label, redisplaying a just-typed secret the SecureField hid."""
+    errors = [{k: v for k, v in e.items() if k != "input"}
+              for e in exc.errors()]
+    return JSONResponse(status_code=422,
+                        content={"detail": jsonable_encoder(errors)})
+
+
 app.include_router(capture_router)
 app.include_router(discovery_router)
 app.include_router(ingest_router)
@@ -1025,6 +1041,19 @@ async def get_insights(mac: str = Query(...)) -> JSONResponse:
         payload["hint"] = ("no rollups yet — if this station has history, "
                            "POST /api/insights/rebuild once")
     return JSONResponse(payload)
+
+
+@app.get("/api/insights/daily", dependencies=[Depends(require_token)])
+async def get_insights_daily(mac: str = Query(...),
+                             days: int = Query(60, ge=7, le=366)) -> JSONResponse:
+    """Per-day temperature series for one station (rollups only) — the
+    sensor-drift card fetches this once per visible station and diffs the
+    daily means client-side. Opt-in with the rest of Insights."""
+    from . import insights
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    from .ingest import _format_mac
+    return JSONResponse(await insights.daily_series(_format_mac(mac), days))
 
 
 @app.post("/api/insights/rebuild", dependencies=[Depends(require_write_token)])

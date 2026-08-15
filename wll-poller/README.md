@@ -5,6 +5,21 @@ gateway on your LAN and forwards observations to a Zasder Weather backend
 via `/ingest/custom`. Runs on any always-on LAN host — a Raspberry Pi is
 ideal.
 
+## Moving to the macOS app
+
+The Mac app has the same poller built in, so you can retire this script.
+One thing matters during the switch: **use the same station ID**. This
+script posts under `WLL_DEVICE_MAC` (default `5D:5D:05:00:00:01`), while
+a fresh Mac install mints its own random ID. If they differ, your server
+grows a SECOND station and the original stops updating, stranding its
+history.
+
+1. Install the Mac app and enter your backend URL and API token.
+2. In its settings, set **Station ID** to this script's `WLL_DEVICE_MAC`
+   value, then add your WeatherLink Live IP and ingest token.
+3. Confirm readings keep arriving on the original station.
+4. Only then remove the LaunchAgent (see below).
+
 ## Why local instead of the cloud poller
 
 The WeatherLink **cloud** API updates every 60 s, needs an account-tied API

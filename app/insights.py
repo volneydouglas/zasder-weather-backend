@@ -325,6 +325,40 @@ def _percentile(sorted_vals: list[float], p: float) -> float | None:
     return sorted_vals[idx]
 
 
+async def daily_series(mac: str, days: int) -> dict[str, Any]:
+    """Per-day temperature series for one station, newest-last — rollups
+    only, so it's cheap enough for the app to call once per station.
+
+    Powers the sensor-drift card: the app fetches this for each visible
+    station and compares daily means, so two sensors that disagree — or
+    START disagreeing — show up as a diverging line, not a hunch.
+
+    Shape: {"mac": ..., "series": [["2026-08-01", lo, hi, mean], ...]}.
+    """
+    from . import db as dbmod
+    async with dbmod.connect() as db:
+        rows = await (await db.execute(
+            "SELECT day, tempf_min, tempf_max, tempf_sum, tempf_n "
+            "FROM daily_rollups WHERE mac = ? ORDER BY day DESC LIMIT ?",
+            (mac, days))).fetchall()
+
+    def clean(v: Any) -> float | None:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    series: list[list[Any]] = []
+    for r in reversed(rows):
+        n = r["tempf_n"] or 0
+        total = clean(r["tempf_sum"])
+        mean = round(total / n, 2) if (n and total is not None) else None
+        series.append([r["day"], clean(r["tempf_min"]),
+                       clean(r["tempf_max"]), mean])
+    return {"mac": mac, "series": series}
+
+
 async def assemble(mac: str) -> dict[str, Any]:
     """The /api/insights payload — reads rollups only."""
     from . import db as dbmod
@@ -480,4 +514,7 @@ async def assemble(mac: str) -> dict[str, Any]:
         "diurnal_feels": feels_grid,
         # Per-day highs for the calendar heatmap (client renders).
         "calendar": [[d[0], d[2]] for d in days if d[2] is not None],
+        # Per-day lows for the heatmap's Low mode (app 1.5+; older apps
+        # ignore the extra key).
+        "calendar_lo": [[d[0], d[1]] for d in days if d[1] is not None],
     }

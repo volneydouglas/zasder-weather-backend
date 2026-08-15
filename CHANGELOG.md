@@ -8,6 +8,47 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.5.0] — 2026-08-13
+
+The data-quality release: plausibility guards keep sensor glitches out
+of your records, sensor drift becomes visible, and WU forwarding keeps
+a Weather Underground station alive after vendor forwarding shutdowns.
+
+### Added
+- **Weather Underground live forwarding** (`PUT /api/devices/{mac}/wu-station`
+  with `upload_enabled` + write-only `upload_key`): posts a station's
+  readings straight to wunderground.com, throttled to 60 s per station,
+  health surfaced in `GET /api/sources`.
+- **Ingest plausibility bands** (`INGEST_PLAUSIBILITY_BANDS`, default on):
+  per-field physical bounds beyond world-record extremes — decode garbage
+  (bit-flip temperatures, negative rain, 3000 mph gusts) is nulled
+  field-by-field before it reaches records, rollups or alerts.
+- **Daily-rain + temperature spike guards**: the yearly-rain guard's
+  rate×elapsed allowance and level-shift rebaseline now also cover
+  `dailyrainin` jumps and impossible temperature steps
+  (`INGEST_MAX_TEMP_JUMP_F`, default 40 °F + 60 °F/h accrued allowance).
+  A persistent new level (sensor swap) is accepted on the second sighting.
+- **Per-day temperature series** (`GET /api/insights/daily`, INSIGHTS-
+  gated): rollup-backed lo/hi/mean per day — powers the app's sensor-
+  drift card.
+- **Elevation-based sea-level pressure correction**
+  (`STATION_ELEVATION_FT` + `PRESSURE_ABSOLUTE_MACS`): absolute-pressure
+  sensors (e.g. a WH32B over SDR) are corrected to sea level from the
+  operator's real elevation; the true absolute reading is kept in
+  `baromabsin`.
+- Insights: rain-gap fields (last rain day/amount, current + per-year
+  longest dry streak).
+
+### Fixed
+- WU import: single automatic retry on a transient transport error
+  (same-day, budget-respecting), and millisecond-epoch timestamps from
+  pre-2019 WU archives are normalized instead of rejected.
+- Pressure correction is applied BEFORE the plausibility bands, so
+  high-elevation stations aren't nulled by the sea-level band.
+- First insert from the Mac app's WLL poller without an explicit name is
+  labeled "Davis WeatherLink Live" (was "Davis Wll Local"); an explicit
+  `device.name` is still the only thing that renames an existing station.
+
 ## [1.4.0] — 2026-08-12
 
 The history release: import your Weather Underground archive, explore it,

@@ -154,6 +154,25 @@ class Settings(BaseSettings):
     # 2 in/hr is well above any real rainfall rate. Set 0 to disable.
     ingest_max_rain_rate_in_per_hr: float = 2.0
 
+    # Plausibility bands (records QC, 1.5). Absolute physical bounds per
+    # metric field — beyond world-record extremes, so they can never clip a
+    # real reading; only decode garbage (bit-flips like 3276.7°F, negative
+    # rain, 3000 mph wind) gets nulled before it can reach records, rollups
+    # and alerts. Field-level: the rest of the reading is kept.
+    # Set false to store readings exactly as posted.
+    ingest_plausibility_bands: bool = True
+
+    # Temperature-jump guard, same family as the rain-glitch guard: a tempf
+    # reading further than this from the device's last stored value (plus a
+    # generous 60 °F per elapsed hour) is a decode glitch or a colliding
+    # sensor, not weather — the largest real swings on record (frontal
+    # passages, monsoon outflow) are ~50 °F over hours, and a station that
+    # was offline accrues allowance for the gap. Rejected readings null
+    # tempf/feelsLike/dewPoint for that row only; a persistent new level
+    # (sensor swap) is accepted on the second consecutive sighting, exactly
+    # like the rain guard's level-shift rebaseline. Set 0 to disable.
+    ingest_max_temp_jump_f: float = 40.0
+
     # Wind-gust glitch guard. Some anemometers / the WeatherLink Live feed
     # occasionally emit a spurious high gust (e.g. 58 mph while the sustained
     # wind is 4 mph — a physically impossible ~13x gust factor). A gust ABOVE

@@ -1016,24 +1016,39 @@ async def set_push_relay(url: str | None, token: str | None) -> None:
         await db.commit()
 
 
-async def last_yearly_rain(mac: str) -> tuple[float, int] | None:
-    """Most recent NON-NULL cumulative yearly-rain reading + its timestamp
-    (ms) for a device. Used by the ingest glitch guard as the 'before' value
+# Columns the ingest glitch guards may ask for. `last_metric_value`
+# interpolates the name into SQL, so it MUST come from this fixed set —
+# never caller input. A plain `if` (not assert: those vanish under
+# `python -O`), same rule as every other interpolated column here.
+_GLITCH_GUARD_COLUMNS = frozenset({"yearlyrainin", "dailyrainin", "tempf"})
+
+
+async def last_metric_value(mac: str, column: str) -> tuple[float, int] | None:
+    """Most recent NON-NULL value of one metric column + its timestamp (ms)
+    for a device. Used by the ingest glitch guards as the 'before' value
     (a dropped glitch leaves NULL, so this returns the last *good* reading)."""
+    if column not in _GLITCH_GUARD_COLUMNS:
+        raise ValueError(f"column not allowed for glitch guard: {column!r}")
     async with connect() as db:
         row = await (await db.execute(
-            "SELECT yearlyrainin, dateutc_ms FROM observations "
-            "WHERE mac = ? AND yearlyrainin IS NOT NULL "
+            f"SELECT {column} AS v, dateutc_ms FROM observations "
+            "WHERE mac = ? AND " + column + " IS NOT NULL "
             "ORDER BY dateutc_ms DESC LIMIT 1", (mac,)
         )).fetchone()
-    if not row or row["yearlyrainin"] is None:
+    if not row or row["v"] is None:
         return None
     # TEXT-in-REAL tolerance: a junk stored value must read as "no prior",
     # not ValueError out of the ingest glitch guard (see _tolerant_float).
-    val = _tolerant_float(row["yearlyrainin"])
+    val = _tolerant_float(row["v"])
     if val is None:
         return None
     return (val, int(row["dateutc_ms"]))
+
+
+async def last_yearly_rain(mac: str) -> tuple[float, int] | None:
+    """Most recent NON-NULL cumulative yearly-rain reading + its timestamp
+    (ms) for a device — the rain glitch guard's 'before' value."""
+    return await last_metric_value(mac, "yearlyrainin")
 
 
 async def observation_count(mac: str) -> int:

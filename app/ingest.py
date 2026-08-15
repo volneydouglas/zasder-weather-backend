@@ -205,9 +205,11 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # post raw temp/humidity still get the tile. Matches AWN's method.
     tempf = out.get("tempf")
     feels_like = out.get("feels_like")
+    feels_derived = False
     if feels_like is None:
         feels_like = _compute_feels_like(tempf, out.get("humidity"),
                                          wind.get("speed_mph"))
+        feels_derived = feels_like is not None
 
     flat = {
         "dateutc":        dateutc_ms,
@@ -217,6 +219,10 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         # "confirmed" the first's rejected spike. Confirmation ordering must
         # use the device's own claimed time, which a retry repeats verbatim.
         "_raw_dateutc":   raw_dateutc_ms,
+        # Popped by _do_ingest (never stored): marks feelsLike as backend-
+        # derived, so the plausibility bands can null it when they null the
+        # inputs it was computed from.
+        "_feels_derived": feels_derived,
         "tempf":          tempf,
         "feelsLike":      feels_like,
         "dewPoint":       out.get("dew_point_f"),
@@ -301,6 +307,54 @@ def _compute_feels_like(tempf: Any, humidity: Any, wind_mph: Any) -> float | Non
     return round(t, 2)
 
 
+# Absolute plausibility bands (records QC): min/max per metric field, set
+# BEYOND world-record extremes so they can never clip a real reading — they
+# exist for decode garbage (bit-flips like 3276.7 °F, negative rain, 3000 mph
+# wind), which otherwise lands in records, rollups and alert evaluation as
+# fact. Units are API-native (°F, mph, inHg, inches) — the storage convention.
+# For reference: world temp extremes −128.6/134.1 °F; strongest measured
+# surface gust 253 mph; sea-level pressure extremes 25.69/32.06 inHg (the
+# absolute-pressure floor is lower for high-elevation stations); 24 h rain
+# record ~71 in; hourly ~12 in; yearly ~1,042 in (Meghalaya).
+_PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
+    "tempf":          (-90.0, 140.0),
+    "feelsLike":      (-110.0, 160.0),
+    "dewPoint":       (-90.0, 100.0),
+    "humidity":       (0.0, 100.0),
+    "tempinf":        (-40.0, 150.0),
+    "humidityin":     (0.0, 100.0),
+    "baromrelin":     (24.0, 33.0),
+    "baromabsin":     (15.0, 33.0),
+    "windspeedmph":   (0.0, 260.0),
+    "windgustmph":    (0.0, 260.0),
+    "maxdailygust":   (0.0, 260.0),
+    "winddir":        (0.0, 360.0),
+    "hourlyrainin":   (0.0, 15.0),
+    "eventrainin":    (0.0, 100.0),
+    "dailyrainin":    (0.0, 80.0),
+    "weeklyrainin":   (0.0, 150.0),
+    "monthlyrainin":  (0.0, 400.0),
+    "yearlyrainin":   (0.0, 1500.0),
+    "uv":             (0.0, 20.0),
+    "solarradiation": (0.0, 1800.0),
+}
+
+
+def _apply_plausibility_bands(flat: dict[str, Any]) -> list[str]:
+    """Null every metric field whose value falls outside its physical band.
+    Field-level on purpose: one garbage field must not cost the reading's
+    good fields. Returns the names of the fields dropped (for the log)."""
+    dropped: list[str] = []
+    for k, (lo, hi) in _PLAUSIBLE_BANDS.items():
+        v = flat.get(k)
+        if v is None or isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        if v < lo or v > hi:
+            flat[k] = None
+            dropped.append(f"{k}={v:g}")
+    return dropped
+
+
 def _is_rain_glitch(jump_in: float, elapsed_h: float,
                     max_rate_in_per_hr: float) -> bool:
     """True if a positive jump in cumulative yearly rain is implausible for the
@@ -313,7 +367,9 @@ def _is_rain_glitch(jump_in: float, elapsed_h: float,
     return jump_in > allowance
 
 
-# Pending rain-level rejections: mac -> (rejected_value_in, dateutc_ms).
+# Pending level-shift rejections, keyed by mac (the original yearly-rain
+# guard) or "mac|field" (the 1.5 daily-rain and temperature guards) ->
+# (rejected_value, dateutc_ms).
 # A true decode glitch is one-shot — the next reading returns to the old level.
 # A LEVEL SHIFT (counter swap, calibration change, the 2026-08-11 removal of
 # the yearly-rain offsets) persists: every subsequent reading agrees with the
@@ -338,10 +394,17 @@ _RAIN_REJECT_MAX = 512
 _RAIN_CONFIRM_MIN_GAP_MS = 90_000
 
 
-def _record_rain_rejection(mac: str, value_in: float, ts_ms: float) -> None:
+def _record_rain_rejection(mac: str, value_in: float, ts_ms: float,
+                           same_tol: float = 0.05) -> None:
     """Register a rejected reading as a pending level-shift candidate,
     evicting the oldest entry at the cap (losing one pending confirmation
-    costs that device a single extra confirming reading)."""
+    costs that device a single extra confirming reading).
+
+    `same_tol` is the per-guard "same level" tolerance: 0.05 in for rain
+    counters (stable between tips), ~5 °F for temperature — which jitters
+    0.1–0.3 °F between posts, so the rain tolerance would advance the
+    pending timestamp on EVERY reading and a sensor posting faster than the
+    90 s gap could never rebaseline (temp nulled forever after a swap)."""
     prev = _rain_reject.get(mac)
     if prev is not None and ts_ms <= prev[1]:
         # An out-of-order (or replayed) packet must not roll the pending
@@ -349,7 +412,7 @@ def _record_rain_rejection(mac: str, value_in: float, ts_ms: float) -> None:
         # of the NEWER original packet pass the strictly-later check and
         # self-confirm the spike it belongs to.
         return
-    if prev is not None and abs(value_in - prev[0]) <= 0.05:
+    if prev is not None and abs(value_in - prev[0]) <= same_tol:
         # Same level seen again but not yet confirmable (e.g. within the
         # burst-dedup gap): keep the FIRST-SEEN timestamp. Advancing it on
         # every repeat would push the confirmation window ahead of a sensor
@@ -388,6 +451,21 @@ def _confirms_rejected_level(mac: str, value_in: float, ts_ms: float,
         return False
     elapsed_h = max((ts_ms - rej_ts) / 3_600_000.0, 1.0 / 3600.0)
     return (value_in - rej_val) <= max_rate_in_per_hr * elapsed_h + 0.25
+
+
+def _confirms_temp_level(key: str, value_f: float, ts_ms: float,
+                         tolerance_f: float = 5.0) -> bool:
+    """Temperature flavor of `_confirms_rejected_level`: a strictly-later,
+    distinct (past the burst-dedup gap) reading within ±tolerance of the
+    rejected value means the new level is real — a swapped/colliding sensor,
+    not a one-shot decode glitch — and should rebaseline."""
+    prev = _rain_reject.get(key)
+    if prev is None:
+        return False
+    rej_val, rej_ts = prev
+    if ts_ms <= rej_ts or ts_ms - rej_ts < _RAIN_CONFIRM_MIN_GAP_MS:
+        return False
+    return abs(value_f - rej_val) <= tolerance_f
 
 
 def _format_mac(raw: str) -> str:
@@ -463,13 +541,17 @@ def _auto_device_name(normalized: dict[str, Any]) -> str:
         "acurite-access": "AcuRite Access",
         "ecowitt": "Ecowitt",
         "tempest": "Tempest",
+        # The Mac app posts WITHOUT device.name unless the user typed one
+        # (posting its default clobbered server-side names), so first inserts
+        # from it land here — and "Davis Wll Local" is not a name to ship.
+        "davis-wll-local": "Davis WeatherLink Live",
     }.get(src, src.replace("-", " ").title())
     return f"{pretty}{f' ({model})' if model and model.lower() not in pretty.lower() else ''}"
 
 
 def _sea_level_pressure(abs_inhg: float, elevation_ft: float) -> float | None:
     """Absolute (station) pressure → sea-level equivalent via the standard-
-    atmosphere barometric formula: slp = p · (1 − 0.0065·h/288.15)^−5.257,
+    atmosphere barometric formula: slp = p * (1 - 0.0065*h/288.15)^-5.257,
     h in meters. Physics from the operator's actual elevation, not a raw
     additive offset — see settings.station_elevation_ft (the 1.3.2 rain-
     offset incident is why hand-tuned per-MAC constants are off the table).
@@ -619,6 +701,43 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
     raw_dateutc = flat.pop("_raw_dateutc", flat.get("dateutc"))
 
+    # Elevation-based sea-level correction BEFORE the plausibility bands
+    # (CodeRabbit, round 2): a configured absolute-pressure station above
+    # ~6,000 ft legitimately reads under the 24 inHg sea-level-relative
+    # floor, so banding first would null the reading and the correction
+    # would never see it. Corrected values are then judged by the relative
+    # band; baromabsin keeps the true absolute reading (15 inHg floor).
+    elev_ft = settings.station_elevation_ft
+    if (elev_ft != 0 and flat.get("baromrelin") is not None
+            and mac in _pressure_absolute_macs()):
+        slp = _sea_level_pressure(flat["baromrelin"], elev_ft)
+        if slp is not None:
+            flat["baromabsin"] = flat["baromrelin"]
+            flat["baromrelin"] = slp
+
+    # Physical plausibility bands next (records QC): decode garbage — values
+    # beyond world-record extremes — is nulled field-by-field before it can
+    # reach records, rollups, alerts or the relative guards below (whose
+    # baselines it would poison).
+    feels_derived = bool(flat.pop("_feels_derived", False))
+    if settings.ingest_plausibility_bands:
+        dropped = _apply_plausibility_bands(flat)
+        if dropped:
+            log.warning("implausible values dropped for %s: %s",
+                        mac, ", ".join(dropped))
+            # A feels-like the backend derived from an input the bands just
+            # nulled is garbage that happened to land in-band (tempf=85 with
+            # humidity=-5 → a plausible-looking 92.9 °F) — never store a
+            # derivation whose inputs didn't survive. Source-provided
+            # feels-like answers to its own band only.
+            # windspeedmph too: wind chill derives from wind speed on cold
+            # readings, so a banded wind input poisons the derivation the
+            # same way banded temp/humidity do.
+            if feels_derived and any(
+                    d.startswith(("tempf=", "humidity=", "windspeedmph="))
+                    for d in dropped):
+                flat["feelsLike"] = None
+
     # Reject SDR rain-decode glitches: a sudden spike in cumulative yearly
     # rain that's physically impossible for the elapsed time. Real rain ramps
     # gradually; a glitch jumps for one reading then the counter returns to its
@@ -656,6 +775,88 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
             else:
                 _rain_reject.pop(mac, None)
 
+    # Same spike guard for the DAILY rain bucket (1.5, records QC): a decode
+    # glitch can spike daily_in while the yearly counter stays sane — the
+    # "3.58-inch day" class that reaches the daily-rain record untouched by
+    # the yearly guard above. Midnight resets are negative jumps, which
+    # _is_rain_glitch ignores. Same level-shift rebaseline: one confirming
+    # reading at the new level accepts it (a real cloudburst confirms on the
+    # next reading and costs a single nulled row).
+    if flat.get("dailyrainin") is not None and max_rate > 0:
+        daily_key = mac + "|dailyrainin"
+        prev = await db.last_metric_value(mac, "dailyrainin")
+        if prev is not None and flat["dateutc"] <= prev[1]:
+            # Out-of-order/replayed packet: judging it against the NEWER
+            # baseline reads a legitimate old value as a spike — worst case
+            # a delayed pre-midnight rain row arriving after the post-reset
+            # 0.0. Store as-is (the plausibility bands already vetted it)
+            # and leave any pending rejection untouched.
+            prev = None
+        if prev is not None:
+            last_val, last_ts = prev
+            jump = flat["dailyrainin"] - last_val
+            elapsed_h = (flat["dateutc"] - last_ts) / 3_600_000.0
+            if _is_rain_glitch(jump, elapsed_h, max_rate):
+                if _confirms_rejected_level(daily_key, flat["dailyrainin"],
+                                            raw_dateutc, max_rate):
+                    log.warning(
+                        "daily-rain level shift ACCEPTED for %s: %.2f→%.2f in "
+                        "(confirmed by consecutive readings)", mac, last_val,
+                        flat["dailyrainin"])
+                    _rain_reject.pop(daily_key, None)
+                else:
+                    _record_rain_rejection(daily_key, flat["dailyrainin"],
+                                           raw_dateutc)
+                    log.warning(
+                        "daily-rain glitch dropped for %s: +%.2f in over "
+                        "%.3f h — %.2f→%.2f (will accept if the next reading "
+                        "confirms)", mac, jump, elapsed_h, last_val,
+                        flat["dailyrainin"])
+                    # Null the sub-yearly buckets from the same decode; the
+                    # yearly counter answered its own guard above.
+                    for k in ("dailyrainin", "hourlyrainin", "eventrainin",
+                              "weeklyrainin", "monthlyrainin"):
+                        flat[k] = None
+            else:
+                _rain_reject.pop(daily_key, None)
+
+    # Temperature-jump guard (1.5, records QC — see ingest_max_temp_jump_f):
+    # a reading impossibly far from the device's last stored temperature is a
+    # decode glitch or a colliding transmitter. Same rebaseline contract as
+    # the rain guards: a persistent new level (swapped sensor) is accepted on
+    # the second consecutive sighting.
+    max_jump = settings.ingest_max_temp_jump_f
+    if flat.get("tempf") is not None and max_jump > 0:
+        temp_key = mac + "|tempf"
+        prev = await db.last_metric_value(mac, "tempf")
+        if prev is not None and flat["dateutc"] <= prev[1]:
+            # Same out-of-order rule as the daily-rain guard above.
+            prev = None
+        if prev is not None:
+            last_val, last_ts = prev
+            delta = abs(flat["tempf"] - last_val)
+            elapsed_h = max((flat["dateutc"] - last_ts) / 3_600_000.0,
+                            1.0 / 3600.0)
+            if delta > max_jump + 60.0 * elapsed_h:
+                if _confirms_temp_level(temp_key, flat["tempf"], raw_dateutc):
+                    log.warning(
+                        "temperature level shift ACCEPTED for %s: "
+                        "%.1f→%.1f °F (confirmed by consecutive readings)",
+                        mac, last_val, flat["tempf"])
+                    _rain_reject.pop(temp_key, None)
+                else:
+                    _record_rain_rejection(temp_key, flat["tempf"], raw_dateutc,
+                                           same_tol=5.0)
+                    log.warning(
+                        "temperature glitch dropped for %s: %.1f→%.1f °F over "
+                        "%.3f h (will accept if the next reading confirms)",
+                        mac, last_val, flat["tempf"], elapsed_h)
+                    # feels-like and dew point derive from the same decode.
+                    for k in ("tempf", "feelsLike", "dewPoint"):
+                        flat[k] = None
+            else:
+                _rain_reject.pop(temp_key, None)
+
     # Drop a spurious wind gust (see settings.ingest_gust_*). A gust wildly
     # higher than the concurrent sustained wind is a sensor glitch — nulling it
     # stops false high-wind alerts and keeps it out of the peak-gust record.
@@ -665,19 +866,8 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
                     "sustained", mac, flat["windgustmph"], flat.get("windspeedmph") or 0.0)
         flat["windgustmph"] = None
 
-    # Elevation-based sea-level correction for devices that post ABSOLUTE
-    # station pressure (a WH32B over SDR knows nothing about elevation, so
-    # its barometer reads ~1.2 inHg low at 1200 ft next to the sea-level-
-    # relative AWN/Davis sources). Physics-based from the operator's real
-    # elevation — see settings.station_elevation_ft for why this is not a
-    # raw fudge offset. baromabsin keeps the true absolute reading.
-    elev_ft = settings.station_elevation_ft
-    if (elev_ft > 0 and flat.get("baromrelin") is not None
-            and mac in _pressure_absolute_macs()):
-        slp = _sea_level_pressure(flat["baromrelin"], elev_ft)
-        if slp is not None:
-            flat["baromabsin"] = flat["baromrelin"]
-            flat["baromrelin"] = slp
+    # (Elevation-based sea-level correction moved ABOVE the plausibility
+    # bands — see the top of this function.)
 
     explicit_name, location = _device_label(payload_obj)
     auto_name = _auto_device_name(payload_obj)

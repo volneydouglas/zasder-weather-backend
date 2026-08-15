@@ -212,6 +212,9 @@ def test_transient_failure_sets_resume_point(client, monkeypatch):
     # The error is diagnosable but carries neither the URL nor the key.
     assert st["error"] and "ConnectError" in st["error"]
     assert "k" * 16 not in str(st) and "http" not in st["error"]
+    # Exactly three calls: day 1, day 2, and day 2's single retry — without
+    # this, removing the retry entirely would still pass (CodeRabbit).
+    assert calls["n"] == 3
 
     # Resuming from the recorded day completes the range.
     days = {"20230409": [_wu_obs(1_680_998_694)],
@@ -228,8 +231,10 @@ def test_transient_failure_retries_once_and_continues(client, monkeypatch):
     import httpx
     _seed_device(client)
     calls = {"n": 0}
+    seen_days: list[str] = []
     async def flaky_once(client_, station_id, day, api_key):
         calls["n"] += 1
+        seen_days.append(day)
         if calls["n"] == 2:             # day 2, first attempt only
             raise httpx.ReadTimeout("boom https://api.weather.com?apiKey=" + api_key)
         return [_wu_obs(1_680_912_294 + calls["n"])]
@@ -242,6 +247,32 @@ def test_transient_failure_retries_once_and_continues(client, monkeypatch):
     assert st["calls_made"] == 4        # 3 days + the one retry
     assert st["rows_inserted"] == 3
     assert "k" * 16 not in str(st)
+    # The retry must target the SAME day, in order — a retry that skipped to
+    # the next day would also produce 4 calls and 3 done days (CodeRabbit).
+    assert seen_days == ["20230408", "20230409", "20230409", "20230410"]
+
+
+def test_retry_respects_call_budget_boundary(client, monkeypatch):
+    """When the failed call consumed the FINAL budget slot, the retry must
+    not run: the import parks at the day with the quota pause, staying
+    within WU_DAILY_CALL_BUDGET."""
+    import httpx
+    _seed_device(client)
+    monkeypatch.setattr(wu_import, "WU_DAILY_CALL_BUDGET", 2)
+    calls = {"n": 0}
+    async def flaky_at_budget(client_, station_id, day, api_key):
+        calls["n"] += 1
+        if calls["n"] == 2:             # day 2 = the final budgeted call
+            raise httpx.ConnectError("boom")
+        return [_wu_obs(1_680_912_294 + calls["n"])]
+    monkeypatch.setattr(wu_import, "_fetch_day", flaky_at_budget)
+    asyncio.run(wu_import._run("AA:BB:CC:DD:EE:FF", "KAZCHAND668", "k" * 16,
+                               dt.date(2023, 4, 8), dt.date(2023, 4, 10), False))
+    st = wu_import.status()
+    assert calls["n"] == 2              # the retry never fired
+    assert st["calls_made"] == 2        # never exceeds the budget
+    assert st["resume_from"] == "2023-04-09"
+    assert st["done_days"] == 1
 
 
 def test_cancel_sets_resume_point(client, monkeypatch):

@@ -267,6 +267,9 @@ def test_key_never_logged_or_stored_on_failure(client, monkeypatch, caplog):
     st = wu_upload.stats(MAC)
     assert st["failures"] == 3
     assert "INVALIDPASSWORDID" not in st["last_error"]
+    # ...but bad credentials are named via a fixed-marker match (R4-49), so
+    # the user can tell "fix your key" from a transient hiccup.
+    assert st["last_error"] == "WU rejected the station ID/key"
 
 
 def test_get_never_returns_key_and_put_clears_it(client):
@@ -360,3 +363,31 @@ def test_sources_reports_upload_health(client, monkeypatch):
                json={"upload_enabled": False})
     j = client.get("/api/sources", headers=_H).json()
     assert j["wu_upload"] == {}
+
+
+def test_overlapping_uploads_send_once(client, monkeypatch):
+    """Throttle reservation is atomic with the config lookup: two overlapping
+    tasks for the same mac must not both pass the check during the awaited
+    DB read and double-send (CodeRabbit on R4-53)."""
+    import asyncio as _asyncio
+    _seed_device(client)
+    _configure(client)
+    calls: list[dict] = []
+    _capture_send(monkeypatch, calls)
+
+    real_get = wu_upload.db.get_wu_station
+
+    async def slow_get(mac):
+        await _asyncio.sleep(0.05)   # widen the race window
+        return await real_get(mac)
+    monkeypatch.setattr(wu_upload.db, "get_wu_station", slow_get)
+
+    now_ms = int(time.time() * 1000)
+
+    async def scenario():
+        return await _asyncio.gather(
+            wu_upload.maybe_upload(MAC, _flat(now_ms)),
+            wu_upload.maybe_upload(MAC, _flat(now_ms + 1000)))
+    results = asyncio.run(scenario())
+    assert sorted(results) == [False, True]
+    assert len(calls) == 1

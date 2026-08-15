@@ -217,9 +217,12 @@ void setup() {
   // Why did we (re)boot? After the watchdog lands, this line tells us
   // whether the last boot was a power-on, a panic, or a watchdog reset.
   Serial.printf("  reset_reason=%d\n", (int) esp_reset_reason());
-  // RTC memory is garbage on a cold boot — the deaf-restart budget only
-  // carries across SOFTWARE resets (that's the boot-loop it bounds).
-  if (esp_reset_reason() == ESP_RST_POWERON) g_deafRestarts = 0;
+  // RTC memory is garbage on a cold boot and stale after panics/brownouts/
+  // watchdogs/EN-pin resets — the deaf-restart budget only carries across
+  // SOFTWARE resets (esp_restart(), the boot-loop it bounds). Clearing only
+  // on POWERON let every other reset reason inherit a stale or garbage
+  // count and lock out deaf-boot recovery (CodeRabbit).
+  if (esp_reset_reason() != ESP_RST_SW) g_deafRestarts = 0;
   // Register the Wi-Fi event handler before connecting so reconnects are
   // handled from first boot.
   WiFi.onEvent(onWifiEvent);

@@ -48,6 +48,7 @@ def test_rollups_fold_incrementally_and_skip_duplicates(insights_on):
     assert year["rain_total"] == pytest.approx(0.3)
     cal = body["calendar"]
     assert cal[0][1] == 110.0                       # daily high
+    assert body["calendar_lo"][0][1] == 100.0       # daily low (Low heatmap)
     # TIMEZONE is pinned to UTC in conftest, so cells are exact: 12:00 →
     # hour 12, 13:30 → hour 13. A double-counted sum would break these.
     grid = body["diurnal_tempf"]
@@ -69,9 +70,24 @@ def test_ledger_tiers_and_percentiles(insights_on):
     assert body["monthly_normals"]["06"] == pytest.approx(96.4, abs=0.1)
 
 
+def _past_mid_july() -> dt.datetime:
+    """The most recent mid-July that is safely in the PAST (UTC).
+
+    Mid-July RELATIVE to now, not hardcoded — a literal 2026-07-15 crosses
+    ingest's ~400-day past horizon around 2027-08-19 and starts failing with
+    a misleading 400 (R4-30). And not simply jan1+195d: from January to
+    mid-July that lands in the FUTURE, where ingest clamps the timestamp to
+    now and the asserted July grid cells silently move (CodeRabbit). Day 195
+    keeps month cell 6; at most ~13 months old stays inside the horizon."""
+    base = _recent_jan1().replace(hour=12) + dt.timedelta(days=195)
+    if base > dt.datetime.now(dt.timezone.utc):
+        base = base.replace(year=base.year - 1)
+    return base
+
+
 def test_diurnal_feels_grid(insights_on):
     client = insights_on
-    base = dt.datetime(2026, 7, 15, 12, 0, tzinfo=dt.timezone.utc)
+    base = _past_mid_july()
     _post(client, base, 100.0, feels=104.0)
     _post(client, base + dt.timedelta(minutes=30), 102.0, feels=108.0)
     # A row without an explicit feels_like still lands in the temp grid;
@@ -257,3 +273,36 @@ def test_jan1_yearly_fallback_not_counted(insights_on):
     assert body["day_count"] == 1
     assert len(body["years"]) == 1, "yearly rollups vanished"
     assert body["years"][0]["rain_total"] == 0.0
+
+
+def test_daily_series_endpoint(insights_on):
+    """/api/insights/daily: per-day lo/hi/mean, oldest-first, days-capped —
+    the sensor-drift card's data source."""
+    client = insights_on
+    # Anchor-relative for the same horizon reason as test_diurnal_feels_grid.
+    base = _past_mid_july()
+    _post(client, base, 100.0)
+    _post(client, base + dt.timedelta(minutes=90), 110.0)
+    _post(client, base + dt.timedelta(days=1), 90.0)
+
+    r = client.get("/api/insights/daily?mac=" + MAC + "&days=60", headers=_H)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mac"] == MAC
+    series = body["series"]
+    d0 = base.strftime("%Y-%m-%d")
+    d1 = (base + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    assert [d[0] for d in series] == [d0, d1]
+    day1 = series[0]
+    assert day1[1] == 100.0 and day1[2] == 110.0
+    assert day1[3] == pytest.approx(105.0)
+    assert series[1][3] == pytest.approx(90.0)
+
+    # days clamp is enforced by FastAPI validation.
+    assert client.get("/api/insights/daily?mac=" + MAC + "&days=1",
+                      headers=_H).status_code == 422
+
+
+def test_daily_series_gated_by_flag(client):
+    r = client.get("/api/insights/daily?mac=" + MAC, headers=_H)
+    assert r.status_code == 404

@@ -138,6 +138,10 @@ Q: Where do they want the backend?
 | `INGEST_MAX_RAIN_RATE_IN_PER_HR` | Optional | Rain-glitch guard on `/ingest/custom`: drop a reading whose cumulative rain jumps faster than this (default 2.0 in/hr; 0 disables). |
 | `INGEST_GUST_MAX_FACTOR` + `INGEST_GUST_MIN_MPH` | Optional | Gust-glitch guard on `/ingest/custom`: null a gust above `_MIN_MPH` (default 30) that exceeds `_MAX_FACTOR` × sustained wind (default 4.0; 0 disables). |
 | `INGEST_MIN_INTERVAL_SECONDS` | Optional | History-write throttle for high-cadence sources; readings within N s of the last stored row skip history (live view unaffected; new-field posts always stored). Default 0 = store everything. |
+| `INGEST_PLAUSIBILITY_BANDS` | Optional | Physical plausibility bands on `/ingest/custom`: values beyond world-record extremes (bit-flip temps, negative rain, 3000 mph gusts) are nulled field-by-field before reaching records/rollups/alerts. Default on; `false` stores readings as posted. |
+| `INGEST_MAX_TEMP_JUMP_F` | Optional | Temperature-jump guard on `/ingest/custom`: a reading further than this from the device's last stored temperature (plus 60 °F per elapsed hour) is dropped; a persistent new level is accepted on the second sighting. Default 40; 0 disables. |
+| `STATION_ELEVATION_FT` | Optional | With `PRESSURE_ABSOLUTE_MACS`: station elevation for sea-level pressure correction of sensors that report ABSOLUTE pressure (e.g. a WH32B over SDR). Default 0 = off. |
+| `PRESSURE_ABSOLUTE_MACS` | Optional | Comma-separated MACs whose posted pressure is absolute station pressure; corrected to sea-level via `STATION_ELEVATION_FT` (true absolute kept in `baromabsin`). |
 | `ALERT_EMAIL_TO` + `SMTP_HOST` | Optional | Both set = device-down email alerts on. SMTP_USERNAME/PASSWORD/PORT/SSL for transport (Gmail App Password works). |
 | `ALERT_STALE_MINUTES` (+ `_BY_MAC`) | Optional | Minutes offline before alerting; per-MAC override map, `0` disables a device. Default 15. |
 | `ALLOWED_HOSTS` | Recommended in prod | Comma-separated allow-list for Host header. Defaults `*`. |

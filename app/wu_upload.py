@@ -146,16 +146,25 @@ async def maybe_upload(mac: str, flat: dict[str, Any]) -> bool:
     try:
         if not isinstance(flat.get("dateutc"), (int, float)):
             return False
-        row = await db.get_wu_station(mac)
-        if (row is None or not row["upload_enabled"]
-                or not row["station_id"] or not row["upload_key"]):
-            return False
+        # Throttle check BEFORE the SQLite read: at SDR cadence (~16-60 s)
+        # roughly 3 of 4 ingested readings land inside the 60 s window, and
+        # each was paying a DB read just to find that out (R4-53).
         now = time.monotonic()
         last = _last_attempt.get(mac)
         if last is not None and now - last < UPLOAD_MIN_INTERVAL_S:
             return False
+        # Reserve the slot BEFORE the await: two overlapping tasks for the
+        # same mac could otherwise both pass the check above, both read the
+        # config, and both send — bypassing the 60 s limit (CodeRabbit).
         _bound(_last_attempt)
         _last_attempt[mac] = now
+        row = await db.get_wu_station(mac)
+        if (row is None or not row["upload_enabled"]
+                or not row["station_id"] or not row["upload_key"]):
+            # Not configured: give the reservation back so enabling
+            # forwarding a moment later doesn't wait out a phantom attempt.
+            _last_attempt.pop(mac, None)
+            return False
         params = build_params(row["station_id"], row["upload_key"], flat)
         try:
             status_code, body = await _send(params)
@@ -169,8 +178,14 @@ async def maybe_upload(mac: str, flat: dict[str, Any]) -> bool:
         if status_code == 200 and "success" in body.lower():
             _record_success(mac)
             return True
-        _record_failure(mac, f"HTTP {status_code}" if status_code != 200
-                        else "HTTP 200 without success ack")
+        # Fixed-marker match only (never the body wholesale): WU answers
+        # HTTP 200 + "INVALIDPASSWORDID" for bad credentials — the one
+        # failure the user can actually fix, so name it (R4-49).
+        if "invalidpasswordid" in body.lower():
+            _record_failure(mac, "WU rejected the station ID/key")
+        else:
+            _record_failure(mac, f"HTTP {status_code}" if status_code != 200
+                            else "HTTP 200 without success ack")
         return False
     except Exception as e:  # pragma: no cover — belt and braces for the task
         log.warning("WU upload internal error for %s (%s)", mac,

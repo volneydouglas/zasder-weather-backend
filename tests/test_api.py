@@ -1454,6 +1454,10 @@ def test_ingest_pressure_correction_off_by_default(client, monkeypatch):
     """station_elevation_ft defaults to 0 = off: even a listed MAC stores
     its pressure untouched."""
     from app import config
+    # Pin explicitly: Settings reads env_file=".env", and a developer .env
+    # with a real STATION_ELEVATION_FT would silently turn the correction on
+    # and fail the default-off assertion (the conftest AWN-keys trap).
+    monkeypatch.setattr(config.settings, "station_elevation_ft", 0.0)
     monkeypatch.setattr(config.settings, "pressure_absolute_macs",
                         "5D:5D:02:00:00:7D")
     _post_pressure(client, "5D5D0200007D", 28.60)
@@ -2260,3 +2264,20 @@ def test_stale_alert_retries_when_delivery_fails(client, monkeypatch):
     assert calls["n"] == 3
     assert s3[mac]["state"] == "stale"
     assert s3[mac]["notified_ms"] is not None
+
+
+def test_422_never_echoes_the_rejected_credential(client):
+    """R4-26: pydantic's default 422 body echoes the rejected value in
+    "input"; the app renders that body verbatim, redisplaying a just-typed
+    secret the SecureField hid. The global handler strips it."""
+    secret = "x" * 80   # over the 64-char upload_key cap -> 422
+    # TWO invalid fields (the station id fails the pattern too), so the
+    # assertion covers every error entry, not just the first.
+    r = client.put("/api/devices/AA:BB:CC:DD:EE:01/wu-station",
+                   headers={"Authorization": "Bearer test-api-token"},
+                   json={"wu_station_id": "KAZ TEST!", "upload_key": secret})
+    assert r.status_code == 422
+    assert secret not in r.text
+    details = r.json()["detail"]
+    assert len(details) >= 2
+    assert all("input" not in e for e in details)

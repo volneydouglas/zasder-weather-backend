@@ -57,6 +57,61 @@ def test_bands_null_garbage_keep_good():
         "dailyrainin", "tempf", "winddir", "windgustmph"]
 
 
+def test_wind_255_sentinel_is_rejected_but_world_record_survives():
+    """0xFF (255) is WU's 'no reading' sentinel for wind, not a wind speed.
+
+    Regression for the 2026-08-15 find: the ceiling was 260, so ~1,200 rows of
+    255 mph imported from a WU archive became the all-time peak wind AND peak
+    gust on a station whose real peak gust is 51. The ceiling must sit between
+    the 253 mph world record and 255.
+    """
+    flat = {"windspeedmph": 255.0, "windgustmph": 255.0, "maxdailygust": 255.0}
+    dropped = ingest._apply_plausibility_bands(flat)
+    assert flat["windspeedmph"] is None
+    assert flat["windgustmph"] is None
+    assert flat["maxdailygust"] is None
+    assert sorted(d.split("=")[0] for d in dropped) == [
+        "maxdailygust", "windgustmph", "windspeedmph"]
+
+    # 253 mph (Barrow Island, 1996) is the strongest gust ever measured. The
+    # band exists to catch decode garbage and must never clip a real reading.
+    real = {"windspeedmph": 253.0, "windgustmph": 253.0, "maxdailygust": 254.0}
+    assert ingest._apply_plausibility_bands(real) == []
+    assert real["windgustmph"] == 253.0
+    assert real["maxdailygust"] == 254.0
+
+
+def test_banded_wind_condemns_its_sibling_speed_channels():
+    """A banded wind value means the anemometer faulted — its siblings go too.
+
+    Nulling only the out-of-band field leaves an orphan the bands can never
+    catch later, because the orphan is physically in-range. That is exactly
+    what happened on 2026-08-15: 255 mph gusts were nulled and 89.7-213.3 mph
+    'sustained' winds were left behind on the same rows.
+    """
+    flat = {"windgustmph": 255.0, "windspeedmph": 213.3, "maxdailygust": 180.0,
+            "tempf": 41.0, "winddir": 270.0}
+    dropped = ingest._apply_plausibility_bands(flat)
+    assert flat["windgustmph"] is None
+    assert flat["windspeedmph"] is None, "orphaned sustained wind must go too"
+    assert flat["maxdailygust"] is None
+    # Non-anemometer fields are untouched — this is not a dropped reading, and
+    # winddir is a separate vane channel.
+    assert flat["tempf"] == 41.0
+    assert flat["winddir"] == 270.0
+    assert any("anemometer" in d for d in dropped)
+
+
+def test_good_wind_is_never_condemned():
+    """The companion rule must not fire when nothing was out of band."""
+    flat = {"windgustmph": 51.0, "windspeedmph": 22.0, "maxdailygust": 51.0,
+            "tempf": 41.0}
+    assert ingest._apply_plausibility_bands(flat) == []
+    assert flat["windgustmph"] == 51.0
+    assert flat["windspeedmph"] == 22.0
+    assert flat["maxdailygust"] == 51.0
+
+
 def test_bands_boundaries_and_nones_survive():
     # Exactly-on-the-line values are legitimate; None and non-numerics pass.
     flat = {"tempf": -90.0, "humidity": 100.0, "winddir": 360.0,

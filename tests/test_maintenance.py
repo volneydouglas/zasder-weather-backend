@@ -97,6 +97,59 @@ def test_clean_glitch_gusts_streams_backup_and_spares_calm_stations(db_mod, temp
     assert v == 40.0
 
 
+# ───────────────────────── clean_implausible ─────────────────────────
+
+def test_clean_implausible_nulls_only_out_of_band_fields(db_mod, temp_env):
+    """Retro-apply the bands to stored history, field by field.
+
+    The 2026-08-15 case: a WU archive imported ~1,200 rows of 255 mph wind
+    (0xFF, the anemometer-dropout sentinel) because the importer applied no
+    bands at all. The repair must null the bad FIELD and leave the rest of
+    the row alone — the day still has good temperature and rain.
+    """
+    from app import maintenance
+    db = db_mod
+    mac = "DD:DD:DD:DD:DD:01"
+    asyncio.run(db.insert_observations(mac, [
+        # The sentinel row: wind is garbage, everything else is real.
+        {"dateutc": 1_000, "windgustmph": 255.0, "windspeedmph": 255.0,
+         "tempf": 48.0, "humidity": 71.0, "dailyrainin": 0.22},
+        # A real windy reading just under the world record — must survive.
+        {"dateutc": 2_000, "windgustmph": 253.0, "tempf": 50.0},
+        # An ordinary reading — untouched.
+        {"dateutc": 3_000, "windgustmph": 22.0, "tempf": 51.0}]))
+
+    dry = maintenance.clean_implausible(apply=False, db_path=temp_env)
+    assert dry["applied"] is False and dry["cleaned"] == 0
+    assert dry["by_field"] == {"windgustmph": 1, "windspeedmph": 1}
+    v, _ = _col(temp_env, mac, 1_000, "windgustmph")
+    assert v == 255.0, "dry run must not mutate"
+
+    res = maintenance.clean_implausible(apply=True, db_path=temp_env)
+    assert res["applied"] is True and res["cleaned"] == 2
+
+    # Sentinel wind gone from BOTH the column and data_json (the /current
+    # composite reads data_json, records read the column).
+    for col in ("windgustmph", "windspeedmph"):
+        v, blob = _col(temp_env, mac, 1_000, col)
+        assert v is None and col not in blob
+    # ...but the rest of that row is intact — the day is not deleted.
+    v, blob = _col(temp_env, mac, 1_000, "tempf")
+    assert v == 48.0 and blob["tempf"] == 48.0
+    v, _ = _col(temp_env, mac, 1_000, "dailyrainin")
+    assert v == 0.22
+    # In-band readings untouched, including the world-record-adjacent one.
+    v, _ = _col(temp_env, mac, 2_000, "windgustmph")
+    assert v == 253.0
+    v, _ = _col(temp_env, mac, 3_000, "windgustmph")
+    assert v == 22.0
+
+    with open(res["backup"]) as f:
+        lines = [json.loads(line) for line in f]
+    assert {(l["field"], l["value"]) for l in lines} == {
+        ("windgustmph", 255.0), ("windspeedmph", 255.0)}
+
+
 # ───────────────────────── repair_yearly_rain_offsets ─────────────────────────
 
 _MAC_R = "CC:CC:CC:CC:CC:01"

@@ -8,6 +8,39 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.5.1] — 2026-08-15
+
+Data-quality fix for imported history. Weather Underground serves 255
+(`0xFF`, the single-byte "no reading" sentinel) as a literal wind speed
+when a station's anemometer drops out. Those values were being stored as
+real readings and taking over all-time wind records.
+
+### Fixed
+- **Wind plausibility ceiling lowered from 260 mph to 254 mph.** The band
+  exists to reject decode garbage without ever clipping a real reading,
+  so it was set above the 253 mph world-record gust — but that left 255
+  inside the band, and the sentinel sailed through. 254 still clears the
+  world record and rejects `0xFF` every time.
+- **The Weather Underground importer now applies the plausibility bands.**
+  It was the only write path into `observations` with no quality checks
+  at all, so whatever an archive held was stored as fact.
+- **A rejected wind value now also clears the other wind speed channels
+  on that reading.** They come from one anemometer, so if it reported an
+  impossible value it was faulting, and its remaining speed readings are
+  not evidence either. Clearing only the out-of-band field left behind
+  in-range garbage (89.7–213.3 mph "sustained" winds on rows whose gust
+  had just been rejected) that the bands could never catch on a later
+  pass. Wind direction is unaffected — separate sensor channel.
+
+### Added
+- `maintenance.clean_implausible()` retro-applies the plausibility bands
+  to already-stored history for operators who imported before this
+  release. Dry-run by default, streams a JSONL backup before writing, and
+  clears values field-by-field — rows and days are never deleted, so a
+  reading with one bad field keeps its good ones. Run
+  `POST /api/insights/rebuild` afterwards, since the daily rollups hold
+  their own per-field maxima and do not notice an observations edit.
+
 ## [1.5.0] — 2026-08-13
 
 The data-quality release: plausibility guards keep sensor glitches out

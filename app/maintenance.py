@@ -179,6 +179,105 @@ def clean_glitch_gusts(apply: bool = False, db_path: str | None = None,
         conn.close()
 
 
+def clean_implausible(apply: bool = False, db_path: str | None = None) -> dict:
+    """Retro-apply the ingest plausibility bands to already-stored history.
+
+    The bands (`ingest._PLAUSIBLE_BANDS`) run on live ingest and, since
+    2026-08-15, on the WU importer too — but the importer had no QC before
+    that, so an archive's garbage is already on disk. This nulls every stored
+    value that today's bands would have rejected at write time, field by
+    field, exactly as `_apply_plausibility_bands` does. Rows and days are
+    NEVER deleted: a reading with one bad field keeps its good fields.
+
+    Both the column and the matching `data_json` key are cleared, because
+    `/current` composes from `data_json` while records/history read columns —
+    clearing only one leaves the two disagreeing.
+
+    Callers must run `insights.rebuild()` afterwards: the daily rollups carry
+    their own per-field maxima and do not notice the observation edit.
+    """
+    from .db import _FIELD_MAP
+    from .ingest import _PLAUSIBLE_BANDS
+
+    path = db_path or settings.database_path
+    api_to_col = {v: k for k, v in _FIELD_MAP.items()}
+    conn = sqlite3.connect(path)
+    try:
+        # (column, api_name, lo, hi) for every banded field that is stored.
+        targets = [(api_to_col[f], f, lo, hi)
+                   for f, (lo, hi) in _PLAUSIBLE_BANDS.items()
+                   if f in api_to_col]
+
+        # Column/JSON-key names are interpolated into SQL below, so they get
+        # the same whitelist guard the rest of the backend uses. Not an
+        # `assert` — those vanish under `python -O`.
+        for col, api, _lo, _hi in targets:
+            if col not in _FIELD_MAP or _FIELD_MAP[col] != api:
+                raise ValueError(
+                    f"refusing to interpolate unknown column/key {col!r}/{api!r}")
+
+        counts: dict[str, int] = {}
+        for col, _api, lo, hi in targets:
+            n = conn.execute(
+                f"SELECT COUNT(*) FROM observations "
+                f"WHERE {col} IS NOT NULL AND ({col} < ? OR {col} > ?)",
+                (lo, hi)).fetchone()[0]
+            if n:
+                counts[col] = n
+
+        total = sum(counts.values())
+        summary = {"bad_values": total, "by_field": counts,
+                   "applied": False, "cleaned": 0, "backup": None}
+        if not total:
+            print("No implausible stored values found. Nothing to clean.")
+            return summary
+
+        print(f"Implausible stored values: {total} across {len(counts)} field(s)")
+        for col, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            lo, hi = next((l, h) for c, _a, l, h in targets if c == col)
+            print(f"  {col:<15} {n:>7}  (band {lo:g}..{hi:g})")
+        if not apply:
+            print("DRY RUN — re-run with --apply to back up + null these values.")
+            return summary
+
+        # Streamed one-JSON-line-per-row backup, same rationale as
+        # clean_glitch_gusts: materialising the rows OOM-kills a small Fly
+        # machine. Nanosecond stamp so two runs in one second cannot collide.
+        stamp = time.time_ns()
+        backup = f"{path}.bandfix-backup-{stamp}.jsonl"
+        n_backed = 0
+        with open(backup, "w") as f:
+            for col, _api, lo, hi in targets:
+                if col not in counts:
+                    continue
+                for r in conn.execute(
+                        f"SELECT mac, dateutc_ms, {col} FROM observations "
+                        f"WHERE {col} IS NOT NULL AND ({col} < ? OR {col} > ?)",
+                        (lo, hi)):
+                    f.write(json.dumps({"mac": r[0], "dateutc_ms": r[1],
+                                        "field": col, "value": r[2]}) + "\n")
+                    n_backed += 1
+        print(f"Backed up {n_backed} value(s) to {backup}")
+
+        cleaned = 0
+        for col, api, lo, hi in targets:
+            if col not in counts:
+                continue
+            cur = conn.execute(
+                f"UPDATE observations SET {col} = NULL, "
+                f"data_json = json_remove(data_json, '$.{api}') "
+                f"WHERE {col} IS NOT NULL AND ({col} < ? OR {col} > ?)",
+                (lo, hi))
+            cleaned += cur.rowcount or 0
+        conn.commit()
+        print(f"Cleaned {cleaned} implausible value(s).")
+        print("NOW RUN insights.rebuild() — daily rollups still hold the old maxima.")
+        summary.update(applied=True, cleaned=cleaned, backup=backup)
+        return summary
+    finally:
+        conn.close()
+
+
 # How close the repaired pre-cutoff maximum must sit to the first post-cutoff
 # raw value. The counter is monotonic, so repaired history may not exceed the
 # raw readings that follow it — beyond this tolerance the offset/cutoff pair

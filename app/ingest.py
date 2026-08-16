@@ -316,6 +316,14 @@ def _compute_feels_like(tempf: Any, humidity: Any, wind_mph: Any) -> float | Non
 # surface gust 253 mph; sea-level pressure extremes 25.69/32.06 inHg (the
 # absolute-pressure floor is lower for high-elevation stations); 24 h rain
 # record ~71 in; hourly ~12 in; yearly ~1,042 in (Meghalaya).
+#
+# The wind ceiling is 254, NOT a round 260, and the exact number matters.
+# 255 is 0xFF — the single-byte "no reading" sentinel — and Weather
+# Underground serves it as a literal wind speed when a station's anemometer
+# drops out. At a 260 ceiling those sentinels sail through and become
+# all-time records (found 2026-08-15 on an imported archive: ~1,200 rows of
+# 255 mph, against a real peak gust of 51). 254 still sits above the 253 mph
+# world record, so the "never clip a real reading" property holds exactly.
 _PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
     "tempf":          (-90.0, 140.0),
     "feelsLike":      (-110.0, 160.0),
@@ -325,9 +333,9 @@ _PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
     "humidityin":     (0.0, 100.0),
     "baromrelin":     (24.0, 33.0),
     "baromabsin":     (15.0, 33.0),
-    "windspeedmph":   (0.0, 260.0),
-    "windgustmph":    (0.0, 260.0),
-    "maxdailygust":   (0.0, 260.0),
+    "windspeedmph":   (0.0, 254.0),
+    "windgustmph":    (0.0, 254.0),
+    "maxdailygust":   (0.0, 254.0),
     "winddir":        (0.0, 360.0),
     "hourlyrainin":   (0.0, 15.0),
     "eventrainin":    (0.0, 100.0),
@@ -338,6 +346,13 @@ _PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
     "uv":             (0.0, 20.0),
     "solarradiation": (0.0, 1800.0),
 }
+
+
+# The anemometer's speed channels. They come from ONE sensor, so a band
+# rejection on any of them condemns the others on that same reading — see
+# _apply_plausibility_bands. winddir is deliberately excluded: it is a
+# separate vane channel and every value it can report is in-band anyway.
+_ANEMOMETER_FIELDS = ("windspeedmph", "windgustmph", "maxdailygust")
 
 
 def _apply_plausibility_bands(flat: dict[str, Any]) -> list[str]:
@@ -352,6 +367,22 @@ def _apply_plausibility_bands(flat: dict[str, Any]) -> list[str]:
         if v < lo or v > hi:
             flat[k] = None
             dropped.append(f"{k}={v:g}")
+
+    # A banded wind value means the anemometer was faulting at this instant,
+    # and the sibling speed channels from that same sensor are not evidence of
+    # anything either. Dropping only the out-of-band one leaves an orphan that
+    # the bands cannot catch on a later pass, because it is physically
+    # in-range: the 2026-08-15 archive left 89.7-213.3 mph "sustained" winds
+    # sitting on rows whose 255 mph gust had just been nulled, on a station
+    # whose 99.9th percentile wind is 13.9. Same reasoning as the derived
+    # feelsLike rule at the call site.
+    if any(d.split("=")[0] in _ANEMOMETER_FIELDS for d in dropped):
+        for k in _ANEMOMETER_FIELDS:
+            v = flat.get(k)
+            if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+            flat[k] = None
+            dropped.append(f"{k}={v:g}(anemometer)")
     return dropped
 
 

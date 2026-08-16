@@ -41,6 +41,8 @@ from typing import Any
 import httpx
 
 from . import db
+from .config import settings
+from .ingest import _apply_plausibility_bands
 
 log = logging.getLogger("zasder.wu_import")
 
@@ -135,6 +137,16 @@ def transform_observation(o: dict[str, Any], station_id: str) -> dict[str, Any] 
         "source": "wu-import",
         "wu_station": station_id,
     }
+    # Same physical plausibility bands the live ingest path applies. Without
+    # this the importer was the one write path into `observations` with no QC
+    # at all, so whatever WU's archive held became fact — including 0xFF (255)
+    # anemometer-dropout sentinels that then owned the all-time wind records.
+    # Field-level, so one bad reading never costs the row its good fields.
+    if settings.ingest_plausibility_bands:
+        dropped = _apply_plausibility_bands(row)
+        if dropped:
+            log.warning("wu-import: implausible values dropped for %s at %s: %s",
+                        station_id, row["dateutc"], ", ".join(dropped))
     return row
 
 

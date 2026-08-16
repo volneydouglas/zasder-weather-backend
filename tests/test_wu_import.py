@@ -72,6 +72,27 @@ def test_transform_maps_api_native_fields():
     assert row["source"] == "wu-import"
 
 
+def test_transform_applies_plausibility_bands():
+    """The importer was the one write path into `observations` with no QC.
+
+    WU serves 0xFF (255) as a literal wind speed when a station's anemometer
+    drops out. Those rows imported as fact and owned the all-time wind records
+    (2026-08-15). The bands must run here exactly as they do on live ingest,
+    and field-level, so the row keeps its good readings.
+    """
+    o = _wu_obs(1_680_912_294)
+    o["imperial"]["windgustHigh"] = 255.0
+    o["imperial"]["windspeedAvg"] = 255.0
+    row = wu_import.transform_observation(o, "KAZCHAND668")
+    assert row["windgustmph"] is None
+    assert row["windspeedmph"] is None
+    # everything else on the row survives — this is not a dropped reading
+    assert row["tempf"] == 95.0
+    assert row["humidity"] == 40.0
+    assert row["dailyrainin"] == 0.13
+    assert row["source"] == "wu-import"
+
+
 def test_transform_feels_like_branches():
     hot = _wu_obs(1, temp=95.0)
     assert wu_import.transform_observation(hot, "X")["feelsLike"] == 99.0

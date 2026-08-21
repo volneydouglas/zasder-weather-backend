@@ -3,6 +3,7 @@ import html as _html
 import logging
 import os
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -23,8 +24,8 @@ from .updates import UpdateChecker
 from .version import __version__
 
 from . import db
+from . import build_guard
 from .alerts import AlertMonitor
-from .ambient_client import AmbientWeatherClient
 from .capture import router as capture_router
 from .config import settings, tokens_match
 from . import source_status
@@ -32,9 +33,6 @@ from . import config_backup
 from . import public_dashboard as _pd
 from .discovery import router as discovery_router
 from .ingest import router as ingest_router
-from .poller import Poller
-from .weatherlink_client import WeatherLinkClient
-from .weatherlink_poller import WeatherlinkPoller
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,52 +51,33 @@ log = logging.getLogger("api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail fast if the stripped public build was deployed onto a host that is
+    # supposed to serve the relay. Deliberately BEFORE anything else, and
+    # deliberately not marked PRIVATE — this line must survive into the mirror,
+    # where it is inert unless REQUIRE_RELAY is set. See app/build_guard.py.
+    build_guard.assert_build_variant()
     await db.init_db()
     app.state.started_at = time.time()
     # Declare every source up front, configured or not. "Not set up" and "set
     # up but broken" are the two answers a self-hoster needs to tell apart,
     # and they look identical from outside.
     source_status.reset()
-    source_status.declare("ambientweather", settings.aw_configured)
-    source_status.declare("davis-cloud", settings.weatherlink_configured)
     source_status.declare("custom-ingest", True,
                           note="LilyGO boards, SDR relays and the WeatherLink "
                                "Live poller POST here; health is per-device "
                                "last-seen, see /api/devices")
-    # AmbientWeather poller only starts when both keys are set. AcuRite-only
-    # deploys leave them unset and rely entirely on /ingest/custom.
-    client = None
-    poller = None
-    if settings.aw_configured:
-        client = AmbientWeatherClient(settings.aw_application_key,  # type: ignore[arg-type]
-                                      settings.aw_api_key)          # type: ignore[arg-type]
-        poller = Poller(client)
-        await poller.start()
-        log.info("AmbientWeather poller started")
-    else:
-        log.info("AmbientWeather keys not set — poller disabled "
-                 "(custom ingest endpoints are still active)")
-    app.state.client = client
-    app.state.poller = poller
-
-    # WeatherLink v2 cloud poller — independent from AWN. Same lifespan
-    # gating (start only if all 3 creds set; explicit log if disabled
-    # so it's obvious in deploy logs whether the secrets landed).
-    wl_client = None
-    wl_poller = None
-    if settings.weatherlink_configured:
-        wl_client = WeatherLinkClient(settings.weatherlink_api_key,  # type: ignore[arg-type]
-                                      settings.weatherlink_api_secret)  # type: ignore[arg-type]
-        wl_poller = WeatherlinkPoller(wl_client,
-                                      settings.weatherlink_station_id,  # type: ignore[arg-type]
-                                      settings.weatherlink_poll_interval_seconds)
-        await wl_poller.start()
-        log.info("WeatherLink poller started (station_id=%s)",
-                 settings.weatherlink_station_id)
-    else:
-        log.info("WeatherLink not configured — skipping Davis cloud poller")
-    app.state.wl_client = wl_client
-    app.state.wl_poller = wl_poller
+    # Cloud pollers (AmbientWeather, Davis WeatherLink, Tempest) — owned by
+    # the IntegrationManager so credentials configured FROM THE APP
+    # (/api/integrations → server_kv, kv-over-env like the WU key) apply at
+    # boot and on change without a redeploy. Each provider's source_status
+    # is declared inside apply(), configured or not: "not set up" and "set
+    # up but broken" are the two answers a self-hoster must be able to tell
+    # apart. AcuRite-only deploys configure none of them and rely entirely
+    # on /ingest/custom.
+    from .integrations import IntegrationManager
+    integration_manager = IntegrationManager()
+    await integration_manager.start_all()
+    app.state.integration_manager = integration_manager
 
     # Device-staleness email alerts — independent of any poller; watches ALL
     # devices (cloud + SDR) for going quiet. ALWAYS started: it re-reads the
@@ -111,10 +90,36 @@ async def lifespan(app: FastAPI):
     app.state.alert_monitor = alert_monitor
     log.info("staleness alert monitor started (active once alerts are configured)")
 
+    # Self-healing rollups: a repair or column backfill marks the ledgers
+    # dirty (records() serves raw — correct but slow — while the flag is
+    # set), and this background rebuild clears it without an operator having
+    # to know POST /api/insights/rebuild exists (CODE_REVIEW_R5 R5-14).
+    # BACKGROUND on purpose: a full rebuild of a 1M-row archive takes
+    # minutes, and running it inline here failed a deploy's health checks
+    # once already (2026-08-20).
+    if settings.insights and await db.get_kv("rollups_dirty"):
+        from . import insights as _insights
+
+        async def _heal_rollups() -> None:
+            try:
+                stats = await _insights.rebuild()   # clears the flag itself
+                log.info("background rollup rebuild done: %s", stats)
+            except Exception:
+                log.exception("background rollup rebuild failed — records "
+                              "stay on the raw path until one succeeds")
+        app.state.rollup_heal_task = asyncio.create_task(_heal_rollups())
+
     # Daily "is there a newer release?" check → status-page banner + /api/version.
     update_checker = UpdateChecker(app)
     update_checker.start()
     app.state.update_checker = update_checker
+
+    # Opt-in self-update rides on the checker's result (AUTO_UPDATE=1 +
+    # FLY_API_TOKEN — inert without both; see app/self_update.py).
+    from .self_update import SelfUpdater
+    self_updater = SelfUpdater(app)
+    self_updater.start()
+    app.state.self_updater = self_updater
 
     # MQTT publisher (Home Assistant discovery) — only if a broker is configured.
     mqtt_pub = None
@@ -129,12 +134,16 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if poller is not None: await poller.stop()
-        if client is not None: await client.aclose()
-        if wl_poller is not None: await wl_poller.stop()
-        if wl_client is not None: await wl_client.aclose()
-        if alert_monitor is not None: await alert_monitor.stop()
+        heal = getattr(app.state, "rollup_heal_task", None)
+        if heal is not None:
+            # Cancellation mid-scan clears the partial tables (the
+            # _rebuild_locked safeguard) and LEAVES the dirty flag set, so
+            # the next boot retries — never a silently truncated ledger.
+            heal.cancel()
+        await integration_manager.stop_all()
+        await alert_monitor.stop()
         await update_checker.stop()
+        await self_updater.stop()
         if mqtt_pub is not None: await mqtt_pub.stop()
 
 
@@ -260,9 +269,12 @@ def _log_auth_failure(request: Request | None) -> None:
 
 def require_token(request: Request,
                   authorization: Annotated[str | None, Header()] = None) -> None:
-    """READ-allowing dep: accepts api_token OR reviewer_api_token. Use on GETs."""
+    """READ-allowing dep: accepts api_token, reviewer_api_token, an env
+    guest token, or an app-minted share token (db.guest_token_cache). Use
+    on GETs."""
     try:
-        ok = tokens_match(_extract_bearer(authorization), settings.valid_api_tokens)
+        ok = tokens_match(_extract_bearer(authorization),
+                          settings.valid_api_tokens | db.guest_token_cache())
     except HTTPException:
         _log_auth_failure(request)
         raise
@@ -288,7 +300,8 @@ def require_write_token(request: Request,
         # gives a real read-only user no clue that a fuller token exists.
         # 403 (authenticated, not permitted) vs 401 (not authenticated).
         token = _extract_bearer(authorization)
-        if tokens_match(token, settings.valid_api_tokens):
+        if tokens_match(token,
+                        settings.valid_api_tokens | db.guest_token_cache()):
             raise HTTPException(
                 status_code=403,
                 detail="this access token is read-only — backups, restores and "
@@ -300,6 +313,30 @@ def require_write_token(request: Request,
 def _is_reviewer(authorization: str | None) -> bool:
     """True when the presented bearer is the read-only reviewer/demo token."""
     return tokens_match(_extract_bearer(authorization), settings.reviewer_api_token)
+
+
+def _is_limited_read(authorization: str | None) -> bool:
+    """True for any read-only token that is NOT the operator's own.
+
+    Covers the reviewer/demo token and every guest share token. Both can read
+    /api/* but neither should see the operator's infrastructure: the alerts
+    response carries SMTP host, username and sender, which is the maintainer's
+    mail setup. Sharing a station with family must not also share that.
+
+    Guest tokens were admitted to the read surface without being added here,
+    so this generalises the reviewer check rather than adding a second one.
+    App-minted share tokens (db.guest_token_cache) are the same read-only
+    contract as the env guests and MUST be limited identically — they were
+    admitted to require_token's union without being added here, which handed
+    every share-link recipient the operator view: SMTP identity from
+    /api/alerts and the un-stripped home coordinates from /api/devices
+    (found by the 2026-08-20 review, same day the minting shipped).
+    """
+    if _is_reviewer(authorization):
+        return True
+    presented = _extract_bearer(authorization)
+    return tokens_match(presented,
+                        settings.guest_tokens | db.guest_token_cache())
 
 
 @app.get("/healthz")
@@ -399,8 +436,7 @@ async def status_page() -> HTMLResponse:
 
     return HTMLResponse(_render_status_html(
         rows, total_obs, uptime, latest_temp, now_ms, update_info,
-        dashboard_html=dashboard_html,
-        app_url=settings.public_dashboard_app_url))
+        dashboard_html=dashboard_html))
 
 
 # The public dashboard is rendered for ANONYMOUS requests on `/`, and the page
@@ -498,10 +534,18 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
         # background warm and render without the strip (it appears on a later
         # auto-refresh). Keeps the public page fast regardless of history size.
         recs = _records_cached_or_warm(mac)
+        # The app main page's summary boards: 24h stats from the rows already
+        # fetched, and the rain-periods row from the same enrichment /current
+        # serves — so the public page replaces a screenshot of the app rather
+        # than approximating one.
+        if obs:
+            await _fill_rain_periods(mac, obs)
         stations.append({"name": d.get("name") or mac, "obs": obs,
                          "series": series, "wind_samples": wind_samples,
-                         "records": recs})
-    return pd.render_dashboard(stations, fields, tz_name=settings.timezone)
+                         "records": recs, "summary": pd.summary_stats(rows)})
+    return pd.render_dashboard(stations, fields, tz_name=settings.timezone,
+                               app_url=settings.public_dashboard_app_url,
+                               location=settings.public_dashboard_location)
 
 
 def _humanize_age(seconds: float) -> str:
@@ -533,8 +577,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
                         latest_temp: dict | None = None,
                         now_ms: int | None = None,
                         update_info: dict | None = None,
-                        dashboard_html: str = "",
-                        app_url: str = "") -> str:
+                        dashboard_html: str = "") -> str:
     started = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
     # Public dashboard on ⇒ swap the app screenshots for the live charts + an
     # App Store link, add its CSS, and auto-refresh the page.
@@ -542,14 +585,10 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     if dashboard_html:
         dashboard_css = _pd.DASHBOARD_CSS
         refresh_meta = '<meta http-equiv="refresh" content="120">'
-        _cta = (f'<a href="{_html.escape(app_url, quote=True)}" target="_blank" '
-                f'rel="noopener">Get the iOS app ↗</a>'
-                if app_url else "")
-        hero_html = (
-            f'<div class="app-cta">{_cta}'
-            f'<span class="sub">Live conditions below · same data in the app</span></div>'
-            f'{dashboard_html}'
-        )
+        # No banner: the App Store link rides beside the first station's
+        # temperature now (Volney: the full-width row "takes up too much
+        # room and looks strange"). render_dashboard placed it.
+        hero_html = dashboard_html
     else:
         dashboard_css = ""
         refresh_meta = ""
@@ -708,6 +747,162 @@ async def api_config_restore(payload: Annotated[dict[str, Any], Body()]) -> dict
                      "it in Alerts if you use email alerts.")}
 
 
+# ── App-minted read-only share tokens ("Share read-only access") ─────────
+# The env-secret GUEST_API_TOKENS path required the fly CLI, which family
+# sharing can't ask of anyone. These are the same read-only contract, minted
+# from the app: valid on GETs (require_token unions db.guest_token_cache),
+# never in write_tokens. ALL THREE routes are write-gated — a guest must not
+# be able to mint further guests, enumerate other people's tokens, or revoke
+# the operator's shares.
+
+class GuestTokenBody(BaseModel):
+    label: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/api/guest-tokens", dependencies=[Depends(require_write_token)])
+async def api_create_guest_token(body: GuestTokenBody | None = None) -> dict[str, Any]:
+    """Mint a read-only share token. The full token appears ONLY in this
+    response — list/revoke work with the short id — so the operator's share
+    sheet is the single place the credential ever surfaces."""
+    token = "zwg_" + secrets.token_hex(16)
+    label = (body.label or "").strip() if body and body.label else None
+    now_ms = int(time.time() * 1000)
+    await db.add_guest_token(token, label or None, now_ms)
+    return {"token": token, "id": token[:db.GUEST_TOKEN_ID_LEN],
+            "label": label or None, "created_ms": now_ms}
+
+
+@app.get("/api/guest-tokens", dependencies=[Depends(require_write_token)])
+async def api_list_guest_tokens() -> dict[str, Any]:
+    rows = await db.list_guest_tokens()
+    return {"tokens": [{"id": r["token"][:db.GUEST_TOKEN_ID_LEN],
+                        "label": r["label"], "created_ms": r["created_ms"]}
+                       for r in rows]}
+
+
+@app.delete("/api/guest-tokens/{token_id}", dependencies=[Depends(require_write_token)])
+async def api_revoke_guest_token(token_id: str) -> dict[str, Any]:
+    n = await db.delete_guest_token(token_id)
+    if n == 0:
+        raise HTTPException(status_code=404, detail="no such share token")
+    return {"ok": True, "revoked": n}
+
+
+# ── Operator-triggered backend upgrade (Settings → "Update now") ─────────
+# The push-button sibling of AUTO_UPDATE for operators who keep it off: the
+# app checks /api/version (open, already carries update_available) and this
+# write-gated endpoint applies the release ON DEMAND through the same
+# machinery — image verified before the machine config is touched, same
+# major only, never a downgrade. Operator intent replaces the maturity
+# delay. The machine restarts on success, so the caller should treat a
+# dropped connection as "probably applied" and re-poll /api/version.
+
+@app.post("/api/update/apply", dependencies=[Depends(require_write_token)])
+async def api_update_apply() -> dict[str, Any]:
+    from . import self_update
+    from .updates import is_newer, parse_version
+    # One update at a time: a double-tap or HTTP retry otherwise POSTs the
+    # machine update twice — a second restart for nothing (CODE_REVIEW_R5
+    # R5-21). Non-blocking on purpose: the second caller learns instantly.
+    lock: asyncio.Lock | None = getattr(app.state, "update_apply_lock", None)
+    if lock is None:      # lazily built — binds to the running loop
+        lock = app.state.update_apply_lock = asyncio.Lock()
+    if lock.locked():
+        raise HTTPException(status_code=409,
+                            detail="an update is already being applied")
+    async with lock:
+        return await _update_apply_locked(self_update, is_newer, parse_version)
+
+
+async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str, Any]:
+    info = getattr(app.state, "update_info", None) or {}
+    latest = info.get("latest")
+    if not latest or not is_newer(latest, __version__):
+        raise HTTPException(status_code=409,
+                            detail=f"already up to date (v{__version__})")
+    if parse_version(latest)[0] != parse_version(__version__)[0]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"v{latest} is a major upgrade and may carry manual "
+                   "steps — follow the release notes to upgrade")
+    if not self_update._fly_token():
+        raise HTTPException(
+            status_code=409,
+            detail="no deploy token on this instance — create one with "
+                   "`fly tokens create deploy` and set it as the "
+                   "FLY_API_TOKEN secret, then try again")
+    repo = self_update._image_repo()
+    if not await self_update.image_exists(repo, latest):
+        raise HTTPException(
+            status_code=409,
+            detail=f"release v{latest} has no published image yet — "
+                   "try again in a few minutes")
+    ok = await self_update.apply_update(latest)
+    if not ok:
+        raise HTTPException(status_code=502,
+                            detail="the platform rejected the update — "
+                                   "see the server logs")
+    return {"ok": True, "applying": latest,
+            "note": "the server restarts into the new release; "
+                    "re-check /api/version shortly"}
+
+
+# ── Cloud-source integrations (Settings → Integrations) ──────────────────
+# Configure the AmbientWeather / WeatherLink / Tempest pollers from the app
+# (server_kv, kv-over-env — the WU-key precedent) without a redeploy. ALL
+# write-gated, and the GET is too: which providers an operator uses is
+# operator business, and the response enumerates credential presence.
+
+@app.get("/api/integrations", dependencies=[Depends(require_write_token)])
+async def api_integrations_status() -> dict[str, Any]:
+    from . import integrations
+    return {"providers": await integrations.status()}
+
+
+@app.put("/api/integrations/{provider}", dependencies=[Depends(require_write_token)])
+async def api_integrations_put(provider: str,
+                               body: Annotated[dict[str, Any], Body()]) -> dict[str, Any]:
+    """Store fields (omitted = unchanged, empty = clear back to env — the
+    SMTP-password partial-update contract) and apply immediately: the
+    provider's poller restarts with the effective credentials."""
+    from . import integrations
+    if provider not in integrations.PROVIDERS:
+        raise HTTPException(status_code=404,
+                            detail=f"unknown provider {provider!r}; "
+                                   f"known: {sorted(integrations.PROVIDERS)}")
+    allowed = {f for f, _, _ in integrations.PROVIDERS[provider]}
+    unknown = set(body) - allowed
+    if unknown:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown fields {sorted(unknown)}; "
+                                   f"allowed: {sorted(allowed)}")
+    try:
+        await integrations.store(provider, body)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=f"bad value: {e}")
+    running = await app.state.integration_manager.apply(provider)
+    # One cheap authenticated call so wrong keys never save as a silent
+    # success (CODE_REVIEW_R5 R5-07; the R3-21 serverNote precedent). The
+    # values persist either way — an upstream outage must not block saving —
+    # but the UI gets the failure to show next to the "On" pill.
+    check = await integrations.probe(provider)
+    return {"ok": True, "running": running, "check": check,
+            "providers": await integrations.status()}
+
+
+@app.delete("/api/integrations/{provider}", dependencies=[Depends(require_write_token)])
+async def api_integrations_clear(provider: str) -> dict[str, Any]:
+    """Clear every app-stored field for the provider. Env-configured
+    credentials (if any) take back over; otherwise the poller stops."""
+    from . import integrations
+    if provider not in integrations.PROVIDERS:
+        raise HTTPException(status_code=404, detail="unknown provider")
+    await integrations.clear(provider)
+    running = await app.state.integration_manager.apply(provider)
+    return {"ok": True, "running": running,
+            "providers": await integrations.status()}
+
+
 @app.get("/api/sources", dependencies=[Depends(require_token)])
 async def api_sources() -> dict[str, Any]:
     """Health of each ingest source.
@@ -755,7 +950,7 @@ async def get_devices(
     authorization: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
     devices = await db.list_devices()
-    if _is_reviewer(authorization):
+    if _is_limited_read(authorization):
         devices = _strip_device_pii(devices)
     return JSONResponse(devices)
 
@@ -781,6 +976,14 @@ class AlertPrefsIn(BaseModel):
     smtp_ssl: bool | None = None
     # 'all' | 'device_down' — which alert kinds may email (push is unscoped).
     email_scope: str | None = None
+    # Storm summary. Bounded rather than free: a quiet window under 5 minutes
+    # would split one storm into several summaries. min_total's ge=0 is
+    # DELIBERATE: 0 opts into a summary for any measurable rain at all
+    # (desert stations count single tips); the default keeps the 0.05 floor
+    # so nobody gets tip-spam without asking for it (R5-28).
+    storm_summary: bool | None = None
+    storm_quiet_minutes: float | None = Field(default=None, ge=5, le=360)
+    storm_min_total_in: float | None = Field(default=None, ge=0, le=10)
 
 
 class DeviceAlertIn(BaseModel):
@@ -828,6 +1031,21 @@ async def _alerts_state() -> dict[str, Any]:
         "smtp_password_set": bool(cfg.smtp_password),
         "smtp_source": "app" if prefs["smtp_host"] else ("env" if cfg.smtp_host else "none"),
         "email_scope": cfg.email_scope,
+        # Storm summary — the effective values, plus whether they came from
+        # the app or the server env, so the UI can say which is in charge.
+        "storm_summary": cfg.storm_summary,
+        "storm_quiet_minutes": cfg.storm_quiet_minutes,
+        "storm_min_total_in": cfg.storm_min_total_in,
+        "storm_source": "app" if prefs["storm_summary"] is not None else "env",
+        # Smart-alert firing state, so a client with no push channel of its
+        # own (the macOS app) can edge-detect these the way it now does
+        # threshold rules. Rides on this response rather than a new endpoint
+        # because the Mac already fetches it every minute.
+        "smart_alerts_enabled": settings.smart_alerts,
+        "smart_alerts": [
+            {"mac": mac, "kind": kind, "triggered": bool(trig)}
+            for (mac, kind), trig in sorted((await db.get_smart_alert_states()).items())
+        ],
         "devices": dev_list,
     }
 
@@ -837,13 +1055,17 @@ async def get_alerts(
     authorization: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
     state = await _alerts_state()
-    if _is_reviewer(authorization):
-        # The read-only reviewer/demo token gets the alerts UI state but not
-        # the SMTP transport identifiers (host/username/from reveal the
+    if _is_limited_read(authorization):
+        # Any non-operator read token gets the alerts UI state but not the
+        # SMTP transport identifiers (host/username/from reveal the
         # maintainer's mail infrastructure; password was already write-only).
         for k in ("smtp_host", "smtp_username", "smtp_from"):
             if state.get(k):
                 state[k] = "(hidden)"
+        # Recipient addresses are the same data class as smtp_from (often
+        # literally the same mailbox) — share-link guests don't get the
+        # operator's personal emails (CODE_REVIEW_R5 R5-04 / R3-07).
+        state["recipients"] = []
     return JSONResponse(state)
 
 
@@ -857,6 +1079,12 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     fields: dict[str, Any] = {}
     if body.enabled is not None:
         fields["enabled"] = 1 if body.enabled else 0
+    if body.storm_summary is not None:
+        fields["storm_summary"] = 1 if body.storm_summary else 0
+    if body.storm_quiet_minutes is not None:
+        fields["storm_quiet_minutes"] = body.storm_quiet_minutes
+    if body.storm_min_total_in is not None:
+        fields["storm_min_total_in"] = body.storm_min_total_in
     if body.default_threshold_minutes is not None:
         fields["default_threshold_min"] = body.default_threshold_minutes
     if body.repeat_hours is not None:
@@ -1321,6 +1549,38 @@ async def delete_device(mac: str) -> JSONResponse:
     return JSONResponse({"ok": True, "deleted_mac": _format_mac(mac), **counts})
 
 
+async def _fill_rain_periods(mac: str, obs: dict[str, Any]) -> None:
+    """Rain rollup enrichment: fill period totals the source doesn't post.
+    SDR posts only yearlyrainin (differenced at period boundaries), the
+    Tempest posts only hourly+daily (summed per-day, rain_rollups tier 3 —
+    before that tier, the old yearlyrainin-only gate here meant a Tempest
+    dashboard simply had no week/month/year). AWN-sourced rows ship every
+    bucket pre-computed and the fill-only-None leaves them untouched. Gated
+    on SOME rain counter being present: a station with no rain sensor at
+    all must stay absent everywhere, not gain zeros. Shared by /current and
+    the public dashboard's rain-periods board."""
+    has_rain_counter = any(obs.get(k) is not None for k in
+                           ("yearlyrainin", "monthlyrainin", "dailyrainin"))
+    if not has_rain_counter or not any(
+        obs.get(k) is None for k in
+        ("dailyrainin", "hourlyrainin", "weeklyrainin", "monthlyrainin",
+         "yearlyrainin")
+    ):
+        return
+    try:
+        rollups = await db.rain_rollups(mac, settings.timezone)
+    except Exception as e:
+        log.warning("rain_rollups failed for %s: %s", mac, e)
+        rollups = {}
+    for k, v in (("dailyrainin",   rollups.get("daily_in")),
+                  ("hourlyrainin",  rollups.get("hourly_in")),
+                  ("weeklyrainin",  rollups.get("weekly_in")),
+                  ("monthlyrainin", rollups.get("monthly_in")),
+                  ("yearlyrainin",  rollups.get("yearly_in"))):
+        if obs.get(k) is None and v is not None:
+            obs[k] = v
+
+
 @app.get("/api/devices/{mac}/current", dependencies=[Depends(require_token)])
 async def get_current(mac: str) -> JSONResponse:
     # Read-side MAC normalization: storage keys are the uppercase colonized
@@ -1331,26 +1591,7 @@ async def get_current(mac: str) -> JSONResponse:
     obs = await db.latest_observation(mac)
     if not obs:
         raise HTTPException(status_code=404, detail="no data for device")
-    # Rain rollup enrichment: if the source posts yearlyrainin (SDR path)
-    # but not the bucketed values (daily/hourly/etc.), compute them from
-    # historical yearlyrainin deltas at local-time period boundaries.
-    # AWN-sourced rows ship pre-computed rollups already and the conditional
-    # leaves those untouched.
-    if obs.get("yearlyrainin") is not None and any(
-        obs.get(k) is None for k in
-        ("dailyrainin", "hourlyrainin", "weeklyrainin", "monthlyrainin")
-    ):
-        try:
-            rollups = await db.rain_rollups(mac, settings.timezone)
-        except Exception as e:
-            log.warning("rain_rollups failed for %s: %s", mac, e)
-            rollups = {}
-        for k, v in (("dailyrainin",   rollups.get("daily_in")),
-                      ("hourlyrainin",  rollups.get("hourly_in")),
-                      ("weeklyrainin",  rollups.get("weekly_in")),
-                      ("monthlyrainin", rollups.get("monthly_in"))):
-            if obs.get(k) is None and v is not None:
-                obs[k] = v
+    await _fill_rain_periods(mac, obs)
     return JSONResponse(obs)
 
 
@@ -1547,6 +1788,7 @@ async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSO
 async def get_forecast(
     lat: float | None = None, lon: float | None = None,
     source: str | None = Query(None, pattern="^(open-meteo|twc)$"),
+    authorization: Annotated[str | None, Header()] = None,
 ) -> JSONResponse:
     """Forecast. Default: 7-day Open-Meteo (free, no key). source=twc asks
     for The Weather Company's 5-day (needs the WU_API_KEY secret — free for
@@ -1614,7 +1856,21 @@ async def get_forecast(
             r = await client.get("https://api.open-meteo.com/v1/forecast", params=params)
             r.raise_for_status()
         body = r.json()
+        if _is_limited_read(authorization):
+            # Guests get the forecast (the family-sharing strip needs it)
+            # but not the operator's home location: Open-Meteo echoes back
+            # the grid-snapped lat/lon it was asked for, which on the
+            # no-args call is the first device's stored coordinates — the
+            # exact fields _strip_device_pii hides on /api/devices
+            # (CODE_REVIEW_R5 R5-03 / R3-06).
+            for k in ("latitude", "longitude", "elevation"):
+                body.pop(k, None)
         body["source"] = "open-meteo"
+        # Always present so the client decodes one shape from both sources.
+        # Empty because Open-Meteo has no written forecast to give — only TWC
+        # ships prose, which is why the app hides the card rather than
+        # inventing one (see forecast_twc.transform).
+        body["narrative"] = []
         if fallback_from:
             body["fallback_from"] = fallback_from
         return JSONResponse(body)

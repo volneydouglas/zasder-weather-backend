@@ -53,7 +53,18 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
                 # REAL notifications to real devices via APNs/FCM or the relay.
                 "APNS_KEY_ID", "APNS_TEAM_ID", "APNS_KEY_P8", "APNS_TOPIC",
                 "APNS_RELAY_URL", "APNS_RELAY_TOKEN",
-                "FCM_SERVICE_ACCOUNT_JSON", "FCM_SERVICE_ACCOUNT_FILE"):
+                "FCM_SERVICE_ACCOUNT_JSON", "FCM_SERVICE_ACCOUNT_FILE",
+                # 1.6 (2026-08-20 review): the Tempest poller and guest
+                # tokens joined config AFTER this list. A developer .env
+                # carrying the live TEMPEST_TOKEN booted a real poller
+                # against the WeatherFlow API in every client-fixture test —
+                # and the token rides the polled URL, so a logged failure
+                # prints it. A .env GUEST_API_TOKENS silently joined
+                # valid_api_tokens in every auth test. (TEMPEST_STATION_ID
+                # is typed int like WEATHERLINK_STATION_ID — blanking the
+                # token alone disables the poller, and "" would fail
+                # Settings validation.)
+                "TEMPEST_TOKEN", "GUEST_API_TOKENS"):
         monkeypatch.setenv(var, "")
     # Module-level caches must not leak across tests (the public dashboard HTML
     # and the per-MAC records cache are process-global by design). Reset only a
@@ -85,7 +96,8 @@ def client(temp_env: str):
     # app.insights precedent for modules with per-test state.
     for mod in ["app.config", "app.db", "app.insights", "app.wu_upload",
                 "app.capture", "app.ingest", "app.discovery",
-                "app.alerts", "app.apns", "app.relay", "app.main"]:
+                "app.alerts", "app.apns", "app.relay", "app.integrations",
+                "app.main"]:
         if mod in importlib.sys.modules: importlib.reload(importlib.sys.modules[mod])
     from fastapi.testclient import TestClient
     from app.main import app

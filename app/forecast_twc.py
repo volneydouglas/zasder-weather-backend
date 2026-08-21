@@ -67,6 +67,13 @@ def transform(twc: dict[str, Any]) -> dict[str, Any]:
     dp_wind = dp0.get("windSpeed") or []
     dp_dir = dp0.get("windDirection") or []
     dp_icon = dp0.get("iconCode") or []
+    # The written forecast, which we already download and used to discard
+    # (Doren's request, 2026-08-16). `narrative` is the prose and
+    # `daypartName` is its own heading — and TWC advances that heading itself
+    # ("Today"/"Tonight"/"Tomorrow"/"Tomorrow night"), so the app does not
+    # need sunset arithmetic to know which half it is showing.
+    dp_narrative = dp0.get("narrative") or []
+    dp_name = dp0.get("daypartName") or []
 
     def at(arr: list, i: int) -> Any:
         return arr[i] if i < len(arr) else None
@@ -117,7 +124,18 @@ def transform(twc: dict[str, Any]) -> dict[str, Any]:
         # back. Raising here routes the caller's blanket except to the
         # marked Open-Meteo fallback ("the strip must always work").
         raise ValueError("TWC returned no daily forecast")
-    return {"daily": days, "timezone": None, "source": "twc"}
+
+    # Dayparts, in TWC's own order, as a flat sequence rather than folded into
+    # `days` — they are twice as many as the days and the first one expires at
+    # mid-afternoon, so index 0 is simply "the half we are in now". Nulls are
+    # dropped rather than kept as placeholders, which is what makes that true.
+    narrative = [
+        {"name": name, "text": text}
+        for name, text in zip(dp_name, dp_narrative)
+        if isinstance(name, str) and isinstance(text, str) and text.strip()
+    ]
+    return {"daily": days, "timezone": None, "source": "twc",
+            "narrative": narrative}
 
 
 async def fetch(lat: float, lon: float, api_key: str) -> dict[str, Any]:

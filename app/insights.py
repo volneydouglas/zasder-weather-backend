@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS daily_rollups (
     uv_max REAL, solarradiation_max REAL,
     rain_total REAL,                    -- max(dailyrainin) seen that day
     yearly_min REAL, yearly_max REAL,   -- fallback rain delta for SDR sources
+    lightning_max REAL,                 -- peak strikes/hr that day (1.6; ALTERed in)
     PRIMARY KEY (mac, day)
 );
 
@@ -83,13 +84,13 @@ INSERT INTO daily_rollups (mac, day,
     humidity_min, humidity_max, windspeedmph_max, windgustmph_max,
     baromrelin_min, baromrelin_max, dew_point_min, dew_point_max,
     feels_like_min, feels_like_max, uv_max, solarradiation_max,
-    rain_total, yearly_min, yearly_max)
+    rain_total, yearly_min, yearly_max, lightning_max)
 VALUES (:mac, :day,
     :tempf, :tempf, :tempf, :tempf_n,
     :humidity, :humidity, :windspeedmph, :windgustmph,
     :baromrelin, :baromrelin, :dew_point, :dew_point,
     :feels_like, :feels_like, :uv, :solarradiation,
-    :dailyrainin, :yearlyrainin, :yearlyrainin)
+    :dailyrainin, :yearlyrainin, :yearlyrainin, :lightning)
 ON CONFLICT(mac, day) DO UPDATE SET
     tempf_min = MIN(COALESCE(tempf_min, :tempf), COALESCE(:tempf, tempf_min)),
     tempf_max = MAX(COALESCE(tempf_max, :tempf), COALESCE(:tempf, tempf_max)),
@@ -109,7 +110,8 @@ ON CONFLICT(mac, day) DO UPDATE SET
     solarradiation_max = MAX(COALESCE(solarradiation_max, :solarradiation), COALESCE(:solarradiation, solarradiation_max)),
     rain_total = MAX(COALESCE(rain_total, :dailyrainin), COALESCE(:dailyrainin, rain_total)),
     yearly_min = MIN(COALESCE(yearly_min, :yearlyrainin), COALESCE(:yearlyrainin, yearly_min)),
-    yearly_max = MAX(COALESCE(yearly_max, :yearlyrainin), COALESCE(:yearlyrainin, yearly_max))
+    yearly_max = MAX(COALESCE(yearly_max, :yearlyrainin), COALESCE(:yearlyrainin, yearly_max)),
+    lightning_max = MAX(COALESCE(lightning_max, :lightning), COALESCE(:lightning, lightning_max))
 """
 
 _UPSERT_HOUR = """
@@ -177,6 +179,9 @@ def rollup_params(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any] | None:
         "solarradiation": num("solarradiation"),
         "dailyrainin": num("dailyrainin"),
         "yearlyrainin": num("yearlyrainin"),
+        # Trailing-hour strike count; the day's MAX is "most strikes in an
+        # hour that day", which is what the records screen quotes.
+        "lightning": num("lightning_last_1hr"),
     }
 
 
@@ -225,7 +230,26 @@ async def rebuild(mac: str | None = None) -> dict[str, int]:
     if _REBUILD_LOCK is None:      # no await between test and assignment
         _REBUILD_LOCK = asyncio.Lock()
     async with _REBUILD_LOCK:
-        return await _rebuild_locked(mac)
+        from . import db as dbmod
+        # Snapshot BEFORE the scan: the clear below is conditional on the
+        # marker still holding this exact value, so a repair that sets a
+        # fresh nonce mid-rebuild (rows the scan already passed) survives
+        # the clear and stays dirty for the next rebuild (CodeRabbit,
+        # 2026-08-20).
+        pre = await dbmod.get_kv("rollups_dirty")
+        out = await _rebuild_locked(mac)
+        if mac is None and pre is not None:
+            # A successful FULL rebuild is the one thing that makes dirty
+            # rollups trustworthy again (records() falls back to raw scans
+            # while the flag is set — R5-14/R5-15). A single-mac rebuild
+            # can't clear it: the flag is global and the other stations'
+            # ledgers are still stale.
+            async with dbmod.connect() as db:
+                await db.execute(
+                    "DELETE FROM server_kv WHERE k = 'rollups_dirty' "
+                    "AND v = ?", (pre,))
+                await db.commit()
+        return out
 
 
 async def _rebuild_locked(mac: str | None) -> dict[str, int]:
@@ -280,7 +304,8 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
             cur = await db.execute(
                 "SELECT mac, dateutc_ms, tempf, humidity, windspeedmph, "
                 "windgustmph, baromrelin, dew_point, feels_like, uv, "
-                "solarradiation, dailyrainin, yearlyrainin "
+                "solarradiation, dailyrainin, yearlyrainin, "
+                "lightning_last_1hr "
                 "FROM observations WHERE mac = ? AND dateutc_ms > ? "
                 "ORDER BY dateutc_ms LIMIT 5000",
                 (one_mac, last))
@@ -293,7 +318,8 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
                        "baromrelin": b[6], "dewPoint": b[7],
                        "feelsLike": b[8], "uv": b[9],
                        "solarradiation": b[10], "dailyrainin": b[11],
-                       "yearlyrainin": b[12]}
+                       "yearlyrainin": b[12],
+                       "lightning_last_1hr": b[13]}
                 p = rollup_params(row, tz)
                 if p is None:
                     continue

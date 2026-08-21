@@ -169,6 +169,16 @@ static void handleStatus() {
   body += "  \"freq_mhz\": "     + String((double) RF_MODULE_FREQUENCY, 2) + ",\n";
   body += "  \"source\": \""     + String(ZASDER_SOURCE_TAG) + "\",\n";
   body += "  \"backend_url\": \""+ escapeJson(backendUrl) + "\",\n";
+  // Whether THIS build verifies the server certificate. A TLS_INSECURE board
+  // is a debug build that sends the ingest token in a readable POST to
+  // anyone on the Wi-Fi path — and until this line it looked identical to a
+  // pinned one from every diagnostic surface, so a dev image left in service
+  // was undetectable without recompiling. Report it.
+#if defined(TLS_INSECURE) && TLS_INSECURE
+  body += "  \"tls\": \"INSECURE-no-cert-check\",\n";
+#else
+  body += "  \"tls\": \"pinned\",\n";
+#endif
   body += "  \"has_token\": "    + String(ingestToken.length() > 0 ? "true" : "false") + ",\n";
   body += "  \"token_len\": "    + String((unsigned) ingestToken.length()) + ",\n";
   body += "  \"provisioned\": "  + String(provisioned ? "true" : "false") + ",\n";

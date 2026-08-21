@@ -225,12 +225,120 @@ def _esc(s: Any) -> str:
     return _html.escape(str(s), quote=True)
 
 
+def summary_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The numbers behind the app main page's "Today · 24h" board. The 24h
+    window the dashboard fetches is NEVER raw: db._auto_bucket_ms buckets
+    anything past 6h into 1-minute AVG rows, so taking max() of the plain
+    columns understates every extreme — a 21 mph gust averaged against the
+    calm seconds around it rendered as "Max Gust 12" (CODE_REVIEW_R5
+    R5-08). Prefer the per-bucket extreme columns the bucketed query
+    carries for exactly this, falling back to the plain column for genuine
+    raw rows. Every entry is None-when-absent — a station with no UV sensor
+    gets no Max UV cell, not a confident 0 (the absent-is-not-zero rule)."""
+    def col(key: str, extreme: str | None = None) -> list[tuple[int, float]]:
+        out = []
+        for r in rows:
+            t = r.get("dateutc")
+            v = _num(r.get(extreme)) if extreme else None
+            if v is None:
+                v = _num(r.get(key))
+            if t is not None and v is not None:
+                out.append((int(t), v))
+        return out
+
+    temps_hi = col("tempf", "tempf_max")
+    temps_lo = col("tempf", "tempf_min")
+    hums = col("humidity", "humidity_min")
+    gusts = col("windgustmph", "windgustmph_max")
+    uvs = col("uv", "uv_max")
+    press = col("baromrelin")
+    hi = max(temps_hi, key=lambda p: p[1]) if temps_hi else None
+    lo = min(temps_lo, key=lambda p: p[1]) if temps_lo else None
+    return {
+        "hi": hi, "lo": lo,                       # (ts_ms, value) or None
+        "gust_max": max(v for _, v in gusts) if gusts else None,
+        "humidity_lo": min(v for _, v in hums) if hums else None,
+        "uv_max": max(v for _, v in uvs) if uvs else None,
+        "press_delta": (press[-1][1] - press[0][1]) if len(press) >= 2 else None,
+        # Bucketed windows make this a POINT count, not a reading count —
+        # the label must not claim "samples" (R5-08).
+        "samples": len(rows),
+    }
+
+
+def _local_time(ts_ms: int, tz_name: str) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        from datetime import timezone
+        tz = timezone.utc
+    return datetime.fromtimestamp(ts_ms / 1000, tz).strftime("%-I:%M %p")
+
+
+def render_summary_strip(stats: dict[str, Any] | None, tz_name: str) -> str:
+    """The "Today · 24h" board: high/low with their local times, max gust,
+    24h pressure change, humidity low, max UV. Cells render only for
+    readings the station actually produced."""
+    if not stats:
+        return ""
+    cells: list[str] = []
+
+    def cell(label: str, value: str, sub: str = "") -> None:
+        sub_html = f'<span class="cc-k">{_esc(sub)}</span>' if sub else ""
+        cells.append(f'<div class="cc-chip"><span class="cc-k">{_esc(label)}</span>'
+                     f'<span class="cc-v">{_esc(value)}</span>{sub_html}</div>')
+
+    if stats.get("hi"):
+        ts, v = stats["hi"]
+        cell("24h High", f"{round(v)}°", _local_time(ts, tz_name))
+    if stats.get("lo"):
+        ts, v = stats["lo"]
+        cell("24h Low", f"{round(v)}°", _local_time(ts, tz_name))
+    if stats.get("gust_max") is not None:
+        cell("Max Gust", f'{stats["gust_max"]:.0f} mph')
+    if stats.get("press_delta") is not None:
+        cell("Press Δ 24h", f'{stats["press_delta"]:+.2f} inHg')
+    if stats.get("humidity_lo") is not None:
+        cell("Humidity Low", f'{stats["humidity_lo"]:.0f}%')
+    if stats.get("uv_max") is not None:
+        cell("Max UV", f'{stats["uv_max"]:.0f}')
+    if not cells:
+        return ""
+    n = stats.get("samples") or 0
+    return (f'<div class="chart"><div class="chart-title">Today '
+            f'<span class="chart-unit">· last 24h · {n:,} points</span></div>'
+            f'<div class="cc-chips">{"".join(cells)}</div></div>')
+
+
+def render_rain_periods(o: dict[str, Any]) -> str:
+    """Today / Week / Month / Year rain, from the same enriched values the
+    app's dashboard shows. Hidden entirely for a station with no rain
+    counters — absent is not zero."""
+    pairs = [("Today", _num(o.get("dailyrainin"))),
+             ("Week", _num(o.get("weeklyrainin"))),
+             ("Month", _num(o.get("monthlyrainin"))),
+             ("Year", _num(o.get("yearlyrainin")))]
+    if all(v is None for _, v in pairs):
+        return ""
+    cells = "".join(
+        f'<div class="cc-chip"><span class="cc-k">{label}</span>'
+        f'<span class="cc-v">{f"{v:.2f} in" if v is not None else "—"}</span></div>'
+        for label, v in pairs)
+    return (f'<div class="chart"><div class="chart-title">Rain '
+            f'<span class="chart-unit">· by period</span></div>'
+            f'<div class="cc-chips">{cells}</div></div>')
+
+
 def render_station(name: str, obs: dict[str, Any] | None,
                    series: dict[str, list[tuple[int, float]]],
                    fields: list[str],
                    wind_samples: list[tuple[float, float]] | None = None,
                    records: dict[str, Any] | None = None,
-                   tz_name: str = "UTC") -> str:
+                   tz_name: str = "UTC",
+                   summary: dict[str, Any] | None = None,
+                   app_url: str = "", location: str | None = None) -> str:
     """One station block: current-conditions header + a chart per field.
 
     The temperature chart overlays the feels-like line (from
@@ -283,14 +391,32 @@ def render_station(name: str, obs: dict[str, Any] | None,
                 f'{svg_wind_rose(wind_samples)}</div>'
             )
 
+    # The app main page's summary boards (Volney, 2026-08-20: the public
+    # page should replace screenshots, so it carries the same boards).
+    boards = render_summary_strip(summary, tz_name) + render_rain_periods(o)
+    # The App Store link rides BESIDE the temperature (Volney: the full-width
+    # top banner "takes up too much room and looks strange"), and the
+    # operator-typed place label sits on the name line.
+    loc_html = (f'<span class="cc-loc"> · {_esc(location)}</span>'
+                if location else "")
+    side_html = ""
+    if app_url:
+        import html as _h
+        side_html = (f'<div class="cc-side">'
+                     f'<a class="cc-app" href="{_h.escape(app_url, quote=True)}" '
+                     f'target="_blank" rel="noopener">Get the iOS app ↗</a>'
+                     f'</div>')
     return (
         f'<section class="station">'
         f'  <div class="cc">'
-        f'    <div class="cc-name">{_esc(name)}</div>'
-        f'    <div class="cc-temp">{temp_html}</div>{feels_html}'
-        f'    <div class="cc-chips">{"".join(chips)}</div>'
+        f'    <div class="cc-main">'
+        f'      <div class="cc-name">{_esc(name)}{loc_html}</div>'
+        f'      <div class="cc-temp">{temp_html}</div>{feels_html}'
+        f'      <div class="cc-chips">{"".join(chips)}</div>'
+        f'    </div>'
+        f'    {side_html}'
         f'  </div>'
-        f'  <div class="charts">{"".join(charts)}</div>'
+        f'  <div class="charts">{boards}{"".join(charts)}</div>'
         f'  {render_records(records, tz_name)}'
         f'</section>'
     )
@@ -358,15 +484,21 @@ def render_records(records: dict[str, Any] | None, tz_name: str) -> str:
 
 
 def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
-                     tz_name: str = "UTC") -> str:
+                     tz_name: str = "UTC",
+                     app_url: str = "", location: str | None = None) -> str:
     """Full dashboard section for all selected stations."""
     if not stations:
         return '<div class="chart-empty">No station data yet.</div>'
     return "".join(
         render_station(s["name"], s.get("obs"), s.get("series", {}), fields,
                        wind_samples=s.get("wind_samples"),
-                       records=s.get("records"), tz_name=tz_name)
-        for s in stations
+                       records=s.get("records"), tz_name=tz_name,
+                       summary=s.get("summary"),
+                       # First station only: one link and one place label per
+                       # page, however many stations it shows.
+                       app_url=app_url if i == 0 else "",
+                       location=location if i == 0 else None)
+        for i, s in enumerate(stations)
     )
 
 
@@ -374,15 +506,18 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
 # a plain string inserted into the page f-string via a {placeholder}, so its
 # value is copied verbatim — use single (normal CSS) braces here.
 DASHBOARD_CSS = """
-    .app-cta { text-align:center; margin: 4px 0 24px; }
-    .app-cta a { display:inline-flex; align-items:center; gap:8px; font-size:13px;
-        font-weight:600; color:#0b0d13; background:#fff; border-radius:10px;
-        padding:10px 18px; text-decoration:none; }
-    .app-cta .sub { display:block; font-size:11px; color:rgba(255,255,255,0.45); margin-top:8px; }
     .station { margin-bottom: 28px; }
-    .cc { margin-bottom: 14px; }
+    .cc { margin-bottom: 14px; display:flex; align-items:flex-start;
+        justify-content:space-between; gap:16px; flex-wrap:wrap; }
+    .cc-main { min-width:0; }
+    .cc-side { flex-shrink:0; padding-top:22px; }
+    .cc-app { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+        font-weight:600; color:#0b0d13; background:#fff; border-radius:9px;
+        padding:8px 14px; text-decoration:none; white-space:nowrap; }
     .cc-name { font-size:11px; font-weight:800; letter-spacing:1.2px;
         text-transform:uppercase; color:rgba(255,255,255,0.5); }
+    .cc-loc { font-weight:600; letter-spacing:0.4px; text-transform:none;
+        color:rgba(255,255,255,0.38); }
     .cc-temp { font-size:56px; font-weight:200; line-height:1; margin-top:2px; }
     .cc-feels { font-size:13px; color:rgba(255,255,255,0.55); margin-top:2px; }
     .cc-chips { display:flex; flex-wrap:wrap; gap:16px; margin-top:10px; }

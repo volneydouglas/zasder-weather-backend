@@ -128,7 +128,10 @@ Q: Where do they want the backend?
 | `DATABASE_PATH` | YES | `/data/weather.db` on Fly; `./data/weather.db` locally. |
 | `AW_APPLICATION_KEY` + `AW_API_KEY` | Path A only | Both unset = AWN poller disabled silently. |
 | `WEATHERLINK_API_KEY` + `_SECRET` + `_STATION_ID` | Path B only | All three required together. |
+| `TEMPEST_TOKEN` + `TEMPEST_STATION_ID` | Path F only | Both required together; `TEMPEST_NAME`/`TEMPEST_POLL_INTERVAL_SECONDS` optional. App-stored Integrations values win over env. |
 | `REVIEWER_API_TOKEN` | Optional | Secondary token for App Store reviewer. |
+| `GUEST_API_TOKENS` | Optional | Comma-separated read-only tokens (family sharing): reads only, PII stripped. Each ≥32 chars, distinct from privileged tokens, placeholders rejected at boot. The app can also mint/revoke these per person. |
+| `STORM_SUMMARY` (+ `_QUIET_MINUTES`, `_MIN_TOTAL_IN`) | Optional | One report after the rain stops. Default on (0.05 in floor, 30 min quiet); app-saved values win over env. |
 | `TIMEZONE` | Optional | IANA zone (e.g. `America/Phoenix`). Defaults UTC. |
 | `WEATHERLINK_POLL_INTERVAL_SECONDS` | Optional | Default 60. Min 15. |
 | `WEATHERLINK_YEARLY_RAIN_BASELINE_IN` | Optional | Inches to add to Davis's reported yearly rain (mid-year install). |

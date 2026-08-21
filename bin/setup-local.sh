@@ -9,6 +9,7 @@
 #
 # Flags mirror setup-fly.sh: --sources= --tz= --yes
 #   --aw-app-key= --aw-api-key= --wl-key= --wl-secret= --wl-station=
+#   --tempest-token= --tempest-station=
 
 set -euo pipefail
 # Everything this script writes holds tokens: .env, the .env.bak.* backup of a
@@ -58,6 +59,7 @@ harden "$APP_DIR/.env" "$APP_DIR/zasder-install-summary.txt"
 NONINTERACTIVE=0; SOURCES=""; SOURCES_SET=0; TZ_FLAG=""
 AW_APP_KEY_FLAG=""; AW_API_KEY_FLAG=""
 WL_KEY_FLAG=""; WL_SECRET_FLAG=""; WL_STATION_FLAG=""
+TEMPEST_TOKEN_FLAG=""; TEMPEST_STATION_FLAG=""
 for arg in "$@"; do
   case "$arg" in
     --yes|--non-interactive) NONINTERACTIVE=1 ;;
@@ -68,6 +70,8 @@ for arg in "$@"; do
     --wl-key=*)     WL_KEY_FLAG="${arg#*=}" ;;
     --wl-secret=*)  WL_SECRET_FLAG="${arg#*=}" ;;
     --wl-station=*) WL_STATION_FLAG="${arg#*=}" ;;
+    --tempest-token=*)   TEMPEST_TOKEN_FLAG="${arg#*=}" ;;
+    --tempest-station=*) TEMPEST_STATION_FLAG="${arg#*=}" ;;
     # Print the header comment block: from line 2 up to the first
     # non-comment line, via $SELF (absolute — $0 may be relative and we
     # already cd'd). A fixed sed range over $0 died under set -e when
@@ -104,6 +108,7 @@ normalize_sources() {
     case "$norm" in
       awn|aw|ambient|ambientweather) norm=awn ;;
       davis|wl|weatherlink) norm=davis ;;
+      tempest|weatherflow|wf) norm=tempest ;;
       lilygo|rf|sdr|433|915) norm=lilygo ;;
       "") continue ;; *) warn "ignoring unknown source '$tok'"; continue ;;
     esac
@@ -165,6 +170,7 @@ if [ "$SOURCES_SET" -eq 0 ]; then
   sel=""
   ask_yn "  AmbientWeather cloud poller?    [y/N]" N && sel="${sel:+$sel,}awn"
   ask_yn "  Davis WeatherLink cloud poller? [y/N]" N && sel="${sel:+$sel,}davis"
+  ask_yn "  WeatherFlow Tempest poller?     [y/N]" N && sel="${sel:+$sel,}tempest"
   ask_yn "  LilyGO / RF direct (433/915)?   [y/N]" N && sel="${sel:+$sel,}lilygo"
   SOURCES="$sel"
 fi
@@ -186,6 +192,15 @@ if source_enabled davis && [ "$NONINTERACTIVE" -eq 0 ]; then
   [ -n "$wl_station" ] || read -r -p "WEATHERLINK_STATION_ID: " wl_station
 fi
 
+tp_token="$TEMPEST_TOKEN_FLAG"; tp_station="$TEMPEST_STATION_FLAG"
+if source_enabled tempest && [ "$NONINTERACTIVE" -eq 0 ]; then
+  echo; bold "WeatherFlow Tempest credentials (https://tempestwx.com/settings/tokens)"
+  info "Create a personal access token there; the station id is the number"
+  info "in your station's URL on that site."
+  [ -n "$tp_token" ]   || ask_secret tp_token "TEMPEST_TOKEN (input hidden): "
+  [ -n "$tp_station" ] || read -r -p "TEMPEST_STATION_ID: " tp_station
+fi
+
 # Fail before writing a broken .env if a selected cloud source is missing
 # credentials (easy to hit with e.g. --sources=davis --yes).
 if source_enabled awn && { [ -z "$aw_app_key" ] || [ -z "$aw_api_key" ]; }; then
@@ -193,6 +208,14 @@ if source_enabled awn && { [ -z "$aw_app_key" ] || [ -z "$aw_api_key" ]; }; then
 fi
 if source_enabled davis && { [ -z "$wl_key" ] || [ -z "$wl_secret" ] || [ -z "$wl_station" ]; }; then
   err "Davis selected but WEATHERLINK_API_KEY / _SECRET / _STATION_ID missing"; exit 1
+fi
+if source_enabled tempest && { [ -z "$tp_token" ] || [ -z "$tp_station" ]; }; then
+  err "Tempest selected but TEMPEST_TOKEN / TEMPEST_STATION_ID missing"; exit 1
+fi
+if source_enabled tempest; then
+  case "$tp_station" in
+    *[!0-9]*) err "TEMPEST_STATION_ID must be a number (got '$tp_station')"; exit 1 ;;
+  esac
 fi
 
 # Timezone — validated up front so a bad zone can't reach .env (see
@@ -205,9 +228,16 @@ if [ -z "$tz" ] && [ "$NONINTERACTIVE" -eq 0 ]; then
   echo
   info "Use an IANA name like America/New_York or Europe/London."
   info "Abbreviations such as EDT or PST are not valid here."
+  # Offer the machine's own zone as the default (same as setup-fly.sh):
+  # it's almost always right and saves guessing at an unfamiliar format.
+  sys_tz="UTC"
+  if [ -L /etc/localtime ]; then
+    sys_tz="$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')"
+  fi
+  [ -n "$sys_tz" ] || sys_tz="UTC"
   while :; do
-    read -r -p "TIMEZONE [UTC]: " tz || tz=""
-    tz=${tz:-UTC}
+    read -r -p "TIMEZONE [$sys_tz]: " tz || tz=""
+    tz=${tz:-$sys_tz}
     valid_timezone "$tz" && break
     err "'$tz' isn't a timezone name this server can use."
     info "It needs the Region/City form — America/New_York, not EDT."
@@ -229,6 +259,9 @@ ingest_token=$(openssl rand -hex 32)
   echo "DATABASE_PATH=/data/weather.db"
   echo "TIMEZONE=$tz"
   echo "POLL_INTERVAL_SECONDS=60"
+  # Instant Records + the Insights tab ride the daily rollups this
+  # enables; a fresh database folds them from day one at no cost.
+  echo "INSIGHTS=1"
   if source_enabled awn; then
     echo "AW_APPLICATION_KEY=$aw_app_key"
     echo "AW_API_KEY=$aw_api_key"
@@ -238,6 +271,10 @@ ingest_token=$(openssl rand -hex 32)
     echo "WEATHERLINK_API_SECRET=$wl_secret"
     echo "WEATHERLINK_STATION_ID=$wl_station"
     echo "WEATHERLINK_NAME=Davis Vantage Pro2 (Cloud)"
+  fi
+  if source_enabled tempest; then
+    echo "TEMPEST_TOKEN=$tp_token"
+    echo "TEMPEST_STATION_ID=$tp_station"
   fi
 } > .env
 info "wrote .env (chmod 600)"

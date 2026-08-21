@@ -1021,3 +1021,62 @@ def test_flatten_yearly_in_overflow_string_with_offset_configured(monkeypatch):
     out = ingest._flatten(payload)
     assert out is not None
     assert out["yearlyrainin"] is None
+
+
+# ───────────────────── guest (read-only) share tokens ─────────────────────
+
+def test_guest_tokens_read_but_never_write():
+    """Family sharing must not hand out the ability to delete a station.
+
+    Volney, 2026-08-16: getting his dad, son and wife onto his station was a
+    pain. The fix is a read-only token per person — but the whole point is
+    lost if it is accepted on writes, so that is pinned here rather than
+    left to the reader.
+    """
+    from app.config import Settings
+    primary = "a" * 64
+    guest = "b" * 64
+    s = Settings(api_token=primary, guest_api_tokens=guest)
+    assert guest in s.valid_api_tokens, "a guest must be able to READ"
+    assert guest not in s.write_tokens, "a guest must never be able to WRITE"
+    assert primary in s.write_tokens
+
+
+def test_guest_tokens_are_individually_revocable():
+    """Each person gets their own, so removing one does not re-pair every
+    device the operator owns."""
+    from app.config import Settings
+    a, b = "a" * 64, "b" * 64
+    s = Settings(api_token="p" * 64, guest_api_tokens=f"{a},{b}")
+    assert s.guest_tokens == {a, b}
+    s2 = Settings(api_token="p" * 64, guest_api_tokens=a)
+    assert a in s2.valid_api_tokens and b not in s2.valid_api_tokens
+
+
+def test_guest_tokens_tolerate_hand_editing():
+    """These are pasted into a Fly secret by hand; "a, b" silently failing to
+    match the second one is undiagnosable from the outside."""
+    from app.config import Settings
+    a, b = "a" * 64, "b" * 64
+    s = Settings(api_token="p" * 64, guest_api_tokens=f" {a} , {b} ")
+    assert s.guest_tokens == {a, b}
+
+
+def test_unset_guest_tokens_change_nothing():
+    from app.config import Settings
+    s = Settings(api_token="p" * 64)
+    assert s.guest_tokens == set()
+    assert s.valid_api_tokens == {"p" * 64}
+
+
+def test_short_or_placeholder_guest_tokens_are_refused():
+    """A guest token is accepted on /api/* exactly like the primary one, so a
+    short one is a guessable backdoor into someone's whole history."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+    from app.config import Settings
+    with _pytest.raises(ValidationError):
+        Settings(api_token="p" * 64, guest_api_tokens="short")
+    with _pytest.raises(ValidationError):
+        Settings(api_token="p" * 64,
+                 guest_api_tokens="replace-with-a-real-token-please-okay")

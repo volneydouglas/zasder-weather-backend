@@ -259,6 +259,21 @@ def clean_implausible(apply: bool = False, db_path: str | None = None) -> dict:
                     n_backed += 1
         print(f"Backed up {n_backed} value(s) to {backup}")
 
+        # The rows whose anemometer this sweep is about to break up. Collected
+        # BEFORE the update, because afterwards the out-of-band value is gone
+        # and there is nothing left to identify them by. Bounded by the count
+        # printed above (a sensor fault, not a fraction of history).
+        anemometer_rows: set[tuple[str, int]] = set()
+        for col in _ANEMOMETER_COLUMNS:
+            if col not in counts:
+                continue
+            lo, hi = next((l, h) for c, _a, l, h in targets if c == col)
+            for r in conn.execute(
+                    f"SELECT mac, dateutc_ms FROM observations "
+                    f"WHERE {col} IS NOT NULL AND ({col} < ? OR {col} > ?)",
+                    (lo, hi)):
+                anemometer_rows.add((r[0], r[1]))
+
         cleaned = 0
         for col, api, lo, hi in targets:
             if col not in counts:
@@ -269,10 +284,148 @@ def clean_implausible(apply: bool = False, db_path: str | None = None) -> dict:
                 f"WHERE {col} IS NOT NULL AND ({col} < ? OR {col} > ?)",
                 (lo, hi))
             cleaned += cur.rowcount or 0
+
+        # Live ingest condemns the whole anemometer set when the bands reject
+        # any one of its channels; this retro path did not, and that asymmetry
+        # is exactly how Doren's archive ended up with three "sustained" winds
+        # of 51-55 mph sitting on readings whose 255 mph gust had just been
+        # swept (his real maximum is 32). Those survivors are in-band, so no
+        # amount of re-running the bands would ever have found them, and one
+        # of them owned the all-time Peak Wind record for a day.
+        orphaned = _condemn_anemometer_rows(conn, anemometer_rows)
+        cleaned += orphaned
+        _mark_rollups_dirty(conn)
         conn.commit()
         print(f"Cleaned {cleaned} implausible value(s).")
+        if orphaned:
+            print(f"  (of which {orphaned} were in-band anemometer channels "
+                  f"condemned alongside a rejected sibling)")
         print("NOW RUN insights.rebuild() — daily rollups still hold the old maxima.")
-        summary.update(applied=True, cleaned=cleaned, backup=backup)
+        summary.update(applied=True, cleaned=cleaned, backup=backup,
+                       anemometer_orphans=orphaned)
+        return summary
+    finally:
+        conn.close()
+
+
+def _mark_rollups_dirty(conn: sqlite3.Connection) -> None:
+    """Repairs invalidate the fold-forward rollups (maxima can't go down),
+    and since 1.6 records() serves long periods FROM those rollups — a
+    repaired spike would persist as a displayed record indefinitely. This
+    flag makes records() fall back to raw scans until a successful FULL
+    insights.rebuild() clears it, so the printed "NOW RUN …" instruction is
+    a reminder, not the only safeguard (CODE_REVIEW_R5 R5-15 / 1.6-REC
+    §1.5). Caller commits.
+
+    The value is a NONCE, not a constant: rebuild() clears the flag only
+    when it still holds the value seen at scan start, so a repair landing
+    MID-rebuild (its rows already behind the scan cursor) survives the
+    clear and the next rebuild picks it up (CodeRabbit, 2026-08-20)."""
+    conn.execute(
+        "INSERT INTO server_kv (k, v) VALUES ('rollups_dirty', ?) "
+        "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        (str(time.time_ns()),))
+
+
+# Storage columns for the anemometer's speed channels — the `observations`
+# spelling of ingest._ANEMOMETER_FIELDS, which names them API-side.
+_ANEMOMETER_COLUMNS = ("windspeedmph", "windgustmph", "maxdailygust")
+
+
+def _condemn_anemometer_rows(conn: sqlite3.Connection,
+                             rows: set[tuple[str, int]]) -> int:
+    """Null every surviving anemometer channel on `rows`. Returns the number
+    of READINGS touched (each UPDATE counts one row, whatever mix of the
+    three wind columns it nulled — R5-29). Caller commits."""
+    if not rows:
+        return 0
+    from .db import _FIELD_MAP
+
+    sets = []
+    for col in _ANEMOMETER_COLUMNS:
+        # Same whitelist guard as the rest of the module's interpolation, and
+        # deliberately not an `assert` (those vanish under `python -O`).
+        if col not in _FIELD_MAP:
+            raise ValueError(f"refusing to interpolate unknown column {col!r}")
+        sets.append(f"{col} = NULL")
+    json_keys = ", ".join(f"'$.{_FIELD_MAP[c]}'" for c in _ANEMOMETER_COLUMNS)
+    any_left = " OR ".join(f"{c} IS NOT NULL" for c in _ANEMOMETER_COLUMNS)
+    sql = (f"UPDATE observations SET {', '.join(sets)}, "
+           f"data_json = json_remove(data_json, {json_keys}) "
+           f"WHERE mac = ? AND dateutc_ms = ? AND ({any_left})")
+
+    cleared = 0
+    for mac, ms in rows:
+        cur = conn.execute(sql, (mac, ms))
+        cleared += cur.rowcount or 0
+    return cleared
+
+
+def clean_wind_inconsistent(apply: bool = False, db_path: str | None = None,
+                            ratio: float | None = None,
+                            abs_mph: float | None = None) -> dict:
+    """Retro-apply the ingest internal-consistency check to stored history.
+
+    Sustained wind cannot exceed the gust measured over the same window, so a
+    reading that claims otherwise is the anemometer contradicting itself and
+    the whole speed set goes — the same rule, and the same thresholds, that
+    `ingest._apply_wind_consistency` applies at write time. Rows and days are
+    never deleted; the reading keeps its temperature, rain and pressure.
+
+    Callers must run `insights.rebuild()` afterwards, for the same reason
+    `clean_implausible` says so.
+    """
+    from .ingest import _WIND_CONSISTENCY_ABS_MPH, _WIND_CONSISTENCY_RATIO
+
+    ratio = _WIND_CONSISTENCY_RATIO if ratio is None else ratio
+    abs_mph = _WIND_CONSISTENCY_ABS_MPH if abs_mph is None else abs_mph
+
+    path = db_path or settings.database_path
+    conn = sqlite3.connect(path)
+    try:
+        where = ("windspeedmph IS NOT NULL AND windgustmph IS NOT NULL "
+                 "AND windspeedmph > windgustmph * ? "
+                 "AND windspeedmph - windgustmph > ?")
+        params = (ratio, abs_mph)
+        n = conn.execute(
+            f"SELECT COUNT(*) FROM observations WHERE {where}", params).fetchone()[0]
+        summary = {"bad_rows": n, "applied": False, "cleaned": 0, "backup": None}
+        if not n:
+            print("No self-contradicting wind readings found. Nothing to clean.")
+            return summary
+        print(f"Self-contradicting wind readings: {n} row(s) "
+              f"(sustained > {ratio:g}x gust and > {abs_mph:g} mph above it).")
+        if not apply:
+            print("DRY RUN — re-run with --apply to back up + null these winds.")
+            return summary
+
+        # Streamed backup, same rationale as clean_glitch_gusts.
+        stamp = time.time_ns()
+        backup = f"{path}.windfix-backup-{stamp}.jsonl"
+        n_backed = 0
+        rows: set[tuple[str, int]] = set()
+        with open(backup, "w") as f:
+            for r in conn.execute(
+                    f"SELECT mac, dateutc_ms, windspeedmph, windgustmph, "
+                    f"maxdailygust FROM observations WHERE {where}", params):
+                rows.add((r[0], r[1]))
+                for field, value in (("windspeedmph", r[2]),
+                                     ("windgustmph", r[3]),
+                                     ("maxdailygust", r[4])):
+                    if value is not None:
+                        f.write(json.dumps({"mac": r[0], "dateutc_ms": r[1],
+                                            "field": field,
+                                            "value": value}) + "\n")
+                        n_backed += 1
+        print(f"Backed up {n_backed} wind value(s) to {backup}")
+
+        cleaned = _condemn_anemometer_rows(conn, rows)
+        _mark_rollups_dirty(conn)
+        conn.commit()
+        print(f"Cleaned the wind channels on {cleaned} reading(s).")
+        print("NOW RUN insights.rebuild() — daily rollups still hold the old maxima.")
+        summary.update(applied=True, cleaned=cleaned, backup=backup,
+                       rows_touched=len(rows))
         return summary
     finally:
         conn.close()
@@ -488,3 +641,8 @@ if __name__ == "__main__":
         clean_cumulative_rain(apply=apply)
         print("\n== glitch wind gusts ==")
         clean_glitch_gusts(apply=apply)
+        # Part of the default sweep since 1.6-RC2: the changelog advertises
+        # this operator tool, but it was reachable only via a REPL import
+        # (CODE_REVIEW_R5 R5-30). Same dry-run/--apply contract as the rest.
+        print("\n== wind internal consistency ==")
+        clean_wind_inconsistent(apply=apply)

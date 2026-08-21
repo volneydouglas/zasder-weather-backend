@@ -17,7 +17,7 @@ from datetime import datetime
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
-from . import apns, db
+from . import apns, db, storm
 from .config import settings
 
 log = logging.getLogger("alerts")
@@ -77,13 +77,11 @@ def _fmt_ts(ms: int | None, tz_name: str) -> str:
     return datetime.fromtimestamp(ms / 1000, zi).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def _clean_name(name: str) -> str:
-    """Sanitize a device name for message headers. Names arrive from ingest
-    payloads, and EmailMessage raises ValueError on a control character (esp.
-    '\\n') in a header — so one hostile/corrupt name would break EVERY email
-    alert for that device. Collapse control chars to spaces."""
-    cleaned = "".join(c if ord(c) >= 32 else " " for c in str(name))
-    return cleaned.strip() or "device"
+# Canonical header scrub lives in storm._clean_name (alerts imports storm;
+# the reverse would be a cycle). It grew as a verbatim copy in both modules
+# — hardening one would have left the other alert channel breakable
+# (2026-08-20 review). Local name kept for the many call sites.
+_clean_name = storm._clean_name
 
 
 def build_alert(event: str, name: str, mac: str, last_seen_ms: int | None,
@@ -143,6 +141,12 @@ _FIELD_UNITS = {
     "hourlyrainin": " in/hr", "baromrelin": " inHg", "uv": "",
 }
 _COMPARATOR_SYM = {"above": ">", "below": "<", "equalTo": "="}
+
+# Oldest a stored storm-counter baseline may be and still count as a
+# tick-to-tick delta (see _check_storm_summaries). Generous next to the
+# ~minute tick cadence, small next to the disabled-for-weeks gaps that
+# fabricated back-dated storms.
+_STORM_BASELINE_MAX_AGE_MS = 6 * 3_600_000
 
 
 def rule_triggered(comparator: str, threshold: float, value: float) -> bool:
@@ -284,6 +288,11 @@ class EffectiveAlertConfig:
     # 'all' | 'device_down' — which alert kinds may EMAIL. Push is always
     # unscoped. Defaulted so positional construction elsewhere stays valid.
     email_scope: str = "all"
+    # Storm summary, resolved DB-over-env like everything above. Defaulted so
+    # existing positional construction (and tests) keep working.
+    storm_summary: bool = True
+    storm_quiet_minutes: float = 30.0
+    storm_min_total_in: float = 0.05
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -317,10 +326,17 @@ async def effective_config() -> EffectiveAlertConfig:
     enabled = transport and bool(recipients) and (p["enabled"] != 0)
     scope = p.get("email_scope")
     email_scope = scope if scope in ("all", "device_down") else "all"
+    storm_on = (bool(p["storm_summary"]) if p["storm_summary"] is not None
+                else settings.storm_summary)
+    storm_quiet = (p["storm_quiet_minutes"] if p["storm_quiet_minutes"] is not None
+                   else settings.storm_summary_quiet_minutes)
+    storm_min = (p["storm_min_total_in"] if p["storm_min_total_in"] is not None
+                 else settings.storm_summary_min_total_in)
     return EffectiveAlertConfig(
         enabled, transport, recipients, float(default_thr), float(repeat),
         smtp_host, smtp_port, smtp_username, smtp_password, smtp_from,
-        smtp_tls, smtp_ssl, email_scope)
+        smtp_tls, smtp_ssl, email_scope,
+        storm_on, float(storm_quiet), float(storm_min))
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -484,6 +500,10 @@ class AlertMonitor:
         # ── smart (derived) alerts: frost / heat / rapid pressure drop
         if settings.smart_alerts:
             await self._check_smart_alerts(cfg, devices, now_ms)
+        # ── storm summary: one report per event, after the rain stops. Not
+        # gated on smart_alerts — it is a different kind of thing, and the
+        # rain counter it watches needs no derived inputs.
+        await self._check_storm_summaries(cfg, devices, now_ms)
 
     async def _check_threshold_rules(self, cfg, devices, now_ms: int) -> None:
         rules = await db.list_alert_rules(enabled_only=True)
@@ -530,6 +550,97 @@ class AlertMonitor:
                     margin = _REARM_MARGIN.get(rule["field"], 0.0)
                     if rule_cleared(rule["comparator"], rule["threshold"], val, margin):
                         await db.upsert_rule_state(rule["id"], d["mac"], 0, now_ms)
+
+    async def _check_storm_summaries(self, cfg, devices, now_ms: int) -> None:
+        """One summary per storm, delivered once the rain has stopped.
+
+        Unlike every other alert here this is trailing-edge and stateful, so
+        the tracker keeps only enough to know an event is open — the numbers
+        come from stored history when it closes (see storm.py).
+        """
+        if not cfg.storm_summary:
+            return
+        for d in devices:
+            mac = d["mac"]
+            last = d.get("lastData") or {}
+            reading = storm.counter_value(last)
+            state = await db.get_storm_state(mac) or {}
+            started = state.get("started_ms")
+            last_rain = state.get("last_rain_ms")
+            prev_field = state.get("counter_field")
+            prev_value = state.get("counter_value")
+
+            prev_ms = state.get("counter_ms")
+            obs_ms = last.get("dateutc")
+            obs_ms = int(obs_ms) if isinstance(obs_ms, (int, float)) else now_ms
+
+            field, value = reading if reading else (prev_field, prev_value)
+            # `counter_value` holds the running PEAK, not merely the last
+            # reading — some sources revise the day's total downward and then
+            # climb back over the same ground, which comparing consecutive
+            # readings counts twice. See storm.counter_progress.
+            #
+            # Only compare like with like: yearly and daily are different
+            # scales, so a source that switched fields between ticks would
+            # otherwise fabricate an enormous increment and open a storm.
+            if reading and prev_field == field:
+                # A baseline this old is history, not a tick-to-tick delta.
+                # The checker stamps counter_ms every tick, so a large gap
+                # means it was OFF (toggle disabled, no alert channel, or
+                # downtime) — and the counter's rise across that gap is
+                # accumulated weather, not a storm. Counting it opened a
+                # "storm" back-dated weeks whose summary spanned the whole
+                # gap (2026-08-20 review). Rebaseline silently; a real storm
+                # in progress loses only its opening increment.
+                if (prev_ms is not None
+                        and now_ms - prev_ms > _STORM_BASELINE_MAX_AGE_MS):
+                    increment = 0.0
+                else:
+                    increment, value = storm.counter_progress(prev_value, value)
+            else:
+                increment = 0.0
+
+            if increment > 0:
+                if started is None:
+                    # Back-date to the PREVIOUS reading. The counter rises one
+                    # reading after the rain began, so starting at "now" would
+                    # drop the very increment that opened the storm from both
+                    # the total and the temperature range.
+                    started = prev_ms if prev_ms is not None else obs_ms
+                    log.info("storm opened on %s", d.get("name") or mac)
+                last_rain = obs_ms
+
+            if started is not None and storm.should_close(
+                    last_rain, now_ms, cfg.storm_quiet_minutes):
+                stats = await db.storm_window_stats(
+                    mac, started, last_rain or started, field or "yearlyrainin")
+                summary = storm.StormSummary(
+                    started_ms=started, ended_ms=last_rain or started, **stats)
+                if storm.worth_reporting(summary, cfg.storm_min_total_in):
+                    dname = d.get("name") or mac
+                    title, body = storm.build_storm_message(
+                        dname, summary, settings.timezone)
+                    # Clear state only after delivery, same as the other
+                    # alerts, so a transport failure retries next tick rather
+                    # than losing the storm entirely.
+                    if await _deliver(cfg, f"[Zasder Weather] {title}", body,
+                                      title, body,
+                                      email_ok=cfg.email_scope == "all"):
+                        await db.upsert_storm_state(mac, None, None, field,
+                                                    value, obs_ms)
+                        log.info("storm summary sent for %s: %.2fin over %.1fh",
+                                 dname, summary.total_in, summary.duration_hours)
+                    else:
+                        log.warning("storm summary delivery failed for %s; "
+                                    "will retry next tick", mac)
+                    continue
+                # Not worth reporting: close it silently so a drizzle does
+                # not leave an event open forever.
+                await db.upsert_storm_state(mac, None, None, field, value, obs_ms)
+                continue
+
+            await db.upsert_storm_state(mac, started, last_rain, field, value,
+                                        obs_ms)
 
     async def _check_smart_alerts(self, cfg, devices, now_ms: int) -> None:
         """Frost / heat / rapid-pressure-drop alerts, edge-triggered per device."""

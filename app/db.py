@@ -20,6 +20,7 @@ _CHART_INDEX_COLS = [
     "mac", "dateutc_ms", "tempf", "feels_like", "humidity", "baromrelin", "uv",
     "windspeedmph", "dew_point", "solarradiation", "hourlyrainin", "winddir",
     "yearlyrainin", "windgustmph", "tempinf", "humidityin", "dailyrainin",
+    "lightning_last_1hr",
 ]
 
 SCHEMA = """
@@ -55,6 +56,12 @@ CREATE TABLE IF NOT EXISTS observations (
     yearlyrainin   REAL,
     uv             REAL,
     solarradiation REAL,
+    -- Lightning (Tempest; AcuRite Atlas can report it too). INTEGER on the
+    -- counts so bucketed history serializes them as JSON ints — the app
+    -- decodes strikes as Int? and a 731.0 would fail the whole row's decode.
+    lightningcount        INTEGER,
+    lightning_last_1hr    INTEGER,
+    lightning_distance_mi REAL,
     PRIMARY KEY (mac, dateutc_ms)
 );
 
@@ -71,7 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_obs_chart
     ON observations (mac, dateutc_ms, tempf, feels_like, humidity, baromrelin,
                      uv, windspeedmph, dew_point, solarradiation, hourlyrainin,
                      winddir, yearlyrainin, windgustmph, tempinf, humidityin,
-                     dailyrainin);
+                     dailyrainin, lightning_last_1hr);
 
 -- Records (db.records) do MIN/MAX + first-occurrence lookups per metric over
 -- the full per-mac history. windgustmph + dailyrainin aren't in idx_obs_chart,
@@ -167,6 +174,12 @@ CREATE TABLE IF NOT EXISTS alert_prefs (
     smtp_from             TEXT,
     smtp_tls              INTEGER,
     smtp_ssl              INTEGER,
+    -- Storm summary (storm.py). NULL = inherit the env default, same
+    -- convention as the SMTP block above, so an operator who configures it
+    -- server-side is not overridden by an app that never set it.
+    storm_summary         INTEGER,
+    storm_quiet_minutes   REAL,
+    storm_min_total_in    REAL,
     -- 'all' (default, NULL = all) or 'device_down': which alert kinds may
     -- EMAIL. Push always delivers everything — this only scopes the email
     -- channel (user ask: device-down emails without threshold-rule emails).
@@ -215,6 +228,43 @@ CREATE TABLE IF NOT EXISTS alert_rule_state (
 -- Edge-trigger state for the built-in smart alerts (frost / heat / pressure
 -- drop). kind = the smart-alert type; mirrors alert_rule_state so each fires
 -- once on clear→triggered and re-arms when the condition clears.
+-- Storm-summary tracker (storm.py). Deliberately tiny: only enough to know
+-- whether an event is open and when rain was last seen. Every number in the
+-- summary is computed from `observations` when the storm closes, so this row
+-- cannot drift out of step with the history.
+CREATE TABLE IF NOT EXISTS storm_state (
+    mac            TEXT PRIMARY KEY,
+    started_ms     INTEGER,
+    last_rain_ms   INTEGER,
+    -- Last cumulative counter reading, so the next tick can tell whether rain
+    -- fell. Stored with its field name because yearly and daily are different
+    -- scales and comparing across them would fabricate a huge increment.
+    counter_field  TEXT,
+    counter_value  REAL,
+    -- Timestamp of that counter reading. A storm opens when the counter
+    -- RISES, which is one reading after the rain actually began — without
+    -- this the window would start late and drop the very increment that
+    -- opened the event.
+    counter_ms     INTEGER
+);
+
+-- New devices on probation. A MAC that looks like a bit-flipped twin of an
+-- existing device (see app/device_probation.py) accumulates sightings here
+-- instead of going straight into `devices`. A real station clears the bar in
+-- minutes; a one-off corrupt packet never does, and its row is pruned.
+CREATE TABLE IF NOT EXISTS pending_devices (
+    mac         TEXT PRIMARY KEY,
+    first_ms    INTEGER NOT NULL,
+    -- Last sighting that COUNTED, not the last one seen. Receivers emit
+    -- duplicates seconds apart, so the gap is measured against counted
+    -- sightings or one burst would clear the bar on its own.
+    last_ms     INTEGER NOT NULL,
+    hits        INTEGER NOT NULL DEFAULT 1,
+    -- The known MAC this looks like a corruption of, kept for the log and
+    -- for /api/devices diagnostics.
+    suspect_of  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS smart_alert_state (
     mac        TEXT NOT NULL,
     kind       TEXT NOT NULL,
@@ -234,6 +284,18 @@ CREATE TABLE IF NOT EXISTS push_relay (
     relay_token TEXT,
     updated_ms  INTEGER
 );
+
+-- App-minted read-only share tokens (Settings "Share read-only access").
+-- Complements the GUEST_API_TOKENS env secret with the same trust model:
+-- stored on the volume like alert_prefs.smtp_password and
+-- wu_station_map.upload_key — revocable one by one, single-tenant, and
+-- app-managed without a redeploy. Read-only is enforced where the env
+-- guests are: membership in valid tokens, never in write_tokens.
+CREATE TABLE IF NOT EXISTS guest_tokens (
+    token      TEXT PRIMARY KEY,
+    label      TEXT,
+    created_ms INTEGER
+);
 """
 
 
@@ -247,7 +309,14 @@ def _tolerant_float(v: Any) -> float | None:
     columns can hold TEXT (the poller path stores upstream JSON verbatim,
     with no coercion) — one junk row must degrade to "no value", not raise
     out of a read path. A ValueError escaping last_yearly_rain, for example,
-    500'd every subsequent /ingest/custom for that MAC."""
+    500'd every subsequent /ingest/custom for that MAC.
+
+    Bools are junk too: a stored True is not a 1.0-inch reading. (This is
+    the module's ONE finite-float sanitizer — a twin named _as_float grew
+    850 lines away and the two drifted on exactly the bool rule; the
+    2026-08-20 review merged them.)"""
+    if isinstance(v, bool):
+        return None
     try:
         f = float(v)
     except (TypeError, ValueError):
@@ -304,6 +373,9 @@ _FIELD_MAP: dict[str, str] = {
     "yearlyrainin": "yearlyrainin",
     "uv": "uv",
     "solarradiation": "solarradiation",
+    "lightningcount": "lightningcount",
+    "lightning_last_1hr": "lightning_last_1hr",
+    "lightning_distance_mi": "lightning_distance_mi",
 }
 _COLUMNS = list(_FIELD_MAP.keys())
 # Numeric columns that can be queried via /summary (use the API field name).
@@ -320,12 +392,81 @@ async def init_db() -> None:
         # is effectively a one-time switch re-asserted on every boot.
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
+        # Migrate observations BEFORE the schema script runs: SCHEMA also
+        # creates idx_obs_chart, which lists lightning_last_1hr — on a
+        # pre-1.6 database that is missing that index, the CREATE would
+        # reference a column the table doesn't have yet and fail the boot.
+        # (CREATE TABLE IF NOT EXISTS never adds columns, so this ALTER is
+        # the only path that reaches an existing database — the alert_prefs
+        # lesson.) Fresh databases skip this: the table doesn't exist yet
+        # and SCHEMA below creates it with the columns in place.
+        lightning_backfilled = False
+        cur = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'")
+        if await cur.fetchone():
+            cur = await db.execute("PRAGMA table_info(observations)")
+            existing = {r[1] for r in await cur.fetchall()}
+            added_lightning = False
+            for col, decl in (
+                ("lightningcount", "INTEGER"),
+                ("lightning_last_1hr", "INTEGER"),
+                ("lightning_distance_mi", "REAL"),
+            ):
+                if col not in existing:
+                    await db.execute(
+                        f"ALTER TABLE observations ADD COLUMN {col} {decl}")
+                    added_lightning = True
+            if added_lightning:
+                # One-time backfill from data_json: the poller captured
+                # lightning into the blob before these columns existed
+                # (deliberately — the counters are interval-scoped, so a
+                # storm that passes unrecorded is gone forever). Without
+                # this, every strike stored before the upgrade would be
+                # invisible to records/charts even though we hold the data.
+                # json_extract of a missing key is NULL and CAST(NULL) is
+                # NULL, so rows without a given key stay NULL — absent is
+                # not zero. The LIKE bounds the rewrite to rows that carry
+                # lightning at all (one full-table read, once, at boot).
+                # typeof-gated: SQLite CAST('junk' AS INTEGER) is 0, so an
+                # unguarded cast would backfill a non-numeric stored value
+                # as a REAL zero-strike reading — a station that never
+                # measured lightning would grow a "0" lightning record
+                # (CodeRabbit, 2026-08-20; the read path's
+                # _normalize_lightning degrades the same junk to None).
+                bf = await db.execute(
+                    """
+                    UPDATE observations SET
+                      lightningcount        = CASE WHEN typeof(json_extract(data_json, '$.lightningcount')) IN ('integer','real')
+                                                   THEN CAST(json_extract(data_json, '$.lightningcount') AS INTEGER) END,
+                      lightning_last_1hr    = CASE WHEN typeof(json_extract(data_json, '$.lightning_last_1hr')) IN ('integer','real')
+                                                   THEN CAST(json_extract(data_json, '$.lightning_last_1hr') AS INTEGER) END,
+                      lightning_distance_mi = CASE WHEN typeof(json_extract(data_json, '$.lightning_distance_mi')) IN ('integer','real')
+                                                   THEN json_extract(data_json, '$.lightning_distance_mi') END
+                    WHERE data_json LIKE '%"lightning%'
+                    """)
+                lightning_backfilled = (bf.rowcount or 0) > 0
         await db.executescript(SCHEMA)
         # Insights rollup tables (see app/insights.py). Created even when
         # the INSIGHTS flag is off — empty tables cost nothing and let the
         # flag flip on without a schema step.
         from .insights import SCHEMA as INSIGHTS_SCHEMA
         await db.executescript(INSIGHTS_SCHEMA)
+        if lightning_backfilled:
+            # The backfill rewrote observations, but daily_rollups' new
+            # lightning_max column stays NULL until a rebuild folds history
+            # in — and records() serves long periods from rollups, so an
+            # upgraded INSIGHTS install would show "Most Lightning" under
+            # Today and under no other period (CODE_REVIEW_R5 R5-14). The
+            # flag makes records() fall back to raw until a full rebuild
+            # clears it; lifespan kicks that rebuild off in the background.
+            # Written AFTER executescript: a pre-1.5 database gets server_kv
+            # from SCHEMA on this same boot.
+            # Nonce value (not a constant) — rebuild()'s conditional clear
+            # depends on it; see maintenance._mark_rollups_dirty.
+            await db.execute(
+                "INSERT INTO server_kv (k, v) VALUES "
+                "('rollups_dirty', lower(hex(randomblob(8)))) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v")
         # Migrate older DBs: add any alert_prefs columns the schema gained
         # after the table was first created (SQLite CREATE IF NOT EXISTS
         # won't add columns to an existing table).
@@ -336,9 +477,25 @@ async def init_db() -> None:
             ("smtp_username", "TEXT"), ("smtp_password", "TEXT"),
             ("smtp_from", "TEXT"), ("smtp_tls", "INTEGER"), ("smtp_ssl", "INTEGER"),
             ("email_scope", "TEXT"),
+            # 1.6 storm summary. Adding these to the CREATE above is not
+            # enough: every existing database already HAS alert_prefs, so
+            # only this ALTER path reaches them — and without it
+            # get_alert_prefs' SELECT raises "no such column" and takes the
+            # whole alert system down on upgrade.
+            ("storm_summary", "INTEGER"), ("storm_quiet_minutes", "REAL"),
+            ("storm_min_total_in", "REAL"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
+        # Same migration for daily_rollups: lightning_max came after the
+        # table shipped (1.6). Existing days read NULL (= "no data") until a
+        # rebuild folds history in — never 0, a station with no detector
+        # must stay absent from lightning records.
+        cur = await db.execute("PRAGMA table_info(daily_rollups)")
+        existing = {r[1] for r in await cur.fetchall()}
+        if "lightning_max" not in existing:
+            await db.execute(
+                "ALTER TABLE daily_rollups ADD COLUMN lightning_max REAL")
         # Same migration for hour_rollups: feels_* came after the table
         # shipped. Existing rows get 0/0 (= "no data"), so the feels-like
         # diurnal grid stays empty until a rebuild folds history in.
@@ -391,6 +548,63 @@ async def init_db() -> None:
             _HAS_MATH_FUNCS = False
             log.warning("SQLite lacks math functions; bucketed wind direction "
                         "falls back to a (circularly incorrect) arithmetic mean")
+
+    # Load app-minted share tokens into the auth cache. Here rather than in
+    # the lifespan hook so every entry point that prepares the DB (app boot,
+    # tests, maintenance scripts) gets a coherent auth view.
+    await refresh_guest_token_cache()
+
+
+# In-process mirror of the guest_tokens table for the auth gate:
+# require_token is a sync dependency and cannot await a query per request.
+# Refreshed at startup (init_db) and after every mint/revoke — this is a
+# single-process app, so those are the only writers. Empty until loaded,
+# which fails closed (an unknown token is rejected, never accepted).
+_GUEST_TOKEN_CACHE: set[str] = set()
+
+# The first 12 chars ("zwg_" + 8 hex) identify a token in list/revoke
+# responses without shipping the whole credential back and forth.
+GUEST_TOKEN_ID_LEN = 12
+
+
+def guest_token_cache() -> set[str]:
+    return _GUEST_TOKEN_CACHE
+
+
+async def refresh_guest_token_cache() -> None:
+    global _GUEST_TOKEN_CACHE
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT token FROM guest_tokens")).fetchall()
+    _GUEST_TOKEN_CACHE = {r["token"] for r in rows}
+
+
+async def add_guest_token(token: str, label: str | None, now_ms: int) -> None:
+    async with connect() as db:
+        await db.execute(
+            "INSERT INTO guest_tokens (token, label, created_ms) "
+            "VALUES (?, ?, ?)", (token, label, now_ms))
+        await db.commit()
+    await refresh_guest_token_cache()
+
+
+async def list_guest_tokens() -> list[dict[str, Any]]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT token, label, created_ms FROM guest_tokens "
+            "ORDER BY created_ms")).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def delete_guest_token(token_id: str) -> int:
+    async with connect() as db:
+        cur = await db.execute(
+            f"DELETE FROM guest_tokens WHERE substr(token, 1, {GUEST_TOKEN_ID_LEN}) = ?",
+            (token_id,))
+        await db.commit()
+        n = cur.rowcount
+    await refresh_guest_token_cache()
+    return n
 
 
 @asynccontextmanager
@@ -796,7 +1010,8 @@ async def upsert_alert_state(mac: str, state: str, last_seen_ms: int | None,
 
 _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipients",
                     "smtp_host", "smtp_port", "smtp_username", "smtp_password",
-                    "smtp_from", "smtp_tls", "smtp_ssl", "email_scope")
+                    "smtp_from", "smtp_tls", "smtp_ssl", "email_scope",
+                    "storm_summary", "storm_quiet_minutes", "storm_min_total_in")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -867,15 +1082,34 @@ async def create_alert_rule(target_mac: str | None, field: str,
 
 
 async def list_alert_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
-    sql = "SELECT id, target_mac, field, comparator, threshold, enabled FROM alert_rules"
+    """Rules, each carrying its current firing state.
+
+    `triggered`/`changed_ms` come from alert_rule_state and exist so a CLIENT
+    can edge-detect a firing the same way the server does. Without them the
+    macOS app had no way to learn a threshold rule had tripped — it only ever
+    saw device stale/recovered — so a Mac showed nothing while the same
+    account's iPhone got the push (Doren, 2026-08-17).
+
+    A rule with no state row has never been evaluated: reported as triggered
+    = False rather than omitted, so the client sees a complete list.
+    """
+    sql = ("SELECT r.id, r.target_mac, r.field, r.comparator, r.threshold, "
+           "r.enabled, MAX(COALESCE(s.triggered, 0)) AS triggered, "
+           "MAX(COALESCE(s.changed_ms, 0)) AS changed_ms "
+           "FROM alert_rules r LEFT JOIN alert_rule_state s ON s.rule_id = r.id")
     if enabled_only:
-        sql += " WHERE enabled = 1"
-    sql += " ORDER BY id"
+        sql += " WHERE r.enabled = 1"
+    # Grouped because a rule with target_mac NULL applies to EVERY device and
+    # therefore has one state row per MAC. MAX() reports it as firing when it
+    # is firing anywhere, which is what a notification cares about.
+    sql += " GROUP BY r.id ORDER BY r.id"
     async with connect() as db:
         rows = await (await db.execute(sql)).fetchall()
     return [{"id": r["id"], "target_mac": r["target_mac"], "field": r["field"],
              "comparator": r["comparator"], "threshold": r["threshold"],
-             "enabled": bool(r["enabled"])} for r in rows]
+             "enabled": bool(r["enabled"]),
+             "triggered": bool(r["triggered"]),
+             "changed_ms": r["changed_ms"] or None} for r in rows]
 
 
 async def delete_alert_rule(rule_id: int) -> int:
@@ -943,6 +1177,173 @@ async def upsert_smart_alert_state(mac: str, kind: str, triggered: int,
             (mac, kind, triggered, changed_ms),
         )
         await db.commit()
+
+
+async def get_storm_state(mac: str) -> dict[str, Any] | None:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT * FROM storm_state WHERE mac = ?", (mac,))).fetchone()
+    return dict(row) if row else None
+
+
+async def upsert_storm_state(mac: str, started_ms: int | None,
+                             last_rain_ms: int | None,
+                             counter_field: str | None,
+                             counter_value: float | None,
+                             counter_ms: int | None = None) -> None:
+    async with connect() as db:
+        await db.execute(
+            "INSERT INTO storm_state (mac, started_ms, last_rain_ms, "
+            "counter_field, counter_value, counter_ms) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(mac) DO UPDATE SET started_ms = excluded.started_ms, "
+            "last_rain_ms = excluded.last_rain_ms, "
+            "counter_field = excluded.counter_field, "
+            "counter_value = excluded.counter_value, "
+            "counter_ms = excluded.counter_ms",
+            (mac, started_ms, last_rain_ms, counter_field, counter_value,
+             counter_ms))
+        await db.commit()
+
+
+# The storm-summary reads used a local twin of _tolerant_float; keep the
+# old name alive for its call sites, pointing at the one sanitizer.
+_as_float = _tolerant_float
+
+
+async def list_device_macs() -> list[str]:
+    """Just the MACs. The probation check runs on every ingest, so it reads
+    this rather than the full device rows with their JSON blobs."""
+    async with connect() as db:
+        rows = await (await db.execute("SELECT mac FROM devices")).fetchall()
+        return [r[0] for r in rows]
+
+
+async def get_pending_device(mac: str) -> dict[str, Any] | None:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT mac, first_ms, last_ms, hits, suspect_of "
+            "FROM pending_devices WHERE mac = ?", (mac,))).fetchone()
+        return dict(row) if row else None
+
+
+async def bump_pending_device(mac: str, now_ms: int, hits: int,
+                              suspect_of: str | None,
+                              advanced: bool, ttl_ms: int = 0) -> None:
+    """Record a sighting. `advanced` false means the counter did not move, so
+    `last_ms` must NOT be touched — it anchors the spacing rule.
+
+    Prunes expired rows in the same transaction. This is the only path that
+    ever writes the table, so pruning here is enough to bound it: a noisy
+    neighbourhood would otherwise leave a row per corrupt packet forever.
+    """
+    async with connect() as db:
+        if ttl_ms > 0:
+            await db.execute("DELETE FROM pending_devices WHERE last_ms < ?",
+                             (now_ms - ttl_ms,))
+        if advanced:
+            await db.execute(
+                "INSERT INTO pending_devices (mac, first_ms, last_ms, hits, "
+                "suspect_of) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(mac) DO UPDATE SET last_ms = excluded.last_ms, "
+                "hits = excluded.hits, suspect_of = excluded.suspect_of",
+                (mac, now_ms, now_ms, hits, suspect_of))
+        else:
+            await db.execute(
+                "INSERT INTO pending_devices (mac, first_ms, last_ms, hits, "
+                "suspect_of) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(mac) DO NOTHING",
+                (mac, now_ms, now_ms, hits, suspect_of))
+        await db.commit()
+
+
+async def clear_pending_device(mac: str) -> None:
+    async with connect() as db:
+        await db.execute("DELETE FROM pending_devices WHERE mac = ?", (mac,))
+        await db.commit()
+
+
+async def prune_pending_devices(before_ms: int) -> int:
+    """Drop probation rows that stopped being seen. Without this a noisy
+    neighbourhood accumulates a row per corrupt packet forever."""
+    async with connect() as db:
+        cur = await db.execute(
+            "DELETE FROM pending_devices WHERE last_ms < ?", (before_ms,))
+        await db.commit()
+        return cur.rowcount or 0
+
+
+async def list_pending_devices() -> list[dict[str, Any]]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, first_ms, last_ms, hits, suspect_of "
+            "FROM pending_devices ORDER BY last_ms DESC")).fetchall()
+        return [dict(r) for r in rows]
+
+
+from . import storm as _storm  # noqa: E402  (cycle-safe: storm imports no db)
+
+
+async def storm_window_stats(mac: str, start_ms: int, end_ms: int,
+                             counter_col: str) -> dict[str, Any]:
+    """Everything the storm summary reports, computed from stored history.
+
+    The rain total is a sum of POSITIVE deltas rather than end-minus-start:
+    a counter that resets mid-window (yearly at New Year, daily at midnight)
+    would otherwise produce a negative or wildly wrong total. Summing the
+    increments is correct either way.
+    """
+    if counter_col not in _FIELD_MAP:
+        raise ValueError(f"refusing to interpolate unknown column {counter_col!r}")
+    async with connect() as db:
+        # Every aggregate is filtered by typeof(). SQLite does not enforce a
+        # column's declared type, and its ordering puts TEXT above every
+        # number — so one garbled reading stored as 'bad' becomes MAX(tempf),
+        # and dropping it in Python afterwards loses the real maximum with
+        # it. Excluding non-numeric rows inside the aggregate keeps the rest.
+        row = await (await db.execute(
+            "SELECT MIN(CASE WHEN typeof(tempf) IN ('integer','real') "
+            "            THEN tempf END) AS min_t, "
+            "       MAX(CASE WHEN typeof(tempf) IN ('integer','real') "
+            "            THEN tempf END) AS max_t, "
+            "       MAX(CASE WHEN typeof(windgustmph) IN ('integer','real') "
+            "            THEN windgustmph END) AS max_gust, "
+            "       MAX(CASE WHEN typeof(hourlyrainin) IN ('integer','real') "
+            "            THEN hourlyrainin END) AS peak_rate "
+            "FROM observations WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?",
+            (mac, start_ms, end_ms))).fetchone()
+        cur = await db.execute(
+            f"SELECT {counter_col} FROM observations WHERE mac = ? "
+            f"AND dateutc_ms BETWEEN ? AND ? AND {counter_col} IS NOT NULL "
+            f"ORDER BY dateutc_ms", (mac, start_ms, end_ms))
+        total = 0.0
+        # High-water mark, not the previous reading: a source that revises its
+        # daily total downward and then climbs back would otherwise have the
+        # re-climb counted as fresh rain. See storm.counter_progress for the
+        # WeatherFlow sequence that exposed this.
+        peak: float | None = None
+        async for r in cur:
+            # `insert_observations` stores poller values uncoerced and SQLite
+            # happily keeps text in a REAL column, so a garbled reading can
+            # arrive here as a string. `float()` would raise and abort the
+            # whole alert-monitor tick — one bad row would stop every alert
+            # for every device. Skip it the way _derive_hourly_rain does, and
+            # leave `prev` alone so the next good row still measures against
+            # the last good one (the 2.0 cap covers the bridged gap).
+            v = _as_float(r[0])
+            if v is None:
+                continue
+            inc, peak = _storm.counter_progress(peak, v)
+            total += inc
+    # Coerced for the same reason: SQLite's MIN/MAX order text ABOVE every
+    # number, so a single text row makes MAX() return a string, and
+    # `build_storm_message` formats these with `:.0f`.
+    return {
+        "total_in": total,
+        "peak_rate_in_hr": _as_float(row["peak_rate"]) if row else None,
+        "min_tempf": _as_float(row["min_t"]) if row else None,
+        "max_tempf": _as_float(row["max_t"]) if row else None,
+        "max_gust_mph": _as_float(row["max_gust"]) if row else None,
+    }
 
 
 async def value_at_or_before(mac: str, field: str, cutoff_ms: int) -> float | None:
@@ -1127,7 +1528,40 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
             for k in ("tempinf", "humidityin"):
                 if out.get(k) is None and src.get(k) is not None:
                     out[k] = src[k]
+    _normalize_lightning(out)
     return out
+
+
+def _normalize_lightning(d: dict[str, Any]) -> dict[str, Any]:
+    """The app decodes strike counts as Int? (synthesized Codable), so a
+    REAL-typed 731.0 or a numeric-string "7" from a custom /ingest poster
+    fails the WHOLE row's decode — dashboard and short-window charts blank
+    until clean rows arrive (CODE_REVIEW_R5 R5-09). The bucketed history
+    path CASTs in SQL for exactly this reason; the raw paths echo
+    data_json verbatim, so they normalize here. Non-numeric junk degrades
+    to None (absent), never 0."""
+    for k in ("lightningcount", "lightning_last_1hr"):
+        if k not in d:
+            continue
+        v = d[k]
+        if v is None or isinstance(v, bool):
+            d[k] = None
+        elif isinstance(v, (int, float)):
+            # math.isfinite, not just int(): json.loads accepts the bare
+            # Infinity/NaN literals, and int(inf) raises OverflowError —
+            # a single such stored row 500'd /current and every raw
+            # history window containing it (CodeRabbit, 2026-08-20).
+            d[k] = int(v) if math.isfinite(v) else None
+        elif isinstance(v, str):
+            try:
+                d[k] = int(float(v))
+            except (ValueError, OverflowError):
+                # OverflowError too: float("inf") parses fine and then
+                # int() blows up — same CodeRabbit finding.
+                d[k] = None
+        else:
+            d[k] = None
+    return d
 
 
 def _derive_hourly_rain(rows: list[dict[str, Any]]) -> None:
@@ -1254,7 +1688,7 @@ async def history(
                 """,
                 (mac, start_ms, end_ms, limit),
             )).fetchall()
-        parsed = [p for r in reversed(rows)
+        parsed = [_normalize_lightning(p) for r in reversed(rows)
                   if (p := _parse_json_col(r["data_json"]))]
         _derive_hourly_rain(parsed)
         return parsed
@@ -1290,6 +1724,12 @@ async def history(
           MAX(dailyrainin)    AS dailyrainin,
           AVG(uv)             AS uv,
           AVG(solarradiation) AS solarradiation,
+          -- MAX, not AVG: the trailing-hour strike count is what the bucket
+          -- peaked at, and averaging a storm's ramp against its tail hides
+          -- the number that mattered. CAST because the app decodes strikes
+          -- as Int? (synthesized Codable) — a REAL-typed 731.0 in the JSON
+          -- would fail the whole row's decode, not just this field.
+          CAST(MAX(lightning_last_1hr) AS INTEGER) AS lightning_last_1hr,
           MIN(tempf)          AS tempf_min,
           MAX(tempf)          AS tempf_max,
           MIN(feels_like)     AS feelsLike_min,
@@ -1306,6 +1746,7 @@ async def history(
           MAX(windgustmph)    AS windgustmph_max,
           MIN(hourlyrainin)   AS hourlyrainin_min,
           MAX(hourlyrainin)   AS hourlyrainin_max,
+          MAX(uv)             AS uv_max,
           MIN(solarradiation) AS solarradiation_min,
           MAX(solarradiation) AS solarradiation_max
         FROM observations
@@ -1394,8 +1835,16 @@ async def _rain_col_at_or_before(mac: str, col: str, cutoff_ms: int,
     pass (frost + heat included) down with it.
 
     `col` is an INTERNAL whitelisted column name (never user input), so the
-    f-string interpolation is safe."""
-    assert col in _COLUMNS, f"bad column: {col}"
+    f-string interpolation is safe.
+
+    The whitelist check is a `raise`, NOT an `assert`. Asserts are stripped by
+    `python -O` / `PYTHONOPTIMIZE=1`, which would silently delete the only
+    thing standing between this f-string and SQL injection if a caller ever
+    started passing an unresolved name. The image does not use -O today, so
+    this was never exploitable — but a guard that a build flag can remove is
+    not a guard. CLAUDE.md states this rule; this line predated it."""
+    if col not in _COLUMNS:
+        raise ValueError(f"refusing to interpolate unknown column {col!r}")
     async with connect() as db:
         row = await (await db.execute(
             f"SELECT {col} AS v FROM observations "
@@ -1444,8 +1893,11 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
             (mac,),
         )).fetchone()
     if not row:
-        return {"hourly_in": None, "daily_in": None,
-                "weekly_in": None, "monthly_in": None}
+        # No yearly and no monthly counter, ever. Tempest is this shape: the
+        # WeatherFlow REST response carries a per-day accumulator and a
+        # trailing hour, nothing longer — so derive the longer periods from
+        # the stored DAILY counters instead (tier 3 below).
+        return await _rollups_from_daily(mac, tz)
     # _tolerant_float: TEXT stored in these REAL columns must degrade to
     # "not computable" (all-None skeleton below), not raise.
     cur_year = _tolerant_float(row["yearlyrainin"])
@@ -1515,6 +1967,85 @@ async def _rollup_from_monthly(mac: str, name: str, boundary_ms: int,
     return round(max(0.0, cur_month + max(0.0, prev_final - prior)), 3)
 
 
+async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
+    """Week/month/year rain for a source whose ONLY counter is the per-day
+    one (Tempest: `precip_accum_local_day`; no monthly, no yearly).
+
+    A day's total is the day's MAX of the daily counter — the high-water
+    choice storm.counter_progress already made, because WeatherFlow revises
+    the accumulator DOWNWARD mid-day and then climbs again; taking the last
+    value instead would drop a day whose final reading was a low revision,
+    and summing increments re-counts every re-climb. Periods are then sums
+    of per-day totals.
+
+    One index-only scan (dailyrainin lives in idx_obs_chart), grouped into
+    local days in SQL and summed per boundary here — at a 60s cadence the
+    year window is ~500k index rows collapsing to ≤366. Day bucketing uses
+    a fixed local-midnight anchor, so in a DST zone the two shift nights a
+    year misassign one hour of rain to a neighbouring day; the counter is
+    station-local anyway, and this stays exact in fixed-offset zones.
+
+    `hourly_in`/`daily_in` stay None on purpose: a source in this tier posts
+    those itself, and its own (revisable) current value is the truth — a MAX
+    here could contradict the number the station is showing right now.
+    `yearly_in` is a true calendar YTD, unlike the sensor-native lifetime
+    counters tier 1 works from — which is why only this tier reports it."""
+    from datetime import datetime, timedelta
+
+    now_local = datetime.now(tz=tz)
+    start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_week = start_of_today - timedelta(days=(now_local.weekday() + 1) % 7)
+    start_of_month = start_of_today.replace(day=1)
+    start_of_year = start_of_today.replace(month=1, day=1)
+    # The earliest boundary anchors the scan: in the first week of January
+    # the week starts in December, and anchoring at Jan 1 would silently
+    # drop those days from the weekly total.
+    anchor_ms = int(min(start_of_week, start_of_year).timestamp() * 1000)
+
+    out: dict[str, float | None] = {"hourly_in": None, "daily_in": None,
+                                    "weekly_in": None, "monthly_in": None,
+                                    "yearly_in": None}
+    day_ms = 86_400_000
+    async with connect() as db:
+        # Same cumulative-counter judgment records() makes: a REAL per-day
+        # counter touches ~0 at some reset; a lifetime counter stored in
+        # dailyrainin never does, and summing its daily maxima reports
+        # 17.10 + 17.16 = 34.26" across two days instead of the 0.06"
+        # increment (CodeRabbit, 2026-08-20). Not computable → all-None.
+        floor_row = await (await db.execute(
+            "SELECT MIN(dailyrainin) AS lo FROM observations WHERE mac = ?",
+            (mac,))).fetchone()
+        lo = _tolerant_float(floor_row["lo"]) if floor_row else None
+        if lo is not None and lo > _DAILY_RAIN_RESET_FLOOR_IN:
+            return out
+        rows = await (await db.execute(
+            """
+            SELECT (dateutc_ms - ?) / ? AS day, MAX(dailyrainin) AS m
+            FROM observations
+            WHERE mac = ? AND dateutc_ms >= ? AND dailyrainin IS NOT NULL
+            GROUP BY day
+            """,
+            (anchor_ms, day_ms, mac, anchor_ms))).fetchall()
+    if not rows:
+        return out
+    days = [(r["day"], _tolerant_float(r["m"])) for r in rows]
+    for name, boundary in (("weekly_in", start_of_week),
+                           ("monthly_in", start_of_month),
+                           ("yearly_in", start_of_year)):
+        # ROUND, don't floor: boundary and anchor are both local midnights,
+        # but in a DST zone they can sit an hour apart (EDT boundary vs EST
+        # anchor), so the difference is N days ± 1h. Flooring N - 1h yields
+        # N-1 and the period absorbed an ENTIRE extra prior day — a week of
+        # rain reported as eight days for the whole DST half of the year
+        # (2026-08-20 review). Rounding recovers N exactly and bounds the
+        # residual error to the docstring's acknowledged single hour.
+        first_day = ((int(boundary.timestamp() * 1000) - anchor_ms
+                      + day_ms // 2) // day_ms)
+        total = sum(m for d, m in days if d >= first_day and m is not None)
+        out[name] = round(max(0.0, total), 3)
+    return out
+
+
 async def aggregate(
     mac: str, field: str, start_ms: int, end_ms: int
 ) -> dict[str, Any]:
@@ -1560,6 +2091,12 @@ async def aggregate(
 RECORD_FIELDS = [
     "tempf", "feelsLike", "dewPoint", "humidity", "baromrelin",
     "windspeedmph", "windgustmph", "uv", "solarradiation", "dailyrainin",
+    # Trailing-hour strike count — "most strikes in an hour" is the record
+    # shape people quote. COUNT()=0 for a station with no detector, so the
+    # field is omitted from the response and the app shows no card (absent
+    # is not zero). The per-interval lightningcount is deliberately NOT a
+    # record: its magnitude depends on the source's reporting interval.
+    "lightning_last_1hr",
 ]
 
 # "Wettest day" comes from dailyrainin.max. A real daily-rain counter resets to
@@ -1571,15 +2108,49 @@ RECORD_FIELDS = [
 _DAILY_RAIN_RESET_FLOOR_IN = 5.0
 
 
+# Which daily_rollups columns back each record field on the long periods.
+# (min_col, max_col); a None min means the rollups keep only the day's peak —
+# which is also the only half the records screen shows for those metrics.
+_ROLLUP_RECORD_COLS: dict[str, tuple[str | None, str]] = {
+    "tempf":              ("tempf_min", "tempf_max"),
+    "feelsLike":          ("feels_like_min", "feels_like_max"),
+    "dewPoint":           ("dew_point_min", "dew_point_max"),
+    "humidity":           ("humidity_min", "humidity_max"),
+    "baromrelin":         ("baromrelin_min", "baromrelin_max"),
+    "windspeedmph":       (None, "windspeedmph_max"),
+    "windgustmph":        (None, "windgustmph_max"),
+    "uv":                 (None, "uv_max"),
+    "solarradiation":     (None, "solarradiation_max"),
+    "dailyrainin":        (None, "rain_total"),
+    "lightning_last_1hr": (None, "lightning_max"),
+}
+
+
 async def records(mac: str, tz_name: str = "UTC",
                   fields: list[str] | None = None) -> dict[str, Any]:
-    """Per-metric high/low — and the local time each was first reached — over
-    today / this month / this year / all-time. Values come straight from the
-    stored observation history (MIN/MAX/AVG over the rows); period boundaries
-    are local-time per `tz_name`. Most metric columns live in idx_obs_chart so
-    the MIN/MAX aggregates are served index-only; the extreme-timestamp lookup
-    is a bounded equality scan. Intended to be cached by the caller — the
-    all-time window scans the whole per-mac history."""
+    """Per-metric high/low over today / this month / this year / all-time.
+
+    TODAY is answered from raw observations (one bounded local day), keeping
+    exact record times. The LONG periods are answered from `daily_rollups`
+    when they cover the period — a few thousand pre-folded rows instead of a
+    full per-mac history scan, which measured 110 s cold on a 1.09M-row
+    archive (Doren, 2026-08-20) against an app timeout well under that. The
+    UI shows date-only for every period except Today, so serving long-period
+    record times at day precision (local noon of the record's day) changes
+    nothing visible.
+
+    Rollups must actually COVER the period to be trusted: INSIGHTS enabled
+    late (or never rebuilt) leaves them starting after the archive does, and
+    answering all-time from partial rollups would silently erase the oldest
+    records. Coverage is judged once per call against the first observation;
+    uncovered periods fall back to the raw scan, as does everything when
+    rollups are absent entirely.
+
+    Long-period caveats of the rollup path: `min`/`avg` are None for the
+    peak-only metrics (wind, gust, UV, solar, rain, lightning) — the screen
+    only quotes their peaks — and rollups are fold-forward accumulators, so
+    a data repair must still `insights.rebuild()` (the established lesson)
+    for long-period records to heal."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -1613,38 +2184,61 @@ async def records(mac: str, tz_name: str = "UTC",
             (mac,))).fetchone()
         daily_is_cumulative = (_dr is not None and _dr["lo"] is not None
                                and _dr["lo"] > _DAILY_RAIN_RESET_FLOOR_IN)
+
+        # Repairs and column backfills poison fold-forward rollups in ways
+        # depth/recency can't see (maxima never go down; a new column stays
+        # NULL) — maintenance helpers and the lightning backfill set this
+        # flag, and a successful full insights.rebuild() clears it. While
+        # set, every long period takes the raw scan: slow but never wrong
+        # (CODE_REVIEW_R5 R5-14/R5-15).
+        dirty_row = await (await db.execute(
+            "SELECT v FROM server_kv WHERE k = 'rollups_dirty'")).fetchone()
+        rollups_dirty = (dirty_row is not None
+                         and dirty_row["v"] not in (None, "", "0"))
+
+        # Rollup coverage check (see docstring). All index-only lookups.
+        cov = await (await db.execute(
+            "SELECT MIN(day) AS lo, MAX(day) AS hi FROM daily_rollups "
+            "WHERE mac = ?", (mac,))).fetchone()
+        first_rollup_day: str | None = cov["lo"] if cov else None
+        last_rollup_day: str | None = cov["hi"] if cov else None
+        span = await (await db.execute(
+            "SELECT MIN(dateutc_ms) AS lo, MAX(dateutc_ms) AS hi "
+            "FROM observations WHERE mac = ?", (mac,))).fetchone()
+        first_obs_day = last_obs_day = None
+        if span and span["lo"] is not None:
+            first_obs_day = (datetime.fromtimestamp(span["lo"] / 1000, tz=tz)
+                             .strftime("%Y-%m-%d"))
+            last_obs_day = (datetime.fromtimestamp(span["hi"] / 1000, tz=tz)
+                            .strftime("%Y-%m-%d"))
+
+        def rollups_cover(start_ms: int) -> bool:
+            if first_rollup_day is None or first_obs_day is None:
+                return False
+            # Rollups must also be CURRENT, not just deep: INSIGHTS turned
+            # off after a rebuild freezes daily_rollups while observations
+            # keep landing, and answering from the frozen table would pin
+            # month/year records at the disable date forever (CodeRabbit,
+            # 2026-08-20). Live folding stamps the last observation's local
+            # day on every insert, so equality is the healthy state.
+            if last_rollup_day is None or (last_obs_day is not None
+                                           and last_rollup_day < last_obs_day):
+                return False
+            period_day = (datetime.fromtimestamp(start_ms / 1000, tz=tz)
+                          .strftime("%Y-%m-%d") if start_ms else "0000-00-00")
+            # Trusted when the rollups reach back at least as far as the
+            # period needs — the period start, or the archive's own first
+            # day for all-time. Lexicographic compare is safe: the day
+            # column is zero-padded ISO dates.
+            return first_rollup_day <= max(period_day, first_obs_day)
+
         for pname, start_ms in periods.items():
-            pfields: dict[str, Any] = {}
-            for fname, col in cols:
-                # col is one of our own _FIELD_MAP keys — never user input —
-                # so the f-string interpolation is safe (same as aggregate()).
-                row = await (await db.execute(
-                    f"SELECT MIN({col}) AS lo, MAX({col}) AS hi, "
-                    f"AVG({col}) AS avg, COUNT({col}) AS n FROM observations "
-                    f"WHERE mac = ? AND dateutc_ms >= ? AND dateutc_ms <= ?",
-                    (mac, start_ms, end_ms),
-                )).fetchone()
-                if row is None or not row["n"]:
-                    continue
-
-                async def _at(val: Any) -> int | None:
-                    if val is None:
-                        return None
-                    r = await (await db.execute(
-                        f"SELECT dateutc_ms FROM observations WHERE mac = ? "
-                        f"AND dateutc_ms >= ? AND dateutc_ms <= ? AND {col} = ? "
-                        f"ORDER BY dateutc_ms ASC LIMIT 1",
-                        (mac, start_ms, end_ms, val),
-                    )).fetchone()
-                    return r["dateutc_ms"] if r else None
-
-                pfields[fname] = {
-                    "min": row["lo"], "max": row["hi"],
-                    "avg": round(row["avg"], 2) if row["avg"] is not None else None,
-                    "count": row["n"],
-                    "minAt": await _at(row["lo"]),
-                    "maxAt": await _at(row["hi"]),
-                }
+            if pname == "today" or rollups_dirty or not rollups_cover(start_ms):
+                pfields = await _raw_period_fields(db, mac, cols,
+                                                   start_ms, end_ms)
+            else:
+                pfields = await _rollup_period_fields(db, mac, fields,
+                                                       start_ms, tz)
             # Drop a "wettest day" that's really a non-resetting cumulative
             # counter (verdict computed once above, not per period).
             dr = pfields.get("dailyrainin")
@@ -1653,3 +2247,104 @@ async def records(mac: str, tz_name: str = "UTC",
                 dr["maxAt"] = None
             out["periods"][pname] = {"start_ms": start_ms, "fields": pfields}
     return out
+
+
+async def _raw_period_fields(db, mac: str, cols: list[tuple[str, str]],
+                             start_ms: int, end_ms: int) -> dict[str, Any]:
+    """The original raw-observation path: exact record times, full scan of
+    the period window. Kept for Today (one bounded day) and as the fallback
+    when rollups are absent or don't cover the period."""
+    pfields: dict[str, Any] = {}
+    for fname, col in cols:
+        # col is one of our own _FIELD_MAP keys — never user input —
+        # so the f-string interpolation is safe (same as aggregate()).
+        row = await (await db.execute(
+            f"SELECT MIN({col}) AS lo, MAX({col}) AS hi, "
+            f"AVG({col}) AS avg, COUNT({col}) AS n FROM observations "
+            f"WHERE mac = ? AND dateutc_ms >= ? AND dateutc_ms <= ?",
+            (mac, start_ms, end_ms),
+        )).fetchone()
+        if row is None or not row["n"]:
+            continue
+
+        async def _at(val: Any) -> int | None:
+            if val is None:
+                return None
+            r = await (await db.execute(
+                f"SELECT dateutc_ms FROM observations WHERE mac = ? "
+                f"AND dateutc_ms >= ? AND dateutc_ms <= ? AND {col} = ? "
+                f"ORDER BY dateutc_ms ASC LIMIT 1",
+                (mac, start_ms, end_ms, val),
+            )).fetchone()
+            return r["dateutc_ms"] if r else None
+
+        pfields[fname] = {
+            "min": row["lo"], "max": row["hi"],
+            "avg": round(row["avg"], 2) if row["avg"] is not None else None,
+            "count": row["n"],
+            "minAt": await _at(row["lo"]),
+            "maxAt": await _at(row["hi"]),
+        }
+    return pfields
+
+
+async def _rollup_period_fields(db, mac: str, fields: list[str],
+                                start_ms: int, tz) -> dict[str, Any]:
+    """Long-period records from daily_rollups: one aggregate scan over the
+    period's day rows plus a tiny day lookup per extreme. `count` is the
+    number of DAYS with data (the raw path counts samples; nothing reads the
+    number as a sample count, and days-with-data keeps the omit-when-empty
+    contract that hides absent sensors)."""
+    from datetime import datetime, timedelta
+
+    start_day = (datetime.fromtimestamp(start_ms / 1000, tz=tz)
+                 .strftime("%Y-%m-%d") if start_ms else "0000-00-00")
+    wanted = [(f, *_ROLLUP_RECORD_COLS[f]) for f in fields
+              if f in _ROLLUP_RECORD_COLS]
+    parts = []
+    for fname, min_col, max_col in wanted:
+        if min_col:
+            parts.append(f"MIN({min_col}) AS {min_col}")
+        parts.append(f"MAX({max_col}) AS {max_col}")
+        parts.append(f"COUNT({max_col}) AS n_{max_col}")
+    # avg only where the rollups carry sums (temperature).
+    parts.append("SUM(tempf_sum) AS t_sum")
+    parts.append("SUM(tempf_n) AS t_n")
+    agg = await (await db.execute(
+        f"SELECT {', '.join(parts)} FROM daily_rollups "
+        f"WHERE mac = ? AND day >= ?",
+        (mac, start_day))).fetchone()
+    if agg is None:
+        return {}
+
+    async def _at_day(col: str, val: Any) -> int | None:
+        """Local NOON of the first day holding the extreme — the UI renders
+        long-period record times date-only, so noon just keeps the date
+        stable against small timezone shifts in the client."""
+        if val is None:
+            return None
+        r = await (await db.execute(
+            f"SELECT day FROM daily_rollups WHERE mac = ? AND day >= ? "
+            f"AND {col} = ? ORDER BY day ASC LIMIT 1",
+            (mac, start_day, val))).fetchone()
+        if not r:
+            return None
+        d = datetime.strptime(r["day"], "%Y-%m-%d").replace(tzinfo=tz)
+        return int((d + timedelta(hours=12)).timestamp() * 1000)
+
+    pfields: dict[str, Any] = {}
+    for fname, min_col, max_col in wanted:
+        n = agg[f"n_{max_col}"]
+        if not n:
+            continue
+        lo = agg[min_col] if min_col else None
+        hi = agg[max_col]
+        avg = None
+        if fname == "tempf" and agg["t_n"]:
+            avg = round(agg["t_sum"] / agg["t_n"], 2)
+        pfields[fname] = {
+            "min": lo, "max": hi, "avg": avg, "count": n,
+            "minAt": await _at_day(min_col, lo) if min_col else None,
+            "maxAt": await _at_day(max_col, hi),
+        }
+    return pfields

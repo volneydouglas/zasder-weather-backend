@@ -8,6 +8,121 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.6.0] — 2026-08-20
+
+Data quality, a new station source, records that answer instantly, and a
+lot of "the app should not tell you about hardware you do not own".
+
+### Added
+- **Lightning.** Tempest strike data is captured (per-interval count, the
+  trailing 1h/3h windows, nearest-strike distance), stored in real columns,
+  charted, and kept as records ("most strikes in an hour"). Existing
+  databases backfill from the raw blobs on first boot, so a storm captured
+  before the upgrade still counts. Stations with no detector show nothing —
+  never a confident zero.
+- **Records from the daily rollups.** Month/year/all-time records are
+  answered from pre-folded daily rollups instead of scanning the whole
+  archive — a 1M-row archive went from a 110-second timeout to instant.
+  Today keeps exact record times; rollups are only trusted when they cover
+  the period end-to-end (stale or partial rollups fall back to the raw
+  scan). Rain periods (week/month/year) also derive for stations that only
+  report a daily counter, like the Tempest.
+- **Share read-only access from the app.** Settings mints a per-person
+  guest token and hands you a one-tap link; name each link when creating
+  it, see every link you've handed out, and revoke one person from the
+  app without touching the others (`POST/GET/DELETE /api/guest-tokens`).
+  Share recipients get the weather, never the operator view — no SMTP
+  identity, no alert recipient emails, no coordinates (the forecast
+  endpoint's location echo is stripped for guests too).
+- **Integrations in the app.** AmbientWeather, Davis WeatherLink and
+  Tempest credentials can be configured from Settings
+  (`/api/integrations`); the matching poller starts, restarts or stops
+  immediately, no redeploy. Values live on your volume and win over env,
+  like the WU key always has.
+- **Automatic updates (opt-in).** With `AUTO_UPDATE=1` and an app-scoped
+  deploy token, a Fly instance applies an official release about two days
+  after it ships — same-major only, never a downgrade, and only after
+  verifying the release image actually exists. The setup script offers it
+  as a yes/no.
+- **The public dashboard carries the app's summary boards** — the 24h
+  high/low/gust strip and rain by period — so sharing your station's page
+  replaces a screenshot.
+- **WeatherFlow Tempest support.** A cloud poller (`TEMPEST_TOKEN` +
+  `TEMPEST_STATION_ID`, both free from the Tempest web app under Data
+  Authorizations) that reads the station's own coordinates and name, so a
+  Tempest gets a working forecast and sunrise without any further setup.
+  Note that the Tempest REST response is **metric** regardless of what the
+  `station_units` block advertises.
+- **Storm summary alerts.** One notification a set time after the last
+  reported rain, summarising the whole event — duration, total, peak rate,
+  temperature range and top gust — instead of alerting during it.
+  `STORM_SUMMARY`, `STORM_SUMMARY_QUIET_MINUTES`,
+  `STORM_SUMMARY_MIN_TOTAL_IN`, and configurable from the app.
+- **Read-only guest tokens** (`GUEST_API_TOKENS`, comma-separated) for
+  sharing your station with family. Accepted on reads and refused on every
+  write, and each one is revocable on its own.
+- **Setup codes.** `setup-fly.sh` now prints a single code carrying the
+  backend URL and token, so nobody has to retype a 64-character hex string
+  into a phone. It prints a separate read-only share code too.
+- **The written forecast** from The Weather Company is passed through
+  (`daypart.narrative`), for the app to show above the six-day strip. It was
+  already in the payload being fetched and was simply discarded.
+- Alert rules and smart alerts now report their firing state on
+  `GET /api/alerts` and `/api/alerts/rules`, so a client without a push
+  channel of its own can raise them locally.
+
+### Fixed
+- **The setup script's auto-update token was broken on arrival.** It
+  stripped all whitespace from the Fly deploy token, but the interior
+  space in `FlyV1 fm2_…` is part of the credential — every scripted
+  opt-in stored a token the platform rejects. Now preserved (and passed
+  via stdin, never argv).
+- **The public page's 24h board understated every extreme.** The window
+  is served as 1-minute averaged buckets, and the board took the max of
+  the averages — a 21 mph gust could render as 12. It now reads the
+  per-bucket true extremes.
+- **Repaired data heals the Records screen.** Data repairs mark the
+  rollup ledgers dirty; records fall back to raw scans (correct, slower)
+  until a background rebuild — kicked off automatically at boot —
+  re-folds history. A cleaned wind spike no longer lives on as a
+  displayed record.
+- **Saving wrong cloud-source keys is no longer a silent success.** The
+  server tries the credentials once on save and the app shows the
+  failure next to the field instead of an "On" that never produces data.
+- **Cleared tokens stay cleared on the Mac.** The pre-1.6 login-keychain
+  copy resurrected a deleted API or ingest token at relaunch — the
+  poller could quietly resume posting with a credential you removed.
+- **Sustained wind can no longer exceed its own gust.** The plausibility
+  bands are a per-field check, so wind garbage landing inside every band
+  walked straight through. An internal-consistency check now condemns the
+  whole speed set when a reading contradicts itself, and
+  `clean_implausible` finally applies the anemometer-sibling rule the live
+  ingest path already had — the asymmetry that left in-band 51-55 mph
+  "sustained" winds behind after a 255 mph gust was swept.
+- `maintenance.clean_wind_inconsistent` retro-applies the same rule to
+  stored history.
+- A station with **no solar sensor** no longer reads as permanent night.
+  `solarradiation` defaulting to zero meant a moon and the word "Night" at
+  noon, forever, for most Davis and many Ecowitt units.
+- **A colliding neighbor sensor can no longer rebaseline your rain
+  counter.** The level-shift confirmation now requires the new level to
+  hold for five minutes of posts (the guard evaluates every relay post,
+  not just stored rows), and a level that falls back to the old baseline
+  is remembered and refused for a day — a real level shift never reverts.
+- **Storm summaries no longer fabricate back-dated storms** after the
+  checker was off: a counter baseline older than six hours rebaselines
+  silently instead of counting weeks of accumulated rain as one event.
+- **Device probation forgets cold trails.** Corrupt-packet sightings
+  spread further apart than the TTL no longer accumulate to admission, so
+  a recurring bit-flip can never slowly mint a phantom station.
+- Daily-rain derivation refuses lifetime cumulative counters and handles
+  DST week/month boundaries exactly; a Tempest reading whose only content
+  is lightning is stored, not discarded.
+
+### Changed
+- Storm and alert preferences resolve app-managed values over environment
+  defaults, matching how the SMTP transport already worked.
+
 ## [1.5.1] — 2026-08-15
 
 Data-quality fix for imported history. Weather Underground serves 255

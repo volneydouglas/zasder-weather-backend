@@ -42,6 +42,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from . import db
+from . import device_probation
 from . import source_status
 from . import wu_upload
 from .config import settings, tokens_match
@@ -129,6 +130,13 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # block ({radiation_wm2, uv}). Accept both — the block was silently
     # dropped before, so WLL-sourced devices never stored solar at all.
     solar = _scrub_numbers(normalized.get("solar"))
+    # Lightning: Tempest reports it, AcuRite Atlas can too. This block was
+    # being DROPPED — the same silent loss the `solar` note above records,
+    # and the module docstring's claim that bonus fields survive in data_json
+    # was false, because data_json stores this flattened dict rather than the
+    # original payload. Carried through as flat lightning_* keys so it lands
+    # in data_json today; dedicated columns can follow.
+    lightning = _scrub_numbers(normalized.get("lightning"))
 
     ts_iso = normalized.get("timestamp_utc")
     # A non-string timestamp (an epoch int, a dict) hit .endswith() below and
@@ -260,10 +268,20 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "battout":        _battery_flag(dev.get("battery_outdoor")),
         "battin":         _battery_flag(dev.get("battery_hub")),
     }
+    # Only the per-interval count is safe to accumulate; the trailing windows
+    # keep their names so nothing mistakes them for additive.
+    for src, dest in (("strike_count", "lightningcount"),
+                      ("strike_count_last_1hr", "lightning_last_1hr"),
+                      ("strike_count_last_3hr", "lightning_last_3hr"),
+                      ("last_distance_mi", "lightning_distance_mi"),
+                      ("last_strike_ms", "lightning_last_strike_ms")):
+        v = lightning.get(src)
+        if v is not None:
+            flat[dest] = v
     # One choke point for every metric field (timestamps excluded — they were
     # validated above and must stay ints).
     for k, v in flat.items():
-        if k not in ("dateutc", "_raw_dateutc"):
+        if k not in ("dateutc", "_raw_dateutc", "lightning_last_strike_ms"):
             flat[k] = _coerce_num(v)
     return flat
 
@@ -345,6 +363,15 @@ _PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
     "yearlyrainin":   (0.0, 1500.0),
     "uv":             (0.0, 20.0),
     "solarradiation": (0.0, 1800.0),
+    # Lightning. Local detectors (Tempest's AS3935-class sensor) top out in
+    # the low thousands of strikes/hr even inside a violent storm — the live
+    # 2026-08-19 monsoon cell peaked at ~1,200 — so these ceilings only ever
+    # catch decode garbage. Distance: the sensor's own range limit is ~25 mi
+    # (40 km); 100 keeps the never-clip property with a wide margin.
+    "lightningcount":        (0.0, 5000.0),
+    "lightning_last_1hr":    (0.0, 20000.0),
+    "lightning_last_3hr":    (0.0, 60000.0),
+    "lightning_distance_mi": (0.0, 100.0),
 }
 
 
@@ -383,6 +410,68 @@ def _apply_plausibility_bands(flat: dict[str, Any]) -> list[str]:
                 continue
             flat[k] = None
             dropped.append(f"{k}={v:g}(anemometer)")
+
+    dropped.extend(_apply_wind_consistency(flat))
+    return dropped
+
+
+# Internal-consistency (relational) check on the anemometer. The bands above
+# are a *plausible value* check — they only see one field at a time, so garbage
+# that lands inside every band walks straight through. Standard station QC
+# pairs that with an internal-consistency check, and the canonical one for wind
+# is the gust/speed relation (Doren, 2026-08-16: "it's impossible to have a
+# steady wind be more powerful than a gust, right?" — correct, and it is true
+# by definition, because the gust is the peak INSIDE the window the sustained
+# average is taken over, and an average cannot exceed its own largest sample).
+#
+# The tolerance is deliberately loose, because a violation is only *definitely*
+# impossible when both numbers describe the same window, and live stations
+# often do not report them that way — an instantaneous speed can legitimately
+# sit above a gust field that is a stale 10-minute maximum. Sized against the
+# real archive that started this: 863 of Doren's 1.09 M readings have sustained
+# above gust, every one by ≤6.4 mph, and they are overwhelmingly a gust channel
+# pinned at 2.0 mph while the sustained value varies (harmless, and nulling
+# them would throw away good data). Requiring BOTH a 25% overshoot and a 5 mph
+# absolute gap cuts those 863 down to 6 flagged readings in eleven years — the
+# handful where the gust channel is so far under the sustained wind that one of
+# the two is certainly wrong.
+_WIND_CONSISTENCY_RATIO = 1.25
+_WIND_CONSISTENCY_ABS_MPH = 5.0
+
+
+def _apply_wind_consistency(flat: dict[str, Any]) -> list[str]:
+    """Condemn the anemometer set when sustained wind contradicts the gust on
+    the same reading. Returns the names of the fields dropped (for the log).
+
+    Whole-set, not just the offending field, for the reason the band sibling
+    rule gives: these channels come from one sensor, and when it contradicts
+    itself there is no way to tell which half is lying — the 8.4 mph sustained
+    /2.0 mph gust pattern blames the gust, a dropout blames both."""
+    def _num(key: str) -> float | None:
+        v = flat.get(key)
+        if v is None or isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v) if math.isfinite(v) else None
+
+    speed = _num("windspeedmph")
+    # maxdailygust is a running daily peak, so sustained legitimately sits
+    # under it all day and above it early — only the instantaneous gust is a
+    # same-window comparison.
+    gust = _num("windgustmph")
+    if speed is None or gust is None:
+        return []
+    if speed <= gust * _WIND_CONSISTENCY_RATIO:
+        return []
+    if speed - gust <= _WIND_CONSISTENCY_ABS_MPH:
+        return []
+
+    dropped: list[str] = []
+    for k in _ANEMOMETER_FIELDS:
+        v = _num(k)
+        if v is None:
+            continue
+        flat[k] = None
+        dropped.append(f"{k}={v:g}(wind-inconsistent)")
     return dropped
 
 
@@ -419,10 +508,49 @@ _RAIN_REJECT_MAX = 512
 # three times within a few seconds, and a burst of identical decodes is one
 # observation, not two: in production a neighboring sensor on a colliding ID
 # (constant 20.22 counter vs Crestview's 17.12) got its duplicate decode
-# accepted as "confirmation" of itself. Real SDR cadence is ~60s, so 90s
-# rejects same-transmission bursts while a genuine level shift still confirms
-# on the second distinct transmission after the first rejected one.
-_RAIN_CONFIRM_MIN_GAP_MS = 90_000
+# accepted as "confirmation" of itself.
+#
+# 300s for RAIN, not the original 90s. The 90s figure was calibrated against
+# the ~60s STORAGE cadence — but this guard runs before the write-throttle,
+# so it evaluates every ~16s relay POST, and the relay serves rain from a
+# per-field cache. On 2026-08-19 the colliding neighbor monopolized that
+# cache for ~2-3 minutes (twice in one day): a throttled post primed the
+# pending rejection and a post 90s+ later "confirmed" it, storing the
+# neighbor's 20.27 counter as fact on a station at 17.16. Each episode ran
+# well under 5 minutes, so requiring the new level to hold for 300s of
+# posts rejects them outright. A genuine level shift never reverts, so the
+# only cost is ~5 minutes of nulled rain rows before a real shift confirms
+# — and a steady climb never enters this path at all (in-allowance jumps
+# aren't rejected in the first place).
+_RAIN_CONFIRM_MIN_GAP_MS = 300_000
+# Temperature keeps the shorter gap: temp jitters 0.1-0.3°F between posts,
+# its guard uses a ±5°F same-level tolerance, and a swapped sensor should
+# rebaseline quickly (R4-02 pinned 108s-after-first-rejection confirming).
+# The rain failure mode above doesn't apply — a colliding temp reading is
+# re-nulled each episode rather than permanently corrupting a counter that
+# feeds rollups.
+_TEMP_CONFIRM_MIN_GAP_MS = 90_000
+
+# Levels that PROVED to be glitches. When a pending level-shift candidate is
+# followed by a reading back at the old baseline, the candidate "fell back" —
+# something a real level shift never does — so that value is remembered here
+# (key -> (value_in, last_seen_ms)) and refused as a confirmation while
+# fresh. This is what ends the RECURRING colliding-neighbor pattern: its
+# counter barely moves between episodes, so after the first fall-back the
+# same 20.27 can reappear all day (or monopolize the relay cache for any
+# length of time) and never rebaseline the station. TTL runs from CREATION
+# and is deliberately NOT refreshed by blocked confirmations — refreshing
+# would let one stale reading during a genuine level shift shadow the new
+# level forever (the full reasoning sits at the check in
+# _confirms_rejected_level). Expiry means a station whose counter genuinely
+# reaches that level someday isn't shadowed beyond 24h. Process-global like
+# _rain_reject: lost on restart, costing one rejection/fall-back cycle —
+# worst case a repeat colliding-neighbor episode within the restart's 300 s
+# confirmation gap rebaselines once more (R5-26: accepted; persisting guard
+# state to disk isn't worth the coupling for a once-per-restart cost).
+_rain_tombstone: dict[str, tuple[float, float]] = {}
+_RAIN_TOMBSTONE_TTL_MS = 24 * 3_600_000
+_RAIN_TOMBSTONE_MAX = 512
 
 
 def _record_rain_rejection(mac: str, value_in: float, ts_ms: float,
@@ -456,12 +584,47 @@ def _record_rain_rejection(mac: str, value_in: float, ts_ms: float,
     _rain_reject[mac] = (value_in, ts_ms)
 
 
+def _note_rain_fallback(key: str, ts_ms: float) -> None:
+    """A reading back at the old baseline arrived while a level-shift
+    candidate was pending: the candidate fell back, which a real level shift
+    never does, so it was a glitch — remember its value so it can't confirm
+    a later pending candidate (the recurring colliding-neighbor pattern).
+    Call in place of the bare `_rain_reject.pop(key)` on the non-glitch
+    path."""
+    prev = _rain_reject.pop(key, None)
+    if prev is None:
+        return
+    if len(_rain_tombstone) >= _RAIN_TOMBSTONE_MAX and key not in _rain_tombstone:
+        oldest = min(_rain_tombstone, key=lambda k: _rain_tombstone[k][1])
+        del _rain_tombstone[oldest]
+    _rain_tombstone[key] = (prev[0], ts_ms)
+
+
 def _confirms_rejected_level(mac: str, value_in: float, ts_ms: float,
                              max_rate_in_per_hr: float) -> bool:
     """True when `value_in` corroborates the previously REJECTED reading for
-    this mac: at or above that level, and the increment since the rejection is
-    itself plausible rain for the elapsed time. A one-shot spike fails this
-    (the next reading falls back below the rejected level)."""
+    this mac: at or above that level, the increment since the rejection is
+    itself plausible rain for the elapsed time, and the level has not already
+    proven itself a glitch by falling back (see _rain_tombstone). A one-shot
+    spike fails this (the next reading falls back below the rejected level)."""
+    tomb = _rain_tombstone.get(mac)
+    if tomb is not None:
+        tomb_val, tomb_ts = tomb
+        if ts_ms - tomb_ts >= _RAIN_TOMBSTONE_TTL_MS:
+            del _rain_tombstone[mac]
+        elif abs(value_in - tomb_val) <= 0.05:
+            # Fixed TTL from CREATION — deliberately not refreshed on
+            # sightings. Refreshing looked attractive (the shadow would
+            # outlive a neighbor that keeps transmitting) but inverts the
+            # failure: one stale old-baseline reading arriving during a
+            # GENUINE level shift tombstones the new level, and since every
+            # subsequent real reading sits at that level, a refreshed
+            # tombstone never expires — months of nulled rain in a dry
+            # season (2026-08-20 review). Bounded at 24h, the worst case
+            # either way is one day; a recurring neighbor beyond the TTL
+            # still has to re-earn a rejection AND hold the cache for the
+            # full 300s confirmation gap.
+            return False
     prev = _rain_reject.get(mac)
     if prev is None:
         return False
@@ -494,7 +657,7 @@ def _confirms_temp_level(key: str, value_f: float, ts_ms: float,
     if prev is None:
         return False
     rej_val, rej_ts = prev
-    if ts_ms <= rej_ts or ts_ms - rej_ts < _RAIN_CONFIRM_MIN_GAP_MS:
+    if ts_ms <= rej_ts or ts_ms - rej_ts < _TEMP_CONFIRM_MIN_GAP_MS:
         return False
     return abs(value_f - rej_val) <= tolerance_f
 
@@ -727,6 +890,12 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     mac = _format_mac(str(raw_id))
     if not mac:
         raise HTTPException(status_code=400, detail="device.id required")
+    if "|" in mac:
+        # '|' is the guard-state key separator (mac + "|tempf"): a device id
+        # containing it would share glitch-guard state with another device
+        # (CODE_REVIEW_R5 R5-24). No legitimate hub id carries one.
+        raise HTTPException(status_code=400,
+                            detail="device.id must not contain '|'")
     flat = _flatten(payload_obj)
     if not flat:
         raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
@@ -804,7 +973,10 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
                               "dailyrainin", "weeklyrainin", "monthlyrainin"):
                         flat[k] = None
             else:
-                _rain_reject.pop(mac, None)
+                # In-band reading at (or plausibly above) the old baseline:
+                # any pending candidate just fell back — tombstone it so the
+                # same value can't confirm a later episode.
+                _note_rain_fallback(mac, raw_dateutc)
 
     # Same spike guard for the DAILY rain bucket (1.5, records QC): a decode
     # glitch can spike daily_in while the yearly counter stays sane — the
@@ -849,7 +1021,7 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
                               "weeklyrainin", "monthlyrainin"):
                         flat[k] = None
             else:
-                _rain_reject.pop(daily_key, None)
+                _note_rain_fallback(daily_key, raw_dateutc)
 
     # Temperature-jump guard (1.5, records QC — see ingest_max_temp_jump_f):
     # a reading impossibly far from the device's last stored temperature is a
@@ -928,6 +1100,21 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
         "info": inner_info,
         "lastData": flat,
     }
+    # New-device probation. A MAC that looks like a bit-flipped twin of a
+    # device we already know has to be seen repeatedly before it earns a row
+    # — one corrupt 433 MHz packet once minted a phantom Atlas that then
+    # emailed a device-down alert about a station that never existed. A
+    # genuinely new MAC is admitted immediately, so ordinary setup is
+    # unaffected. See app/device_probation.py.
+    if not await _admit_device(mac):
+        # 200, not an error: the sender is behaving correctly and a 4xx would
+        # make a LilyGO count it toward its 401-wipe heuristic. `quarantined`
+        # is how a caller can tell this reading was dropped on purpose.
+        source_status.record_success("custom-ingest", rows=0)
+        return {"ok": True, "mac": mac, "inserted": 0,
+                "ts_ms": flat["dateutc"], "throttled": False,
+                "quarantined": True}
+
     # Always refresh the device row (lastData / live view) so throttling the
     # history write below never staleness the dashboard.
     await db.upsert_device(mac, info)
@@ -1016,6 +1203,74 @@ async def _parse_json_body(request: Request) -> Any:
         # "[[[[…" raises RecursionError, not JSONDecodeError — still a 400.
         raise HTTPException(status_code=400,
                             detail="invalid JSON: too deeply nested")
+
+
+def _probation_now_ms() -> int:
+    """SERVER clock for probation sighting spacing — patchable in tests.
+    The device-claimed timestamp must play no role here: a replayed backfill
+    with crafted dateutc values could space its "sightings" perfectly and
+    mint a phantom device with zero real-time presence (CODE_REVIEW_R5
+    R5-25). Real-time evidence is the entire point of probation."""
+    return int(time.time() * 1000)
+
+
+async def _admit_device(mac: str) -> bool:
+    """False when this reading is from a MAC still serving probation.
+
+    Returns True for every device we already know (the overwhelmingly common
+    path, one indexed lookup) and for any unknown MAC that is not a near
+    neighbour of an existing one.
+    """
+    needed = settings.device_confirm_suspect_hits
+    if needed <= 0:
+        return True
+    known = await db.list_device_macs()
+    if any(k.upper() == mac.upper() for k in known):
+        return True
+
+    suspect = device_probation.suspect_of(
+        mac, known, settings.device_confirm_max_bits)
+    if suspect is None:
+        log.info("new device %s admitted (no similar device known)", mac)
+        return True
+
+    now_ms = _probation_now_ms()
+    prior = await db.get_pending_device(mac) or {}
+    # A pending row older than the TTL is history, not evidence: the read
+    # path had no staleness check and bump's global prune runs AFTER decide()
+    # already computed hits, re-inserting the carried count fresh — so the
+    # same recurring bit-flip arriving every couple of weeks still summed to
+    # admission over months, minting the phantom device (and its eventual
+    # false device-down alert) that probation exists to stop (2026-08-20
+    # review). Counting restarts from zero once the trail has gone cold.
+    ttl_ms = int(settings.device_confirm_ttl_hours * 3_600_000)
+    last_ms = prior.get("last_ms")
+    if isinstance(last_ms, (int, float)) and now_ms - last_ms >= ttl_ms:
+        prior = {}
+    verdict = device_probation.decide(
+        prior_hits=int(prior.get("hits") or 0),
+        prior_ms=prior.get("last_ms"),
+        now_ms=now_ms,
+        suspect=suspect,
+        needed=needed,
+        min_gap_ms=int(settings.device_confirm_min_gap_seconds * 1000),
+    )
+    if verdict.admit:
+        await db.clear_pending_device(mac)
+        log.warning(
+            "admitting %s after %d confirmed sightings — it closely resembles "
+            "%s, so if these are the same station the extra row is a decoder "
+            "problem worth investigating", mac, verdict.hits, suspect)
+        return True
+
+    await db.bump_pending_device(
+        mac, now_ms, verdict.hits, suspect, verdict.counted,
+        ttl_ms=int(settings.device_confirm_ttl_hours * 3_600_000))
+    log.warning(
+        "quarantining %s: looks like a corrupted %s (%d/%d confirmed "
+        "sightings). Reading dropped.",
+        mac, suspect, verdict.hits, verdict.needed)
+    return False
 
 
 def _truncate_source(payload_obj: dict[str, Any]) -> dict[str, Any]:

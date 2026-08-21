@@ -21,9 +21,10 @@
 # Non-interactive overrides (used by the web planner at zasder.com/weather-helper;
 # any value not supplied falls back to a prompt unless --yes is set):
 #   --app=NAME            --region=CODE        --tz=IANA/Zone
-#   --host=HOSTNAME       --sources=awn,davis,lilygo
+#   --host=HOSTNAME       --sources=awn,davis,tempest,lilygo
 #   --aw-app-key=…        --aw-api-key=…
 #   --wl-key=…            --wl-secret=…        --wl-station=…
+#   --tempest-token=…     --tempest-station=…
 #   --yes                 don't prompt; use flags + defaults only
 
 set -euo pipefail
@@ -49,6 +50,7 @@ SOURCES=""
 APP_NAME_FLAG=""; REGION_FLAG=""; TZ_FLAG=""; HOST_FLAG=""
 AW_APP_KEY_FLAG=""; AW_API_KEY_FLAG=""
 WL_KEY_FLAG=""; WL_SECRET_FLAG=""; WL_STATION_FLAG=""
+TEMPEST_TOKEN_FLAG=""; TEMPEST_STATION_FLAG=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -66,6 +68,8 @@ for arg in "$@"; do
     --wl-key=*)      WL_KEY_FLAG="${arg#*=}" ;;
     --wl-secret=*)   WL_SECRET_FLAG="${arg#*=}" ;;
     --wl-station=*)  WL_STATION_FLAG="${arg#*=}" ;;
+    --tempest-token=*)   TEMPEST_TOKEN_FLAG="${arg#*=}" ;;
+    --tempest-station=*) TEMPEST_STATION_FLAG="${arg#*=}" ;;
     -h|--help)
       # Print the header comment block: from line 2 up to the first
       # non-comment line. A fixed sed range overran the header and dumped
@@ -107,13 +111,14 @@ ask_secret() {  # ask_secret <varname> <prompt>
   printf -v "$__var" '%s' "$__val"
 }
 
-normalize_sources() {  # map aliases → canonical awn|davis|lilygo, dedup
+normalize_sources() {  # map aliases → canonical awn|davis|tempest|lilygo, dedup
   local out="" tok norm
   for tok in ${SOURCES//,/ }; do
     norm="$(printf '%s' "$tok" | tr 'A-Z' 'a-z')"
     case "$norm" in
       awn|aw|ambient|ambientweather) norm=awn ;;
       davis|wl|weatherlink)          norm=davis ;;
+      tempest|weatherflow|wf)        norm=tempest ;;
       lilygo|rf|sdr|433|915)         norm=lilygo ;;
       "") continue ;;
       *) warn "ignoring unknown source '$tok'"; continue ;;
@@ -121,6 +126,39 @@ normalize_sources() {  # map aliases → canonical awn|davis|lilygo, dedup
     case ",$out," in *,"$norm",*) ;; *) out="${out:+$out,}$norm" ;; esac
   done
   SOURCES="$out"
+}
+
+# Pack a backend URL + token into the one scannable string the app reads
+# (SetupCode.swift). Format: ZW1.<base64url(JSON)>.<6-char base32 checksum>.
+# The checksum exists so a truncated or mistyped code fails immediately
+# instead of handing the app a plausible URL that quietly never connects.
+#
+# python3 is OPTIONAL for this script, so a machine without it simply gets no
+# code and falls back to the URL/token fields printed above.
+zasder_setup_code() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$1" "$2" <<'PYCODE'
+import base64, hashlib, json, sys
+
+url, token = sys.argv[1], sys.argv[2]
+payload = base64.urlsafe_b64encode(
+    json.dumps({"u": url, "t": token}, sort_keys=True,
+               separators=(",", ":")).encode()).decode().rstrip("=")
+
+# 6 chars of base32 over SHA-256(payload) — must match SetupCode.checksum.
+alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+digest = hashlib.sha256(payload.encode()).digest()
+out, acc, bits = "", 0, 0
+for byte in digest:
+    acc = (acc << 8) | byte
+    bits += 8
+    while bits >= 5 and len(out) < 6:
+        bits -= 5
+        out += alphabet[(acc >> bits) & 0x1F]
+    if len(out) >= 6:
+        break
+print(f"ZW1.{payload}.{out}")
+PYCODE
 }
 
 # The backend resolves this with Python's zoneinfo, so validate the same way
@@ -257,6 +295,7 @@ if [ "$mode" = "create" ]; then
     sel=""
     ask_yn "  AmbientWeather cloud poller?    [y/N]" N && sel="${sel:+$sel,}awn"
     ask_yn "  Davis WeatherLink cloud poller? [y/N]" N && sel="${sel:+$sel,}davis"
+    ask_yn "  WeatherFlow Tempest poller?     [y/N]" N && sel="${sel:+$sel,}tempest"
     ask_yn "  LilyGO / RF direct (433/915)?   [y/N]" N && sel="${sel:+$sel,}lilygo"
     SOURCES="$sel"
   fi
@@ -351,6 +390,11 @@ if [ "$mode" = "create" ]; then
   # 7. Fresh tokens
   api_token=$(openssl rand -hex 32)
   ingest_token=$(openssl rand -hex 32)
+  # A read-only token to share with family. Accepted on GETs and refused on
+  # every write, so someone you invited to LOOK at your weather cannot delete
+  # a station or rewrite your alerts. Minted now so sharing is possible from
+  # day one rather than needing a second trip through fly secrets.
+  guest_token=$(openssl rand -hex 32)
   echo
   info "Generated API_TOKEN (iOS app reads with this):"
   printf '  \033[33m%s\033[0m\n' "$api_token"
@@ -379,10 +423,62 @@ if [ "$mode" = "create" ]; then
 
   # 10. Secrets — only the ones the chosen paths need
   bold "Setting secrets"
-  secret_args=(API_TOKEN="$api_token" INGEST_TOKEN="$ingest_token" TIMEZONE="$tz")
+  # 5b. WeatherFlow Tempest credentials — only if Path F enabled. Also
+  # configurable later from the app (Settings → Integrations), which wins
+  # over these env values — this path exists for scripted setups.
+  tp_token="$TEMPEST_TOKEN_FLAG"; tp_station="$TEMPEST_STATION_FLAG"
+  if source_enabled tempest; then
+    echo
+    bold "WeatherFlow Tempest credentials (https://tempestwx.com/settings/tokens)"
+    info "Create a personal access token there; your station id is the number"
+    info "in the station's URL on that site."
+    if [ "$NONINTERACTIVE" -eq 0 ]; then
+      [ -n "$tp_token" ]   || ask_secret tp_token "TEMPEST_TOKEN (input hidden): "
+      [ -n "$tp_station" ] || read -r -p "TEMPEST_STATION_ID (number from the station URL): " tp_station
+    fi
+    if [ -z "$tp_token" ] || [ -z "$tp_station" ]; then
+      err "Tempest selected but TEMPEST_TOKEN / TEMPEST_STATION_ID missing"; exit 1
+    fi
+    case "$tp_station" in
+      *[!0-9]*) err "TEMPEST_STATION_ID must be a number (got '$tp_station')"; exit 1 ;;
+    esac
+  fi
+
+  # INSIGHTS on by default for NEW installs: the instant Records screen
+  # and the Insights tab both ride the daily rollups it enables, and a
+  # fresh database folds them from day one at no cost. Without it, a
+  # year of SDR-cadence data re-creates the 110-second Records scan the
+  # rollups exist to prevent. (Update mode never touches it — operators
+  # who turned it off stay off.)
+  secret_args=(API_TOKEN="$api_token" INGEST_TOKEN="$ingest_token" TIMEZONE="$tz" GUEST_API_TOKENS="$guest_token" INSIGHTS=1)
   source_enabled awn   && secret_args+=(AW_APPLICATION_KEY="$aw_app_key" AW_API_KEY="$aw_api_key")
   source_enabled davis && secret_args+=(WEATHERLINK_API_KEY="$wl_key" WEATHERLINK_API_SECRET="$wl_secret" WEATHERLINK_STATION_ID="$wl_station")
+  source_enabled tempest && secret_args+=(TEMPEST_TOKEN="$tp_token" TEMPEST_STATION_ID="$tp_station")
   fly secrets set --app "$app_name" "${secret_args[@]}"
+
+  # Optional: automatic backend updates. The token is app-scoped (deploy
+  # only), and the updater applies a release only after it has been out
+  # ~2 days, stays within the same major version, and verifies the image
+  # exists first — the full safety model is documented in .env.example.
+  # --stage: these apply with the deploy right below, no extra restart.
+  if ask_yn "Enable automatic backend updates (applies releases ~2 days after they ship)? [Y/n]" Y; then
+    # Strip ONLY line endings: a Fly deploy token is "FlyV1 fm2_..." and the
+    # interior space is part of the token — deleting all whitespace produces
+    # a credential the Machines API 401s forever (verified live 2026-08-20:
+    # intact -> 200, space-stripped -> 401).
+    deploy_tok=$(fly tokens create deploy --app "$app_name" 2>/dev/null | tr -d '\r\n') || deploy_tok=""
+    if [ -n "$deploy_tok" ]; then
+      # stdin import keeps the token out of the process list (same reason
+      # .env.example documents the `fly secrets set FLY_API_TOKEN=-` form).
+      printf 'AUTO_UPDATE=1\nFLY_API_TOKEN=%s\n' "$deploy_tok" \
+        | fly secrets import --stage --app "$app_name"
+      info "Automatic updates ON (turn off: fly secrets set AUTO_UPDATE=0 --app $app_name)"
+    else
+      warn "Could not create a deploy token — automatic updates skipped."
+      warn "Enable later:  fly tokens create deploy --app $app_name"
+      warn "  then:        fly secrets set FLY_API_TOKEN=<token> AUTO_UPDATE=1 --app $app_name"
+    fi
+  fi
 
   # 11. Deploy
   bold "Deploying"
@@ -423,9 +519,44 @@ if [ "$mode" = "create" ]; then
   echo "--- next steps (also saved to zasder-install-summary.txt) ---" >> "$summary_file"
 
   emit ""
-  emit "iOS app → Settings, paste:"
+  emit "iOS app → Settings → Quick setup → paste the code below."
+  emit "If you would rather type them in by hand, the same two values are:"
   emit "  Backend URL:   $url"
   emit "  Bearer Token:  $api_token"
+
+  # One-shot setup codes. Nobody should have to retype a 64-character hex
+  # token into a phone keyboard, which is the first thing every self-hoster
+  # has to do and the thing they most often get wrong.
+  #
+  # A code rather than a QR: the setup output usually reaches people in an
+  # email, a note or a web page ON THE PHONE ITSELF, and you cannot scan your
+  # own screen. Copy-paste works from all of those, and from a forwarded
+  # message.
+  setup_code=$(zasder_setup_code "$url" "$api_token" || true)
+  share_code=$(zasder_setup_code "$url" "$guest_token" || true)
+  if [ -n "$setup_code" ]; then
+    emit ""
+    emit "SETUP CODE (full access — this is YOUR device):"
+    emit "  $setup_code"
+    emit ""
+    emit "SHARE CODE (read-only — safe to send to family):"
+    emit "  $share_code"
+    emit "  Whoever pastes this can SEE your weather and change nothing."
+    emit "  Send it however you like — message, email, AirDrop."
+    emit "  Revoke it any time with:"
+    emit "    fly secrets set GUEST_API_TOKENS=\"\" --app $app_name"
+  else
+    # python3 unavailable → no ZW1 codes, but the guest token was still
+    # provisioned as a secret; without this branch the operator got no
+    # usable read-only credential at all (CodeRabbit, 2026-08-20).
+    emit ""
+    emit "Setup codes unavailable (python3 not found) — raw values instead:"
+    emit "  Backend URL:           $url"
+    emit "  READ-ONLY guest token: $guest_token"
+    emit "  Enter the URL + token in the app's Settings for read-only"
+    emit "  access. Revoke it any time with:"
+    emit "    fly secrets set GUEST_API_TOKENS=\"\" --app $app_name"
+  fi
 
   emit ""
   emit "INGEST_TOKEN (any source that POSTs to /ingest/custom uses this —"
@@ -549,6 +680,13 @@ if [ "$ROTATE_TOKENS" -eq 1 ]; then
   upd_args+=(API_TOKEN="$new_api" INGEST_TOKEN="$new_ingest")
   echo
   warn "New tokens generated. Save these BEFORE pressing enter on the next step:"
+  warn ""
+  warn "  ⚠  ROTATING INGEST_TOKEN UNPAIRS EVERY LILYGO BOARD."
+  warn "     A board that gets 5 consecutive 401s wipes its stored token on"
+  warn "     purpose, so it cannot keep replaying a dead credential. Recovery"
+  warn "     needs the per-device setup key, which is shown ONLY on the OLED"
+  warn "     and the serial banner — i.e. physical access to each board."
+  warn "     Re-provision every board promptly after this, or walk to them."
   printf "  API_TOKEN     \033[33m%s\033[0m\n" "$new_api"
   printf "  INGEST_TOKEN  \033[33m%s\033[0m\n" "$new_ingest"
   read -r -p "Press Enter to commit the rotation..."

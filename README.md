@@ -4,9 +4,10 @@
 [![Changelog](https://img.shields.io/badge/changelog-md-blue)](CHANGELOG.md)
 
 Self-hosted weather-station backend. Pulls data from any combination of
-**AmbientWeather cloud**, **Davis WeatherLink cloud**, or direct **433/915 MHz
-RF capture** (LilyGO ESP32+SX1276), stores it in SQLite, and exposes a small
-HTTP API that a [companion iOS app](https://zasder.com/weather) reads.
+**AmbientWeather cloud**, **Davis WeatherLink cloud or LAN**, **WeatherFlow
+Tempest cloud**, or direct **433/915 MHz RF capture** (LilyGO ESP32+SX1276),
+stores it in SQLite, and exposes a small HTTP API that a
+[companion iOS app](https://zasder.com/weather) reads.
 
 Built because [MyAcurite](https://www.acurite.com/) was killed by AcuRite in
 2026 and Davis's WeatherLink Console is a paid cloud lock-in. Owning your
@@ -36,6 +37,7 @@ as separate device rows in the iOS app.
 | **B. Davis WeatherLink cloud** | Davis Vantage Vue / Pro 2 + WeatherLink Console (any) | 1–5 min cadence (subscription-tier dependent) | Davis VP2 + 6313 Console works only via cloud — the new console doesn't broadcast in the legacy unencrypted protocol. |
 | **C. LilyGO 433 MHz** | LilyGO T3 LoRa32 V1.6.1 board (~$20), AcuRite Atlas — or any 433 MHz OOK station via **discovery mode** | ~16s real-time | Captures AcuRite Atlas first-class; `forward_all=1` additionally posts any decoded 433 MHz weather station (LaCrosse, Oregon Scientific, AcuRite towers/5-in-1, Auriol, TFA, … ~180 protocols). |
 | **D. LilyGO 915 MHz** | Second LilyGO board, Fine Offset / AmbientWeather WS-2000 outdoor + WH32B indoor — or other 915 MHz FSK stations via **discovery mode** | ~16s real-time | Captures Fineoffset family (FSK) first-class; merges WH32B indoor data into the outdoor station's tile grid. |
+| **F. WeatherFlow Tempest cloud** | A Tempest station (no extra hardware) | 60s cadence | Free personal access token from tempestwx.com. Also configurable from the app: Settings → Integrations. |
 
 Board to buy for C/D: **LilyGO T3 LoRa32 V1.6.1** from the
 [official LilyGO store](https://lilygo.cc/products/lora3) — variant
@@ -98,7 +100,7 @@ cd zasder-weather-backend
 > wrong.
 
 `setup-fly.sh` asks **which sources you want first** (AmbientWeather / Davis
-/ LilyGO), then only prompts for what those paths need. It generates your
+/ Tempest / LilyGO), then only prompts for what those paths need. It generates your
 tokens, creates the app + volume + secrets, deploys, and at the end prints —
 **and saves to `zasder-install-summary.txt`** — the exact next steps for
 each path you chose (iOS token, LilyGO provision commands, verify curls).
@@ -266,6 +268,24 @@ curl -X POST "http://zasder-lilygo-1234.local/provision" \
 Search your exact station in the
 [planner's device finder](https://zasder.com/weather-helper) to see which
 band/board it needs.
+
+## Path F — WeatherFlow Tempest cloud poller
+
+Add to `.env` (or as Fly secrets):
+
+```sh
+TEMPEST_TOKEN=<personal access token from https://tempestwx.com/settings/tokens>
+TEMPEST_STATION_ID=<the number in your station's URL on that site>
+```
+
+Restart. The backend polls every 60s (`TEMPEST_POLL_INTERVAL_SECONDS` to
+change), converts the metric REST payload to API-native units, and captures
+lightning (strike counts + nearest-strike distance) alongside the usual
+readings. `TEMPEST_NAME` overrides the station's display name.
+
+No terminal? The app can configure this instead: **Settings →
+Integrations → WeatherFlow Tempest** — app-stored values win over these
+env values.
 
 ## Path E — Davis WeatherLink LIVE (LAN, local poller)
 
@@ -460,6 +480,29 @@ published to `<MQTT_TOPIC_PREFIX>/<node>/state` every ~30 seconds. Tune with
 The backend checks GitHub once a day and shows an **"update available"** banner
 on the status page (and at `GET /api/version`) when a newer release exists.
 Disable with `UPDATE_CHECK=0`. See [CHANGELOG.md](CHANGELOG.md) for what changed.
+
+### Automatic updates (Fly.io, optional)
+
+If you said yes during setup, your instance updates **itself**: about two days
+after an official release ships, it verifies the release image exists, swaps
+its own machine onto it, and restarts (sub-minute; your `/data` volume and
+settings are untouched). The delay exists so a bad release can be pulled
+before any auto-updater picks it up; the updater also never crosses a major
+version (those may carry manual steps) and never downgrades.
+
+Enable it later on an existing instance:
+
+```sh
+# Piped: the token (FlyV1 fm2_…, the interior space is part of it) never
+# touches your shell history or the process list.
+fly tokens create deploy --app <your-app> |     # app-scoped, deploy-only
+  fly secrets set FLY_API_TOKEN=- AUTO_UPDATE=1 --app <your-app>
+```
+
+Turn it off any time with `fly secrets set AUTO_UPDATE=0 --app <your-app>` —
+and if you want the deploy *capability* gone too, not just unused, remove the
+token: `fly secrets unset FLY_API_TOKEN --app <your-app>`.
+The full knob list (delay hours, image repository) is in `.env.example`.
 
 To upgrade, from the repo directory:
 

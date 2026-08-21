@@ -129,6 +129,8 @@ if [ -n "$APP" ]; then
     || note "AmbientWeather poller not configured (fine if you don't use it)"
   [ -n "$(ssh_env WEATHERLINK_API_KEY)" ] && ok "Davis WeatherLink poller configured" \
     || note "Davis WeatherLink poller not configured (fine if you don't use it)"
+  [ -n "$(ssh_env TEMPEST_TOKEN)" ] && ok "WeatherFlow Tempest poller configured" \
+    || note "WeatherFlow Tempest poller not configured (fine if you don't use it)"
 fi
 
 # ── 9. Recent data (device count + freshest obs age) ─────────────────

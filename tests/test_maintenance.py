@@ -246,3 +246,100 @@ def test_repair_yearly_offsets_requires_post_cutoff_rows(db_mod, temp_env):
     assert res["macs"][mac]["skipped"] == "no post-cutoff raw rows"
     v, _ = _col(temp_env, mac, 2_000, "yearlyrainin")
     assert v == 2.0
+
+
+# ────────────────── anemometer orphans + wind consistency ──────────────────
+
+def test_clean_implausible_condemns_in_band_anemometer_orphan(db_mod, temp_env):
+    """Regression for Doren's 55 mph Peak Wind (2026-08-16).
+
+    Live ingest condemns the whole anemometer set when the bands reject any
+    one of its channels. This retro path did not, so sweeping a 255 mph gust
+    left the sustained value from the SAME dropout sitting on the row — and at
+    51-55 mph it is comfortably in-band, so re-running the bands forever would
+    never have found it. One of those survivors then owned the all-time Peak
+    Wind record, above a Peak Gust of 51, which is physically impossible.
+    """
+    from app import maintenance
+    db = db_mod
+    mac = "DD:DD:DD:DD:DD:09"
+    asyncio.run(db.insert_observations(mac, [
+        # The dropout: 0xFF gust, and a sustained value that survives the
+        # bands on its own but is the same faulting sensor.
+        {"dateutc": 1_000, "windgustmph": 255.0, "windspeedmph": 55.2,
+         "winddir": 336.0, "tempf": 48.0, "dailyrainin": 0.22},
+        # A real windy reading — the sweep must not reach it.
+        {"dateutc": 2_000, "windgustmph": 51.0, "windspeedmph": 15.0,
+         "tempf": 50.0}]))
+
+    res = maintenance.clean_implausible(apply=True, db_path=temp_env)
+    assert res["applied"] is True
+    assert res["anemometer_orphans"] == 1, "in-band sibling left behind"
+
+    # Both channels gone from column AND data_json.
+    for col in ("windgustmph", "windspeedmph"):
+        v, blob = _col(temp_env, mac, 1_000, col)
+        assert v is None and col not in blob, col
+    # The vane is a separate sensor, and the rest of the reading is real.
+    v, _ = _col(temp_env, mac, 1_000, "winddir")
+    assert v == 336.0
+    v, _ = _col(temp_env, mac, 1_000, "tempf")
+    assert v == 48.0
+    v, _ = _col(temp_env, mac, 1_000, "dailyrainin")
+    assert v == 0.22
+    # The genuine reading is untouched.
+    v, _ = _col(temp_env, mac, 2_000, "windgustmph")
+    assert v == 51.0
+    v, _ = _col(temp_env, mac, 2_000, "windspeedmph")
+    assert v == 15.0
+
+
+def test_clean_wind_inconsistent_dry_run_then_apply(db_mod, temp_env):
+    """Retro version of the sustained-vs-gust check: same rule and the same
+    thresholds as ingest, with a dry run and a streamed backup first."""
+    from app import maintenance
+    db = db_mod
+    mac = "DD:DD:DD:DD:DD:0A"
+    asyncio.run(db.insert_observations(mac, [
+        # Contradiction: 1.84x the gust and 21 mph above it.
+        {"dateutc": 1_000, "windspeedmph": 46.0, "windgustmph": 25.0,
+         "maxdailygust": 30.0, "winddir": 90.0, "tempf": 40.0},
+        # Ordinary reading — sustained under gust.
+        {"dateutc": 2_000, "windspeedmph": 12.0, "windgustmph": 22.0},
+        # Window slack: over the gust, but only just.
+        {"dateutc": 3_000, "windspeedmph": 12.0, "windgustmph": 11.0}]))
+
+    dry = maintenance.clean_wind_inconsistent(apply=False, db_path=temp_env)
+    assert dry["applied"] is False and dry["bad_rows"] == 1
+    v, _ = _col(temp_env, mac, 1_000, "windspeedmph")
+    assert v == 46.0, "dry run must not mutate"
+
+    res = maintenance.clean_wind_inconsistent(apply=True, db_path=temp_env)
+    assert res["applied"] is True and res["rows_touched"] == 1
+    # All three speed channels cleared on the contradicting reading only.
+    for col in ("windspeedmph", "windgustmph", "maxdailygust"):
+        v, blob = _col(temp_env, mac, 1_000, col)
+        assert v is None and col not in blob, col
+    v, _ = _col(temp_env, mac, 1_000, "winddir")
+    assert v == 90.0
+    v, _ = _col(temp_env, mac, 1_000, "tempf")
+    assert v == 40.0
+    for ts in (2_000, 3_000):
+        v, _ = _col(temp_env, mac, ts, "windspeedmph")
+        assert v == 12.0, ts
+
+    with open(res["backup"]) as f:
+        lines = [json.loads(line) for line in f]
+    assert {(l["field"], l["value"]) for l in lines} == {
+        ("windspeedmph", 46.0), ("windgustmph", 25.0), ("maxdailygust", 30.0)}
+
+
+def test_clean_wind_inconsistent_noop_on_clean_history(db_mod, temp_env):
+    from app import maintenance
+    db = db_mod
+    mac = "DD:DD:DD:DD:DD:0B"
+    asyncio.run(db.insert_observations(mac, [
+        {"dateutc": 1_000, "windspeedmph": 10.0, "windgustmph": 18.0}]))
+    res = maintenance.clean_wind_inconsistent(apply=True, db_path=temp_env)
+    assert res["bad_rows"] == 0 and res["cleaned"] == 0
+    assert res["backup"] is None

@@ -97,6 +97,15 @@ class Settings(BaseSettings):
     #     rotation of `api_token` still requires a brief client update.)
     # Writes always require the primary `api_token` (see `write_tokens`).
     reviewer_api_token: str | None = None
+    # Read-only tokens for people you share your station with — family, a
+    # neighbour, a school. Comma-separated, so each can be revoked on its own
+    # without rotating your own token and re-pairing every device you own.
+    #
+    # Deliberately NOT accepted on writes (see `write_tokens`): someone you
+    # invited to LOOK at your weather must not be able to delete a station,
+    # rewrite alert rules or wipe history. This reuses the split the reviewer
+    # token already established.
+    guest_api_tokens: str | None = None
     # Bearer token for /ingest/custom — write-only, used by sources that POST
     # observations (relay containers, custom SDR, etc.). Distinct from
     # api_token (read) so revoking write doesn't lock the iOS app out.
@@ -128,6 +137,32 @@ class Settings(BaseSettings):
     # actual cumulative rainfall was already higher. Other receivers
     # (AWN, Atlas) have the right total; we baseline Davis here.
     weatherlink_yearly_rain_baseline_in: float = 0.0
+
+    # WeatherFlow Tempest cloud poller. Token + station id must BOTH be set;
+    # either unset and the poller stays asleep (same shape as
+    # weatherlink_configured). The token is a Personal Access Token, free for
+    # station owners from the Tempest web app under Data Authorizations, and
+    # it rides as a query param — see TempestError for why that matters.
+    # --- New-device probation (see app/device_probation.py) -------------
+    # A MAC that is a near neighbour of an existing device must be seen this
+    # many times, spaced apart, before it earns a device row. Guards against
+    # a bit-flipped station ID minting a phantom device that then emails a
+    # device-down alert about a station that never existed. 0 disables.
+    device_confirm_suspect_hits: int = 5
+    device_confirm_min_gap_seconds: float = 45.0
+    # Bit distance (within the last 3 octets, same first 3) at or below which
+    # an unknown MAC is treated as a probable corruption of a known one.
+    device_confirm_max_bits: int = 2
+    # A device on probation that stops being seen for this long is forgotten,
+    # so a one-off corrupt packet does not leave a row behind for good.
+    device_confirm_ttl_hours: float = 168.0
+
+    tempest_token: str | None = None
+    tempest_station_id: int | None = None
+    tempest_poll_interval_seconds: int = 60
+    # Friendly name for the synthetic device row; falls back to the Tempest
+    # station's own name when unset.
+    tempest_name: str | None = None
 
     # INERT since v1.3.2 — the offset calibration was removed after it
     # corrupted rain history in production (ingest.py stores counters
@@ -280,6 +315,11 @@ class Settings(BaseSettings):
     # "Get the app" link shown in place of the screenshots. Defaults to the
     # published iOS app; point it at your own listing if you ship your own.
     public_dashboard_app_url: str = "https://apps.apple.com/us/app/zasder-weather/id6774523656"
+    # A rough, OPERATOR-TYPED place label shown beside the station name on
+    # the public page ("Chandler, AZ"). Typed on purpose — the page refuses
+    # to derive location from stored coordinates, so what appears is exactly
+    # what the operator chose to reveal, at whatever coarseness they chose.
+    public_dashboard_location: str | None = None
 
     # ── Staleness alerting (email) ───────────────────────────────────────
     # Email an operator when a device that was reporting goes quiet for
@@ -318,6 +358,18 @@ class Settings(BaseSettings):
     smart_alert_heat_f: float = 105.0          # feelsLike at/above → heat danger
     smart_alert_pressure_drop_inhg: float = 0.06  # baromrelin fall over 3h → storm
 
+    # Storm summary — one notification AFTER the rain stops, reporting the
+    # whole event (Doren's request, 2026-08-17). On by default because it is
+    # strictly less noisy than the per-threshold rain alerts people already
+    # build by hand, and it only ever fires once per storm.
+    storm_summary: bool = True
+    # Quiet time after the last rain before the storm is considered over.
+    storm_summary_quiet_minutes: float = 30.0
+    # Below this the event is a drizzle, not a storm. Without a floor a single
+    # bucket tip sends a "storm summary" of 0.01in and trains people to ignore
+    # the notification that matters.
+    storm_summary_min_total_in: float = 0.05
+
     # ── Integrations (opt-in) ────────────────────────────────────────────
     # Prometheus /metrics endpoint (open when enabled — same data class as the
     # public dashboard; point Grafana/Prometheus at it for dashboards + alerts).
@@ -355,6 +407,27 @@ class Settings(BaseSettings):
         "your-token-here",
     )
 
+    @field_validator("guest_api_tokens", mode="after")
+    @classmethod
+    def _validate_guest_tokens(cls, v):
+        """Each guest token is accepted on /api/* exactly like the primary
+        one, so a short one is a guessable backdoor into someone's history —
+        the same reasoning the reviewer token's length floor documents."""
+        if v is None:
+            return v
+        parts = [t.strip() for t in v.split(",") if t.strip()]
+        for t in parts:
+            low = t.lower()
+            if low in cls._PLACEHOLDER_TOKENS or "replace-with" in low:
+                raise ValueError(
+                    f"guest_api_tokens contains a known placeholder ({t!r}). "
+                    f"Generate one with `openssl rand -hex 32`.")
+            if len(t) < 32 and not (t.startswith("test-") and _under_pytest()):
+                raise ValueError(
+                    f"each guest token must be at least 32 characters "
+                    f"(got {len(t)}). Generate with `openssl rand -hex 32`.")
+        return ",".join(parts) if parts else None
+
     @field_validator("api_token", "ingest_token", "reviewer_api_token", mode="after")
     @classmethod
     def _reject_placeholder_tokens(cls, v, info):
@@ -388,6 +461,29 @@ class Settings(BaseSettings):
                 f"{info.field_name} must be at least 32 characters "
                 f"(got {len(s)}). Generate with `openssl rand -hex 32`.")
         return s
+
+    @model_validator(mode="after")
+    def _guest_tokens_are_not_privileged(self):
+        """A guest token must not reuse a privileged one.
+
+        `valid_api_tokens` is a UNION and `write_tokens` is a separate set, so
+        setting GUEST_API_TOKENS to the primary token produced a "read-only"
+        share that was fully write-capable — verified before this guard
+        existed. Reusing the ingest token is the same shape: it would let a
+        guest POST observations.
+
+        Model-level rather than a field validator because `guest_api_tokens`
+        is declared before `ingest_token`, so `info.data` cannot see it.
+        """
+        privileged = {t.strip() for t in (self.api_token, self.ingest_token,
+                                          self.reviewer_api_token) if t}
+        clash = privileged & self.guest_tokens
+        if clash:
+            raise ValueError(
+                "a guest token must not reuse api_token, ingest_token or "
+                "reviewer_api_token — it would be write-capable. Generate a "
+                "separate one with `openssl rand -hex 32`.")
+        return self
 
     @model_validator(mode="after")
     def _reject_identical_tokens(self):
@@ -429,6 +525,10 @@ class Settings(BaseSettings):
                     and self.weatherlink_station_id)
 
     @property
+    def tempest_configured(self) -> bool:
+        return bool(self.tempest_token and self.tempest_station_id)
+
+    @property
     def alert_recipients(self) -> list[str]:
         return [e.strip() for e in (self.alert_email_to or "").split(",") if e.strip()]
 
@@ -451,7 +551,19 @@ class Settings(BaseSettings):
         """Tokens accepted on READ endpoints (GET). Includes the optional
         reviewer/demo token so App Store reviewers can exercise the read
         surface without seeing the write-capable primary token."""
-        return {t for t in [self.api_token, self.reviewer_api_token] if t}
+        return ({t for t in [self.api_token, self.reviewer_api_token] if t}
+                | self.guest_tokens)
+
+    @property
+    def guest_tokens(self) -> set[str]:
+        """Read-only share tokens, parsed from the comma-separated setting.
+
+        Per-segment trim for the same reason hiddenMacs does it: these get
+        hand-edited into a Fly secret, and "a, b" silently failing to match
+        the second one is a support email nobody can diagnose.
+        """
+        raw = self.guest_api_tokens or ""
+        return {t.strip() for t in raw.split(",") if t.strip()}
 
     @property
     def write_tokens(self) -> set[str]:

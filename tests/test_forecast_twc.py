@@ -228,3 +228,48 @@ def test_transform_accepts_float_icon_codes():
                       "iconCode": [33.0, 33.0, 38.0, 38.0]}]
     out = forecast_twc.transform(fx)
     assert out["daily"]["weather_code"] == [1, 95]
+
+
+# ────────────────────────── written forecast (1.6) ──────────────────────────
+
+def test_transform_carries_the_written_forecast():
+    """Doren's request, 2026-08-16. The narrative and its heading already ride
+    in the payload we fetch for the strip, so the card costs no extra call.
+
+    TWC advances `daypartName` itself, which is why the app needs no sunset
+    arithmetic to know whether it is showing Today or Tonight."""
+    from app import forecast_twc
+    fixture = dict(TWC_FIXTURE)
+    fixture["daypart"] = [dict(TWC_FIXTURE["daypart"][0],
+                               daypartName=[None, "Tonight", "Tomorrow",
+                                            "Tomorrow night"],
+                               narrative=[None,
+                                          "Mainly clear skies. Low near 85F.",
+                                          "A mix of clouds and sun. Hot.",
+                                          "Partly cloudy. Low 84F."])]
+    out = forecast_twc.transform(fixture)
+    # The expired day-0 daytime half is dropped, not padded — so index 0 is
+    # always "the half we are in now".
+    assert out["narrative"] == [
+        {"name": "Tonight", "text": "Mainly clear skies. Low near 85F."},
+        {"name": "Tomorrow", "text": "A mix of clouds and sun. Hot."},
+        {"name": "Tomorrow night", "text": "Partly cloudy. Low 84F."},
+    ]
+
+
+def test_transform_without_narrative_is_empty_not_missing():
+    """A payload with no prose must still decode — the key is always present
+    so the client reads one shape from both forecast sources."""
+    from app import forecast_twc
+    out = forecast_twc.transform(TWC_FIXTURE)
+    assert out["narrative"] == []
+
+
+def test_transform_skips_blank_narrative_entries():
+    from app import forecast_twc
+    fixture = dict(TWC_FIXTURE)
+    fixture["daypart"] = [dict(TWC_FIXTURE["daypart"][0],
+                               daypartName=["Today", "Tonight", None, "X"],
+                               narrative=["   ", "Clear.", "orphaned", None])]
+    out = forecast_twc.transform(fixture)
+    assert out["narrative"] == [{"name": "Tonight", "text": "Clear."}]

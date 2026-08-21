@@ -274,3 +274,172 @@ def test_daily_rain_out_of_order_across_midnight_not_glitch(client):
     assert _post(client, _ts(10.0), rain={"daily_in": 2.3}).status_code == 200
     rains = [r.get("dailyrainin") for r in _rows(client)]
     assert rains[-2:] == [2.3, 0.02], rains
+
+
+# ─────────────────── internal consistency: sustained vs gust ───────────────────
+
+def test_sustained_above_gust_condemns_the_anemometer():
+    """Doren, 2026-08-16: "it's impossible to have a steady wind be more
+    powerful than a gust, right?" — right, and his Records proved the app
+    could show it anyway (Peak Wind 55 over Peak Gust 51).
+
+    The gust is the peak inside the window the sustained average is taken
+    over, so sustained > gust means the sensor contradicted itself and the
+    whole speed set goes. The bands cannot catch this: both numbers here are
+    perfectly ordinary Pennsylvania weather taken one at a time.
+    """
+    flat = {"windspeedmph": 55.2, "windgustmph": 40.0, "maxdailygust": 44.0,
+            "winddir": 336.0, "tempf": 48.0}
+    dropped = ingest._apply_plausibility_bands(flat)
+    assert flat["windspeedmph"] is None
+    assert flat["windgustmph"] is None
+    assert flat["maxdailygust"] is None
+    # The vane is a separate channel and the rest of the reading is real.
+    assert flat["winddir"] == 336.0
+    assert flat["tempf"] == 48.0
+    assert sorted(d.split("=")[0] for d in dropped) == [
+        "maxdailygust", "windgustmph", "windspeedmph"]
+    assert all("wind-inconsistent" in d for d in dropped)
+
+
+def test_gust_reporting_window_slack_survives():
+    """Live stations report sustained and gust over DIFFERENT windows, so a
+    small overshoot is normal and must not cost the reading its wind. Sized
+    against Doren's archive, where 863 of 1.09 M readings sit above their gust
+    and every one of them is a harmless artifact of WU's 5-minute buckets."""
+    for speed, gust in ((12.0, 11.0),      # 1 mph over: rounding
+                        (7.0, 6.0),        # ratio trips, absolute gap does not
+                        (25.0, 22.0),      # 3 mph over at a real windy moment
+                        (0.0, 0.0)):       # calm
+        flat = {"windspeedmph": speed, "windgustmph": gust}
+        ingest._apply_plausibility_bands(flat)
+        assert flat["windspeedmph"] == speed, (speed, gust)
+        assert flat["windgustmph"] == gust, (speed, gust)
+
+
+def test_wind_consistency_needs_both_thresholds():
+    """Either threshold alone is a false-positive machine. A big ratio at low
+    wind (2.0 → 6.0) is noise; a big absolute gap at a proportionate ratio
+    (40 → 46) is an ordinary squall. Only both together condemn."""
+    ratio_only = {"windspeedmph": 6.0, "windgustmph": 2.0}   # 3x, but +4 mph
+    ingest._apply_plausibility_bands(ratio_only)
+    assert ratio_only["windspeedmph"] == 6.0
+
+    gap_only = {"windspeedmph": 46.0, "windgustmph": 40.0}   # +6 mph, 1.15x
+    ingest._apply_plausibility_bands(gap_only)
+    assert gap_only["windspeedmph"] == 46.0
+
+    both = {"windspeedmph": 46.0, "windgustmph": 30.0}       # 1.53x and +16
+    ingest._apply_plausibility_bands(both)
+    assert both["windspeedmph"] is None and both["windgustmph"] is None
+
+
+def test_wind_consistency_ignores_missing_and_nonfinite():
+    """A reading with no gust is normal (WU often omits it) and must not be
+    condemned — only a gust that is PRESENT and contradicted counts."""
+    orphan = {"windspeedmph": 20.0, "windgustmph": None}
+    ingest._apply_plausibility_bands(orphan)
+    assert orphan["windspeedmph"] == 20.0
+
+    nan = {"windspeedmph": float("nan"), "windgustmph": 4.0}
+    ingest._apply_plausibility_bands(nan)
+    assert nan["windgustmph"] == 4.0
+
+
+# ─────────────── level-shift confirmation vs colliding neighbors ───────────────
+# Regression family for 2026-08-19 (Crestview): the guard runs on every ~16s
+# relay POST while storage is throttled to 60s, and the relay serves rain from
+# a per-field cache — so a colliding neighbor that monopolized the cache for
+# ~2 minutes primed a pending rejection on a throttled post and "confirmed" it
+# 90s later, storing the neighbor's 20.27 yearly counter on a station at
+# 17.16. Twice in one day.
+
+
+def test_rain_collision_monopoly_under_5min_cannot_confirm(client):
+    """A repeat sighting 2 minutes after the rejection — enough under the old
+    90s gap to self-confirm — must stay nulled: a collision episode has to
+    hold the cache for a full 5 minutes before it can rebaseline anything."""
+    ingest._rain_reject.clear()
+    ingest._rain_tombstone.clear()
+    assert _post(client, _ts(10), rain={"daily_in": 0.02}).status_code == 200
+    assert _post(client, _ts(8), rain={"daily_in": 3.20}).status_code == 200
+    assert _post(client, _ts(6), rain={"daily_in": 3.20}).status_code == 200
+    dailies = [r.get("dailyrainin") for r in _rows(client)]
+    assert dailies[-3:] == [0.02, None, None], dailies
+
+
+def test_rain_real_level_shift_confirms_after_the_full_gap(client):
+    """The rebaseline path must survive the longer gap: a persistent new
+    level (counter swap, offset removal) still confirms once it has held for
+    5 minutes — the anti-lockout contract the pending map exists for."""
+    ingest._rain_reject.clear()
+    ingest._rain_tombstone.clear()
+    assert _post(client, _ts(20), rain={"daily_in": 0.00}).status_code == 200
+    assert _post(client, _ts(10), rain={"daily_in": 2.00}).status_code == 200
+    # 6 minutes after the rejection, still at the new level: accepted.
+    assert _post(client, _ts(4), rain={"daily_in": 2.02}).status_code == 200
+    dailies = [r.get("dailyrainin") for r in _rows(client)]
+    assert dailies[-3:] == [0.00, None, 2.02], dailies
+
+
+def test_fallen_back_level_is_tombstoned_and_never_confirms(client):
+    """Once a pending level FALLS BACK to the old baseline it has proven
+    itself a glitch — a real level shift never reverts — so the same value
+    must not confirm a later episode however long that episode lasts. This
+    is the recurring-neighbor killer: their counter barely moves, so every
+    episode replays the same number."""
+    ingest._rain_reject.clear()
+    ingest._rain_tombstone.clear()
+    assert _post(client, _ts(60), rain={"daily_in": 0.02}).status_code == 200
+    assert _post(client, _ts(50), rain={"daily_in": 3.20}).status_code == 200
+    # Back at the station's own level: the 3.20 candidate fell back.
+    assert _post(client, _ts(40), rain={"daily_in": 0.02}).status_code == 200
+    # Second episode, same neighbor value, corroborated 20 minutes apart —
+    # far past the confirmation gap. Without the tombstone this rebaselines.
+    assert _post(client, _ts(30), rain={"daily_in": 3.20}).status_code == 200
+    assert _post(client, _ts(10), rain={"daily_in": 3.20}).status_code == 200
+    dailies = [r.get("dailyrainin") for r in _rows(client)]
+    assert dailies[-5:] == [0.02, None, 0.02, None, None], dailies
+
+
+def test_lightning_bands_null_garbage_keep_real_storm():
+    """Decode garbage in the lightning fields must be nulled before it lands
+    in records — but a violent real storm (the live 2026-08-19 cell peaked at
+    ~1,200 strikes/hr, nearest 0.6 mi) sails through untouched."""
+    garbage = {"lightningcount": -3, "lightning_last_1hr": 65535.0,
+               "lightning_distance_mi": 400.0}
+    dropped = ingest._apply_plausibility_bands(garbage)
+    assert garbage["lightningcount"] is None
+    assert garbage["lightning_last_1hr"] is None
+    assert garbage["lightning_distance_mi"] is None
+    assert sorted(d.split("=")[0] for d in dropped) == [
+        "lightning_distance_mi", "lightning_last_1hr", "lightningcount"]
+    real = {"lightningcount": 23, "lightning_last_1hr": 1208,
+            "lightning_distance_mi": 0.6}
+    assert ingest._apply_plausibility_bands(real) == []
+    assert real["lightning_last_1hr"] == 1208
+
+
+def test_tombstone_expires_even_while_the_level_keeps_posting(client, monkeypatch):
+    """Review 2026-08-20: refreshing the tombstone on every same-level
+    sighting made a FALSE tombstone immortal — one stale old-baseline
+    reading during a genuine level shift, and every real reading thereafter
+    sits at the tombstoned level, re-arming it forever (months of nulled
+    rain). The TTL must run from CREATION: after it lapses, the persistent
+    new level confirms normally."""
+    ingest._rain_reject.clear()
+    ingest._rain_tombstone.clear()
+    monkeypatch.setattr(ingest, "_RAIN_TOMBSTONE_TTL_MS", 600_000)  # 10 min
+    assert _post(client, _ts(40), rain={"daily_in": 0.02}).status_code == 200
+    assert _post(client, _ts(30), rain={"daily_in": 2.00}).status_code == 200  # pending
+    # One stale-cache reading at the old baseline: tombstones 2.00.
+    assert _post(client, _ts(28), rain={"daily_in": 0.02}).status_code == 200
+    # The REAL new level keeps posting.
+    assert _post(client, _ts(26), rain={"daily_in": 2.00}).status_code == 200
+    assert _post(client, _ts(20), rain={"daily_in": 2.00}).status_code == 200
+    # 12 minutes after the tombstone was created (> the 10-min TTL): the
+    # shadow has lapsed and the level confirms. With refresh-on-sighting the
+    # 20-minutes-ago post re-armed it and this stays nulled forever.
+    assert _post(client, _ts(16), rain={"daily_in": 2.00}).status_code == 200
+    dailies = [r.get("dailyrainin") for r in _rows(client)]
+    assert dailies[-1] == 2.00, dailies

@@ -452,12 +452,22 @@ def test_throttle_lock_registry_evicts_idle_macs():
 
 # ───────────────── rain glitch guard: level shifts rebaseline ─────────────────
 
+import datetime as _dt
+
+# ONE clock snapshot for every rain timestamp in this module, truncated to
+# the second. _rain_ts used to re-read now() per call, so the sub-second
+# phase could shift a truncated timestamp by one second between two calls —
+# which flipped the EXACT-boundary assertions in the slow-cadence test
+# (they pin < vs <= at precisely the confirmation gap) into a rare
+# whole-suite-only flake.
+_RAIN_NOW = _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0)
+
+
 def _rain_ts(hours_ago: float) -> str:
     """Timestamps must be in the PAST: the R2-56 sanity clamp pulls
     future-dated posts to server time, which collapsed fixed 2026 dates into
     one bucket and made these assertions read a single row."""
-    import datetime as _dt
-    t = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours_ago)
+    t = _RAIN_NOW - _dt.timedelta(hours=hours_ago)
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -571,19 +581,23 @@ def test_rain_slow_cadence_level_shift_still_confirms(client):
     """The burst gap must not break genuine shifts on a fast-posting sensor:
     repeats of the SAME rejected level keep the FIRST-seen timestamp, so the
     confirmation window is measured from the first sighting — otherwise a
-    sensor posting every 60s (< the 90s gap) could never rebaseline."""
+    sensor posting every 60s (< the confirmation gap) could never rebaseline.
+    Gap-derived offsets, not literals, so the boundary pin survives the gap
+    being recalibrated (90s → 300s after the 2026-08-19 collision)."""
     from app import ingest
     ingest._rain_reject.clear()
+    ingest._rain_tombstone.clear()
+    gap_s = ingest._RAIN_CONFIRM_MIN_GAP_MS / 1000
     assert _post_rain(client, 1.00, _rain_ts(30 / 60)).status_code == 200
-    base = 10 / 60  # hours ago; shift readings 60s apart from here
+    base = (gap_s + 120) / 3600  # hours ago; shift readings 60s apart from here
     assert _post_rain(client, 17.12, _rain_ts(base)).status_code == 200            # rejected
     assert _post_rain(client, 17.12, _rain_ts(base - 60 / 3600)).status_code == 200  # +60s: inside gap
     assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject
-    # Exact boundary (gap counts from the FIRST sighting): 89s still pending,
-    # 90,000 ms exactly confirms — pins < vs <= in the gap check.
-    assert _post_rain(client, 17.12, _rain_ts(base - 89 / 3600)).status_code == 200
+    # Exact boundary (gap counts from the FIRST sighting): gap-1s still
+    # pending, the gap exactly confirms — pins < vs <= in the gap check.
+    assert _post_rain(client, 17.12, _rain_ts(base - (gap_s - 1) / 3600)).status_code == 200
     assert "AA:BB:CC:DD:0A:10" in ingest._rain_reject
-    assert _post_rain(client, 17.12, _rain_ts(base - 90 / 3600)).status_code == 200
+    assert _post_rain(client, 17.12, _rain_ts(base - gap_s / 3600)).status_code == 200
     assert "AA:BB:CC:DD:0A:10" not in ingest._rain_reject, \
         "shift never confirmed — first-seen timestamp was not preserved"
     cur = client.get("/api/devices/AA:BB:CC:DD:0A:10/current", headers=H).json()

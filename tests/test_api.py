@@ -1173,7 +1173,10 @@ def test_public_dashboard_on_renders_charts(client, monkeypatch):
                           "wind": {"speed_mph": 3}, "rain": {}, "pressure": {"relative_inhg": 29.9},
                           "source": "test"})
     page = client.get("/").text
-    assert "app-cta" in page and "Get the iOS app" in page
+    # The App Store link rides beside the first station's temperature (the
+    # full-width banner is gone), exactly once however many stations render.
+    assert page.count('class="cc-app"') == 1 and "Get the iOS app" in page
+    assert "app-cta" not in page                  # the old banner markup
     assert 'class="hero-shots"' not in page       # screenshots markup replaced
     assert "Davis Vantage Pro 2" in page          # station shown
     assert "Temperature" in page and "<svg" in page  # charts rendered
@@ -2281,3 +2284,174 @@ def test_422_never_echoes_the_rejected_credential(client):
     details = r.json()["detail"]
     assert len(details) >= 2
     assert all("input" not in e for e in details)
+
+
+def test_current_fills_periods_for_a_daily_only_rain_source(client):
+    """Tempest shape end-to-end: the source posts hourly+daily rain and no
+    longer counters (WeatherFlow's REST has none), so /current must fill
+    week/month/year from the stored daily counters — before rain_rollups
+    tier 3, the enrichment gate required yearlyrainin and a Tempest
+    dashboard simply had no period totals. And a station with NO rain
+    sensor must stay absent everywhere — filling zeros is the
+    absent-is-not-zero bug in a new hat."""
+    import datetime as dt
+    ts = (dt.datetime.now(dt.timezone.utc)
+          .strftime("%Y-%m-%dT%H:%M:%SZ"))
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDD0777"},
+                          "timestamp_utc": ts, "source": "tempest",
+                          "outdoor": {"tempf": 88.0},
+                          "rain": {"hourly_in": 0.02, "daily_in": 0.123}})
+    assert r.status_code == 200
+    cur = client.get("/api/devices/AA:BB:CC:DD:07:77/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert cur["dailyrainin"] == 0.123     # the source's own value stands
+    assert cur["hourlyrainin"] == 0.02
+    assert cur["weeklyrainin"] == 0.123    # derived
+    assert cur["monthlyrainin"] == 0.123
+    assert cur["yearlyrainin"] == 0.123    # calendar YTD, from tier 3
+
+    # No rain sensor at all: nothing may appear.
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDD0778"},
+                          "timestamp_utc": ts, "source": "t",
+                          "outdoor": {"tempf": 70.0}})
+    assert r.status_code == 200
+    dry = client.get("/api/devices/AA:BB:CC:DD:07:78/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    for k in ("dailyrainin", "weeklyrainin", "monthlyrainin", "yearlyrainin"):
+        assert dry.get(k) is None, f"{k} fabricated for a rainless station"
+
+
+def test_public_dashboard_carries_the_summary_boards(client, monkeypatch):
+    """Volney, 2026-08-20: the public page replaces app screenshots, so it
+    carries the same summary boards as the app's main page — the 24h
+    high/low/gust strip and the rain-periods row. Cells exist only for
+    readings the station produced (a UV-less station gains no Max UV cell,
+    and a rainless station gets NO rain board — absent is not zero)."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    for mins, temp, daily in ((180, 88.0, 0.02), (120, 95.0, 0.10), (60, 91.0, 0.12)):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDD0E01", "name": "Boards"},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": temp, "humidity": 40 + mins / 60},
+                          "wind": {"speed_mph": 3, "gust_mph": 21},
+                          "rain": {"daily_in": daily},
+                          "pressure": {"relative_inhg": 29.9},
+                          "source": "test"})
+    page = client.get("/").text
+    assert "24h High" in page and "95°" in page
+    assert "24h Low" in page and "88°" in page
+    assert "Max Gust" in page and "21 mph" in page
+    assert "Max UV" not in page, "UV cell fabricated for a UV-less station"
+    # Rain board: today's counter, and the week derived from it (tier 3).
+    assert 'Rain <span class="chart-unit">· by period</span>' in page
+    assert "0.12 in" in page
+
+
+def test_public_dashboard_rainless_station_has_no_rain_board(client, monkeypatch):
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    ts = (_dt.datetime.now(_dt.timezone.utc)
+          - _dt.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDD0E02", "name": "Dry"},
+                      "timestamp_utc": ts,
+                      "outdoor": {"tempf": 70.0}, "source": "test"})
+    page = client.get("/").text
+    assert 'Rain <span class="chart-unit">· by period</span>' not in page
+
+
+def test_public_dashboard_place_label_is_typed_not_derived(client, monkeypatch):
+    """PUBLIC_DASHBOARD_LOCATION shows an operator-TYPED place label beside
+    the station name. Unset, nothing renders — the page must never derive a
+    label from stored coordinates."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    ts = (_dt.datetime.now(_dt.timezone.utc)
+          - _dt.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDD0E03", "name": "Yard",
+                                 "info": {"coords": {"location": "Secret House",
+                                                     "coords": {"lat": 33.3,
+                                                                "lon": -111.9}}}},
+                      "timestamp_utc": ts, "outdoor": {"tempf": 70.0},
+                      "source": "test"})
+    page = client.get("/").text
+    assert 'class="cc-loc"' not in page, "a place label appeared with none configured"
+    assert "Secret House" not in page
+
+    monkeypatch.setattr(settings, "public_dashboard_location", "Chandler, AZ")
+    from app import main as _m
+    _m._PUBLIC_DASH_CACHE = None            # bust the page cache
+    page = client.get("/").text
+    assert "Chandler, AZ" in page and 'class="cc-loc"' in page
+    assert "Secret House" not in page
+
+
+def test_public_dashboard_summary_uses_bucket_extremes(client, monkeypatch):
+    """CODE_REVIEW_R5 R5-08: the dashboard's 24h window is ALWAYS bucketed
+    (1-minute AVG rows past 6h — db._auto_bucket_ms), and summary_stats
+    took max() of the averaged columns, understating every extreme the
+    board exists to show. Two readings in the SAME minute bucket: the board
+    must carry the true gust/high/low/humidity-low from the per-bucket
+    extreme columns, not the bucket average."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    base = (_dt.datetime.now(_dt.timezone.utc)
+            - _dt.timedelta(minutes=30)).replace(second=5, microsecond=0)
+    for secs, temp, gust, hum in ((0, 88.0, 3.0, 63.0), (10, 95.0, 21.0, 37.0)):
+        ts = (base + _dt.timedelta(seconds=secs)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = client.post("/ingest/custom",
+                        headers={"Authorization": "Bearer test-ingest-token"},
+                        json={"device": {"id": "AABBCCDD0E02", "name": "Peaks"},
+                              "timestamp_utc": ts,
+                              "outdoor": {"tempf": temp, "humidity": hum},
+                              "wind": {"speed_mph": 2, "gust_mph": gust},
+                              "source": "test"})
+        assert r.status_code == 200
+    page = client.get("/").text
+    assert "21 mph" in page, "bucket AVG flattened the max gust"
+    assert "95°" in page, "bucket AVG flattened the 24h high"
+    assert "88°" in page, "bucket AVG flattened the 24h low"
+    assert "37%" in page, "bucket AVG flattened the humidity low"
+
+
+def test_public_dashboard_escapes_hostile_names_when_on(client, monkeypatch):
+    """CODE_REVIEW_R5 R5-49: the existing escaping test ran with the
+    dashboard OFF (minimal landing page). With it ON, a hostile station
+    name and a quote-bearing operator location must render escaped on the
+    anonymous page."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    monkeypatch.setattr(settings, "public_dashboard_location",
+                        'Chandler" onmouseover="alert(1)')
+    ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=5)
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDD0E03",
+                                     "name": '<script>alert("xss")</script>'},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": 90.0},
+                          "source": "test"})
+    assert r.status_code == 200
+    page = client.get("/").text
+    assert "<script>alert(" not in page, "hostile station name unescaped"
+    assert 'onmouseover="alert' not in page, "operator location unescaped"
+    # Positive control: the name reached the page (escaped), so the two
+    # asserts above aren't passing vacuously because it was dropped.
+    assert "&lt;script&gt;" in page

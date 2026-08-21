@@ -172,7 +172,7 @@ def svg_wind_rose(samples: list[tuple[float, float]], size: int = 200) -> str:
     # faint grid rings
     for frac in (0.5, 1.0):
         parts.append(f'<circle cx="{cx}" cy="{cy}" r="{round(R*frac,1)}" '
-                     f'fill="none" stroke="rgba(255,255,255,0.10)" stroke-width="1"/>')
+                     f'fill="none" style="stroke:var(--grid)" stroke-width="1"/>')
     # petals
     half = sec * 0.42   # leave a small gap between sectors
     for i in range(_ROSE_SECTORS):
@@ -198,7 +198,7 @@ def svg_wind_rose(samples: list[tuple[float, float]], size: int = 200) -> str:
                 x4, y4 = pt(r0, a1)
                 d = (f"M{x1},{y1} L{x2},{y2} A{round(r1,1)},{round(r1,1)} 0 0 1 {x3},{y3} "
                      f"L{x4},{y4} A{round(r0,1)},{round(r0,1)} 0 0 0 {x1},{y1} Z")
-            parts.append(f'<path d="{d}" fill="{_ROSE_SPEED_COLORS[bi]}" '
+            parts.append(f'<path d="{d}" class="rose-b{bi}" '
                          f'fill-opacity="0.9"/>')
     # cardinal labels
     for k, lbl in enumerate(_COMPASS):
@@ -209,7 +209,7 @@ def svg_wind_rose(samples: list[tuple[float, float]], size: int = 200) -> str:
 
     legend = ['<div class="rose-legend">']
     for bi, lbl in enumerate(_ROSE_SPEED_LABELS):
-        legend.append(f'<span class="rs"><i style="background:{_ROSE_SPEED_COLORS[bi]}"></i>{lbl}</span>')
+        legend.append(f'<span class="rs"><i class="rose-b{bi}"></i>{lbl}</span>')
     legend.append('<span class="rs-unit">mph</span></div>')
     return "".join(parts) + "".join(legend)
 
@@ -502,6 +502,40 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
     )
 
 
+# Shared theme tokens for every page that renders the dashboard fragment
+# (the "/" status page and /embed). Dark is the default; light applies via
+# the visitor's system preference, and /embed can FORCE either with
+# ?theme= (data-theme on <html> wins over the media query). Light values
+# are tuned for contrast, not naively inverted — the light-mode lesson
+# from the app applies to the web too.
+_TOKENS_DARK = (
+    "--page-bg:#0d0f12; --page-fg:#fff; "
+    "--ink-70:rgba(255,255,255,0.7); --ink-55:rgba(255,255,255,0.55); "
+    "--ink-50:rgba(255,255,255,0.5); --ink-40:rgba(255,255,255,0.4); "
+    "--ink-38:rgba(255,255,255,0.38); --ink-35:rgba(255,255,255,0.35); "
+    "--card-bg:rgba(255,255,255,0.03); --card-edge:rgba(255,255,255,0.06); "
+    "--grid:rgba(255,255,255,0.10); "
+    "--rose-0:#cdeef2; --rose-1:#7fdce4;"
+)
+_TOKENS_LIGHT = (
+    "--page-bg:#f2f4f7; --page-fg:#14171c; "
+    "--ink-70:rgba(15,20,28,0.78); --ink-55:rgba(15,20,28,0.66); "
+    "--ink-50:rgba(15,20,28,0.62); --ink-40:rgba(15,20,28,0.55); "
+    "--ink-38:rgba(15,20,28,0.53); --ink-35:rgba(15,20,28,0.5); "
+    "--card-bg:#ffffff; --card-edge:rgba(15,20,28,0.12); "
+    "--grid:rgba(15,20,28,0.12); "
+    "--rose-0:#8fcdd8; --rose-1:#57b9c6;"
+)
+THEME_CSS = f"""
+    :root {{ color-scheme: dark; {_TOKENS_DARK} }}
+    @media (prefers-color-scheme: light) {{
+      :root:not([data-theme="dark"]) {{ color-scheme: light; {_TOKENS_LIGHT} }}
+    }}
+    :root[data-theme="light"] {{ color-scheme: light; {_TOKENS_LIGHT} }}
+    body {{ background: var(--page-bg); color: var(--page-fg); }}
+"""
+
+
 # CSS injected into the status page's <style> when the dashboard is on. This is
 # a plain string inserted into the page f-string via a {placeholder}, so its
 # value is copied verbatim — use single (normal CSS) braces here.
@@ -512,46 +546,52 @@ DASHBOARD_CSS = """
     .cc-main { min-width:0; }
     .cc-side { flex-shrink:0; padding-top:22px; }
     .cc-app { display:inline-flex; align-items:center; gap:6px; font-size:12px;
-        font-weight:600; color:#0b0d13; background:#fff; border-radius:9px;
+        font-weight:600; color:#0b0d13; background:#fff; border:1px solid var(--card-edge); border-radius:9px;
         padding:8px 14px; text-decoration:none; white-space:nowrap; }
     .cc-name { font-size:11px; font-weight:800; letter-spacing:1.2px;
-        text-transform:uppercase; color:rgba(255,255,255,0.5); }
+        text-transform:uppercase; color:var(--ink-50); }
     .cc-loc { font-weight:600; letter-spacing:0.4px; text-transform:none;
-        color:rgba(255,255,255,0.38); }
+        color:var(--ink-38); }
     .cc-temp { font-size:56px; font-weight:200; line-height:1; margin-top:2px; }
-    .cc-feels { font-size:13px; color:rgba(255,255,255,0.55); margin-top:2px; }
+    .cc-feels { font-size:13px; color:var(--ink-55); margin-top:2px; }
     .cc-chips { display:flex; flex-wrap:wrap; gap:16px; margin-top:10px; }
     .cc-k { font-size:9px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase;
-        color:rgba(255,255,255,0.4); display:block; }
+        color:var(--ink-40); display:block; }
     .cc-v { font-size:15px; font-weight:600; }
     .charts { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; }
-    .chart { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06);
+    .chart { background:var(--card-bg); border:1px solid var(--card-edge);
         border-radius:12px; padding:12px 14px; }
-    .chart-title { font-size:11px; font-weight:700; color:rgba(255,255,255,0.7); margin-bottom:6px; }
-    .chart-unit { font-weight:400; color:rgba(255,255,255,0.35); }
+    .chart-title { font-size:11px; font-weight:700; color:var(--ink-70); margin-bottom:6px; }
+    .chart-unit { font-weight:400; color:var(--ink-35); }
     .chart-svg { width:100%; height:110px; display:block; }
     .chart-axis { display:flex; justify-content:space-between; font-size:9px;
-        color:rgba(255,255,255,0.35); margin-top:2px; }
-    .chart-empty { font-size:12px; color:rgba(255,255,255,0.4); padding:20px 0; }
+        color:var(--ink-35); margin-top:2px; }
+    .chart-empty { font-size:12px; color:var(--ink-40); padding:20px 0; }
     .chart-legend { display:flex; gap:14px; margin-top:6px; }
     .chart-legend .lg { display:inline-flex; align-items:center; gap:5px;
-        font-size:10px; color:rgba(255,255,255,0.55); }
+        font-size:10px; color:var(--ink-55); }
     .chart-legend .lg i { width:14px; height:0; border-top:2px solid; display:inline-block; }
     .chart-rose { display:flex; flex-direction:column; }
     .rose-svg { width:100%; max-width:210px; height:auto; margin:2px auto 0; display:block; }
-    .rose-lbl { fill:rgba(255,255,255,0.5); font-size:11px; font-weight:700; }
+    .rose-svg path { stroke:var(--grid); stroke-width:0.5; }
+    .rose-b0 { fill:var(--rose-0); background:var(--rose-0); }
+    .rose-b1 { fill:var(--rose-1); background:var(--rose-1); }
+    .rose-b2 { fill:#39c9d6; background:#39c9d6; }
+    .rose-b3 { fill:#2b93b3; background:#2b93b3; }
+    .rose-b4 { fill:#1f6f9e; background:#1f6f9e; }
+    .rose-lbl { fill:var(--ink-50); font-size:11px; font-weight:700; }
     .rose-legend { display:flex; flex-wrap:wrap; justify-content:center; gap:10px; margin-top:8px; }
     .rose-legend .rs { display:inline-flex; align-items:center; gap:4px;
-        font-size:9px; color:rgba(255,255,255,0.5); }
+        font-size:9px; color:var(--ink-50); }
     .rose-legend .rs i { width:9px; height:9px; border-radius:2px; display:inline-block; }
-    .rose-legend .rs-unit { font-size:9px; color:rgba(255,255,255,0.35); }
+    .rose-legend .rs-unit { font-size:9px; color:var(--ink-35); }
     .records { margin-top:18px; }
-    .records-h { font-size:11px; font-weight:700; color:rgba(255,255,255,0.7); margin-bottom:8px; }
+    .records-h { font-size:11px; font-weight:700; color:var(--ink-70); margin-bottom:8px; }
     .records-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; }
-    .rec { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06);
+    .rec { background:var(--card-bg); border:1px solid var(--card-edge);
         border-radius:10px; padding:10px 12px; }
     .rec-k { font-size:9px; font-weight:700; letter-spacing:0.6px; text-transform:uppercase;
-        color:rgba(255,255,255,0.4); }
+        color:var(--ink-40); }
     .rec-v { font-size:19px; font-weight:600; margin-top:3px; }
-    .rec-d { font-size:10px; color:rgba(255,255,255,0.4); margin-top:2px; }
+    .rec-d { font-size:10px; color:var(--ink-40); margin-top:2px; }
 """

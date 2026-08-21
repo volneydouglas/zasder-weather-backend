@@ -2491,3 +2491,89 @@ def test_embed_page_is_framable_and_gated(client, monkeypatch):
     home = client.get("/")
     assert home.headers["x-frame-options"] == "DENY"
     assert "frame-ancestors 'none'" in home.headers["content-security-policy"]
+
+
+def test_embed_theme_param_and_tokenized_pages(client, monkeypatch):
+    """1.6.2: the public pages are themed by CSS tokens (dark default,
+    light via prefers-color-scheme), and /embed?theme=light|dark PINS the
+    palette for embedding sites via data-theme on <html> — an embedding
+    page's theme matters more than the visitor's OS. Invalid values 422."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=5)
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDD0E05", "name": "Themed"},
+                      "timestamp_utc": ts,
+                      "outdoor": {"tempf": 90.0}, "source": "test"})
+    from app import main as m
+    m._PUBLIC_DASH_CACHE = None
+
+    plain = client.get("/embed").text
+    assert '<html lang="en">' in plain          # auto: no data-theme attr
+    assert "--page-bg" in plain and "prefers-color-scheme: light" in plain
+
+    light = client.get("/embed?theme=light").text
+    assert '<html lang="en" data-theme="light">' in light
+    dark = client.get("/embed?theme=dark").text
+    assert '<html lang="en" data-theme="dark">' in dark
+    assert client.get("/embed?theme=neon").status_code == 422
+
+    front = client.get("/").text
+    assert "--page-bg" in front, "status page shell not tokenized"
+    assert "rgba(255,255,255,0.03)" not in front.split("</style>")[0].replace(
+        "--card-bg:rgba(255,255,255,0.03)", ""), \
+        "hardcoded dark overlay survived outside the token definitions"
+
+
+def test_public_dashboard_api_kv_over_env(client, monkeypatch):
+    """1.6.2: the 1.7 apps' sharing switch. App-stored config wins over env
+    field-by-field; PUT is partial (empty string clears to env); a config
+    change busts the page cache immediately; owner-only both directions."""
+    import datetime as _dt
+    from app.config import settings
+    H = {"Authorization": "Bearer test-api-token"}
+
+    # Owner-only: reading exposure posture or changing it needs write auth.
+    assert client.get("/api/public-dashboard",
+                      headers={"Authorization": "Bearer test-reviewer-token"}
+                      ).status_code == 403
+
+    # Env says off → effective off; the app flips it on.
+    eff = client.get("/api/public-dashboard", headers=H).json()
+    assert eff["enabled"] is False and eff["enabled_source"] == "env"
+    eff = client.put("/api/public-dashboard", headers=H,
+                     json={"enabled": True, "location": "Irwin, PA"}).json()
+    assert eff["enabled"] is True and eff["enabled_source"] == "app"
+    assert eff["location"] == "Irwin, PA"
+
+    ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=5)
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDD0E06", "name": "SwitchTest"},
+                      "timestamp_utc": ts,
+                      "outdoor": {"tempf": 90.0}, "source": "test"})
+    assert client.get("/embed").status_code == 200   # app flag gates the page
+    assert "Irwin, PA" in client.get("/").text
+
+    # Flip off through the API: page cache must bust, embed 404s again.
+    client.put("/api/public-dashboard", headers=H, json={"enabled": False})
+    assert client.get("/embed").status_code == 404
+
+    # Clearing location falls back to env (None here).
+    client.put("/api/public-dashboard", headers=H, json={"location": ""})
+    assert client.get("/api/public-dashboard", headers=H).json()["location"] is None
+
+
+def test_embed_with_zero_devices_renders_empty_state(client, monkeypatch):
+    """CodeRabbit on the 1.6.1 retro-review: a fresh deployment with
+    PUBLIC_DASHBOARD=1 and no devices 500'd /embed — the primary-station
+    selection indexed devices[0]. Must render a friendly empty state."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    r = client.get("/embed")
+    assert r.status_code == 200
+    assert "No stations reporting yet" in r.text

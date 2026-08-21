@@ -428,6 +428,27 @@ that one page are exposed.
 The page auto-refreshes every 2 minutes. Leave `PUBLIC_DASHBOARD` unset (or `0`)
 to keep the screenshots.
 
+### Embed it on your own website (1.6.1+)
+
+With the dashboard on, `GET /embed` serves the dashboard **alone** — no
+status chrome — with framing allowed, so you can put your weather inline
+on any site you run with one iframe:
+
+```html
+<iframe src="https://YOUR-APP.fly.dev/embed" title="Weather dashboard"
+        width="100%" height="1300" style="border:0" loading="lazy"></iframe>
+```
+
+Adjust `height` to taste. The embed reuses the same cached dashboard
+fragment as the front page — no second dashboard build — auto-refreshes
+every 5 minutes, and 404s while `PUBLIC_DASHBOARD` is off.
+
+By default the page follows the visitor's system appearance
+(`prefers-color-scheme`, dark being the base look). A site with a fixed
+palette can pin it: `/embed?theme=light` or `/embed?theme=dark`. Every other page keeps strict
+anti-framing headers — `/embed` is the one page designed to be framed.
+Live example: <https://weather.zasder.com/embed>.
+
 ## Records
 
 `GET /api/devices/{mac}/records` returns per-metric highs & lows — with the

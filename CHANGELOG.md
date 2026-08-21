@@ -8,6 +8,20 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.6.2] — 2026-08-21
+
+### Added
+- **Light mode for the public pages.** The status page, public dashboard,
+  and `/embed` now follow the visitor's system appearance (dark remains
+  the default look), and `/embed?theme=light|dark` pins the palette so an
+  embedded dashboard can match the page it sits on.
+- **App-controllable sharing.** `GET/PUT /api/public-dashboard`
+  (owner-token) reads and sets the public page's switch, station
+  selection (primary only / `all` / a MAC list), and location label —
+  stored server-side, winning over the env values, so the 1.7 apps can
+  offer a proper sharing screen. Changes apply immediately (the page
+  cache is busted on save).
+
 ## [1.6.1] — 2026-08-21
 
 ### Added

@@ -379,7 +379,9 @@ async def api_version() -> JSONResponse:
 
 
 @app.get("/embed", response_class=HTMLResponse)
-async def embed_page() -> HTMLResponse:
+async def embed_page(
+    theme: str | None = Query(None, pattern="^(light|dark|auto)$"),
+) -> HTMLResponse:
     """The public dashboard ALONE — no status chrome — served with framing
     allowed, so an operator can put their weather inline on their own site
     with one iframe (the way WeatherLink's embeddablePage works; asked for
@@ -387,23 +389,25 @@ async def embed_page() -> HTMLResponse:
     when the operator opted into PUBLIC_DASHBOARD; 404s otherwise, so a
     non-public instance exposes nothing new. Same 100s-cached fragment the
     front page uses — an embedded page adds no extra load."""
-    if not settings.public_dashboard:
+    if not (await _pd_effective())["enabled"]:
         raise HTTPException(status_code=404, detail="public dashboard is off")
     from . import public_dashboard as _pd
     devices = await db.list_devices()
     now_ms = int(time.time() * 1000)
     dash = await _cached_public_dashboard(devices, now_ms)
+    # ?theme=light|dark pins the palette (an embedding page's theme matters
+    # more than the visitor's OS); auto/absent follows prefers-color-scheme.
+    attr = f' data-theme="{theme}"' if theme in ("light", "dark") else ""
     page = f"""<!doctype html>
-<html lang="en">
+<html lang="en"{attr}>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="300">
   <title>Zasder Weather</title>
   <style>
-    :root {{ color-scheme: dark; }}
-    body {{ background: #0d0f12; color: #fff;
-            font-family: system-ui, -apple-system, sans-serif;
+{_pd.THEME_CSS}
+    body {{ font-family: system-ui, -apple-system, sans-serif;
             margin: 0; padding: 16px; line-height: 1.4; }}
     .wrap {{ max-width: 720px; margin: 0 auto; }}
 {_pd.DASHBOARD_CSS}
@@ -476,7 +480,7 @@ async def status_page() -> HTMLResponse:
     # Optional public dashboard: current conditions + 24h charts for the
     # operator's station(s), rendered in place of the app screenshots.
     dashboard_html = ""
-    if settings.public_dashboard and devices:
+    if (await _pd_effective())["enabled"] and devices:
         dashboard_html = await _cached_public_dashboard(devices, now_ms)
 
     return HTMLResponse(_render_status_html(
@@ -504,6 +508,37 @@ _PUBLIC_DASH_TTL_S = 100
 _PUBLIC_DASH_LOCK: asyncio.Lock | None = None
 
 
+async def _invalidate_public_dashboard_cache() -> None:
+    """Clear the dashboard cache WITHOUT racing an in-flight build: the
+    builder assigns to the cache while holding _PUBLIC_DASH_LOCK, so a
+    lock-held clear is ordered strictly after any build that already
+    started — the stale html can never land after the clear."""
+    global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK
+    if _PUBLIC_DASH_LOCK is None:
+        _PUBLIC_DASH_CACHE = None
+        return
+    async with _PUBLIC_DASH_LOCK:
+        _PUBLIC_DASH_CACHE = None
+
+
+async def _pd_effective() -> dict:
+    """Public-dashboard config, app-stored value winning field-by-field over
+    env (the WU-key/integrations precedent). This is the groundwork for the
+    1.7 apps' sharing screen: the flag the apps flip lives in server_kv, so
+    an operator can turn the public page on/off and choose primary-station
+    vs mirror-everything without touching env vars (Volney, 2026-08-21)."""
+    raw_en = await db.get_kv("public_dashboard.enabled")
+    enabled = (raw_en == "1") if raw_en in ("0", "1") else settings.public_dashboard
+    macs = await db.get_kv("public_dashboard.macs")
+    if macs is None:
+        macs = settings.public_dashboard_macs
+    loc = await db.get_kv("public_dashboard.location")
+    if loc is None:
+        loc = settings.public_dashboard_location
+    return {"enabled": enabled, "macs": macs or None, "location": loc or None,
+            "enabled_source": "app" if raw_en in ("0", "1") else "env"}
+
+
 async def _cached_public_dashboard(devices: list[dict], now_ms: int) -> str:
     global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK
     hit = _PUBLIC_DASH_CACHE
@@ -527,8 +562,16 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
     dashboard section. Selection: PUBLIC_DASHBOARD_MACS ('all' | csv | unset →
     primary/first device)."""
     from . import public_dashboard as pd
+    eff = await _pd_effective()
+    if not devices:
+        # A fresh deployment with the dashboard already on: the selection
+        # below indexes devices[0], which 500'd /embed before any station
+        # ever posted (CodeRabbit on the 1.6.1 retro-review, 2026-08-21).
+        return ('<div class="station"><div class="chart-empty">'
+                'No stations reporting yet — data appears here as soon as '
+                'the first reading arrives.</div></div>')
     fields = pd.resolve_fields(settings.public_dashboard_fields)
-    sel = (settings.public_dashboard_macs or "").strip()
+    sel = (eff["macs"] or "").strip()
     by_mac = {d["mac"]: d for d in devices}
     if sel.lower() == "all":
         macs = [d["mac"] for d in devices]
@@ -590,7 +633,7 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
                          "records": recs, "summary": pd.summary_stats(rows)})
     return pd.render_dashboard(stations, fields, tz_name=settings.timezone,
                                app_url=settings.public_dashboard_app_url,
-                               location=settings.public_dashboard_location)
+                               location=eff["location"])
 
 
 def _humanize_age(seconds: float) -> str:
@@ -627,6 +670,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     # Public dashboard on ⇒ swap the app screenshots for the live charts + an
     # App Store link, add its CSS, and auto-refresh the page.
     from . import public_dashboard as _pd
+    theme_css = _pd.THEME_CSS
     if dashboard_html:
         dashboard_css = _pd.DASHBOARD_CSS
         refresh_meta = '<meta http-equiv="refresh" content="120">'
@@ -685,40 +729,40 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
   {refresh_meta}
   <title>Zasder Weather — Status</title>
   <style>
-    :root {{ color-scheme: dark; }}
-    body {{ background: #0d0f12; color: #fff; font-family: system-ui, -apple-system, sans-serif;
+{theme_css}
+    body {{ font-family: system-ui, -apple-system, sans-serif;
             margin: 0; padding: 32px 16px; line-height: 1.4; }}
     .wrap {{ max-width: 720px; margin: 0 auto; }}
     h1 {{ font-size: 18px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.2px; }}
-    .sub {{ font-size: 12px; color: rgba(255,255,255,0.55); margin-bottom: 24px; }}
+    .sub {{ font-size: 12px; color: var(--ink-55); margin-bottom: 24px; }}
     .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 24px; }}
-    .ver {{ font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.4);
+    .ver {{ font-size: 12px; font-weight: 600; color: var(--ink-40);
             vertical-align: middle; margin-left: 6px; }}
     .update-banner {{ margin: 14px 0 0; padding: 10px 14px; border-radius: 8px;
             background: rgba(212,168,83,0.14); border: 1px solid rgba(212,168,83,0.4);
             color: #e6c56a; font-size: 13px; }}
     .update-banner a {{ color: #e6c56a; font-weight: 700; }}
-    .stat {{ background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06);
+    .stat {{ background: var(--card-bg); border: 1px solid var(--card-edge);
               border-radius: 10px; padding: 12px; }}
     .stat .k {{ font-size: 9px; font-weight: 800; letter-spacing: 1.2px;
-                 color: rgba(255,255,255,0.55); text-transform: uppercase; }}
+                 color: var(--ink-55); text-transform: uppercase; }}
     .stat .v {{ font-size: 22px; font-weight: 300; margin-top: 4px;
                  font-variant-numeric: tabular-nums; }}
-    .stat-sub {{ font-size: 9px; color: rgba(255,255,255,0.45); margin-top: 4px;
+    .stat-sub {{ font-size: 9px; color: var(--ink-40); margin-top: 4px;
                   letter-spacing: 0.3px; }}
     @media (max-width: 540px) {{
       .grid {{ grid-template-columns: repeat(2, 1fr); }}
     }}
-    table {{ width: 100%; border-collapse: collapse; background: rgba(255,255,255,0.03);
-              border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; overflow: hidden; }}
+    table {{ width: 100%; border-collapse: collapse; background: var(--card-bg);
+              border: 1px solid var(--card-edge); border-radius: 10px; overflow: hidden; }}
     th, td {{ text-align: left; padding: 10px 12px; font-size: 12px;
-               border-bottom: 1px solid rgba(255,255,255,0.05); }}
-    th {{ font-size: 9px; font-weight: 800; letter-spacing: 1px; color: rgba(255,255,255,0.55);
-           text-transform: uppercase; background: rgba(255,255,255,0.02); }}
+               border-bottom: 1px solid var(--card-edge); }}
+    th {{ font-size: 9px; font-weight: 800; letter-spacing: 1px; color: var(--ink-55);
+           text-transform: uppercase; background: var(--card-bg); }}
     tr:last-child td {{ border-bottom: none; }}
     .num, .age {{ font-variant-numeric: tabular-nums; }}
-    .muted {{ color: rgba(255,255,255,0.5); }}
-    .mono {{ font-family: ui-monospace, SF Mono, monospace; font-size: 10px; color: rgba(255,255,255,0.6); }}
+    .muted {{ color: var(--ink-50); }}
+    .mono {{ font-family: ui-monospace, SF Mono, monospace; font-size: 10px; color: var(--ink-55); }}
     .fresh {{ color: oklch(78% 0.14 145); }}
     .warm  {{ color: oklch(78% 0.14 70); }}
     .stale {{ color: oklch(70% 0.20 28); }}
@@ -727,15 +771,15 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     .hero-shot {{ flex: 0 0 220px; }}
     .hero-shot img {{ width: 100%; height: auto; display: block;
                        border-radius: 28px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }}
-    .hero-shot .cap {{ font-size: 10px; color: rgba(255,255,255,0.45); margin-top: 8px;
+    .hero-shot .cap {{ font-size: 10px; color: var(--ink-40); margin-top: 8px;
                         text-align: center; letter-spacing: 0.3px; }}
-    .hero-copy p {{ font-size: 13px; color: rgba(255,255,255,0.75); margin: 0 0 10px;
+    .hero-copy p {{ font-size: 13px; color: var(--ink-70); margin: 0 0 10px;
                      max-width: 560px; margin-left: auto; margin-right: auto; text-align: center; }}
     @media (max-width: 540px) {{
       .hero-shots {{ flex-wrap: wrap; }}
       .hero-shot {{ flex: 0 0 calc(50% - 8px); max-width: calc(50% - 8px); }}
     }}
-    footer {{ margin-top: 24px; font-size: 10px; color: rgba(255,255,255,0.35); }}
+    footer {{ margin-top: 24px; font-size: 10px; color: var(--ink-35); }}
     a {{ color: oklch(70% 0.14 245); text-decoration: none; }}
     {dashboard_css}
   </style>
@@ -897,6 +941,44 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
 # (server_kv, kv-over-env — the WU-key precedent) without a redeploy. ALL
 # write-gated, and the GET is too: which providers an operator uses is
 # operator business, and the response enumerates credential presence.
+
+# ── Public dashboard config (Settings → Sharing, 1.7 apps) ──────────────
+# The app-facing switch for the public page: on/off, which stations
+# ("" = primary only, "all" = mirror every visible station, or a MAC csv),
+# and the location label. kv-over-env like the WU key — env stays the
+# scripted-setup path, the app value wins. Owner-only both ways: the GET
+# reveals exposure posture, the PUT changes what the world sees.
+
+class PublicDashboardBody(BaseModel):
+    enabled: bool | None = None
+    macs: str | None = Field(default=None, max_length=500)
+    location: str | None = Field(default=None, max_length=80)
+
+
+@app.get("/api/public-dashboard", dependencies=[Depends(require_write_token)])
+async def api_public_dashboard_get() -> dict[str, Any]:
+    return await _pd_effective()
+
+
+@app.put("/api/public-dashboard", dependencies=[Depends(require_write_token)])
+async def api_public_dashboard_put(body: PublicDashboardBody) -> dict[str, Any]:
+    """Partial update; omitted fields keep their value. For macs/location an
+    EMPTY STRING clears back to the env fallback (the SMTP contract)."""
+    if body.enabled is not None:
+        await db.set_kv("public_dashboard.enabled", "1" if body.enabled else "0")
+    if body.macs is not None:
+        m = body.macs.strip()
+        await db.set_kv("public_dashboard.macs", m if m else None)
+    if body.location is not None:
+        loc = body.location.strip()
+        await db.set_kv("public_dashboard.location", loc if loc else None)
+    # The page caches its HTML for ~100s — a config change must show on the
+    # next visit, not two minutes later. Cleared under the build lock: a
+    # bare clear raced an in-flight build, which could assign the OLD html
+    # back into the cache after this PUT returned (CodeRabbit, 2026-08-21).
+    await _invalidate_public_dashboard_cache()
+    return await _pd_effective()
+
 
 @app.get("/api/integrations", dependencies=[Depends(require_write_token)])
 async def api_integrations_status() -> dict[str, Any]:

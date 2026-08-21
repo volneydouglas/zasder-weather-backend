@@ -217,23 +217,30 @@ async def _security_headers(request: Request, call_next):
     # Conservative CSP — page renders inline styles + same-origin images.
     # When DEBUG=1 and /docs is enabled, Swagger UI also needs cdn.jsdelivr.net
     # for its script and style assets; we allow that selectively.
+    # /embed is the ONE page other sites may iframe (the operator's public
+    # dashboard on their own homepage — the WeatherLink-embeddablePage use
+    # case). It is anonymous, read-only, and has no actions, so there is
+    # nothing for a framing page to clickjack. Everything else stays DENY.
+    framable = request.url.path == "/embed"
+    fa = "frame-ancestors *" if framable else "frame-ancestors 'none'"
     if _DEBUG:
         csp = ("default-src 'self'; "
                "img-src 'self' data:; "
                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
                "script-src 'self' https://cdn.jsdelivr.net; "
-               "connect-src 'self'; frame-ancestors 'none'")
+               f"connect-src 'self'; {fa}")
     else:
         csp = ("default-src 'self'; "
                "img-src 'self' data:; "
                "style-src 'self' 'unsafe-inline'; "
                "script-src 'self'; "
-               "connect-src 'self'; frame-ancestors 'none'")
+               f"connect-src 'self'; {fa}")
     response.headers.setdefault("Content-Security-Policy", csp)
     response.headers.setdefault("Strict-Transport-Security",
                                  "max-age=63072000; includeSubDomains")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
+    if not framable:
+        response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Permissions-Policy",
                                  "geolocation=(), microphone=(), camera=()")
@@ -369,6 +376,44 @@ async def api_version() -> JSONResponse:
                                               "update_available": False,
                                               "checked_ms": None, "enabled": False})
     return JSONResponse(info)
+
+
+@app.get("/embed", response_class=HTMLResponse)
+async def embed_page() -> HTMLResponse:
+    """The public dashboard ALONE — no status chrome — served with framing
+    allowed, so an operator can put their weather inline on their own site
+    with one iframe (the way WeatherLink's embeddablePage works; asked for
+    by the first user who did exactly that with WeatherLink). Exists only
+    when the operator opted into PUBLIC_DASHBOARD; 404s otherwise, so a
+    non-public instance exposes nothing new. Same 100s-cached fragment the
+    front page uses — an embedded page adds no extra load."""
+    if not settings.public_dashboard:
+        raise HTTPException(status_code=404, detail="public dashboard is off")
+    from . import public_dashboard as _pd
+    devices = await db.list_devices()
+    now_ms = int(time.time() * 1000)
+    dash = await _cached_public_dashboard(devices, now_ms)
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="300">
+  <title>Zasder Weather</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{ background: #0d0f12; color: #fff;
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0; padding: 16px; line-height: 1.4; }}
+    .wrap {{ max-width: 720px; margin: 0 auto; }}
+{_pd.DASHBOARD_CSS}
+  </style>
+</head>
+<body><div class="wrap">
+{dash}
+</div></body>
+</html>"""
+    return HTMLResponse(page)
 
 
 @app.get("/", response_class=HTMLResponse)

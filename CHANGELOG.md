@@ -8,6 +8,17 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.6.1] — 2026-08-21
+
+### Added
+- **Embeddable dashboard.** `GET /embed` serves the public dashboard alone
+  — no status chrome — with framing allowed, so you can put your weather
+  inline on your own website with a single iframe:
+  `<iframe src="https://YOUR-APP.fly.dev/embed" width="100%" height="1300"
+  style="border:0"></iframe>`. Only exists when `PUBLIC_DASHBOARD=1`
+  (404s otherwise); every other page keeps its strict anti-framing
+  headers. Auto-refreshes every 5 minutes.
+
 ## [1.6.0] — 2026-08-20
 
 Data quality, a new station source, records that answer instantly, and a

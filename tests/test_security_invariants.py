@@ -65,6 +65,11 @@ def _routes():
 PUBLIC_BY_DESIGN = {
     ("GET", "/"), ("GET", "/status"), ("GET", "/healthz"),
     ("GET", "/api/version"), ("GET", "/metrics"),
+    # The iframe-able public dashboard. Anonymous BY OPT-IN: the handler
+    # 404s unless the operator set PUBLIC_DASHBOARD=1, and it serves the
+    # same fragment the open "/" page already shows when that flag is on —
+    # no new data crosses the line (1.6.1).
+    ("GET", "/embed"),
 }
 
 _AUTH_CALL = re.compile(
@@ -154,7 +159,7 @@ def test_every_undeclared_route_authenticates_in_its_handler():
 def test_the_public_route_list_has_not_quietly_grown():
     """PUBLIC_BY_DESIGN is the whole unauthenticated surface. It should change
     only by deliberate edit, never as a side effect."""
-    assert len(PUBLIC_BY_DESIGN) == 5
+    assert len(PUBLIC_BY_DESIGN) == 6   # +/embed, the opt-in iframe page (1.6.1)
     assert all(m == "GET" for m, _ in PUBLIC_BY_DESIGN), (
         "a mutating route was added to the public-by-design list")
 

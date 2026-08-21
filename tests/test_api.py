@@ -2455,3 +2455,39 @@ def test_public_dashboard_escapes_hostile_names_when_on(client, monkeypatch):
     # Positive control: the name reached the page (escaped), so the two
     # asserts above aren't passing vacuously because it was dropped.
     assert "&lt;script&gt;" in page
+
+
+def test_embed_page_is_framable_and_gated(client, monkeypatch):
+    """/embed exists so an operator can iframe their public dashboard on
+    their own site (the WeatherLink-embeddablePage pattern). Contract:
+    404 while the dashboard is off (a non-public instance exposes nothing
+    new); when on, the page carries frame-ancestors * and NO
+    X-Frame-Options — while every other page keeps DENY + 'none'."""
+    import datetime as _dt
+    from app.config import settings
+
+    assert client.get("/embed").status_code == 404, \
+        "embed reachable with the public dashboard off"
+
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    ts = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=5)
+          ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDD0E04", "name": "Embedded"},
+                      "timestamp_utc": ts,
+                      "outdoor": {"tempf": 88.0}, "source": "test"})
+    # The 100s dashboard cache may hold the pre-ingest build — reset it the
+    # same way the conftest does between tests.
+    from app import main as m
+    m._PUBLIC_DASH_CACHE = None
+
+    r = client.get("/embed")
+    assert r.status_code == 200
+    assert "Embedded" in r.text
+    assert "frame-ancestors *" in r.headers["content-security-policy"]
+    assert "x-frame-options" not in {k.lower() for k in r.headers}
+
+    home = client.get("/")
+    assert home.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in home.headers["content-security-policy"]

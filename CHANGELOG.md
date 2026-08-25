@@ -8,6 +8,16 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.7.1] — 2026-08-25
+
+### Fixed
+- The public dashboard and `/embed` no longer make a visitor wait for a
+  full page rebuild after a quiet spell. A cold rebuild can take several
+  seconds on a large history; the server now returns the previous page
+  instantly and rebuilds in the background (pages older than 15 minutes
+  still rebuild in the foreground). First reported as an embed that
+  "takes 10 seconds to load."
+
 ## [1.7.0] — 2026-08-25
 
 ### Added

@@ -77,6 +77,8 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     if _m is not None:
         _m._PUBLIC_DASH_CACHE = None
         _m._PUBLIC_DASH_LOCK = None     # rebound to each test's event loop
+        _m._PUBLIC_DASH_REFRESHING = False   # a test's leaked flag would
+        _m._PUBLIC_DASH_REFRESH_TASK = None  # silently disable SWR forever
         _m._RECORDS_CACHE.clear()
         _m._RECORDS_LOCKS.clear()
         _m._DB_BACKUP_JOB = {"state": "idle"}

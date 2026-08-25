@@ -533,6 +533,17 @@ async def status_page() -> HTMLResponse:
 # the only unauthenticated compute path flat under load.
 _PUBLIC_DASH_CACHE: tuple[float, str] | None = None
 _PUBLIC_DASH_TTL_S = 100
+# Serve-stale ceiling. A cold build takes ~7s on a large history (measured
+# on Doren's 1.15M-row box, 2026-08-25 — his "embed takes 10sec" report),
+# and with only the 100s TTL the first visitor after every quiet spell paid
+# it. Between TTL and this ceiling the stale page is served instantly and a
+# single background task rebuilds; past the ceiling we block like a cold
+# build, because a quarter-hour-old "live" dashboard is a lie, not a cache.
+_PUBLIC_DASH_STALE_MAX_S = 15 * 60
+_PUBLIC_DASH_REFRESHING = False
+# Strong ref: asyncio only weakly holds tasks, and a GC'd refresh task
+# would silently never fill the cache.
+_PUBLIC_DASH_REFRESH_TASK: "asyncio.Task | None" = None
 # Serializes cache MISSES, mirroring _RECORDS_LOCKS. The TTL alone only flattens
 # load once the cache is warm: every anonymous request arriving during a cold
 # build started its own full 24h aggregation per device, so a burst on `/` (the
@@ -576,10 +587,51 @@ async def _pd_effective() -> dict:
             "enabled_source": "app" if raw_en in ("0", "1") else "env"}
 
 
+def _refresh_public_dashboard_soon(devices: list[dict], now_ms: int) -> None:
+    """Fire one background rebuild of the dashboard cache. At most one runs
+    at a time (the flag, not the lock, is the gate — stale requests must
+    never queue behind the build they exist to avoid)."""
+    global _PUBLIC_DASH_REFRESHING, _PUBLIC_DASH_REFRESH_TASK, _PUBLIC_DASH_LOCK
+    if _PUBLIC_DASH_REFRESHING:
+        return
+    # Create the lock BEFORE scheduling (sync, no await): invalidation has a
+    # no-lock fast path, and it must never coexist with a pending refresh or
+    # its clear would be unordered against _run's build+write. In practice a
+    # stale cache already implies a lock-holding build created the lock —
+    # this line makes that invariant local instead of archaeological
+    # (CodeRabbit, PR #29).
+    if _PUBLIC_DASH_LOCK is None:
+        _PUBLIC_DASH_LOCK = asyncio.Lock()
+    _PUBLIC_DASH_REFRESHING = True
+
+    async def _run() -> None:
+        global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK, _PUBLIC_DASH_REFRESHING
+        try:
+            if _PUBLIC_DASH_LOCK is None:
+                _PUBLIC_DASH_LOCK = asyncio.Lock()
+            async with _PUBLIC_DASH_LOCK:
+                hit = _PUBLIC_DASH_CACHE
+                if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
+                    return          # someone else already rebuilt
+                html = await _build_public_dashboard(devices, now_ms)
+                _PUBLIC_DASH_CACHE = (time.time(), html)
+        except Exception:
+            log.exception("background public-dashboard refresh failed")
+        finally:
+            _PUBLIC_DASH_REFRESHING = False
+
+    _PUBLIC_DASH_REFRESH_TASK = asyncio.get_running_loop().create_task(_run())
+
+
 async def _cached_public_dashboard(devices: list[dict], now_ms: int) -> str:
     global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK
     hit = _PUBLIC_DASH_CACHE
     if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
+        return hit[1]
+    # Stale-while-revalidate: between the TTL and the stale ceiling, the
+    # visitor gets the old page NOW and the rebuild happens behind them.
+    if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_STALE_MAX_S:
+        _refresh_public_dashboard_soon(devices, now_ms)
         return hit[1]
     if _PUBLIC_DASH_LOCK is None:      # no await between test and assignment
         _PUBLIC_DASH_LOCK = asyncio.Lock()

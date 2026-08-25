@@ -3632,3 +3632,87 @@ def test_rule_patch_edits_threshold_and_target(client):
                         json={"threshold": float("inf")}).status_code in (400, 422)
     assert client.patch("/api/alerts/rules/99999", headers=H,
                         json={"enabled": True}).status_code == 404
+
+
+def test_public_dashboard_serves_stale_while_revalidating(client, monkeypatch):
+    """Doren, 2026-08-25: cold /embed took ~7-10s on his 1.15M-row box and
+    the 100s TTL made the FIRST visitor after every quiet spell pay it.
+    Between the TTL and the stale ceiling the old page must return
+    immediately (no await on the build) while ONE background task rebuilds."""
+    import time as _time
+    from app import main as _m
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+
+    builds = []
+
+    async def fake_build(devices, now_ms):
+        builds.append(now_ms)
+        return f"<html>build-{len(builds)}</html>"
+
+    monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
+    # Seed a cache entry that is past the TTL but inside the stale ceiling.
+    stale_at = _time.time() - _m._PUBLIC_DASH_TTL_S - 5
+    _m._PUBLIC_DASH_CACHE = (stale_at, "<html>stale-page</html>")
+
+    page = client.get("/embed").text
+    assert "stale-page" in page, \
+        "stale-but-serveable cache must be returned instantly"
+    # The TestClient portal runs the loop to completion, so the background
+    # refresh has landed by the time the request returns.
+    assert builds, "no background rebuild was scheduled"
+    assert _m._PUBLIC_DASH_CACHE[1] == "<html>build-1</html>"
+    assert _m._PUBLIC_DASH_REFRESHING is False
+
+    # Next request is a fresh hit on the rebuilt cache: no further builds.
+    page2 = client.get("/embed").text
+    assert "build-1" in page2
+    assert len(builds) == 1
+
+
+def test_public_dashboard_blocks_past_stale_ceiling(client, monkeypatch):
+    """Past _PUBLIC_DASH_STALE_MAX_S the cache is a lie, not a shortcut —
+    the request must block on a fresh build exactly like a cold start."""
+    import time as _time
+    from app import main as _m
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+
+    async def fake_build(devices, now_ms):
+        return "<html>fresh</html>"
+
+    monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
+    ancient = _time.time() - _m._PUBLIC_DASH_STALE_MAX_S - 1
+    _m._PUBLIC_DASH_CACHE = (ancient, "<html>ancient</html>")
+
+    page = client.get("/embed").text
+    assert "fresh" in page and "ancient" not in page, \
+        "ancient cache must not be served"
+
+
+def test_public_dashboard_single_background_refresh(client, monkeypatch):
+    """A burst of stale hits schedules exactly ONE rebuild — the refreshing
+    flag, not the lock, is the gate, so stale requests never queue behind
+    the build they exist to avoid."""
+    import time as _time
+    from app import main as _m
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+
+    builds = []
+
+    async def fake_build(devices, now_ms):
+        builds.append(now_ms)
+        return "<html>rebuilt</html>"
+
+    monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
+    stale_at = _time.time() - _m._PUBLIC_DASH_TTL_S - 5
+    _m._PUBLIC_DASH_CACHE = (stale_at, "<html>stale</html>")
+    # Simulate the burst: mark a refresh already in flight, then hit again.
+    _m._PUBLIC_DASH_REFRESHING = True
+    try:
+        page = client.get("/embed").text
+        assert "stale" in page
+        assert builds == [], "second stale hit must not schedule a second build"
+    finally:
+        _m._PUBLIC_DASH_REFRESHING = False

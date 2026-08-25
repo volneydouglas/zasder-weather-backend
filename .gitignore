@@ -36,3 +36,6 @@ data/
 
 # Fly
 fly.toml.bak
+
+# Written by the mirror generator as a destination-sanity marker.
+.zasder-public-mirror

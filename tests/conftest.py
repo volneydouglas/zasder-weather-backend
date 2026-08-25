@@ -79,6 +79,18 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._PUBLIC_DASH_LOCK = None     # rebound to each test's event loop
         _m._RECORDS_CACHE.clear()
         _m._RECORDS_LOCKS.clear()
+        _m._DB_BACKUP_JOB = {"state": "idle"}
+        _m._DB_BACKUP_TASK = None
+    # app.db's guest last-used stamps are process-global for the same reason
+    # (written by the sync auth dep, flushed on list) — a stale stamp from
+    # one test must not flush into another test's database.
+    _d = sys.modules.get("app.db")
+    if _d is not None:
+        _d._GUEST_LAST_USED.clear()
+        _d._INGEST_LAST_USED.clear()
+        # R5-33 rollup cache: a value computed against one test's DB must
+        # not answer for the next test's — same isolation rule as above.
+        _d._DAILY_ROLLUP_CACHE.clear()
     yield db_path
     shutil.rmtree(tmpdir, ignore_errors=True)
 

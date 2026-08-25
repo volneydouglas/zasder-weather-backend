@@ -1,9 +1,12 @@
 import asyncio
 import html as _html
+import math
 import logging
 import os
 import re
 import secrets
+import shutil
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -13,7 +16,9 @@ import httpx
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               PlainTextResponse)
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
@@ -280,7 +285,8 @@ def require_token(request: Request,
     guest token, or an app-minted share token (db.guest_token_cache). Use
     on GETs."""
     try:
-        ok = tokens_match(_extract_bearer(authorization),
+        presented = _extract_bearer(authorization)
+        ok = tokens_match(presented,
                           settings.valid_api_tokens | db.guest_token_cache())
     except HTTPException:
         _log_auth_failure(request)
@@ -288,6 +294,11 @@ def require_token(request: Request,
     if not ok:
         _log_auth_failure(request)
         raise HTTPException(status_code=401, detail="invalid token")
+    # Last-used for the share screen. Second digest pass over the guest set
+    # only (tokens_match doesn't say WHICH member matched); memory-only —
+    # this dep is sync on the hot path, persistence happens on list.
+    if tokens_match(presented, db.guest_token_cache()):
+        db.touch_guest_token(presented)
 
 
 def require_write_token(request: Request,
@@ -415,7 +426,33 @@ async def embed_page(
 </head>
 <body><div class="wrap">
 {dash}
-</div></body>
+</div>
+<script>
+/* Auto-height (1.7): tell the embedding page how tall this content really
+   is, so its iframe can fit exactly instead of guessing a magic number.
+   scrolling="no" clips anything below the frame's bottom edge, and a
+   clipped bottom looks identical to content that never loaded — the
+   50/50 missing-cards report (Doren, 2026-08-23). Fires on load and on
+   every content resize; a no-op when the page isn't framed. The height
+   is not sensitive, so the wildcard target is fine; the companion
+   listener verifies the SOURCE frame before trusting the number. */
+(function () {{
+  if (window.parent === window) return;
+  var last = 0;
+  function post() {{
+    var h = document.documentElement.scrollHeight;
+    if (Math.abs(h - last) < 2) return;
+    last = h;
+    window.parent.postMessage({{ type: "zasder-embed-height", height: h }}, "*");
+  }}
+  if (window.ResizeObserver) {{
+    new ResizeObserver(post).observe(document.documentElement);
+  }}
+  window.addEventListener("load", post);
+  post();
+}})();
+</script>
+</body>
 </html>"""
     return HTMLResponse(page)
 
@@ -577,11 +614,15 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
         macs = [d["mac"] for d in devices]
     elif sel:
         # Match on the separator-stripped uppercase form so the operator can
-        # write the MAC colonized or compact, lower or upper case.
+        # write the MAC colonized or compact, lower or upper case. Walk the
+        # CSV, not the devices list: the csv's order IS the page order — the
+        # app's sharing screen writes it in the user's chosen ranking
+        # (Volney, 2026-08-21). dict.fromkeys dedups while preserving order.
         def _compact(m: str) -> str:
             return m.upper().replace("-", "").replace(":", "")
-        want = {_compact(m) for m in sel.split(",") if m.strip()}
-        macs = [d["mac"] for d in devices if _compact(d["mac"]) in want] or [devices[0]["mac"]]
+        by_compact = {_compact(d["mac"]): d["mac"] for d in devices}
+        want = dict.fromkeys(_compact(m) for m in sel.split(",") if m.strip())
+        macs = [by_compact[w] for w in want if w in by_compact] or [devices[0]["mac"]]
     else:
         macs = [devices[0]["mac"]]  # primary = first device
 
@@ -787,7 +828,6 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
 <body>
   <div class="wrap">
     <h1>Zasder Weather {version_html}</h1>
-    <div class="sub">Read-only status — no auth required. The iOS app reads protected endpoints under <code>/api</code>.</div>
     {update_banner}
     {hero_html}
     <div class="grid">
@@ -803,7 +843,9 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
       </tbody>
     </table>
     <footer>
-      Uptime {uptime_label} · Generated {started}
+      Read-only status — no auth required; the iOS app reads protected
+      endpoints under <code>/api</code>.
+      · Uptime {uptime_label} · Generated {started}
       · <a href="https://github.com/volneydouglas/zasder-weather-backend">source</a>
     </footer>
   </div>
@@ -821,6 +863,164 @@ async def api_config_backup() -> dict[str, Any]:
     exactly what GET /api/alerts hides from the read-only reviewer token. A
     read-gated backup made that redaction a one-request bypass."""
     return await config_backup.export_config()
+
+
+# ── Database backup (1.7) ────────────────────────────────────────────────
+# Job pattern, learned the hard way on day one: the inline version VACUUMed
+# BEFORE sending any bytes, so a real-sized history sat silent past the
+# client's 60s timeout (and Fly's idle timeout) — Volney's own instance
+# timed out on the first try. Now: POST starts the snapshot in the
+# background, GET /status polls it, GET the file streams bytes immediately
+# because the file already exists. Process-global job state, one at a time
+# (reset per test in conftest, like main's other module caches).
+_DB_BACKUP_JOB: dict[str, Any] = {"state": "idle"}
+_DB_BACKUP_TASK: asyncio.Task | None = None
+_DB_BACKUP_FRESH_MS = 10 * 60_000     # a ready snapshot is reusable this long
+
+
+def _db_backup_dest() -> Path:
+    """Pick a directory with room for a full copy of the database.
+
+    Data volumes are often sized just above the database itself (Fly volumes
+    especially), so VACUUM INTO next to the DB dies with SQLite's 'database
+    or disk is full' once history grows past half the volume — after minutes
+    of work, with no hint WHOSE disk (2026-08-22, Volney's own instance).
+    The root filesystem is a separate disk with its own free space; use it
+    when the volume can't hold a second copy. When nothing can, refuse
+    up front with a sized, human message instead of running the long VACUUM
+    into a wall."""
+    src = Path(settings.database_path)
+    need = src.stat().st_size
+    for side in ("-wal", "-shm"):
+        p = Path(str(src) + side)
+        # No exists() pre-check (R6): SQLite deletes the sidecars when the
+        # last connection closes, and this app opens/closes aiosqlite
+        # connections constantly — exists() then stat() raced exactly that
+        # window and 500'd the backup endpoints intermittently (also the
+        # suite's ~1-in-3 backup-test flake). A vanished sidecar simply
+        # doesn't need space.
+        try:
+            need += p.stat().st_size
+        except OSError:
+            pass
+    need = int(need * 1.02) + 32 * 1024 * 1024   # slack for mid-VACUUM growth
+    seen: list[tuple[Path, int]] = []
+    for d in (src.parent, Path(tempfile.gettempdir())):
+        try:
+            free = shutil.disk_usage(d).free
+        except OSError:
+            continue
+        seen.append((d, free))
+        if free >= need:
+            return d / f".dbbackup-{secrets.token_hex(8)}.db"
+    detail = ", ".join(f"{d} has {f // 2**20} MB free" for d, f in seen)
+    raise HTTPException(
+        status_code=507,
+        detail=(f"Not enough free disk on the server for a database "
+                f"snapshot — it needs about {need // 2**20} MB ({detail})."))
+
+
+async def _run_db_backup(job: dict[str, Any], dest: Path) -> None:
+    """VACUUM INTO on a FRESH connection (the pooled one always has
+    statements in progress and VACUUM refuses; a raw file copy of a live
+    WAL database can capture a torn state). Consistent, compacted, and on
+    aiosqlite's worker thread so the event loop never blocks."""
+    import aiosqlite
+    try:
+        conn = await aiosqlite.connect(settings.database_path)
+        try:
+            await conn.execute("VACUUM INTO ?", (str(dest),))
+        finally:
+            await conn.close()
+        job.update(state="ready", size=dest.stat().st_size,
+                   finished_ms=int(time.time() * 1000))
+    except Exception as e:
+        # The job dict carries the failure — this task's exception must
+        # never vanish into a fire-and-forget void.
+        dest.unlink(missing_ok=True)
+        job.update(state="error", error=str(e))
+
+
+@app.post("/api/backup/database", dependencies=[Depends(require_write_token)])
+async def api_backup_database_start() -> dict[str, Any]:
+    """Start (or reuse) a snapshot job. Idempotent: a running job answers
+    'running', a fresh ready snapshot answers 'ready' — double-taps and
+    HTTP retries never stack VACUUMs."""
+    global _DB_BACKUP_JOB, _DB_BACKUP_TASK
+    job = _DB_BACKUP_JOB
+    now_ms = int(time.time() * 1000)
+    # Trust "running" only while the task is actually alive (CodeRabbit,
+    # PR #27): _run_db_backup catches Exception but a CANCELLED task (app
+    # shutdown mid-backup) left state="running" forever, and this early
+    # return then refused every later backup until a process restart.
+    if job.get("state") == "running":
+        task = _DB_BACKUP_TASK
+        if task is not None and not task.done():
+            return {"state": "running"}
+        job["state"] = "error"
+        job.setdefault("error", "previous backup was interrupted")
+    if (job.get("state") == "ready"
+            and Path(job.get("path", "")).exists()
+            and now_ms - int(job.get("finished_ms") or 0) < _DB_BACKUP_FRESH_MS):
+        return {"state": "ready", "size": job.get("size")}
+    # Sweep a stale/error leftover before starting fresh.
+    if job.get("path"):
+        Path(job["path"]).unlink(missing_ok=True)
+    dest = _db_backup_dest()
+    _DB_BACKUP_JOB = {"state": "running", "path": str(dest), "started_ms": now_ms}
+    _DB_BACKUP_TASK = asyncio.create_task(_run_db_backup(_DB_BACKUP_JOB, dest))
+    return {"state": "running"}
+
+
+@app.get("/api/backup/database/status", dependencies=[Depends(require_write_token)])
+async def api_backup_database_status() -> dict[str, Any]:
+    job = _DB_BACKUP_JOB
+    out: dict[str, Any] = {"state": job.get("state", "idle")}
+    if job.get("state") == "ready":
+        out["size"] = job.get("size")
+    if job.get("state") == "error":
+        out["error"] = job.get("error")
+    return out
+
+
+@app.get("/api/backup/database", dependencies=[Depends(require_write_token)])
+async def api_backup_database() -> FileResponse:
+    """Download the snapshot. With a ready job: streams it (bytes flow
+    immediately — no silent VACUUM window for timeouts to kill) and the
+    file+job are cleared after the send. Without one: VACUUMs inline, which
+    stays fine for small databases and curl one-liners.
+
+    Write-gated despite being a GET, harder than config/backup even: the
+    file is everything — alert prefs including the app-managed SMTP
+    password, guest tokens, the works."""
+    global _DB_BACKUP_JOB
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    job = _DB_BACKUP_JOB
+    if job.get("state") == "ready" and Path(job.get("path", "")).exists():
+        dest = Path(job["path"])
+        _DB_BACKUP_JOB = {"state": "idle"}
+
+        def _cleanup(p: Path = dest) -> None:
+            p.unlink(missing_ok=True)
+
+        return FileResponse(
+            dest, media_type="application/vnd.sqlite3",
+            filename=f"zasder-weather-{stamp}.db",
+            background=BackgroundTask(_cleanup))
+    import aiosqlite
+    dest = _db_backup_dest()
+    conn = await aiosqlite.connect(settings.database_path)
+    try:
+        await conn.execute("VACUUM INTO ?", (str(dest),))
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+    finally:
+        await conn.close()
+    return FileResponse(
+        dest, media_type="application/vnd.sqlite3",
+        filename=f"zasder-weather-{stamp}.db",
+        background=BackgroundTask(lambda: dest.unlink(missing_ok=True)))
 
 
 @app.post("/api/config/restore", dependencies=[Depends(require_write_token)])
@@ -850,9 +1050,11 @@ class GuestTokenBody(BaseModel):
 
 @app.post("/api/guest-tokens", dependencies=[Depends(require_write_token)])
 async def api_create_guest_token(body: GuestTokenBody | None = None) -> dict[str, Any]:
-    """Mint a read-only share token. The full token appears ONLY in this
-    response — list/revoke work with the short id — so the operator's share
-    sheet is the single place the credential ever surfaces."""
+    """Mint a read-only share token. The list never carries token values —
+    list/revoke/rename work with the short id. The full value surfaces in
+    exactly two write-gated places: this response, and the deliberate
+    re-share reveal below (added 1.7 so one person's several devices can
+    reuse one token)."""
     token = "zwg_" + secrets.token_hex(16)
     label = (body.label or "").strip() if body and body.label else None
     now_ms = int(time.time() * 1000)
@@ -863,10 +1065,48 @@ async def api_create_guest_token(body: GuestTokenBody | None = None) -> dict[str
 
 @app.get("/api/guest-tokens", dependencies=[Depends(require_write_token)])
 async def api_list_guest_tokens() -> dict[str, Any]:
+    # Flush the in-memory auth stamps first, so "last used" is current the
+    # moment the owner looks. last_used_ms is best-effort by design: stamps
+    # between the last flush and a process restart are lost, which can only
+    # UNDER-report recency — fine for "is anyone still using this share".
+    await db.flush_guest_last_used()
     rows = await db.list_guest_tokens()
+    # Deliberately app-minted tokens ONLY: the env-configured reviewer/guest
+    # tokens stay invisible here (Volney's call, 2026-08-23 — "okay if it
+    # doesn't show in the list"). If a row you can't place appears, it is
+    # NOT the reviewer; it's an app-minted share.
     return {"tokens": [{"id": r["token"][:db.GUEST_TOKEN_ID_LEN],
-                        "label": r["label"], "created_ms": r["created_ms"]}
+                        "label": r["label"], "created_ms": r["created_ms"],
+                        "last_used_ms": r["last_used_ms"]}
                        for r in rows]}
+
+
+@app.patch("/api/guest-tokens/{token_id}", dependencies=[Depends(require_write_token)])
+async def api_rename_guest_token(token_id: str,
+                                 body: GuestTokenBody) -> dict[str, Any]:
+    """Relabel a share (labels used to be set-at-mint only). A null/empty
+    label clears it back to unnamed."""
+    label = (body.label or "").strip() or None
+    n = await db.rename_guest_token(token_id, label)
+    if n == 0:
+        raise HTTPException(status_code=404, detail="no such share token")
+    return {"ok": True, "id": token_id, "label": label}
+
+
+@app.get("/api/guest-tokens/{token_id}/token",
+         dependencies=[Depends(require_write_token)])
+async def api_reveal_guest_token(token_id: str) -> dict[str, Any]:
+    """Full token value by id — the re-share path (one person, several
+    devices, ONE token to manage). This deliberately amends the original
+    mint-only surfacing contract: the list still never carries token
+    values, and this route is write-gated, so revealing adds no capability
+    an api_token holder doesn't already have by minting. Write-gated
+    despite being a GET, same reasoning as the config export."""
+    row = await db.get_guest_token(token_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such share token")
+    return {"token": row["token"], "id": token_id, "label": row["label"],
+            "created_ms": row["created_ms"]}
 
 
 @app.delete("/api/guest-tokens/{token_id}", dependencies=[Depends(require_write_token)])
@@ -874,6 +1114,77 @@ async def api_revoke_guest_token(token_id: str) -> dict[str, Any]:
     n = await db.delete_guest_token(token_id)
     if n == 0:
         raise HTTPException(status_code=404, detail="no such share token")
+    return {"ok": True, "revoked": n}
+
+
+# ── App-minted per-device ingest tokens ──────────────────────────────────
+# The write-side siblings of the share tokens above, with the same surface
+# and the same reasons: the single INGEST_TOKEN env secret is shared by
+# every board and poller, so rotating it unpairs ALL of them at once
+# (security review 2026-08-19, finding 4 — recovery needs physical access
+# to each board's setup key). Mint one per device, revoke one at a time.
+# Valid ONLY where the env INGEST_TOKEN is valid (/ingest/custom and
+# discovery) — never a read or write API credential, which the tests pin.
+
+class IngestTokenBody(BaseModel):
+    label: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/api/ingest-tokens", dependencies=[Depends(require_write_token)])
+async def api_create_ingest_token(body: IngestTokenBody | None = None) -> dict[str, Any]:
+    """Mint a per-device ingest token. Same surfacing contract as the share
+    tokens: the list never carries values; the full value appears here and
+    in the deliberate re-provisioning reveal below."""
+    token = "zwi_" + secrets.token_hex(16)
+    label = (body.label or "").strip() if body and body.label else None
+    now_ms = int(time.time() * 1000)
+    await db.add_ingest_token(token, label or None, now_ms)
+    return {"token": token, "id": token[:db.INGEST_TOKEN_ID_LEN],
+            "label": label or None, "created_ms": now_ms}
+
+
+@app.get("/api/ingest-tokens", dependencies=[Depends(require_write_token)])
+async def api_list_ingest_tokens() -> dict[str, Any]:
+    # Flush first so "last used" is current the moment the owner looks —
+    # for a board posting every few seconds this is the "is it alive and
+    # using ITS token?" answer.
+    await db.flush_ingest_last_used()
+    rows = await db.list_ingest_tokens()
+    return {"tokens": [{"id": r["token"][:db.INGEST_TOKEN_ID_LEN],
+                        "label": r["label"], "created_ms": r["created_ms"],
+                        "last_used_ms": r["last_used_ms"]}
+                       for r in rows]}
+
+
+@app.patch("/api/ingest-tokens/{token_id}", dependencies=[Depends(require_write_token)])
+async def api_rename_ingest_token(token_id: str,
+                                  body: IngestTokenBody) -> dict[str, Any]:
+    label = (body.label or "").strip() or None
+    n = await db.rename_ingest_token(token_id, label)
+    if n == 0:
+        raise HTTPException(status_code=404, detail="no such ingest token")
+    return {"ok": True, "id": token_id, "label": label}
+
+
+@app.get("/api/ingest-tokens/{token_id}/token",
+         dependencies=[Depends(require_write_token)])
+async def api_reveal_ingest_token(token_id: str) -> dict[str, Any]:
+    """Full token value by id — the re-provisioning path: a board that
+    wiped its credential needs the same value pasted back, not a fresh mint
+    that orphans the old row. Write-gated despite being a GET, same
+    reasoning as the share-token reveal."""
+    row = await db.get_ingest_token(token_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such ingest token")
+    return {"token": row["token"], "id": token_id, "label": row["label"],
+            "created_ms": row["created_ms"]}
+
+
+@app.delete("/api/ingest-tokens/{token_id}", dependencies=[Depends(require_write_token)])
+async def api_revoke_ingest_token(token_id: str) -> dict[str, Any]:
+    n = await db.delete_ingest_token(token_id)
+    if n == 0:
+        raise HTTPException(status_code=404, detail="no such ingest token")
     return {"ok": True, "revoked": n}
 
 
@@ -1058,16 +1369,29 @@ async def api_sources() -> dict[str, Any]:
 
 
 def _strip_device_pii(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop the operator's home location from a device list.
+    """Coarsen the operator's home location for read-only tokens.
 
-    `location` is a free-text label that routinely names a house, and
-    `info.coords` is the precise lat/lon — the same pair the public dashboard
-    refuses to publish. The reviewer/demo token needs the weather, not the
-    address."""
+    `location` is a free-text label that routinely names a house — dropped
+    entirely, same as always. Coordinates used to be dropped too, which
+    silently broke every coords-driven feature on shared installs: the sun
+    dial and the NWS weather alerts are computed client-side from station
+    coords, so guests got neither (Volney, 2026-08-23 — read-only installs
+    should match the owner wherever the difference isn't a secret). Since
+    1.7 coords are ROUNDED to one decimal (~11 km, town scale — the same
+    granularity the public dashboard's location label already publishes),
+    which keeps sunrise within a minute and the NWS zone correct while
+    still hiding the address."""
     out = []
     for d in devices:
         info = {k: v for k, v in (d.get("info") or {}).items()
                 if k not in ("coords", "location")}
+        coords = ((d.get("info") or {}).get("coords") or {}).get("coords") or {}
+        try:
+            lat, lon = float(coords["lat"]), float(coords["lon"])
+            info["coords"] = {"coords": {"lat": round(lat, 1),
+                                         "lon": round(lon, 1)}}
+        except (KeyError, TypeError, ValueError):
+            pass
         out.append({**d, "location": None, "info": info})
     return out
 
@@ -1111,11 +1435,21 @@ class AlertPrefsIn(BaseModel):
     storm_summary: bool | None = None
     storm_quiet_minutes: float | None = Field(default=None, ge=5, le=360)
     storm_min_total_in: float | None = Field(default=None, ge=0, le=10)
+    # 1.7 rain-start nowcast toggle (Open-Meteo minutely_15, opt-in).
+    rain_start: bool | None = None
+    # 1.7 storm-summary channels: 'push' | 'email' | 'both'; "" clears back
+    # to legacy delivery (push always, email by email_scope).
+    storm_channels: str | None = None
 
 
 class DeviceAlertIn(BaseModel):
-    monitor: bool = True
+    # monitor None = leave the device-down setting alone. (It used to default
+    # True, but a 1.7 storm-only PUT must not silently re-enable monitoring;
+    # every shipped client sends monitor explicitly, so nothing regresses.)
+    monitor: bool | None = None
     threshold_minutes: float | None = Field(default=None, ge=1, le=1440)
+    # 1.7 per-station storm-summary switch. None = leave unchanged.
+    storm_summary: bool | None = None
 
 
 async def _alerts_state() -> dict[str, Any]:
@@ -1139,6 +1473,8 @@ async def _alerts_state() -> dict[str, Any]:
             "threshold_override": dp.get("threshold_min"),  # raw per-device value or None
             "last_seen_ms": d.get("lastSeen"),
             "state": (states.get(mac) or {}).get("state"),  # 'ok'|'stale'|None
+            # 1.7 per-station storm-summary switch, effective (never-set = on).
+            "storm_summary": dp.get("storm_summary") is not False,
         })
     return {
         "transport_configured": cfg.transport_configured,
@@ -1164,6 +1500,13 @@ async def _alerts_state() -> dict[str, Any]:
         "storm_quiet_minutes": cfg.storm_quiet_minutes,
         "storm_min_total_in": cfg.storm_min_total_in,
         "storm_source": "app" if prefs["storm_summary"] is not None else "env",
+        # 1.7: 'push'|'email'|'both', or None = legacy (push always, email
+        # by email_scope). A pre-1.7 backend omits the key entirely, which
+        # is how the app knows to hide the picker.
+        "storm_channels": prefs.get("storm_channels"),
+        # Rain-start nowcast (1.7) — same effective-value + source shape.
+        "rain_start": cfg.rain_start,
+        "rain_start_source": "app" if prefs.get("rain_start") is not None else "env",
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -1196,6 +1539,34 @@ async def get_alerts(
     return JSONResponse(state)
 
 
+@app.get("/api/session", dependencies=[Depends(require_token)])
+async def get_session(
+    authorization: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    """What can THIS token do? (1.7) One startup probe instead of each app
+    section discovering read-only-ness through its own 403 — a shared
+    install can then hide whole settings pages (sharing, integrations,
+    server management) rather than rendering doors onto near-empty rooms."""
+    can_write = tokens_match(_extract_bearer(authorization),
+                             settings.write_tokens)
+    # Read-only installs can't see (or set) the forecast-source picker, so
+    # they follow the server: a configured WU key means the owner set up
+    # TWC, and guests should see the same forecast (Volney, 2026-08-23).
+    src = "twc" if await effective_wu_key() else "open-meteo"
+    return JSONResponse({"can_write": can_write, "forecast_source": src})
+
+
+@app.get("/api/alerts/recent", dependencies=[Depends(require_token)])
+async def get_recent_alerts(limit: int = 50) -> JSONResponse:
+    """Alert history, newest first (1.7). The server-side answer to a swiped-
+    away notification: every handled alert — device-down, threshold rule,
+    smart, storm summary, rain-start — lands in alert_log at the delivery
+    funnel, so this list is identical on iPhone, iPad, and Mac. Readable by
+    any token: titles carry no more than the pushes themselves did."""
+    limit = max(1, min(limit, 200))
+    return JSONResponse({"alerts": await db.recent_alerts(limit)})
+
+
 def _has_ctl(s: str) -> bool:
     """True if the string contains an ASCII control character (incl. \\n)."""
     return any(ord(c) < 32 or ord(c) == 127 for c in s)
@@ -1208,6 +1579,8 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
         fields["enabled"] = 1 if body.enabled else 0
     if body.storm_summary is not None:
         fields["storm_summary"] = 1 if body.storm_summary else 0
+    if body.rain_start is not None:
+        fields["rain_start"] = 1 if body.rain_start else 0
     if body.storm_quiet_minutes is not None:
         fields["storm_quiet_minutes"] = body.storm_quiet_minutes
     if body.storm_min_total_in is not None:
@@ -1221,6 +1594,16 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             raise HTTPException(status_code=400,
                                 detail="email_scope must be 'all' or 'device_down'")
         fields["email_scope"] = body.email_scope
+    if body.storm_channels is not None:
+        # "" clears back to legacy delivery (push always, email by scope).
+        if body.storm_channels == "":
+            fields["storm_channels"] = None
+        elif body.storm_channels not in ("push", "email", "both"):
+            raise HTTPException(
+                status_code=400,
+                detail="storm_channels must be 'push', 'email' or 'both'")
+        else:
+            fields["storm_channels"] = body.storm_channels
     if body.recipients is not None:
         clean = [r.strip() for r in body.recipients if r.strip()]
         for r in clean:
@@ -1253,7 +1636,20 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
 @app.put("/api/devices/{mac}/alert", dependencies=[Depends(require_write_token)])
 async def put_device_alert(mac: str, body: DeviceAlertIn) -> JSONResponse:
     from .ingest import _format_mac
-    await db.upsert_device_alert_pref(_format_mac(mac), body.monitor, body.threshold_minutes)
+    if body.monitor is not None:
+        await db.upsert_device_alert_pref(_format_mac(mac), body.monitor,
+                                          body.threshold_minutes)
+    elif body.threshold_minutes is not None:
+        # R6: a threshold sent WITHOUT monitor used to 200 with no effect.
+        # Preserve the device's current monitor state (absent row = the
+        # monitored-by-default the alert monitor assumes).
+        prefs = await db.get_device_alert_prefs()
+        current = prefs.get(_format_mac(mac)) or {}
+        await db.upsert_device_alert_pref(
+            _format_mac(mac), bool(current.get("monitor", True)),
+            body.threshold_minutes)
+    if body.storm_summary is not None:
+        await db.set_device_storm_summary(_format_mac(mac), body.storm_summary)
     return JSONResponse(await _alerts_state())
 
 
@@ -1550,6 +1946,29 @@ async def push_register(body: PushRegisterIn) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+class LiveActivityTokenIn(BaseModel):
+    # Same bound + shape rationale as PushRegisterIn: ActivityKit tokens
+    # are hex, but Apple documents no fixed length — printable ASCII with
+    # sane bounds keeps junk out without betting on today's format.
+    token: str = Field(min_length=8, max_length=512, pattern=r"^[\x21-\x7e]+$")
+    env: str | None = None
+    kind: str = "start"
+
+
+@app.post("/api/push/live-activity-token",
+          dependencies=[Depends(require_write_token)])
+async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONResponse:
+    """Push-to-start token for the rain-start Live Activity (1.7, nowcast
+    phase 2). The app re-posts whenever iOS rotates it; idempotent upsert,
+    same lifecycle as /api/push/register."""
+    if body.kind != "start":
+        raise HTTPException(status_code=400,
+                            detail="only kind 'start' is supported")
+    env = body.env if body.env in ("sandbox", "production") else None
+    await db.register_live_activity_token(body.token, body.kind, env)
+    return JSONResponse({"ok": True})
+
+
 class PushRelayIn(BaseModel):
     # Both optional: omit a field to leave it unchanged, send "" to clear it.
     relay_url: str | None = None
@@ -1640,18 +2059,41 @@ async def create_rule(body: AlertRuleIn) -> JSONResponse:
     if body.comparator not in THRESHOLD_COMPARATORS:
         raise HTTPException(status_code=400,
                             detail=f"comparator must be one of {sorted(THRESHOLD_COMPARATORS)}")
+    # R6: same guard PATCH has. Starlette's JSON parser accepts the
+    # non-standard Infinity/NaN literals and pydantic's float admits them;
+    # an Infinity threshold STORED (sqlite keeps inf as REAL) and then
+    # 500'd every GET /api/alerts/rules forever — JSONResponse serializes
+    # with allow_nan=False, and the list is the only way to learn the id
+    # to delete. One bad authenticated request bricked the alerts screen.
+    if not math.isfinite(body.threshold):
+        raise HTTPException(status_code=400,
+                            detail="threshold must be a finite number")
     mac = _format_mac(body.target_mac) if body.target_mac else None
     rule = await db.create_alert_rule(mac, body.field, body.comparator, body.threshold)
     return JSONResponse(rule)
 
 
 class AlertRulePatch(BaseModel):
-    enabled: bool
+    # All optional (1.7): omit = leave unchanged. Pre-1.7 clients that send
+    # only {"enabled": …} keep working; a 1.7 app editing a rule sends
+    # threshold and/or target_mac ("" = back to all devices).
+    enabled: bool | None = None
+    threshold: float | None = None
+    target_mac: str | None = None
 
 
 @app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_write_token)])
 async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
-    rule = await db.set_alert_rule_enabled(rule_id, body.enabled)
+    import math
+    from .ingest import _format_mac
+    if body.threshold is not None and not math.isfinite(body.threshold):
+        raise HTTPException(status_code=400, detail="threshold must be finite")
+    set_target = body.target_mac is not None
+    tgt = (_format_mac(body.target_mac)
+           if set_target and body.target_mac != "" else None)
+    rule = await db.update_alert_rule(rule_id, enabled=body.enabled,
+                                      threshold=body.threshold,
+                                      target_mac=tgt, set_target=set_target)
     if rule is None:
         raise HTTPException(status_code=404, detail="rule not found")
     return JSONResponse(rule)
@@ -1745,11 +2187,40 @@ async def get_history(
     return JSONResponse({"start": start, "end": end, "count": len(rows), "rows": rows})
 
 
+@app.get("/api/devices/{mac}/normals", dependencies=[Depends(require_token)])
+async def get_normals(mac: str) -> JSONResponse:
+    """Today's NOAA 1991-2020 climate normals for this station's location
+    (1.7 "today vs normal"). {"available": false} when the station has no
+    coordinates or no U.S. normals coverage — the app renders nothing then,
+    never a made-up comparison. Exposes only the NCEI station NAME (coarse,
+    city-level — same exposure class as the public location label), never
+    the device's coordinates."""
+    from . import normals
+    from .ingest import _format_mac
+    mac = _format_mac(mac)
+    for d in await db.list_devices():
+        if d["mac"] != mac:
+            continue
+        coords = ((d.get("info") or {}).get("coords") or {}).get("coords") or {}
+        lat, lon = coords.get("lat"), coords.get("lon")
+        if lat is None or lon is None:
+            break
+        result = await normals.today(float(lat), float(lon))
+        if result:
+            return JSONResponse({"available": True, **result})
+        break
+    return JSONResponse({"available": False})
+
+
 @app.get("/api/devices/{mac}/summary", dependencies=[Depends(require_token)])
 async def get_summary(
     mac: str,
     field: str = Query("tempf"),
     hours: int = Query(24, ge=1, le=24 * 30),
+    # Optional bucket-averaged series over the same window, sized for
+    # sparklines (the widgets' 2x2 face). Bounded small on purpose: a
+    # client that wants real resolution should use /history's buckets.
+    points: int | None = Query(None, ge=2, le=200),
 ) -> JSONResponse:
     from .ingest import _format_mac
     mac = _format_mac(mac)              # read-side key normalization
@@ -1757,6 +2228,8 @@ async def get_summary(
     start = end - hours * 3600 * 1000
     try:
         agg = await db.aggregate(mac, field, start, end)
+        if points is not None:
+            agg["series"] = await db.field_series(mac, field, start, end, points)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return JSONResponse(agg)

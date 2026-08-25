@@ -23,6 +23,7 @@
 #include <rtl_433_ESP.h>
 
 #include "config_server.h"
+#include "improv_serial.h"
 #include "display.h"
 #include "zasder_post.h"
 
@@ -81,6 +82,7 @@ void rtl_433_Callback(char *message) {
 //   2. A Wi-Fi event handler: kick a reconnect on disconnect, and on
 //      GOT_IP flag the loop to re-bind the HTTP server + mDNS (onReconnect).
 static volatile uint32_t g_lastLoopMs = 0;
+static void feedLoopWatchdog() { g_lastLoopMs = millis(); }
 static volatile bool g_wifiReconnect = false;
 #define WDT_STALL_MS 60000UL     // reset if loop() stalls this long
 
@@ -273,11 +275,29 @@ void setup() {
   // was considered and rejected: a board whose display has failed would then
   // be impossible to set up at all, which is a worse failure than the risk it
   // removes. Revisit if the portal ever carries the ingest token.
-  Serial.println("Wi-Fi: trying saved creds, AP=ZasderLilyGO (pw zasder-setup) if none");
+  // Two provisioning routes now run side by side while unprovisioned:
+  // the captive-portal AP above, and Improv Wi-Fi over USB serial — the
+  // web flasher's dialog offers a Wi-Fi form right after installing, and
+  // the credentials arrive over the cable instead of through the AP. The
+  // portal goes non-blocking so both can be serviced in one wait loop;
+  // the 300s timeout-and-restart matches the old blocking behavior.
+  Serial.println("Wi-Fi: trying saved creds; AP=ZasderLilyGO (pw zasder-setup) or browser/USB (Improv) if none");
+  ZasderImprov::begin(feedLoopWatchdog);
+  wm.setConfigPortalBlocking(false);
   if (!wm.autoConnect("ZasderLilyGO", "zasder-setup")) {
-    Serial.println("WiFi setup timed out — restarting");
-    delay(500);
-    ESP.restart();
+    const uint32_t portalStart = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+      wm.process();                 // captive-portal path
+      ZasderImprov::service();      // browser/USB path
+      feedLoopWatchdog();
+      if (millis() - portalStart > 300000UL) {
+        Serial.println("WiFi setup timed out — restarting");
+        delay(500);
+        ESP.restart();
+      }
+      delay(5);
+    }
+    wm.stopConfigPortal();
   }
   Serial.printf("Wi-Fi OK  IP=%s\n", WiFi.localIP().toString().c_str());
   WiFi.setAutoReconnect(true);
@@ -342,4 +362,8 @@ void loop() {
   rtl_433.loop();
   ZasderConfigServer::loop();
   ZasderDisplay::loop();
+  // Improv stays live after provisioning too, so the web flasher can
+  // re-point a board's Wi-Fi (or just answer "which device is this?")
+  // over USB at any time. No-op unless bytes are waiting.
+  ZasderImprov::service();
 }

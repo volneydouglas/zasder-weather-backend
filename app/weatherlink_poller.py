@@ -73,7 +73,14 @@ def build_payload(station: dict[str, Any],
         if stype in SENSOR_TYPES_ISS:
             iss_data = r
             if r.get("tx_id"):
-                tx_id = int(r["tx_id"])
+                # R6: a truthy non-numeric tx_id raised out of build_payload
+                # and dropped the ENTIRE cycle's reading — fall back to the
+                # default instead, matching this module's own "mis-naming
+                # silently drops data" lesson.
+                try:
+                    tx_id = int(r["tx_id"])
+                except (TypeError, ValueError):
+                    pass
         elif stype == SENSOR_TYPE_INDOOR:
             indoor_data = r
         elif stype == SENSOR_TYPE_BAROM:

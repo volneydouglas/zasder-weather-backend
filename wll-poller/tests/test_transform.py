@@ -424,3 +424,57 @@ class SetupUrlValidatorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BatteryTests(unittest.TestCase):
+    """trans_battery_flag (0 = ok, 1 = low) → device.battery_outdoor, the
+    same relay convention the SDR/Davis relays post. Absent flag = absent
+    key — a WLL that doesn't report battery must not claim one."""
+
+    def test_flag_maps_to_battery_outdoor(self):
+        s = _sample()
+        s["data"]["conditions"][0]["trans_battery_flag"] = 0
+        self.assertEqual(to_observation(s)["device"]["battery_outdoor"], "normal")
+        s["data"]["conditions"][0]["trans_battery_flag"] = 1
+        self.assertEqual(to_observation(s)["device"]["battery_outdoor"], "low")
+
+    def test_absent_flag_stays_absent(self):
+        self.assertNotIn("battery_outdoor", to_observation(_sample())["device"])
+
+
+# ────────────────────── R6: timestamp + type guards ──────────────────────
+
+class R6TimestampAndTypeGuards(unittest.TestCase):
+    def test_huge_numeric_ts_falls_back_to_now(self):
+        # R6 finding 1: 99999999999999 raised "year must be in 1..9999"
+        # out of to_observation and killed every tick for as long as the
+        # gateway clock stayed broken.
+        obs = poller.to_observation({"data": {
+            "ts": 99999999999999,
+            "conditions": [{"data_structure_type": 1, "txid": 1,
+                            "temp": 70.0}]}})
+        self.assertIsNotNone(obs)
+        year = int(obs["timestamp_utc"][:4])
+        self.assertGreaterEqual(year, 2020)
+
+    def test_tiny_and_negative_ts_fall_back_to_now(self):
+        # R6 finding 2: ts=1 posted "1970-01-01…", the backend 400'd it,
+        # and the poller's error message blamed the INGEST_TOKEN.
+        for bad in (1, -5):
+            obs = poller.to_observation({"data": {
+                "ts": bad,
+                "conditions": [{"data_structure_type": 1, "txid": 1,
+                                "temp": 70.0}]}})
+            self.assertIsNotNone(obs, bad)
+            self.assertGreaterEqual(int(obs["timestamp_utc"][:4]), 2020, bad)
+
+    def test_num_rejects_json_booleans(self):
+        # R6 finding 3: isinstance(True, int) is True.
+        self.assertIsNone(poller._num({"x": True}, "x"))
+        self.assertIsNone(poller._num({"x": False}, "x"))
+        self.assertEqual(poller._num({"x": 1}, "x"), 1)
+
+    def test_non_dict_payload_returns_none(self):
+        # R6 finding 4: a JSON list crashed on .get instead of the
+        # documented None.
+        self.assertIsNone(poller.to_observation([1, 2, 3]))

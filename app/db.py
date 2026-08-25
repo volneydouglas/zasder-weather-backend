@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -178,18 +179,27 @@ CREATE TABLE IF NOT EXISTS alert_prefs (
     -- convention as the SMTP block above, so an operator who configures it
     -- server-side is not overridden by an app that never set it.
     storm_summary         INTEGER,
+    rain_start            INTEGER,
     storm_quiet_minutes   REAL,
     storm_min_total_in    REAL,
     -- 'all' (default, NULL = all) or 'device_down': which alert kinds may
     -- EMAIL. Push always delivers everything — this only scopes the email
     -- channel (user ask: device-down emails without threshold-rule emails).
-    email_scope           TEXT
+    email_scope           TEXT,
+    -- 1.7: 'push' | 'email' | 'both' — which channels carry STORM SUMMARIES
+    -- specifically. NULL = legacy behavior (push always, email iff
+    -- email_scope='all'), so nobody's delivery changes until they pick.
+    storm_channels        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS device_alert_prefs (
     mac           TEXT PRIMARY KEY,
     monitor       INTEGER NOT NULL DEFAULT 1,   -- 0 = don't watch this device
-    threshold_min REAL                          -- NULL = use default threshold
+    threshold_min REAL,                         -- NULL = use default threshold
+    -- 1.7: 0 = no storm summaries for THIS station, NULL/1 = summaries on
+    -- (when the global toggle is on). Doren's ask: his haptic Tempest sits
+    -- feet from the Davis and reported every storm twice.
+    storm_summary INTEGER
 );
 
 -- APNs device tokens registered by the iOS app. `env` records whether the
@@ -198,6 +208,19 @@ CREATE TABLE IF NOT EXISTS device_alert_prefs (
 CREATE TABLE IF NOT EXISTS push_tokens (
     token        TEXT PRIMARY KEY,
     platform     TEXT NOT NULL DEFAULT 'ios',
+    env          TEXT,
+    created_ms   INTEGER NOT NULL,
+    last_seen_ms INTEGER NOT NULL
+);
+
+-- Live Activity push-to-start tokens (1.7, nowcast phase 2). One row per
+-- install, exactly like push_tokens — the app re-registers whenever iOS
+-- rotates the token. kind is future-proofing: v1 stores only 'start'
+-- (the rain-start Activity counts down client-side and auto-dismisses via
+-- stale/dismissal dates, so no per-activity update tokens are needed yet).
+CREATE TABLE IF NOT EXISTS live_activity_tokens (
+    token        TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL DEFAULT 'start',
     env          TEXT,
     created_ms   INTEGER NOT NULL,
     last_seen_ms INTEGER NOT NULL
@@ -222,6 +245,12 @@ CREATE TABLE IF NOT EXISTS alert_rule_state (
     mac        TEXT NOT NULL,
     triggered  INTEGER NOT NULL DEFAULT 0,
     changed_ms INTEGER,
+    -- Re-arm dwell clock (1.7): when a triggered rule's value first cleared
+    -- the deadband, or NULL when it hasn't / the clearance broke. The rule
+    -- re-arms only after the value stays clear for the whole dwell window —
+    -- the value-only deadband couldn't hold against wind's sample-to-sample
+    -- noise (Doren, 2026-08-23: wind alerts every ~8 min all afternoon).
+    clear_since_ms INTEGER,
     PRIMARY KEY (rule_id, mac)
 );
 
@@ -292,9 +321,61 @@ CREATE TABLE IF NOT EXISTS push_relay (
 -- app-managed without a redeploy. Read-only is enforced where the env
 -- guests are: membership in valid tokens, never in write_tokens.
 CREATE TABLE IF NOT EXISTS guest_tokens (
-    token      TEXT PRIMARY KEY,
-    label      TEXT,
-    created_ms INTEGER
+    token        TEXT PRIMARY KEY,
+    label        TEXT,
+    created_ms   INTEGER,
+    -- Best-effort "when did this share last authenticate" (1.7). NULL =
+    -- never seen (or never seen since the column was added) — the UI says
+    -- "never used", not "used at epoch 0". Stamped in memory on auth and
+    -- flushed when the owner lists tokens; also in the ALTER list below.
+    last_used_ms INTEGER
+);
+
+-- App-minted per-device ingest tokens (1.7). The single INGEST_TOKEN env
+-- secret is shared by every board and poller, so rotating it silently
+-- unpairs ALL of them at once — recovery needs physical access to each
+-- board's setup key (security review 2026-08-19, finding 4). These are the
+-- write-side siblings of guest_tokens: mint one per device ("915 board",
+-- "WLL poller"), revoke one without touching the rest. Valid ONLY where
+-- the env INGEST_TOKEN is valid (/ingest/custom, discovery) — never as a
+-- read or write API credential.
+CREATE TABLE IF NOT EXISTS ingest_tokens (
+    token        TEXT PRIMARY KEY,
+    label        TEXT,
+    created_ms   INTEGER,
+    last_used_ms INTEGER
+);
+
+-- Token auto-upgrade registry (1.7): one per-device assignment per station.
+-- A device that authenticates with the SHARED ingest token and sends
+-- X-Token-Upgrade is handed a freshly minted per-device token IN THE INGEST
+-- RESPONSE — the one channel it already trusts and is already authenticated
+-- on. The row remembers the assignment so re-delivery is idempotent (same
+-- token every time until adopted, and again if the device loses its NVS and
+-- falls back to the shared token). adopted_ms flips when the device first
+-- authenticates WITH its assigned token.
+CREATE TABLE IF NOT EXISTS ingest_token_assignments (
+    mac        TEXT PRIMARY KEY,
+    token      TEXT NOT NULL,
+    created_ms INTEGER,
+    adopted_ms INTEGER
+);
+
+-- Alert history (1.7, Doren: "Many times I accidentally swipe away or hit X
+-- to clear the notifications ... now I have no idea what notifications I had
+-- just gotten"). One row per HANDLED alert, written at the _deliver funnel so
+-- every kind lands here — device-down, threshold rules, smart alerts, storm
+-- summaries, rain-start nowcasts. Pruned to the newest rows on insert;
+-- delivered=0 marks an alert that fired with no willing channel (muted by
+-- scope / nothing configured) — it still happened, the app still shows it.
+CREATE TABLE IF NOT EXISTS alert_log (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms     INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    mac       TEXT,
+    title     TEXT NOT NULL,
+    body      TEXT,
+    delivered INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -484,9 +565,30 @@ async def init_db() -> None:
             # whole alert system down on upgrade.
             ("storm_summary", "INTEGER"), ("storm_quiet_minutes", "REAL"),
             ("storm_min_total_in", "REAL"),
+            # 1.7 rain-start nowcast. Same ALTER-list rule as the storm
+            # columns above it: CREATE alone never reaches existing DBs.
+            ("rain_start", "INTEGER"),
+            # 1.7 storm-summary channel choice (push/email/both).
+            ("storm_channels", "TEXT"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
+        # Same migration for device_alert_prefs: storm_summary (1.7 per-
+        # station mute) came after the table shipped in 1.4. NULL = on.
+        cur = await db.execute("PRAGMA table_info(device_alert_prefs)")
+        existing = {r[1] for r in await cur.fetchall()}
+        if "storm_summary" not in existing:
+            await db.execute(
+                "ALTER TABLE device_alert_prefs ADD COLUMN storm_summary INTEGER")
+        # Same migration for alert_rule_state: the re-arm dwell clock (1.7)
+        # came after the table shipped in 1.6. NULL = no clearance being
+        # timed, which is exactly the pre-dwell behavior until a rule next
+        # clears.
+        cur = await db.execute("PRAGMA table_info(alert_rule_state)")
+        existing = {r[1] for r in await cur.fetchall()}
+        if "clear_since_ms" not in existing:
+            await db.execute(
+                "ALTER TABLE alert_rule_state ADD COLUMN clear_since_ms INTEGER")
         # Same migration for daily_rollups: lightning_max came after the
         # table shipped (1.6). Existing days read NULL (= "no data") until a
         # rebuild folds history in — never 0, a station with no detector
@@ -519,6 +621,14 @@ async def init_db() -> None:
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE wu_station_map ADD COLUMN {col} {decl}")
+        # Same migration for guest_tokens: last_used_ms came after the table
+        # shipped in 1.6. Existing shares read NULL = "never used" until
+        # they next authenticate (absent is not zero — no epoch-0 stamps).
+        cur = await db.execute("PRAGMA table_info(guest_tokens)")
+        existing = {r[1] for r in await cur.fetchall()}
+        if "last_used_ms" not in existing:
+            await db.execute(
+                "ALTER TABLE guest_tokens ADD COLUMN last_used_ms INTEGER")
         # idx_obs_chart gained windgustmph so the bucketed chart query can serve
         # wind gust index-only. SQLite won't alter an existing index, so rebuild
         # it once if the stored definition predates the column (one-time cost at
@@ -553,6 +663,8 @@ async def init_db() -> None:
     # the lifespan hook so every entry point that prepares the DB (app boot,
     # tests, maintenance scripts) gets a coherent auth view.
     await refresh_guest_token_cache()
+    await refresh_ingest_token_cache()
+    await refresh_ingest_assignment_cache()
 
 
 # In-process mirror of the guest_tokens table for the auth gate:
@@ -591,9 +703,66 @@ async def add_guest_token(token: str, label: str | None, now_ms: int) -> None:
 async def list_guest_tokens() -> list[dict[str, Any]]:
     async with connect() as db:
         rows = await (await db.execute(
-            "SELECT token, label, created_ms FROM guest_tokens "
+            "SELECT token, label, created_ms, last_used_ms FROM guest_tokens "
             "ORDER BY created_ms")).fetchall()
     return [dict(r) for r in rows]
+
+
+# In-memory last-used stamps, keyed by full token. The auth dependency is a
+# sync function on the request hot path, so it only writes this dict (a GIL
+# dict store — no lock, and a lost race just re-stamps the same second);
+# flush_guest_last_used() persists from an async context. The tradeoff is
+# documented on the endpoint: stamps not yet flushed die with the process,
+# so last_used is best-effort, refreshed whenever the owner looks at it.
+_GUEST_LAST_USED: dict[str, int] = {}
+
+
+def touch_guest_token(token: str) -> None:
+    """Record that a guest token just authenticated. Sync + memory-only on
+    purpose — callable from the sync auth dependency. The caller has already
+    digest-verified membership in guest_token_cache()."""
+    _GUEST_LAST_USED[token] = int(time.time() * 1000)
+
+
+async def flush_guest_last_used() -> None:
+    """Persist pending stamps. Take the dict's items atomically first — the
+    auth dep may stamp mid-flush, and those newer stamps must survive for
+    the next flush rather than being cleared unwritten."""
+    if not _GUEST_LAST_USED:
+        return
+    pending = list(_GUEST_LAST_USED.items())
+    async with connect() as db:
+        for token, ms in pending:
+            await db.execute(
+                "UPDATE guest_tokens SET last_used_ms = ? "
+                "WHERE token = ? AND (last_used_ms IS NULL OR last_used_ms < ?)",
+                (ms, token, ms))
+        await db.commit()
+    for token, ms in pending:
+        # Drop only stamps we actually wrote; a concurrent newer stamp for
+        # the same token stays queued.
+        if _GUEST_LAST_USED.get(token) == ms:
+            _GUEST_LAST_USED.pop(token, None)
+
+
+async def get_guest_token(token_id: str) -> dict[str, Any] | None:
+    """Full row (token value included) by short id — the re-share path."""
+    async with connect() as db:
+        row = await (await db.execute(
+            f"SELECT token, label, created_ms, last_used_ms FROM guest_tokens "
+            f"WHERE substr(token, 1, {GUEST_TOKEN_ID_LEN}) = ?",
+            (token_id,))).fetchone()
+    return dict(row) if row else None
+
+
+async def rename_guest_token(token_id: str, label: str | None) -> int:
+    async with connect() as db:
+        cur = await db.execute(
+            f"UPDATE guest_tokens SET label = ? "
+            f"WHERE substr(token, 1, {GUEST_TOKEN_ID_LEN}) = ?",
+            (label, token_id))
+        await db.commit()
+        return cur.rowcount
 
 
 async def delete_guest_token(token_id: str) -> int:
@@ -605,6 +774,178 @@ async def delete_guest_token(token_id: str) -> int:
         n = cur.rowcount
     await refresh_guest_token_cache()
     return n
+
+
+# ── App-minted per-device ingest tokens ──────────────────────────────────
+# Structurally a carbon copy of the guest-token block above, for the same
+# reasons: the ingest auth check is sync and per-request (every ~8s per
+# LilyGO board), so validity lives in an in-process cache and last-used
+# stamps ride memory until an async context flushes them.
+
+_INGEST_TOKEN_CACHE: set[str] = set()
+
+# "zwi_" + 8 hex — same shape contract as GUEST_TOKEN_ID_LEN.
+INGEST_TOKEN_ID_LEN = 12
+
+
+def ingest_token_cache() -> set[str]:
+    return _INGEST_TOKEN_CACHE
+
+
+async def refresh_ingest_token_cache() -> None:
+    global _INGEST_TOKEN_CACHE
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT token FROM ingest_tokens")).fetchall()
+    _INGEST_TOKEN_CACHE = {r["token"] for r in rows}
+
+
+async def add_ingest_token(token: str, label: str | None, now_ms: int) -> None:
+    async with connect() as db:
+        await db.execute(
+            "INSERT INTO ingest_tokens (token, label, created_ms) "
+            "VALUES (?, ?, ?)", (token, label, now_ms))
+        await db.commit()
+    await refresh_ingest_token_cache()
+
+
+async def list_ingest_tokens() -> list[dict[str, Any]]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT token, label, created_ms, last_used_ms FROM ingest_tokens "
+            "ORDER BY created_ms")).fetchall()
+    return [dict(r) for r in rows]
+
+
+_INGEST_LAST_USED: dict[str, int] = {}
+
+
+def touch_ingest_token(token: str) -> None:
+    """Record that a minted ingest token just authenticated. Sync + memory-
+    only on purpose — called from the request hot path after the caller has
+    digest-verified membership in ingest_token_cache()."""
+    _INGEST_LAST_USED[token] = int(time.time() * 1000)
+
+
+async def flush_ingest_last_used() -> None:
+    """Same atomic-snapshot contract as flush_guest_last_used: stamps that
+    arrive mid-flush survive for the next one."""
+    if not _INGEST_LAST_USED:
+        return
+    pending = list(_INGEST_LAST_USED.items())
+    async with connect() as db:
+        for token, ms in pending:
+            await db.execute(
+                "UPDATE ingest_tokens SET last_used_ms = ? "
+                "WHERE token = ? AND (last_used_ms IS NULL OR last_used_ms < ?)",
+                (ms, token, ms))
+        await db.commit()
+    for token, ms in pending:
+        if _INGEST_LAST_USED.get(token) == ms:
+            _INGEST_LAST_USED.pop(token, None)
+
+
+async def get_ingest_token(token_id: str) -> dict[str, Any] | None:
+    """Full row (token value included) by short id — the re-provisioning
+    path: a wiped board needs the full value pasted back in."""
+    async with connect() as db:
+        row = await (await db.execute(
+            f"SELECT token, label, created_ms, last_used_ms FROM ingest_tokens "
+            f"WHERE substr(token, 1, {INGEST_TOKEN_ID_LEN}) = ?",
+            (token_id,))).fetchone()
+    return dict(row) if row else None
+
+
+async def rename_ingest_token(token_id: str, label: str | None) -> int:
+    async with connect() as db:
+        cur = await db.execute(
+            f"UPDATE ingest_tokens SET label = ? "
+            f"WHERE substr(token, 1, {INGEST_TOKEN_ID_LEN}) = ?",
+            (label, token_id))
+        await db.commit()
+        return cur.rowcount
+
+
+async def delete_ingest_token(token_id: str) -> int:
+    async with connect() as db:
+        cur = await db.execute(
+            f"DELETE FROM ingest_tokens WHERE substr(token, 1, {INGEST_TOKEN_ID_LEN}) = ?",
+            (token_id,))
+        await db.commit()
+        n = cur.rowcount
+    await refresh_ingest_token_cache()
+    return n
+
+
+# ── Token auto-upgrade assignments ───────────────────────────────────────
+# In-memory mirror of the UNADOPTED assignments so the ingest hot path can
+# detect adoption ("this minted token is the one we handed this mac") with
+# a dict lookup instead of a query per post.
+
+_UNADOPTED_ASSIGNMENTS: dict[str, str] = {}
+
+
+def unadopted_assignment_token(mac: str) -> str | None:
+    return _UNADOPTED_ASSIGNMENTS.get(mac)
+
+
+async def refresh_ingest_assignment_cache() -> None:
+    global _UNADOPTED_ASSIGNMENTS
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, token FROM ingest_token_assignments "
+            "WHERE adopted_ms IS NULL")).fetchall()
+    _UNADOPTED_ASSIGNMENTS = {r["mac"]: r["token"] for r in rows}
+
+
+async def get_device_name(mac: str) -> str | None:
+    """The station's display name, for labeling its auto-minted token."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT name FROM devices WHERE mac = ?", (mac,))).fetchone()
+    return row["name"] if row and row["name"] else None
+
+
+async def count_ingest_assignments() -> int:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM ingest_token_assignments")).fetchone()
+    return int(row["n"])
+
+
+async def get_ingest_assignment(mac: str) -> dict[str, Any] | None:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT mac, token, created_ms, adopted_ms "
+            "FROM ingest_token_assignments WHERE mac = ?", (mac,))).fetchone()
+    return dict(row) if row else None
+
+
+async def set_ingest_assignment(mac: str, token: str, now_ms: int) -> None:
+    """Record (or replace — the re-mint path after a revoked assignment) the
+    token handed to this mac. Resets adoption: a fresh assignment hasn't
+    been seen in use yet."""
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO ingest_token_assignments (mac, token, created_ms)
+            VALUES (?, ?, ?)
+            ON CONFLICT(mac) DO UPDATE SET
+                token = excluded.token, created_ms = excluded.created_ms,
+                adopted_ms = NULL
+            """,
+            (mac, token, now_ms))
+        await db.commit()
+    await refresh_ingest_assignment_cache()
+
+
+async def mark_ingest_assignment_adopted(mac: str, now_ms: int) -> None:
+    async with connect() as db:
+        await db.execute(
+            "UPDATE ingest_token_assignments SET adopted_ms = ? "
+            "WHERE mac = ? AND adopted_ms IS NULL", (now_ms, mac))
+        await db.commit()
+    await refresh_ingest_assignment_cache()
 
 
 @asynccontextmanager
@@ -954,6 +1295,16 @@ async def delete_device(mac: str) -> dict[str, int]:
         # the "new" device's first frost/heat alert (the edge-trigger never
         # sees a clear→triggered transition).
         n_loc   = await _del("DELETE FROM device_location     WHERE mac = ?")
+        # R6: storm_state and pending_devices are mac-keyed too — a
+        # re-registered MAC inherited an OPEN STORM tracker (delete→recreate
+        # within the 6h baseline window judged the new device's counters
+        # against the old baseline and could fabricate a storm) and skipped
+        # probation. Same inheritance class as every row above. The token
+        # auto-upgrade assignment goes with them: a fresh device must not
+        # inherit its predecessor's credential.
+        n_storm = await _del("DELETE FROM storm_state          WHERE mac = ?")
+        n_pend  = await _del("DELETE FROM pending_devices      WHERE mac = ?")
+        n_asgn  = await _del("DELETE FROM ingest_token_assignments WHERE mac = ?")
         n_smart = await _del("DELETE FROM smart_alert_state   WHERE mac = ?")
         # 1.4's MAC-keyed tables — same inheritance bug class: a leftover
         # wu_station_map row makes a re-registered MAC default to the OLD
@@ -1008,10 +1359,43 @@ async def upsert_alert_state(mac: str, state: str, last_seen_ms: int | None,
         await db.commit()
 
 
+# History cap: ~a month of normal alerting. Pruned by id (insert order), not
+# ts_ms, so a device with a wrong clock can't evict everyone else's history.
+_ALERT_LOG_KEEP = 200
+
+
+async def log_alert(ts_ms: int, kind: str, mac: str | None, title: str,
+                    body: str | None, delivered: bool) -> None:
+    async with connect() as db:
+        await db.execute(
+            "INSERT INTO alert_log (ts_ms, kind, mac, title, body, delivered) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (ts_ms, kind, mac, title, body, 1 if delivered else 0),
+        )
+        await db.execute(
+            "DELETE FROM alert_log WHERE id NOT IN "
+            "(SELECT id FROM alert_log ORDER BY id DESC LIMIT ?)",
+            (_ALERT_LOG_KEEP,),
+        )
+        await db.commit()
+
+
+async def recent_alerts(limit: int = 50) -> list[dict[str, Any]]:
+    """Newest-first alert history for GET /api/alerts/recent."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT id, ts_ms, kind, mac, title, body, delivered "
+            "FROM alert_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )).fetchall()
+    return [dict(r) for r in rows]
+
+
 _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipients",
                     "smtp_host", "smtp_port", "smtp_username", "smtp_password",
                     "smtp_from", "smtp_tls", "smtp_ssl", "email_scope",
-                    "storm_summary", "storm_quiet_minutes", "storm_min_total_in")
+                    "storm_summary", "storm_quiet_minutes", "storm_min_total_in",
+                    "rain_start", "storm_channels")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -1042,12 +1426,37 @@ async def set_alert_prefs(**fields: Any) -> None:
 async def get_device_alert_prefs() -> dict[str, dict[str, Any]]:
     async with connect() as db:
         rows = await (await db.execute(
-            "SELECT mac, monitor, threshold_min FROM device_alert_prefs"
+            "SELECT mac, monitor, threshold_min, storm_summary "
+            "FROM device_alert_prefs"
         )).fetchall()
     return {
-        r["mac"]: {"monitor": bool(r["monitor"]), "threshold_min": r["threshold_min"]}
+        r["mac"]: {
+            "monitor": bool(r["monitor"]),
+            "threshold_min": r["threshold_min"],
+            # None = never set = summaries on. Kept tri-state so the UI can
+            # tell an explicit choice from the default.
+            "storm_summary": (None if r["storm_summary"] is None
+                              else bool(r["storm_summary"])),
+        }
         for r in rows
     }
+
+
+async def set_device_storm_summary(mac: str, on: bool) -> None:
+    """Per-station storm-summary switch (1.7). Deliberately its own writer:
+    the monitor/threshold upsert must not clobber this column and vice
+    versa — the two settings are edited from different screens."""
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO device_alert_prefs (mac, storm_summary)
+            VALUES (?, ?)
+            ON CONFLICT(mac) DO UPDATE SET
+                storm_summary = excluded.storm_summary
+            """,
+            (mac, 1 if on else 0),
+        )
+        await db.commit()
 
 
 async def upsert_device_alert_pref(mac: str, monitor: bool,
@@ -1120,6 +1529,52 @@ async def delete_alert_rule(rule_id: int) -> int:
         return cur.rowcount or 0
 
 
+async def update_alert_rule(rule_id: int, *, enabled: bool | None = None,
+                            threshold: float | None = None,
+                            target_mac: str | None = None,
+                            set_target: bool = False) -> dict[str, Any] | None:
+    """Partial rule edit (1.7 — before this, changing a rule's threshold or
+    station meant delete-and-recreate, and retargeting Doren's 28 rules took
+    raw sqlite on his box). `set_target` distinguishes "leave the scope
+    alone" from "set it to target_mac" (None there = all devices).
+
+    A threshold or scope change clears the rule's trigger state on purpose:
+    a rule stuck triggered=1 under its OLD threshold would swallow the
+    first crossing of the new one, and a retargeted rule's per-mac states
+    describe stations it no longer watches."""
+    sets: list[str] = []
+    args: list[Any] = []
+    if enabled is not None:
+        sets.append("enabled = ?")
+        args.append(1 if enabled else 0)
+    if threshold is not None:
+        sets.append("threshold = ?")
+        args.append(float(threshold))
+    if set_target:
+        sets.append("target_mac = ?")
+        args.append(target_mac)
+    async with connect() as db:
+        if sets:
+            cur = await db.execute(
+                f"UPDATE alert_rules SET {', '.join(sets)} WHERE id = ?",
+                (*args, rule_id))
+            if not cur.rowcount:
+                return None
+            if threshold is not None or set_target:
+                await db.execute(
+                    "DELETE FROM alert_rule_state WHERE rule_id = ?",
+                    (rule_id,))
+            await db.commit()
+        r = await (await db.execute(
+            "SELECT id, target_mac, field, comparator, threshold, enabled "
+            "FROM alert_rules WHERE id = ?", (rule_id,))).fetchone()
+    if r is None:
+        return None
+    return {"id": r["id"], "target_mac": r["target_mac"], "field": r["field"],
+            "comparator": r["comparator"], "threshold": r["threshold"],
+            "enabled": bool(r["enabled"])}
+
+
 async def set_alert_rule_enabled(rule_id: int, enabled: bool) -> dict[str, Any] | None:
     """Toggle a rule on/off. Returns the updated rule, or None if it doesn't exist."""
     async with connect() as db:
@@ -1143,16 +1598,45 @@ async def get_rule_states() -> dict[tuple[int, str], int]:
     return {(r["rule_id"], r["mac"]): r["triggered"] for r in rows}
 
 
+async def get_rule_states_full() -> dict[tuple[int, str], tuple[int, int | None]]:
+    """(triggered, clear_since_ms) per (rule, device) — the monitor's view.
+    Separate from get_rule_states so the API surface (and every test built
+    on it) keeps its plain triggered map."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT rule_id, mac, triggered, clear_since_ms "
+            "FROM alert_rule_state")).fetchall()
+    return {(r["rule_id"], r["mac"]): (r["triggered"], r["clear_since_ms"])
+            for r in rows}
+
+
 async def upsert_rule_state(rule_id: int, mac: str, triggered: int, changed_ms: int) -> None:
+    """Record a real transition (fire or re-arm). Resets the dwell clock —
+    both transitions invalidate any clearance being timed."""
     async with connect() as db:
         await db.execute(
             """
             INSERT INTO alert_rule_state (rule_id, mac, triggered, changed_ms)
             VALUES (?, ?, ?, ?)
             ON CONFLICT(rule_id, mac) DO UPDATE SET
-                triggered = excluded.triggered, changed_ms = excluded.changed_ms
+                triggered = excluded.triggered, changed_ms = excluded.changed_ms,
+                clear_since_ms = NULL
             """,
             (rule_id, mac, triggered, changed_ms),
+        )
+        await db.commit()
+
+
+async def set_rule_clear_since(rule_id: int, mac: str,
+                               clear_since_ms: int | None) -> None:
+    """Dwell-clock bookkeeping only. Deliberately does NOT touch changed_ms:
+    the client renders "triggered since" from it, and a clock tick is not a
+    state change."""
+    async with connect() as db:
+        await db.execute(
+            "UPDATE alert_rule_state SET clear_since_ms = ? "
+            "WHERE rule_id = ? AND mac = ?",
+            (clear_since_ms, rule_id, mac),
         )
         await db.commit()
 
@@ -1283,6 +1767,20 @@ async def list_pending_devices() -> list[dict[str, Any]]:
 from . import storm as _storm  # noqa: E402  (cycle-safe: storm imports no db)
 
 
+async def max_windgust_in_window(mac: str, start_ms: int, end_ms: int) -> float | None:
+    """Max windgustmph in [start, end] — the storm summary's gust-front lead
+    (alerts._check_storm_summaries): the day's headline gust often arrives
+    minutes BEFORE the first bucket tip opens the storm window. Fixed column
+    on purpose — nothing to interpolate, nothing to whitelist."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT MAX(CASE WHEN typeof(windgustmph) IN ('integer','real') "
+            "            THEN windgustmph END) "
+            "FROM observations WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?",
+            (mac, start_ms, end_ms))).fetchone()
+    return row[0]
+
+
 async def storm_window_stats(mac: str, start_ms: int, end_ms: int,
                              counter_col: str) -> dict[str, Any]:
     """Everything the storm summary reports, computed from stored history.
@@ -1386,6 +1884,41 @@ async def remove_push_token(token: str) -> None:
     """Prune a token APNs rejected as dead (410 Unregistered / BadDeviceToken)."""
     async with connect() as db:
         await db.execute("DELETE FROM push_tokens WHERE token = ?", (token,))
+        await db.commit()
+
+
+async def register_live_activity_token(token: str, kind: str,
+                                       env: str | None) -> None:
+    """Push-to-start registration, same idempotent shape as push_tokens —
+    iOS rotates these and the app re-posts whatever it currently holds."""
+    now = int(time.time() * 1000)
+    async with connect() as db:
+        await db.execute(
+            """
+            INSERT INTO live_activity_tokens (token, kind, env, created_ms, last_seen_ms)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(token) DO UPDATE SET
+                kind = excluded.kind, env = excluded.env,
+                last_seen_ms = excluded.last_seen_ms
+            """,
+            (token, kind, env, now, now),
+        )
+        await db.commit()
+
+
+async def list_live_activity_tokens(kind: str = "start") -> list[dict[str, Any]]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT token, env FROM live_activity_tokens WHERE kind = ?",
+            (kind,))).fetchall()
+    return [{"token": r["token"], "env": r["env"]} for r in rows]
+
+
+async def remove_live_activity_token(token: str) -> None:
+    """Prune a token APNs rejected as dead — same rule as push_tokens."""
+    async with connect() as db:
+        await db.execute(
+            "DELETE FROM live_activity_tokens WHERE token = ?", (token,))
         await db.commit()
 
 
@@ -1989,11 +2522,27 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
     those itself, and its own (revisable) current value is the truth — a MAX
     here could contradict the number the station is showing right now.
     `yearly_in` is a true calendar YTD, unlike the sensor-native lifetime
-    counters tier 1 works from — which is why only this tier reports it."""
+    counters tier 1 works from — which is why only this tier reports it.
+
+    Cached ~60s per (mac, local day) — R5-33, measured on Doren's guest
+    2026-08-23: at 1.15M rows the two scans below cost 0.5–3.0s on a cold
+    page cache (shared-CPU/256MB can't keep the index hot), and /current
+    runs this for EVERY request to a tier-3 station — every client's 60s
+    poll, every widget, every public-page build. A Tempest at its 1-minute
+    cadence reaches that row count in about a year. The cached values are
+    week/month/year sums only, so 60s of staleness is invisible; hourly/
+    daily stay None (the station's own numbers are the truth for those)."""
     from datetime import datetime, timedelta
 
     now_local = datetime.now(tz=tz)
     start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    cache_key = (mac, start_of_today.date().isoformat())
+    now_mono = time.monotonic()
+    hit = _DAILY_ROLLUP_CACHE.get(cache_key)
+    if hit is not None and now_mono < hit[0]:
+        return dict(hit[1])
+
     start_of_week = start_of_today - timedelta(days=(now_local.weekday() + 1) % 7)
     start_of_month = start_of_today.replace(day=1)
     start_of_year = start_of_today.replace(month=1, day=1)
@@ -2012,11 +2561,18 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
         # dailyrainin never does, and summing its daily maxima reports
         # 17.10 + 17.16 = 34.26" across two days instead of the 0.06"
         # increment (CodeRabbit, 2026-08-20). Not computable → all-None.
+        # Bounded to the anchor window (R5-33's other half): the judgment
+        # only needs to hold for the rows being summed, a real per-day
+        # counter touches ~0 on any dry midnight inside the window, and a
+        # lifetime counter stays high in ANY window — same verdict, one
+        # year of index instead of the station's whole history.
         floor_row = await (await db.execute(
-            "SELECT MIN(dailyrainin) AS lo FROM observations WHERE mac = ?",
-            (mac,))).fetchone()
+            "SELECT MIN(dailyrainin) AS lo FROM observations "
+            "WHERE mac = ? AND dateutc_ms >= ?",
+            (mac, anchor_ms))).fetchone()
         lo = _tolerant_float(floor_row["lo"]) if floor_row else None
         if lo is not None and lo > _DAILY_RAIN_RESET_FLOOR_IN:
+            _rollup_cache_store(cache_key, out, now_mono)
             return out
         rows = await (await db.execute(
             """
@@ -2027,6 +2583,7 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
             """,
             (anchor_ms, day_ms, mac, anchor_ms))).fetchall()
     if not rows:
+        _rollup_cache_store(cache_key, out, now_mono)
         return out
     days = [(r["day"], _tolerant_float(r["m"])) for r in rows]
     for name, boundary in (("weekly_in", start_of_week),
@@ -2043,7 +2600,24 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
                       + day_ms // 2) // day_ms)
         total = sum(m for d, m in days if d >= first_day and m is not None)
         out[name] = round(max(0.0, total), 3)
+    _rollup_cache_store(cache_key, out, now_mono)
     return out
+
+
+# R5-33: (mac, local-day) → (expires_monotonic, result). Keyed by day so a
+# midnight rollover always recomputes with fresh boundaries even inside the
+# TTL; stale-day entries are pruned on store, so the dict stays a handful of
+# entries. TTL is a module var, not a constant, so tests can zero it.
+_DAILY_ROLLUP_CACHE: dict[tuple[str, str], tuple[float, dict[str, float | None]]] = {}
+_DAILY_ROLLUP_TTL_S = 60.0
+
+
+def _rollup_cache_store(key: tuple[str, str], value: dict[str, float | None],
+                        now_mono: float) -> None:
+    stale = [k for k in _DAILY_ROLLUP_CACHE if k[1] != key[1]]
+    for k in stale:
+        _DAILY_ROLLUP_CACHE.pop(k, None)
+    _DAILY_ROLLUP_CACHE[key] = (now_mono + _DAILY_ROLLUP_TTL_S, dict(value))
 
 
 async def aggregate(
@@ -2059,10 +2633,10 @@ async def aggregate(
         row = await (await db.execute(
             f"""
             SELECT
-              MIN({col}) AS lo,
-              MAX({col}) AS hi,
-              AVG({col}) AS avg,
-              COUNT({col}) AS n
+              MIN(CASE WHEN typeof({col}) IN ('integer','real') THEN {col} END) AS lo,
+              MAX(CASE WHEN typeof({col}) IN ('integer','real') THEN {col} END) AS hi,
+              AVG(CASE WHEN typeof({col}) IN ('integer','real') THEN {col} END) AS avg,
+              COUNT(CASE WHEN typeof({col}) IN ('integer','real') THEN {col} END) AS n
             FROM observations
             WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?
             """,
@@ -2085,6 +2659,46 @@ async def aggregate(
         "minAt": lo_row["dateutc_ms"] if lo_row else None,
         "maxAt": hi_row["dateutc_ms"] if hi_row else None,
     }
+
+
+async def field_series(
+    mac: str, field: str, start_ms: int, end_ms: int, points: int
+) -> list[float | None]:
+    """Bucket-averaged series for one field: `points` equal buckets across
+    [start_ms, end_ms), None where a bucket holds no rows (a data gap must
+    stay a gap — never zero). Built for widget/complication sparklines,
+    where the full bucketed /history payload is too heavy.
+
+    `field` is the public API name; the column it resolves to is
+    interpolated into SQL, so it MUST come from _FIELD_MAP and nowhere
+    else (same guard as aggregate(), and a real raise, not an assert).
+    """
+    inverse = {v: k for k, v in _FIELD_MAP.items()}
+    if field not in inverse:
+        raise ValueError(f"unknown field {field!r}")
+    col = inverse[field]
+    span = end_ms - start_ms
+    if span <= 0 or points <= 0:
+        return []
+    # Ceil so the last observation's bucket index stays < points; a floored
+    # width made the tail spill into an index that was then dropped.
+    bucket = -(-span // points)
+    async with connect() as db:
+        rows = await (await db.execute(
+            f"""
+            SELECT CAST((dateutc_ms - ?) / ? AS INTEGER) AS b, AVG({col}) AS v
+            FROM observations
+            WHERE mac = ? AND dateutc_ms >= ? AND dateutc_ms < ?
+              AND {col} IS NOT NULL
+            GROUP BY b ORDER BY b
+            """,
+            (start_ms, bucket, mac, start_ms, end_ms),
+        )).fetchall()
+    out: list[float | None] = [None] * points
+    for r in rows:
+        if 0 <= r["b"] < points:
+            out[r["b"]] = r["v"]
+    return out
 
 
 # Curated metrics for the records screen. API field names (see _FIELD_MAP).
@@ -2258,9 +2872,15 @@ async def _raw_period_fields(db, mac: str, cols: list[tuple[str, str]],
     for fname, col in cols:
         # col is one of our own _FIELD_MAP keys — never user input —
         # so the f-string interpolation is safe (same as aggregate()).
+        # typeof() filter (R6): SQLite orders TEXT above every number, so
+        # one garbled reading stored as 'bad' in a REAL column became the
+        # displayed all-time MAX, and AVG coerced it to 0.0 and dragged the
+        # mean. storm_window_stats grew this guard first; records was the
+        # screen it mattered most on and didn't have it.
+        num = f"CASE WHEN typeof({col}) IN ('integer','real') THEN {col} END"
         row = await (await db.execute(
-            f"SELECT MIN({col}) AS lo, MAX({col}) AS hi, "
-            f"AVG({col}) AS avg, COUNT({col}) AS n FROM observations "
+            f"SELECT MIN({num}) AS lo, MAX({num}) AS hi, "
+            f"AVG({num}) AS avg, COUNT({num}) AS n FROM observations "
             f"WHERE mac = ? AND dateutc_ms >= ? AND dateutc_ms <= ?",
             (mac, start_ms, end_ms),
         )).fetchone()

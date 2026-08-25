@@ -1017,6 +1017,394 @@ def test_threshold_alert_state_advances_on_successful_delivery(client, monkeypat
     assert any(v == 1 for v in states.values())
 
 
+def test_wind_chatter_is_one_alert_until_sustained_calm(client, monkeypatch):
+    """Doren's live pattern (verified in his observations, 2026-08-23):
+    instantaneous wind bounces 2→10+ mph within single minutes, so a
+    '>10 mph' rule fired, re-armed through the 2 mph deadband one tick
+    later, and fired again on the next poke — an alert every ~8 minutes all
+    afternoon. With the dwell clock, one breezy spell is ONE alert; re-arm
+    takes 15 minutes of CONTINUOUS calm, and a poke during the countdown
+    restarts it."""
+    import asyncio
+    import app.alerts as alerts
+    from app.alerts import AlertMonitor, effective_config
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/api/alerts/rules", headers=H,
+                json={"field": "windspeedmph", "comparator": "above",
+                      "threshold": 10})
+    fired = []
+    async def fake_deliver(cfg, subj, body, *a, **kw):
+        fired.append(body)
+        return True
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    MIN = 60_000
+    def tick(minute: int, mph: float) -> None:
+        # Fresh observation, then one monitor pass at that minute — the
+        # sync TestClient must not be driven from inside asyncio.run.
+        client.post("/ingest/custom",
+            headers={"Authorization": "Bearer test-ingest-token",
+                     "Content-Type": "application/json"},
+            json={"device": {"id": "AA:BB:CC:DD:EE:FF", "name": "Chaucer"},
+                  "timestamp_utc": f"2026-06-01T12:{minute:02d}:00Z",
+                  "wind": {"speed_mph": mph}})
+        async def one():
+            cfg = await effective_config()
+            devs = await db.list_devices()
+            await AlertMonitor()._check_threshold_rules(cfg, devs, minute * MIN)
+        asyncio.run(one())
+
+    tick(1, 10.18)                 # Doren's actual 21:33 sample
+    assert len(fired) == 1
+    tick(2, 5.0)                   # lull below the deadband: clock starts
+    tick(3, 11.0)                  # poke during the countdown
+    assert len(fired) == 1, ("a poke minutes after a lull must NOT re-fire "
+                             "— this was the every-8-minutes spam")
+    tick(4, 5.0)                   # calm again: clock restarts here
+    tick(10, 5.0)                  # 6 min of calm — still inside the window
+    tick(21, 11.0)                 # wind returns 17 min after the calm began
+    assert len(fired) == 1, ("re-arm can only complete on a CALM tick — "
+                             "wind returning at the 17-minute mark finds the "
+                             "rule still armed off and resets the clock")
+    tick(22, 5.0)                  # calm; clock restarts
+    tick(38, 5.0)                  # 16 min of continuous calm → re-armed
+    tick(39, 12.0)                 # a genuinely new event
+    assert len(fired) == 2
+    assert "12" in fired[-1]
+
+
+# ───── per-device ingest tokens (1.7) ─────
+
+def _ingest_payload(mac: str, minute: int = 0) -> dict:
+    return {"device": {"id": mac, "name": "Board"},
+            "timestamp_utc": f"2026-06-01T12:{minute:02d}:00Z",
+            "outdoor": {"tempf": 71}}
+
+
+def test_ingest_token_lifecycle_and_scope(client):
+    """Mint → use → list (last-used) → reveal → rename → revoke. And the
+    scope boundary both ways: a minted ingest token is never a read/write
+    API credential, and a guest token never ingests — the whole point is
+    per-DEVICE blast radius, not a second master key."""
+    H = {"Authorization": "Bearer test-api-token"}
+
+    r = client.post("/api/ingest-tokens", headers=H, json={"label": "915 board"})
+    assert r.status_code == 200
+    minted = r.json()
+    assert minted["token"].startswith("zwi_") and len(minted["token"]) == 36
+    assert minted["id"] == minted["token"][:12]
+    assert minted["label"] == "915 board"
+
+    # Both header forms a board might send.
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": f"Bearer {minted['token']}"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:11"))
+    assert r.status_code == 200
+    r = client.post("/ingest/custom",
+                    headers={"X-Ingest-Token": minted["token"]},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:12"))
+    assert r.status_code == 200
+
+    # The classic env INGEST_TOKEN keeps working alongside — additive, so
+    # nothing already provisioned unpairs when tokens are minted.
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:13"))
+    assert r.status_code == 200
+
+    # List: values never ship; the use above is visible as last_used_ms
+    # (the GET flushes the in-memory stamps first).
+    listed = client.get("/api/ingest-tokens", headers=H).json()["tokens"]
+    assert [t["id"] for t in listed] == [minted["id"]]
+    assert "token" not in listed[0]
+    assert listed[0]["last_used_ms"] is not None
+
+    # Reveal returns the SAME value (re-provisioning a wiped board), rename
+    # sticks.
+    r = client.get(f"/api/ingest-tokens/{minted['id']}/token", headers=H)
+    assert r.json()["token"] == minted["token"]
+    assert client.patch(f"/api/ingest-tokens/{minted['id']}", headers=H,
+                        json={"label": "shed board"}).status_code == 200
+    listed = client.get("/api/ingest-tokens", headers=H).json()["tokens"]
+    assert listed[0]["label"] == "shed board"
+
+    # Scope boundary: not a read credential, not a write credential.
+    r = client.get("/api/devices",
+                   headers={"Authorization": f"Bearer {minted['token']}"})
+    assert r.status_code == 401
+    r = client.post("/api/guest-tokens",
+                    headers={"Authorization": f"Bearer {minted['token']}"},
+                    json={})
+    assert r.status_code == 401
+
+    # ...and the reverse: a read-only share token must not ingest.
+    guest = client.post("/api/guest-tokens", headers=H, json={}).json()["token"]
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": f"Bearer {guest}"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:14"))
+    assert r.status_code == 401
+
+    # Revoke: THIS token dies, the env token and everything else live on —
+    # the un-unpairing the feature exists for.
+    assert client.delete(f"/api/ingest-tokens/{minted['id']}",
+                         headers=H).status_code == 200
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": f"Bearer {minted['token']}"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:11", minute=2))
+    assert r.status_code == 401
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:13", minute=2))
+    assert r.status_code == 200
+
+
+def test_ingest_token_works_for_discovery(client):
+    """A board provisioned with its own token runs the SDR survey too —
+    discovery has a separate auth gate that must accept minted tokens."""
+    H = {"Authorization": "Bearer test-api-token"}
+    minted = client.post("/api/ingest-tokens", headers=H,
+                         json={"label": "sdr"}).json()["token"]
+    r = client.post("/ingest/discovery",
+                    headers={"X-Ingest-Token": minted},
+                    json={"model": "Acurite-Atlas", "id": 1234})
+    assert r.status_code == 200
+    r = client.post("/ingest/discovery",
+                    headers={"X-Ingest-Token": "zwi_" + "0" * 32},
+                    json={"model": "Acurite-Atlas", "id": 1234})
+    assert r.status_code == 401
+
+
+def test_token_auto_upgrade_full_lifecycle(client):
+    """The 1.7 auto-upgrade: a shared-token device that opts in (the
+    X-Token-Upgrade header) is handed its own zwi_ token IN the ingest
+    response; delivery repeats the SAME token until the device adopts it;
+    a wiped device that falls back to the shared token recovers its
+    original identity; a REVOKED assignment mints fresh instead of
+    resurrecting the dead credential."""
+    H = {"Authorization": "Bearer test-api-token"}
+    SH = {"Authorization": "Bearer test-ingest-token",
+          "X-Token-Upgrade": "request"}
+
+    def post(headers, minute):
+        return client.post("/ingest/custom", headers=headers,
+                           json=_ingest_payload("AA:BB:CC:DD:EE:21", minute))
+
+    # Opt-in on the shared token → assignment arrives in the response.
+    r = post(SH, 0)
+    assert r.status_code == 200
+    assigned = r.json().get("assign_ingest_token")
+    assert assigned and assigned.startswith("zwi_")
+
+    # Re-delivery is idempotent — same token, no second mint.
+    r = post(SH, 1)
+    assert r.json().get("assign_ingest_token") == assigned
+    listed = client.get("/api/ingest-tokens", headers=H).json()["tokens"]
+    autos = [t for t in listed if (t["label"] or "").endswith("(auto)")]
+    assert len(autos) == 1
+    assert autos[0]["label"] == "Board (auto)"
+
+    # Adoption: the device posts WITH its assigned token — accepted, and
+    # no assignment rides a minted-token response.
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": f"Bearer {assigned}"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:21", 2))
+    assert r.status_code == 200
+    assert "assign_ingest_token" not in r.json()
+
+    # NVS-loss recovery: back on the shared token, the SAME identity comes
+    # back — no orphan tokens from a device that keeps forgetting.
+    r = post(SH, 3)
+    assert r.json().get("assign_ingest_token") == assigned
+
+    # Without the opt-in header, the shared token gets no assignment —
+    # a curl user's script output stays clean.
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:21", 4))
+    assert "assign_ingest_token" not in r.json()
+
+    # Revocation is final: the operator revokes the assigned token; the
+    # next opt-in mints a FRESH one rather than resurrecting the corpse.
+    r = client.get("/api/ingest-tokens", headers=H).json()["tokens"]
+    auto_id = next(t["id"] for t in r if (t["label"] or "").endswith("(auto)"))
+    assert client.delete(f"/api/ingest-tokens/{auto_id}",
+                         headers=H).status_code == 200
+    r = post(SH, 5)
+    fresh = r.json().get("assign_ingest_token")
+    assert fresh and fresh.startswith("zwi_") and fresh != assigned
+    # ...and the revoked token no longer authenticates.
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": f"Bearer {assigned}"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:21", 6))
+    assert r.status_code == 401
+
+
+def test_token_upgrade_ignores_minted_token_requests(client):
+    """A device already holding a per-device token gets nothing even if it
+    keeps sending the header (firmware guards on the zwi_ prefix, but the
+    server must not rely on that)."""
+    H = {"Authorization": "Bearer test-api-token"}
+    minted = client.post("/api/ingest-tokens", headers=H,
+                         json={"label": "manual"}).json()["token"]
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": f"Bearer {minted}",
+                             "X-Token-Upgrade": "request"},
+                    json=_ingest_payload("AA:BB:CC:DD:EE:22"))
+    assert r.status_code == 200
+    assert "assign_ingest_token" not in r.json()
+    # And no assignment row was created for the mac.
+    listed = client.get("/api/ingest-tokens", headers=H).json()["tokens"]
+    assert all(not (t["label"] or "").endswith("(auto)") for t in listed)
+
+
+def test_rule_create_rejects_non_finite_threshold(client):
+    """R6 C5: Starlette's parser accepts the non-standard Infinity/NaN JSON
+    literals; an Infinity rule STORED and then 500'd GET /api/alerts/rules
+    forever (JSONResponse allow_nan=False), with the list being the only way
+    to learn the id to delete. Both routes must 400."""
+    H = {"Authorization": "Bearer test-api-token",
+         "Content-Type": "application/json"}
+    for bad in ("Infinity", "-Infinity", "NaN"):
+        r = client.post("/api/alerts/rules", headers=H,
+                        content='{"field": "tempf", "comparator": "above", '
+                                f'"threshold": {bad}}}'.replace("}}", "}"))
+        assert r.status_code == 400, f"{bad}: {r.status_code}"
+    # The list stays serializable afterwards — the actual blast radius.
+    assert client.get("/api/alerts/rules", headers=H).status_code == 200
+    # PATCH keeps its existing guard.
+    rid = client.post("/api/alerts/rules", headers=H,
+                      json={"field": "tempf", "comparator": "above",
+                            "threshold": 100}).json()["id"]
+    r = client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                     content='{"threshold": Infinity}')
+    assert r.status_code == 400
+
+
+def test_delete_device_clears_storm_and_probation_state(client):
+    """R6 finding 4: storm_state / pending_devices / the token-upgrade
+    assignment are mac-keyed and survived deletion — a re-registered MAC
+    inherited an open storm tracker and skipped probation."""
+    import asyncio
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json=_ingest_payload("AA:BB:CC:DD:EE:31"))
+
+    async def seed():
+        await db.upsert_storm_state("AA:BB:CC:DD:EE:31", 1_000, 2_000,
+                                    "dailyrainin", 0.5, 3_000)
+        await db.set_ingest_assignment("AA:BB:CC:DD:EE:31", "zwi_" + "1" * 32, 1)
+    asyncio.run(seed())
+
+    r = client.delete("/api/devices/AA:BB:CC:DD:EE:31", headers=H)
+    assert r.status_code == 200
+
+    async def check():
+        return (await db.get_storm_state("AA:BB:CC:DD:EE:31"),
+                await db.get_ingest_assignment("AA:BB:CC:DD:EE:31"))
+    storm_row, assign_row = asyncio.run(check())
+    assert storm_row is None or not storm_row.get("started_ms")
+    assert assign_row is None
+
+
+def test_device_alert_threshold_applies_without_monitor(client):
+    """R6 finding 11: {"threshold_minutes": 45} alone used to 200 with no
+    effect — it must apply while preserving the current monitor state."""
+    import asyncio
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json=_ingest_payload("AA:BB:CC:DD:EE:32"))
+    r = client.put("/api/devices/AA:BB:CC:DD:EE:32/alert", headers=H,
+                   json={"threshold_minutes": 45})
+    assert r.status_code == 200
+    prefs = asyncio.run(db.get_device_alert_prefs())
+    row = prefs.get("AA:BB:CC:DD:EE:32")
+    assert row and row["threshold_min"] == 45
+    assert row["monitor"] is True          # preserved default, not clobbered
+
+
+def test_records_aggregates_ignore_text_in_real_columns(client):
+    """R6 finding 5: SQLite orders TEXT above every number, so one garbled
+    poller row became the all-time MAX and dragged AVG toward 0. The
+    typeof() guard storm_window_stats always had now covers /summary too."""
+    import asyncio
+    import datetime as dt
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    now = dt.datetime.now(dt.timezone.utc)
+    ts = (now - dt.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AA:BB:CC:DD:EE:33"},
+                      "timestamp_utc": ts, "outdoor": {"tempf": 88.0}})
+
+    async def poison():
+        async with db.connect() as conn:
+            await conn.execute(
+                "UPDATE observations SET tempf = 'garbled' "
+                "WHERE mac = 'AA:BB:CC:DD:EE:33'")
+            await conn.commit()
+        # A second clean row so the aggregate has one real number.
+        return None
+    asyncio.run(poison())
+    ts2 = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AA:BB:CC:DD:EE:33"},
+                      "timestamp_utc": ts2, "outdoor": {"tempf": 90.0}})
+
+    start = int((now - dt.timedelta(hours=1)).timestamp() * 1000)
+    end = int((now + dt.timedelta(minutes=1)).timestamp() * 1000)
+    r = client.get(f"/api/devices/AA:BB:CC:DD:EE:33/summary"
+                   f"?field=tempf&start_ms={start}&end_ms={end}", headers=H)
+    assert r.status_code == 200
+    body = r.json()
+    # TEXT sorts above numbers in SQLite: unguarded MAX returned 'garbled'.
+    assert body["max"] == 90.0
+    assert body["avg"] == 90.0
+
+
+def test_live_activity_token_registration(client):
+    """Push-to-start tokens (nowcast phase 2): idempotent upsert, owner
+    gated, unknown kinds refused so a future 'update' rollout can't be
+    half-registered against a v1 server."""
+    import asyncio
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    r = client.post("/api/push/live-activity-token", headers=H,
+                    json={"token": "ab" * 32, "env": "production"})
+    assert r.status_code == 200
+    r = client.post("/api/push/live-activity-token", headers=H,
+                    json={"token": "ab" * 32, "env": "production"})
+    assert r.status_code == 200          # re-register is a no-op upsert
+    rows = asyncio.run(db.list_live_activity_tokens("start"))
+    assert [t["token"] for t in rows] == ["ab" * 32]
+    assert client.post("/api/push/live-activity-token", headers=H,
+                       json={"token": "cd" * 32, "kind": "update"}).status_code == 400
+    guest = client.post("/api/guest-tokens", headers=H, json={}).json()["token"]
+    assert client.post("/api/push/live-activity-token",
+                       headers={"Authorization": f"Bearer {guest}"},
+                       json={"token": "ee" * 32}).status_code in (401, 403)
+
+
+def test_ingest_token_routes_are_write_gated(client):
+    """A guest must not mint, list, reveal, or revoke ingest credentials —
+    same containment contract as the share-token routes."""
+    H = {"Authorization": "Bearer test-api-token"}
+    guest = client.post("/api/guest-tokens", headers=H, json={}).json()["token"]
+    GH = {"Authorization": f"Bearer {guest}"}
+    assert client.post("/api/ingest-tokens", headers=GH, json={}).status_code in (401, 403)
+    assert client.get("/api/ingest-tokens", headers=GH).status_code in (401, 403)
+    assert client.get("/api/ingest-tokens/zwi_00000000/token",
+                      headers=GH).status_code in (401, 403)
+    assert client.delete("/api/ingest-tokens/zwi_00000000",
+                         headers=GH).status_code in (401, 403)
+
+
 # ───── reviewer P3: relay URL must reject SSRF-able destinations ─────
 
 def test_relay_url_rejects_unsafe_schemes_and_hosts(client):
@@ -1209,6 +1597,80 @@ def test_public_dashboard_explicit_mac_selects_station(client, monkeypatch):
     # page — both stations still appear in the lower device-stats table.
     assert 'class="cc-name">Davis Vantage Pro 2' in page   # pinned station rendered
     assert 'class="cc-name">Crestview SDR' not in page     # other one filtered out
+
+
+def test_public_dashboard_csv_order_is_page_order(client, monkeypatch):
+    """The macs CSV's order IS the render order — the app's sharing screen
+    writes it in the user's chosen ranking. The old selector filtered the
+    devices list instead, so the page always followed ingest order no matter
+    what the operator wrote."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ts = (now - _dt.timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Ingest order: SDR first, Davis second.
+    for dev_id, name, temp in (("AABBCCDDEEFF", "Crestview SDR", 87.0),
+                               ("5D5D05000001", "Davis Vantage Pro 2", 91.0)):
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": dev_id, "name": name},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": temp, "humidity": 40},
+                          "wind": {"speed_mph": 3}, "rain": {},
+                          "pressure": {"relative_inhg": 29.9},
+                          "source": "test"})
+    # CSV asks for the REVERSE of ingest order (and lists the Davis twice —
+    # the dedup must keep first position, not render it twice).
+    monkeypatch.setattr(settings, "public_dashboard_macs",
+                        "5d5d05000001,AA:BB:CC:DD:EE:FF,5D5D05000001")
+    page = client.get("/").text
+    davis = page.find('class="cc-name">Davis Vantage Pro 2')
+    sdr = page.find('class="cc-name">Crestview SDR')
+    assert davis != -1 and sdr != -1
+    assert davis < sdr, "page order must follow the CSV, not ingest order"
+    assert page.count('class="cc-name">Davis Vantage Pro 2') == 1
+
+
+def test_public_dashboard_compare_block_leads_multi_station_pages(client, monkeypatch):
+    """With 2+ stations a 'Side by side' overlay block renders FIRST (temp/
+    feels/humidity/pressure, one axis per field, every station a line). A
+    single-station page must not grow the block."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    def post(dev_id, name, temp):
+        # Two rows per station: svg_multi_chart drops <2-point series.
+        for mins in (90, 30):
+            ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            client.post("/ingest/custom",
+                        headers={"Authorization": "Bearer test-ingest-token"},
+                        json={"device": {"id": dev_id, "name": name},
+                              "timestamp_utc": ts,
+                              "outdoor": {"tempf": temp, "humidity": 40},
+                              "wind": {"speed_mph": 3}, "rain": {},
+                              "pressure": {"relative_inhg": 29.9},
+                              "source": "test"})
+    post("AABBCCDDEEFF", "Crestview SDR", 87.0)
+    # Single station: no compare block.
+    monkeypatch.setattr(settings, "public_dashboard_macs", "")
+    page = client.get("/").text
+    assert "Side by side" not in page
+    # Second station arrives; select both.
+    post("5D5D05000001", "Davis Vantage Pro 2", 91.0)
+    monkeypatch.setattr(settings, "public_dashboard_macs", "all")
+    from app import main as _m
+    _m._PUBLIC_DASH_CACHE = None            # bust the ~100s page cache
+    page = client.get("/").text
+    assert "Side by side" in page
+    # The block leads: before the first per-station header.
+    assert page.find("Side by side") < page.find('class="cc-name">Crestview SDR')
+    # Both stations appear in a compare legend, and the overlay charts
+    # carry the all-stations caption.
+    assert page.count("all stations · 24h") >= 2
+    legend_zone = page[page.find("Side by side"):page.find('class="cc-name">Crestview SDR')]
+    assert "Davis Vantage Pro 2" in legend_zone and "Crestview SDR" in legend_zone
 
 
 def test_records_endpoint(client):
@@ -2092,6 +2554,54 @@ def test_summary_validates_hours_bounds_and_auth(client):
     assert client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary").status_code == 401
 
 
+def test_summary_points_returns_bucketed_series_with_gaps(client):
+    """`points=N` adds a bucket-averaged series over the same window, built
+    for the widget sparkline. The two seeded rows (2h and 1h ago) land in
+    buckets 22 and 23 of a 24h/24-point request; every other bucket is null —
+    a data gap must serialize as a gap, never as zero (absent-is-not-zero)."""
+    _seed_summary_device(client)
+    r = client.get(
+        "/api/devices/AA:BB:CC:DD:EE:FF/summary?field=tempf&hours=24&points=24",
+        headers=_H)
+    assert r.status_code == 200
+    body = r.json()
+    series = body["series"]
+    assert len(series) == 24
+    # The rows sit 2h and 1h before the window's end; the request-time `end`
+    # lands moments after seeding, so each offset is a hair under the exact
+    # hour boundary. Assert structure, not exact indices: chronological
+    # order, adjacent one-hour buckets, at the tail of the window.
+    filled = [(i, v) for i, v in enumerate(series) if v is not None]
+    assert [v for _, v in filled] == [70.0, 90.0]
+    assert filled[1][0] - filled[0][0] == 1
+    assert filled[1][0] in (22, 23)
+    assert series.count(None) == 22
+    # The aggregate half of the response is unchanged by asking for a series.
+    assert body["min"] == 70.0 and body["max"] == 90.0
+
+
+def test_summary_points_bounds_shape_and_field_guard(client):
+    _seed_summary_device(client)
+    # points rides Query(ge=2, le=200).
+    for bad in (1, 201):
+        assert client.get(
+            f"/api/devices/AA:BB:CC:DD:EE:FF/summary?points={bad}",
+            headers=_H).status_code == 422, f"points={bad}"
+    # Omitted → no `series` key at all, so pre-points clients see the exact
+    # old shape.
+    body = client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary?field=tempf",
+                      headers=_H).json()
+    assert "series" not in body
+    # The series path interpolates the resolved column like aggregate() does;
+    # an unlisted field must 400 with points set too, and leave the table.
+    assert client.get(
+        "/api/devices/AA:BB:CC:DD:EE:FF/summary",
+        params={"field": "tempf;DROP TABLE observations", "points": 24},
+        headers=_H).status_code == 400
+    assert client.get("/api/devices/AA:BB:CC:DD:EE:FF/summary?field=tempf",
+                      headers=_H).status_code == 200
+
+
 # ───────────────── PUT /api/push/relay update/clear semantics (R2-163) ─────────────────
 
 def test_push_relay_partial_updates_preserve_and_empty_string_clears(client):
@@ -2230,7 +2740,7 @@ def test_stale_alert_retries_when_delivery_fails(client, monkeypatch):
                       "timestamp_utc": "2026-06-01T12:00:00Z",
                       "outdoor": {"tempf": 75}})
     calls = {"n": 0}
-    async def failing_deliver(cfg, subj, body, ptitle, pbody):
+    async def failing_deliver(cfg, subj, body, ptitle, pbody, **kw):
         calls["n"] += 1
         return False
     monkeypatch.setattr(alerts, "_deliver", failing_deliver)
@@ -2256,7 +2766,7 @@ def test_stale_alert_retries_when_delivery_fails(client, monkeypatch):
     assert s1[mac]["notified_ms"] is None
 
     # Delivery recovers → the alert goes out once, state + notify clock advance.
-    async def good_deliver(cfg, subj, body, ptitle, pbody):
+    async def good_deliver(cfg, subj, body, ptitle, pbody, **kw):
         calls["n"] += 1
         return True
     monkeypatch.setattr(alerts, "_deliver", good_deliver)
@@ -2323,6 +2833,50 @@ def test_current_fills_periods_for_a_daily_only_rain_source(client):
                      headers={"Authorization": "Bearer test-api-token"}).json()
     for k in ("dailyrainin", "weeklyrainin", "monthlyrainin", "yearlyrainin"):
         assert dry.get(k) is None, f"{k} fabricated for a rainless station"
+
+
+def test_daily_rollup_cache_serves_within_ttl_and_day_key(client):
+    """R5-33: the tier-3 derivation scans a station's whole year of rows —
+    measured at 0.5–3.0s on a 1.15M-row archive (Doren's box, 2026-08-23)
+    — and /current used to run it per REQUEST. Now cached ~60s per
+    (mac, local day): within the TTL the derived week/month/year hold
+    still (they move on day scales anyway) while the station's own
+    dailyrainin stays live; expiry or a midnight rollover recomputes."""
+    import datetime as dt
+    from app import db as dbm
+    H = {"Authorization": "Bearer test-api-token"}
+    now = dt.datetime.now(dt.timezone.utc)
+
+    def blow(daily: float, mins_ago: int) -> None:
+        ts = (now - dt.timedelta(minutes=mins_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = client.post("/ingest/custom",
+                        headers={"Authorization": "Bearer test-ingest-token"},
+                        json={"device": {"id": "AABBCCDD0779"},
+                              "timestamp_utc": ts, "source": "tempest",
+                              "outdoor": {"tempf": 70.0},
+                              "rain": {"daily_in": daily}})
+        assert r.status_code == 200
+
+    # Modest increment on purpose — a 0.4" jump inside a minute reads as
+    # a 24 in/hr rate and the ingest rain-glitch guard (correctly) drops
+    # it, which failed this test's first draft.
+    blow(0.10, 30)
+    cur = client.get("/api/devices/AA:BB:CC:DD:07:79/current", headers=H).json()
+    assert cur["weeklyrainin"] == 0.10
+    assert dbm._DAILY_ROLLUP_CACHE, "derivation result must be cached"
+
+    blow(0.13, 1)
+    cur = client.get("/api/devices/AA:BB:CC:DD:07:79/current", headers=H).json()
+    # The station's OWN value is live (tier 3 never derives daily)...
+    assert cur["dailyrainin"] == 0.13
+    # ...while the derived periods answer from cache — the R5-33 point:
+    # no year-window scan per request.
+    assert cur["weeklyrainin"] == 0.10
+
+    # TTL elapses (same effect as the day-key changing at midnight).
+    dbm._DAILY_ROLLUP_CACHE.clear()
+    cur = client.get("/api/devices/AA:BB:CC:DD:07:79/current", headers=H).json()
+    assert cur["weeklyrainin"] == 0.13
 
 
 def test_public_dashboard_carries_the_summary_boards(client, monkeypatch):
@@ -2577,3 +3131,504 @@ def test_embed_with_zero_devices_renders_empty_state(client, monkeypatch):
     r = client.get("/embed")
     assert r.status_code == 200
     assert "No stations reporting yet" in r.text
+
+
+def test_alerts_rain_start_pref_roundtrip(client):
+    """1.7 rain-start toggle rides alert_prefs DB-over-env like the storm
+    columns: env default off, PUT flips it, source flips to 'app'."""
+    body = client.get("/api/alerts", headers=_H).json()
+    assert body["rain_start"] is False and body["rain_start_source"] == "env"
+    r = client.put("/api/alerts", headers=_H, json={"rain_start": True})
+    assert r.status_code == 200
+    body = client.get("/api/alerts", headers=_H).json()
+    assert body["rain_start"] is True and body["rain_start_source"] == "app"
+
+
+def test_database_backup_streams_a_real_snapshot(client, monkeypatch):
+    """GET /api/backup/database returns a standalone, CONSISTENT SQLite file
+    (VACUUM INTO) carrying the ingested history — and it is write-gated:
+    the file is everything, including secrets the read APIs redact."""
+    import datetime as _dt
+    import sqlite3
+    import tempfile
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF"}, "timestamp_utc": ts,
+                      "outdoor": {"tempf": 91.0}, "source": "test"})
+    r = client.get("/api/backup/database", headers=_H)
+    assert r.status_code == 200
+    assert r.content.startswith(b"SQLite format 3\x00")
+    assert "zasder-weather-" in r.headers.get("content-disposition", "")
+    with tempfile.NamedTemporaryFile(suffix=".db") as f:
+        f.write(r.content)
+        f.flush()
+        con = sqlite3.connect(f.name)
+        n = con.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        con.close()
+    assert n >= 1, "snapshot must carry the ingested rows"
+    # Write-gated: no token and read-only both refused.
+    assert client.get("/api/backup/database").status_code == 401
+
+
+def test_database_backup_job_flow(client):
+    """The job pattern that replaced the inline-only design after it timed
+    out on a real-sized database: POST starts the VACUUM in the background,
+    /status reaches ready, GET streams the file immediately and clears the
+    job. POST is idempotent while running/fresh."""
+    import time as _t
+    import datetime as _dt
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEEFF"}, "timestamp_utc": ts,
+                      "outdoor": {"tempf": 91.0}, "source": "test"})
+    r = client.post("/api/backup/database", headers=_H)
+    assert r.status_code == 200 and r.json()["state"] in ("running", "ready")
+    state = None
+    for _ in range(50):
+        state = client.get("/api/backup/database/status", headers=_H).json()
+        if state["state"] == "ready":
+            break
+        _t.sleep(0.1)
+    assert state and state["state"] == "ready" and state["size"] > 0
+    # A second start reuses the fresh snapshot instead of stacking VACUUMs.
+    assert client.post("/api/backup/database", headers=_H).json()["state"] == "ready"
+    r = client.get("/api/backup/database", headers=_H)
+    assert r.status_code == 200
+    assert r.content.startswith(b"SQLite format 3\x00")
+    assert len(r.content) == state["size"]
+    # Job cleared after the download; status is idle again.
+    assert client.get("/api/backup/database/status",
+                      headers=_H).json()["state"] == "idle"
+    # All three routes stay write-gated.
+    assert client.post("/api/backup/database").status_code == 401
+    assert client.get("/api/backup/database/status").status_code == 401
+
+
+def test_public_dashboard_right_now_strip(client, monkeypatch):
+    """Option A (Volney, 2026-08-22): multi-station pages open with a
+    composite 'Right now' strip — primary temp/feels, per-field chips from
+    the FRESHEST station reporting that field (never cross-station
+    averages), source named in the chip tooltip. Single-station pages skip
+    it: their own header already opens the page."""
+    import datetime as _dt
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    now = _dt.datetime.now(_dt.timezone.utc)
+
+    def post(dev_id, name, mins_ago, outdoor):
+        ts = (now - _dt.timedelta(minutes=mins_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": dev_id, "name": name},
+                          "timestamp_utc": ts, "outdoor": outdoor,
+                          "wind": {"speed_mph": 3}, "rain": {},
+                          "pressure": {"relative_inhg": 29.9}, "source": "test"})
+
+    # Primary: older readings, NO humidity. Secondary: fresher, has
+    # humidity. Two rows each so the compare block renders too (its charts
+    # drop single-point series).
+    post("5D5D05000001", "Davis Vantage Pro 2", 40, {"tempf": 106.0})
+    post("5D5D05000001", "Davis Vantage Pro 2", 20, {"tempf": 107.1})
+    monkeypatch.setattr(settings, "public_dashboard_macs", "")
+    page = client.get("/").text
+    assert "RIGHT NOW" not in page, "single station must not grow the strip"
+
+    post("AABBCCDDEEFF", "Chandler Tempest", 30,
+         {"tempf": 104.0, "humidity": 25})
+    post("AABBCCDDEEFF", "Chandler Tempest", 1,
+         {"tempf": 105.0, "humidity": 22})
+    monkeypatch.setattr(settings, "public_dashboard_macs", "all")
+    from app import main as _m
+    _m._PUBLIC_DASH_CACHE = None
+    page = client.get("/").text
+    strip = page[page.find("RIGHT NOW"):page.find("Side by side")]
+    assert "RIGHT NOW" in page
+    # Big temp = PRIMARY station's (107 rounded), not the fresher secondary.
+    assert ">107°<" in strip
+    # Humidity chip fell through to the only station reporting it, with the
+    # source named in the tooltip.
+    assert "22%" in strip and 'title="from Chandler Tempest"' in strip
+    assert "2 stations" in strip and "updated" in strip
+    # Strip leads the page — before the compare block.
+    assert page.find("RIGHT NOW") < page.find("Side by side")
+    # The Today row rides the strip: PRIMARY's 24h numbers (high 107 from
+    # the primary's own two rows — the fresher secondary's 105 max must
+    # not leak in).
+    assert "24h High" in strip
+    assert ">107°<" in strip.split("24h High")[1], \
+        "Today row must carry the PRIMARY's 24h high (107), not the secondary's 105"
+
+
+def test_recent_alerts_history(client):
+    """1.7 alert history (Doren: swiped-away notifications are gone forever).
+
+    The _deliver funnel writes one row per HANDLED alert; a muted alert (no
+    willing channel) still lands, marked undelivered, because the Recent list
+    is then the only place it is visible at all. Endpoint is newest-first and
+    capped."""
+    import asyncio
+    from app import alerts as A
+    from app import db as adb
+
+    class _Cfg:
+        enabled = False          # email muted
+        recipients = []
+
+    # No email, no push configured → "handled, nothing attempted" → logged
+    # with delivered=0.
+    ok = asyncio.run(A._deliver(_Cfg(), "s", "b", "Frost warning", "31°F at Yard",
+                                email_ok=False, kind="frost", mac="AA:BB"))
+    assert ok is True
+    asyncio.run(adb.log_alert(1000, "rule", "AA:BB", "Wind over 25 mph",
+                              "Gusting 31 mph", True))
+
+    r = client.get("/api/alerts/recent",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    rows = r.json()["alerts"]
+    assert [x["kind"] for x in rows[:2]] == ["rule", "frost"]
+    assert rows[1]["title"] == "Frost warning"
+    assert rows[1]["delivered"] == 0 and rows[0]["delivered"] == 1
+    assert rows[1]["mac"] == "AA:BB"
+
+    # limit clamps and applies
+    r = client.get("/api/alerts/recent?limit=1",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert len(r.json()["alerts"]) == 1
+
+
+def test_db_backup_dest_space_handling(client, monkeypatch):
+    """2026-08-22, Volney's instance: VACUUM INTO next to the DB died with
+    'database or disk is full' after minutes of work — the Fly volume can't
+    hold a second copy of a multi-year database. The picker must fall back
+    to the root filesystem's tempdir, and refuse UP FRONT with a sized
+    message when nothing has room."""
+    import collections
+    import tempfile as T
+    import pytest
+    from fastapi import HTTPException
+    from app import main as M
+
+    Usage = collections.namedtuple("usage", "total used free")
+    db_parent = str(M.Path(M.settings.database_path).parent)
+
+    def volume_full(d):
+        if str(d) == db_parent:
+            return Usage(100, 99, 1024)
+        return Usage(10**12, 0, 10**11)
+
+    monkeypatch.setattr(M.shutil, "disk_usage", volume_full)
+    dest = M._db_backup_dest()
+    assert str(dest).startswith(str(M.Path(T.gettempdir())))
+
+    monkeypatch.setattr(M.shutil, "disk_usage", lambda d: Usage(100, 99, 1024))
+    with pytest.raises(HTTPException) as ei:
+        M._db_backup_dest()
+    assert ei.value.status_code == 507
+    assert "MB" in ei.value.detail
+
+
+def test_storm_summary_channels_and_per_device(client):
+    """1.7 storm-summary controls (Volney: own settings section, per-device
+    selection, push/email/both). Channel choice validates and round-trips;
+    "" clears back to legacy; the per-device switch rides the existing
+    device-alert PUT without touching monitor."""
+    H = {"Authorization": "Bearer test-api-token"}
+
+    r = client.put("/api/alerts", headers=H, json={"storm_channels": "sms"})
+    assert r.status_code == 400
+
+    r = client.put("/api/alerts", headers=H, json={"storm_channels": "email"})
+    assert r.status_code == 200
+    assert r.json()["storm_channels"] == "email"
+
+    r = client.put("/api/alerts", headers=H, json={"storm_channels": ""})
+    assert r.json()["storm_channels"] is None
+
+    # Seed a device, mute its summaries; monitor must stay untouched.
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEE55", "name": "Tempest"},
+                      "timestamp_utc": "2026-08-22T12:00:00Z",
+                      "outdoor": {"tempf": 70}})
+    mac = "AA:BB:CC:DD:EE:55"
+    r = client.put(f"/api/devices/{mac}/alert", headers=H,
+                   json={"storm_summary": False})
+    assert r.status_code == 200
+    dev = next(d for d in r.json()["devices"] if d["mac"] == mac)
+    assert dev["storm_summary"] is False
+    assert dev["monitor"] is True          # storm-only PUT left monitoring on
+
+    # And a monitor PUT must not resurrect the muted summaries.
+    r = client.put(f"/api/devices/{mac}/alert", headers=H,
+                   json={"monitor": True, "threshold_minutes": 30})
+    dev = next(d for d in r.json()["devices"] if d["mac"] == mac)
+    assert dev["storm_summary"] is False
+
+
+def test_storm_summary_skips_muted_device_and_email_only_channel(client, monkeypatch):
+    """The checker must skip a muted station entirely, and storm_channels=
+    'email' must keep push out of the delivery."""
+    import asyncio
+    import app.alerts as A
+    from app import db
+
+    sent = []
+
+    async def fake_deliver(cfg, subject, body, title, pbody,
+                           email_ok=True, **kw):
+        sent.append((kw.get("mac"), email_ok, kw.get("push_ok", True)))
+        return True
+
+    monkeypatch.setattr(A, "_deliver", fake_deliver)
+
+    async def fake_stats(mac, start_ms, end_ms, counter_col):
+        return {"total_in": 0.5, "peak_rate_in_hr": 0.3,
+                "min_tempf": 66.0, "max_tempf": 73.0, "max_gust_mph": 12.0}
+
+    monkeypatch.setattr(A.db, "storm_window_stats", fake_stats)
+
+    class _Cfg:
+        storm_summary = True
+        storm_quiet_minutes = 30
+        storm_min_total_in = 0.05
+        email_scope = "device_down"
+        storm_channels = "email"
+
+    now = 1_787_000_000_000
+    device = {"mac": "AA:BB:CC:DD:EE:66",
+              "name": "Yard",
+              "lastData": {"dailyrainin": 0.0, "dateutc": now}}
+
+    async def run():
+        await db.init_db()
+        # An open storm whose quiet window has long expired → would report.
+        await db.upsert_storm_state("AA:BB:CC:DD:EE:66", now - 7_200_000,
+                                    now - 3_600_000, "dailyrainin", 0.5, now)
+        mon = A.AlertMonitor()
+        # Muted: nothing may be delivered for this mac.
+        await mon._check_storm_summaries(
+            _Cfg(), [device], now,
+            {"AA:BB:CC:DD:EE:66": {"storm_summary": False}})
+        muted_calls = list(sent)
+        # Unmuted: delivery happens, email-only (push_ok False).
+        await db.upsert_storm_state("AA:BB:CC:DD:EE:66", now - 7_200_000,
+                                    now - 3_600_000, "dailyrainin", 0.5, now)
+        await mon._check_storm_summaries(_Cfg(), [device], now, {})
+        return muted_calls, list(sent)
+
+    muted_calls, all_calls = asyncio.run(run())
+    assert muted_calls == []
+    storm_calls = [c for c in all_calls if c[0] == "AA:BB:CC:DD:EE:66"]
+    assert len(storm_calls) == 1
+    _, email_ok, push_ok = storm_calls[0]
+    assert email_ok is True and push_ok is False
+
+
+def test_session_probe_and_storm_gust_lead(client, monkeypatch):
+    """Two 1.7 pieces. GET /api/session tells a token what it can do (the
+    app's one-probe read-only detection). And the storm summary's gust
+    window now leads the rain by 30 min — Doren's 23.81 mph gust front hit
+    18 minutes before the first tip and the summary said 17."""
+    H = {"Authorization": "Bearer test-api-token"}
+    r = client.get("/api/session", headers=H)
+    assert r.status_code == 200 and r.json()["can_write"] is True
+
+    # The ingest token is not a read token at all; a guest token would be
+    # can_write False — mint one through the API to prove it end-to-end.
+    r = client.post("/api/guest-tokens", headers=H, json={"label": "t"})
+    guest = r.json()["token"]
+    r = client.get("/api/session",
+                   headers={"Authorization": f"Bearer {guest}"})
+    assert r.status_code == 200 and r.json()["can_write"] is False
+
+    # Gust lead: rain-window stats say 16.6, but a 23.8 gust sits 18 min
+    # before the window opens — the summary must report 23.8.
+    import asyncio
+    import app.alerts as A
+    from app import db
+
+    delivered = []
+
+    async def fake_deliver(cfg, subject, body, title, pbody,
+                           email_ok=True, **kw):
+        delivered.append(body)
+        return True
+
+    async def fake_stats(mac, start_ms, end_ms, counter_col):
+        return {"total_in": 0.5, "peak_rate_in_hr": 0.3,
+                "min_tempf": 66.0, "max_tempf": 73.0, "max_gust_mph": 16.6}
+
+    monkeypatch.setattr(A, "_deliver", fake_deliver)
+    monkeypatch.setattr(A.db, "storm_window_stats", fake_stats)
+
+    now = 1_787_000_000_000
+    started = now - 7_200_000
+    mac = "AA:BB:CC:DD:EE:77"
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEE77", "name": "Yard"},
+                      "timestamp_utc": "2026-08-17T21:46:00Z",  # ~18min pre
+                      "wind": {"gust_mph": 23.81}})
+
+    async def run():
+        await db.init_db()
+        # Pin the pre-window observation's timestamp relative to `started`.
+        async with db.connect() as conn:
+            await conn.execute(
+                "UPDATE observations SET dateutc_ms = ? WHERE mac = ?",
+                (started - 18 * 60_000, mac))
+            await conn.commit()
+        await db.upsert_storm_state(mac, started, now - 3_600_000,
+                                    "dailyrainin", 0.5, now)
+        device = {"mac": mac, "name": "Yard",
+                  "lastData": {"dailyrainin": 0.0, "dateutc": now}}
+
+        class _Cfg:
+            storm_summary = True
+            storm_quiet_minutes = 30
+            storm_min_total_in = 0.05
+            email_scope = "all"
+            storm_channels = None
+
+        await A.AlertMonitor()._check_storm_summaries(_Cfg(), [device], now, {})
+
+    asyncio.run(run())
+    assert delivered, "storm summary should have been delivered"
+    assert "24 mph" in delivered[0] or "23.8" in delivered[0]
+
+
+def test_guest_last_used_stamps_and_periodic_flush(client):
+    """Volney, 2026-08-23: set up a work phone on a share link, used it,
+    list still said 'never used'. The stamp mechanism must work end-to-end,
+    and the monitor tick now flushes stamps so they survive a deploy
+    restart instead of waiting for the owner to open the list."""
+    import asyncio
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+
+    guest = client.post("/api/guest-tokens", headers=H,
+                        json={"label": "Work phone"}).json()["token"]
+
+    # The work phone "using it": any read through require_token.
+    r = client.get("/api/devices", headers={"Authorization": f"Bearer {guest}"})
+    assert r.status_code == 200
+
+    # Periodic flush path (the monitor tick) — NOT the owner list.
+    asyncio.run(db.flush_guest_last_used())
+    rows = asyncio.run(db.list_guest_tokens())
+    row = next(x for x in rows if x["token"] == guest)
+    assert row["last_used_ms"] is not None
+
+    # And the owner's list shows it.
+    listed = client.get("/api/guest-tokens", headers=H).json()["tokens"]
+    mine = next(x for x in listed if x["label"] == "Work phone")
+    assert mine["last_used_ms"] is not None
+    assert mine["id"] == guest[:db.GUEST_TOKEN_ID_LEN]
+
+
+def test_session_forecast_source_follows_wu_key(client):
+    """Read-only installs can't see the forecast picker, so /api/session
+    tells them which source the server is set up for — WU key configured
+    means the owner uses TWC and guests should match."""
+    import asyncio
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+
+    r = client.get("/api/session", headers=H)
+    assert r.json()["forecast_source"] == "open-meteo"
+
+    asyncio.run(db.set_kv("wu_api_key", "k" * 20))
+    r = client.get("/api/session", headers=H)
+    assert r.json()["forecast_source"] == "twc"
+
+
+def test_limited_read_gets_rounded_coords(client):
+    """Read-only tokens used to get NO coords, which silently killed the
+    sun dial and NWS alerts on shared installs. They now get town-rounded
+    (1 decimal, ~11 km) coords — and still no free-text location label."""
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEE88", "name": "Yard"},
+                      "timestamp_utc": "2026-08-23T12:00:00Z",
+                      "outdoor": {"tempf": 88}})
+    mac = "AA:BB:CC:DD:EE:88"
+    r = client.put(f"/api/devices/{mac}/location", headers=H,
+                   json={"lat": 33.3123, "lon": -111.8462, "label": "My house"})
+    assert r.status_code == 200
+
+    guest = client.post("/api/guest-tokens", headers=H,
+                        json={"label": "coords-test"}).json()["token"]
+    devs = client.get("/api/devices",
+                      headers={"Authorization": f"Bearer {guest}"}).json()
+    dev = next(d for d in devs if d["mac"] == mac)
+    coords = dev["info"]["coords"]["coords"]
+    assert coords == {"lat": 33.3, "lon": -111.8}
+    assert dev["location"] is None
+    assert "location" not in dev["info"].get("coords", {})
+
+    # The owner still sees the full precision.
+    devs = client.get("/api/devices", headers=H).json()
+    dev = next(d for d in devs if d["mac"] == mac)
+    assert dev["info"]["coords"]["coords"]["lat"] == 33.3123
+
+
+def test_embed_reports_its_height(client, monkeypatch):
+    """/embed carries the auto-height reporter (1.7): a framed page posts
+    zasder-embed-height to the parent so the iframe can fit exactly —
+    scrolling='no' clips anything below the frame edge, and a clipped
+    bottom looks identical to cards that never loaded."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    body = client.get("/embed").text
+    assert "zasder-embed-height" in body
+    assert "ResizeObserver" in body
+    assert "window.parent === window" in body   # no-op when not framed
+
+
+def test_rule_patch_edits_threshold_and_target(client):
+    """1.7 rule editing: PATCH takes threshold and target_mac ("" = back to
+    all devices), a threshold/scope change clears the rule's trigger state
+    so evaluation restarts fresh, and enabled-only patches (the pre-1.7
+    client shape) keep working."""
+    import asyncio
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+
+    rule = client.post("/api/alerts/rules", headers=H,
+                       json={"field": "windspeedmph", "comparator": "above",
+                             "threshold": 10}).json()
+    rid = rule["id"]
+    # Simulate a fired rule: state row exists.
+    asyncio.run(db.upsert_rule_state(rid, "AA:BB:CC:DD:EE:01", 1, 1000))
+
+    # Old-client shape still works.
+    r = client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                     json={"enabled": False})
+    assert r.status_code == 200 and r.json()["enabled"] is False
+
+    # Threshold + retarget in one edit.
+    r = client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                     json={"threshold": 15, "target_mac": "AABBCCDDEE01",
+                           "enabled": True})
+    body = r.json()
+    assert body["threshold"] == 15
+    assert body["target_mac"] == "AA:BB:CC:DD:EE:01"
+    assert body["enabled"] is True
+    # Trigger state cleared → the next crossing of the NEW threshold fires.
+    states = asyncio.run(db.get_rule_states())
+    assert (rid, "AA:BB:CC:DD:EE:01") not in states
+
+    # "" clears the scope back to all devices.
+    r = client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                     json={"target_mac": ""})
+    assert r.json()["target_mac"] is None
+
+    # Guard rails.
+    assert client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                        json={"threshold": float("inf")}).status_code in (400, 422)
+    assert client.patch("/api/alerts/rules/99999", headers=H,
+                        json={"enabled": True}).status_code == 404

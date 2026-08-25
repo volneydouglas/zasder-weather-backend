@@ -1,4 +1,4 @@
-app = "zasder-weather"
+app = "zasder-weather-CHANGEME"
 primary_region = "lax"
 
 [build]

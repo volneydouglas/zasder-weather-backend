@@ -8,6 +8,7 @@ unit-tested (`decide`); the task layer adds DB-persisted state + SMTP delivery.
 Off unless `alert_email_to` and `smtp_host` are configured (see Settings).
 """
 import asyncio
+import functools
 import logging
 import smtplib
 import ssl
@@ -147,6 +148,11 @@ _COMPARATOR_SYM = {"above": ">", "below": "<", "equalTo": "="}
 # ~minute tick cadence, small next to the disabled-for-weeks gaps that
 # fabricated back-dated storms.
 _STORM_BASELINE_MAX_AGE_MS = 6 * 3_600_000
+# How far before the first bucket tip the storm summary looks for its top
+# gust. Storms lead with their wind: Doren's 23.81 mph front hit 18 minutes
+# before the rain opened the window, and the summary's "17 mph" — true for
+# the rain window — read as a wrong variable (2026-08-23).
+_STORM_GUST_LEAD_MS = 30 * 60_000
 
 
 def rule_triggered(comparator: str, threshold: float, value: float) -> bool:
@@ -189,6 +195,31 @@ def rule_cleared(comparator: str, threshold: float, value: float,
         return value >= threshold + margin
     # equalTo triggers within ±0.5; require leaving that band by the margin.
     return abs(value - threshold) >= 0.5 + margin
+
+
+# The deadband alone couldn't hold against wind: instantaneous samples swing
+# 2→10 mph within a single minute (Doren's station, verified in his
+# observations 2026-08-23), so a ">10 mph" rule fired, re-armed through the
+# 2 mph margin one tick later, and fired again on the next poke above 10 —
+# an alert every ~8 minutes all afternoon, reported as "duplicate
+# notifications". Value says WHERE the reading is; only time says the event
+# is OVER. Re-arm now additionally requires the value to stay clear for this
+# long, continuously — one breezy afternoon is one alert.
+_REARM_DWELL_MS = 15 * 60_000
+
+
+def rearm_transition(cleared: bool, clear_since_ms: int | None, now_ms: int,
+                     dwell_ms: int = _REARM_DWELL_MS) -> tuple[bool, int | None]:
+    """(rearm_now, new_clear_since_ms) for a currently-triggered rule.
+    Clearance must be CONTINUOUS: any tick that isn't clear (re-triggered or
+    merely back inside the deadband) resets the clock to none. Pure."""
+    if not cleared:
+        return False, None
+    if clear_since_ms is None:
+        return False, now_ms
+    if now_ms - clear_since_ms >= dwell_ms:
+        return True, None
+    return False, clear_since_ms
 
 
 def build_threshold_message(device_name: str, field: str, value: float,
@@ -293,6 +324,12 @@ class EffectiveAlertConfig:
     storm_summary: bool = True
     storm_quiet_minutes: float = 30.0
     storm_min_total_in: float = 0.05
+    # Rain-start nowcast (1.7), resolved the same way.
+    rain_start: bool = False
+    # 1.7: 'push' | 'email' | 'both' — which channels carry storm summaries.
+    # None = legacy (push always, email iff email_scope='all'), so existing
+    # installs keep their exact delivery until the user picks.
+    storm_channels: str | None = None
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -332,11 +369,16 @@ async def effective_config() -> EffectiveAlertConfig:
                    else settings.storm_summary_quiet_minutes)
     storm_min = (p["storm_min_total_in"] if p["storm_min_total_in"] is not None
                  else settings.storm_summary_min_total_in)
+    rain_on = (bool(p["rain_start"]) if p.get("rain_start") is not None
+               else settings.rain_start_alerts)
+    chan = p.get("storm_channels")
+    storm_channels = chan if chan in ("push", "email", "both") else None
     return EffectiveAlertConfig(
         enabled, transport, recipients, float(default_thr), float(repeat),
         smtp_host, smtp_port, smtp_username, smtp_password, smtp_from,
         smtp_tls, smtp_ssl, email_scope,
-        storm_on, float(storm_quiet), float(storm_min))
+        storm_on, float(storm_quiet), float(storm_min), rain_on,
+        storm_channels=storm_channels)
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -372,13 +414,16 @@ def _send_sync(subject: str, body: str, to_list: list[str],
 # ───────────────────────── delivery ─────────────────────────
 async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
                    push_title: str, push_body: str,
-                   email_ok: bool = True) -> bool:
+                   email_ok: bool = True, *,
+                   push_ok: bool = True,
+                   kind: str = "alert", mac: str | None = None) -> bool:
     """Send an alert through every configured channel (email + push). Returns
     True when the alert is HANDLED: at least one channel delivered, or no
     channel had anything to attempt. Shared by device-down + threshold.
 
     `email_ok` scopes the EMAIL channel only (cfg.email_scope='device_down'
-    keeps rule/smart alerts out of the inbox); push always goes out.
+    keeps rule/smart alerts out of the inbox); `push_ok` scopes push the
+    same way (1.7 storm_channels='email' — every other caller leaves it on).
 
     "Nothing to deliver" must NOT read as a transient failure: with
     email_scope='device_down' and push unconfigured (or push configured but
@@ -397,7 +442,7 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
             delivered = True
         except Exception as e:
             log.exception("alert email send failed: %s", e)
-    if await apns.push_configured():
+    if push_ok and await apns.push_configured():
         try:
             res = await apns.send_to_all(push_title, push_body)
             if res.get("sent"):
@@ -414,7 +459,18 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
     if not attempted and not delivered:
         log.info("alert had no willing channel (muted by scope / no "
                  "recipients) — treating as handled: %s", push_title)
-    return delivered or not attempted
+    handled = delivered or not attempted
+    if handled:
+        # History rides the HANDLED outcome, not the delivered one: callers
+        # retry unhandled alerts next tick (logging those would duplicate),
+        # while a muted alert still happened — it lands with delivered=0 and
+        # the app's Recent list becomes the only place it's visible at all.
+        try:
+            await db.log_alert(int(time.time() * 1000), kind, mac,
+                               push_title, push_body, delivered)
+        except Exception as e:
+            log.exception("alert history write failed: %s", e)
+    return handled
 
 
 # ───────────────────────── monitor task ─────────────────────────
@@ -446,6 +502,22 @@ class AlertMonitor:
                 pass
 
     async def _tick(self) -> None:
+        # Persist guest-token last-used stamps every tick, not only when the
+        # owner opens the share list: memory-only stamps die with the process,
+        # and a deploy between someone's use and the owner's look read as
+        # "never used" (Volney's work-phone test, 2026-08-23). No-op when
+        # nothing is pending; never allowed to break alerting.
+        try:
+            await db.flush_guest_last_used()
+        except Exception as e:
+            log.warning("guest last-used flush failed: %s", e)
+        # Same deal for the per-device ingest tokens — a board posts every
+        # few seconds, so unflushed stamps pile up fast and a restart would
+        # eat them.
+        try:
+            await db.flush_ingest_last_used()
+        except Exception as e:
+            log.warning("ingest last-used flush failed: %s", e)
         cfg = await effective_config()
         # Run if EITHER channel can deliver — email (cfg.enabled) or push
         # (local APNs key or a configured relay, env or app-managed).
@@ -472,7 +544,8 @@ class AlertMonitor:
                 subject, bodytext = build_alert(
                     dec.event, name, mac, last_seen, now_ms, thr_min, settings.timezone)
                 ptitle, pbody = build_push(dec.event, name, last_seen, now_ms, thr_min)
-                delivered = await _deliver(cfg, subject, bodytext, ptitle, pbody)
+                delivered = await _deliver(cfg, subject, bodytext, ptitle, pbody,
+                                           kind=f"device_{dec.event}", mac=mac)
                 if delivered:
                     notified_ms = now_ms     # advance re-notify clock only on delivery
                 elif prior is not None and dec.state != prior["state"]:
@@ -503,13 +576,20 @@ class AlertMonitor:
         # ── storm summary: one report per event, after the rain stops. Not
         # gated on smart_alerts — it is a different kind of thing, and the
         # rain counter it watches needs no derived inputs.
-        await self._check_storm_summaries(cfg, devices, now_ms)
+        await self._check_storm_summaries(cfg, devices, now_ms, dev_prefs)
+        # ── rain-start nowcast (1.7): the leading edge to the storm
+        # summary's trailing one. Internally throttled + opt-in; passing
+        # _deliver keeps nowcast.py import-cycle-free. The partial stamps the
+        # history kind — nowcast's callback signature stays five-positional.
+        from . import nowcast
+        await nowcast.check(cfg, devices, now_ms,
+                            functools.partial(_deliver, kind="rain_start"))
 
     async def _check_threshold_rules(self, cfg, devices, now_ms: int) -> None:
         rules = await db.list_alert_rules(enabled_only=True)
         if not rules:
             return
-        rstates = await db.get_rule_states()
+        rstates = await db.get_rule_states_full()
         for d in devices:
             last = d.get("lastData") or {}
             for rule in rules:
@@ -522,7 +602,7 @@ class AlertMonitor:
                     val = float(raw)
                 except (TypeError, ValueError):
                     continue
-                prev = rstates.get((rule["id"], d["mac"]), 0)
+                prev, clear_since = rstates.get((rule["id"], d["mac"]), (0, None))
                 now_trig, fire = evaluate_rule(rule["comparator"], rule["threshold"], val, prev)
                 if fire:
                     # Reviewer P2: only persist triggered=1 AFTER delivery succeeds.
@@ -534,7 +614,8 @@ class AlertMonitor:
                         dname, rule["field"], val, rule["comparator"], rule["threshold"])
                     delivered = await _deliver(
                         cfg, f"[Zasder Weather] {title}", body, title, body,
-                        email_ok=cfg.email_scope == "all")
+                        email_ok=cfg.email_scope == "all",
+                        kind="rule", mac=d["mac"])
                     if delivered:
                         await db.upsert_rule_state(rule["id"], d["mac"], 1, now_ms)
                         log.info("threshold alert fired: rule %s (%s) on %s value=%.3f",
@@ -543,15 +624,24 @@ class AlertMonitor:
                         log.warning(
                             "threshold alert delivery failed for rule %s on %s; "
                             "will retry next tick", rule["id"], d["mac"])
-                elif not now_trig and prev:
-                    # Cleared (1→0): persist so the rule re-arms. No delivery
-                    # here. Re-arm only once the value clears the threshold by
-                    # the field's deadband — see _REARM_MARGIN.
+                elif prev:
+                    # Triggered and not (re)firing: decide whether to re-arm.
+                    # Two gates, both required — the value must clear the
+                    # threshold by the field's deadband (_REARM_MARGIN) AND
+                    # stay clear for the whole dwell window (_REARM_DWELL_MS).
+                    # A re-triggered or deadband tick breaks the clearance
+                    # and the clock starts over.
                     margin = _REARM_MARGIN.get(rule["field"], 0.0)
-                    if rule_cleared(rule["comparator"], rule["threshold"], val, margin):
+                    cleared = (not now_trig) and rule_cleared(
+                        rule["comparator"], rule["threshold"], val, margin)
+                    rearm, new_since = rearm_transition(cleared, clear_since, now_ms)
+                    if rearm:
                         await db.upsert_rule_state(rule["id"], d["mac"], 0, now_ms)
+                    elif new_since != clear_since:
+                        await db.set_rule_clear_since(rule["id"], d["mac"], new_since)
 
-    async def _check_storm_summaries(self, cfg, devices, now_ms: int) -> None:
+    async def _check_storm_summaries(self, cfg, devices, now_ms: int,
+                                     dev_prefs: dict | None = None) -> None:
         """One summary per storm, delivered once the rain has stopped.
 
         Unlike every other alert here this is trailing-edge and stateful, so
@@ -560,8 +650,24 @@ class AlertMonitor:
         """
         if not cfg.storm_summary:
             return
+        if dev_prefs is None:            # direct callers (tests) skip _tick
+            dev_prefs = await db.get_device_alert_prefs()
+        # 1.7 channel choice for summaries. None = legacy delivery, so
+        # nobody's setup changes until they pick in the app.
+        if cfg.storm_channels is not None:
+            email_ok = cfg.storm_channels in ("email", "both")
+            push_ok = cfg.storm_channels in ("push", "both")
+        else:
+            email_ok = cfg.email_scope == "all"
+            push_ok = True
         for d in devices:
             mac = d["mac"]
+            # Per-station mute (1.7, Doren: haptic Tempest feet from the
+            # Davis reported every storm twice). Skipping the TRACKER too is
+            # deliberate: the stale-baseline rebaseline below handles the
+            # gap if the station is ever unmuted mid-storm.
+            if (dev_prefs.get(mac) or {}).get("storm_summary") is False:
+                continue
             last = d.get("lastData") or {}
             reading = storm.counter_value(last)
             state = await db.get_storm_state(mac) or {}
@@ -614,6 +720,14 @@ class AlertMonitor:
                     last_rain, now_ms, cfg.storm_quiet_minutes):
                 stats = await db.storm_window_stats(
                     mac, started, last_rain or started, field or "yearlyrainin")
+                # Gusts lead the rain: widen the GUST window (only) to the
+                # half hour before the first tip, so the summary reports the
+                # storm's headline wind rather than just the wind-while-wet.
+                lead = await db.max_windgust_in_window(
+                    mac, started - _STORM_GUST_LEAD_MS, started)
+                if lead is not None and (stats.get("max_gust_mph") is None
+                                         or lead > stats["max_gust_mph"]):
+                    stats["max_gust_mph"] = lead
                 summary = storm.StormSummary(
                     started_ms=started, ended_ms=last_rain or started, **stats)
                 if storm.worth_reporting(summary, cfg.storm_min_total_in):
@@ -625,7 +739,8 @@ class AlertMonitor:
                     # than losing the storm entirely.
                     if await _deliver(cfg, f"[Zasder Weather] {title}", body,
                                       title, body,
-                                      email_ok=cfg.email_scope == "all"):
+                                      email_ok=email_ok, push_ok=push_ok,
+                                      kind="storm", mac=mac):
                         await db.upsert_storm_state(mac, None, None, field,
                                                     value, obs_ms)
                         log.info("storm summary sent for %s: %.2fin over %.1fh",
@@ -639,8 +754,17 @@ class AlertMonitor:
                 await db.upsert_storm_state(mac, None, None, field, value, obs_ms)
                 continue
 
-            await db.upsert_storm_state(mac, started, last_rain, field, value,
-                                        obs_ms)
+            # R6: with storm_summary default-on this unconditional upsert
+            # committed one write per device per minute forever — storm or
+            # no storm, pure WAL churn on a 256MB machine. Skip when this
+            # tick changed nothing (the freshly-read `state` is the
+            # baseline; any real transition differs in at least one field).
+            if (started, last_rain, field, value, obs_ms) != (
+                    state.get("started_ms"), state.get("last_rain_ms"),
+                    state.get("counter_field"), state.get("counter_value"),
+                    state.get("counter_ms")):
+                await db.upsert_storm_state(mac, started, last_rain, field,
+                                            value, obs_ms)
 
     async def _check_smart_alerts(self, cfg, devices, now_ms: int) -> None:
         """Frost / heat / rapid-pressure-drop alerts, edge-triggered per device."""
@@ -682,7 +806,8 @@ class AlertMonitor:
                     # rules) so a transport failure retries next tick.
                     if await _deliver(cfg, f"[Zasder Weather] {title}", body,
                                       title, body,
-                                      email_ok=cfg.email_scope == "all"):
+                                      email_ok=cfg.email_scope == "all",
+                                      kind=kind, mac=mac):
                         await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
                         log.info("smart alert fired: %s on %s", kind, dname)
                     else:

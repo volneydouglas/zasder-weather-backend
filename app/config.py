@@ -363,6 +363,11 @@ class Settings(BaseSettings):
     # strictly less noisy than the per-threshold rain alerts people already
     # build by hand, and it only ever fires once per storm.
     storm_summary: bool = True
+    # 1.7 rain-start nowcast (Open-Meteo minutely_15). OFF by default — a
+    # new outbound-polling alert kind must be an explicit choice on a
+    # self-hosted box; the app exposes the toggle (DB-over-env like the
+    # rest of alert_prefs).
+    rain_start_alerts: bool = False
     # Quiet time after the last rain before the storm is considered over.
     storm_summary_quiet_minutes: float = 30.0
     # Below this the event is a drizzle, not a storm. Without a floor a single

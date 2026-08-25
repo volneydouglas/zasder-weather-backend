@@ -53,6 +53,26 @@ def build_payload(title: str, body: str) -> dict:
     return {"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}
 
 
+def build_live_activity_start(attributes_type: str, attributes: dict,
+                              content_state: dict, title: str, body: str,
+                              now_s: int, stale_s: int, dismiss_s: int) -> dict:
+    """ActivityKit push-to-start payload (1.7, nowcast phase 2). Start-only
+    by design: the Activity's countdown renders client-side from the epoch
+    in content-state (Text(timerInterval:)), and stale/dismissal dates make
+    it expire on its own — so one push runs the whole lifecycle with no
+    per-activity update-token round trip."""
+    return {"aps": {
+        "timestamp": now_s,
+        "event": "start",
+        "content-state": content_state,
+        "attributes-type": attributes_type,
+        "attributes": attributes,
+        "alert": {"title": title, "body": body},
+        "stale-date": stale_s,
+        "dismissal-date": dismiss_s,
+    }}
+
+
 def _resolve_env(t: dict) -> tuple[str | None, bool]:
     """(env, came_from_the_token) for one token row.
 
@@ -67,16 +87,25 @@ def _resolve_env(t: dict) -> tuple[str | None, bool]:
     return None, False
 
 
-async def _push_tokens(tokens: list[dict], title: str, body: str) -> dict:
+async def _push_tokens(tokens: list[dict], title: str, body: str,
+                       payload: dict | None = None,
+                       push_type: str = "alert") -> dict:
     """Sign with the local APNs key and POST to Apple for each token. `tokens`
     is a list of {token, env?} dicts. Returns {sent, dead, failed} where `dead`
     lists tokens Apple says are gone (caller prunes). Does NOT touch the DB —
-    shared by send_to_all (own-key path) and the hosted relay."""
-    payload = build_payload(title, body)
+    shared by send_to_all (own-key path) and the hosted relay.
+
+    `payload`/`push_type` override the standard alert shape — the Live
+    Activity path sends a prebuilt ActivityKit payload with push-type
+    `liveactivity`, whose topic carries Apple's mandatory suffix."""
+    payload = payload if payload is not None else build_payload(title, body)
+    topic = settings.apns_topic
+    if push_type == "liveactivity":
+        topic = f"{topic}.push-type.liveactivity"
     headers = {
         "authorization": f"bearer {_provider_jwt()}",
-        "apns-topic": settings.apns_topic,
-        "apns-push-type": "alert",
+        "apns-topic": topic,
+        "apns-push-type": push_type,
         "apns-priority": "10",
     }
     sent = failed = 0
@@ -131,7 +160,8 @@ async def _push_tokens(tokens: list[dict], title: str, body: str) -> dict:
 
 
 async def _push_via_relay(tokens: list[str], title: str, body: str,
-                          url: str, token: str) -> dict:
+                          url: str, token: str,
+                          la_payload: dict | None = None) -> dict:
     """Send through a shared relay instead of signing locally. For self-hosters
     who don't run their own APNs key: the relay holds the key, fans out to
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
@@ -147,6 +177,13 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
                   settings.apns_env, len(tokens))
         return {"sent": 0, "dead": [], "failed": len(tokens)}
     payload = {"tokens": tokens, "title": title, "body": body, "env": env}
+    if la_payload is not None:
+        # Live Activity through the relay: the raw ActivityKit payload rides
+        # alongside; a pre-1.7 relay rejects unknown fields loudly rather
+        # than delivering it as a mangled alert (Pydantic extra=forbid), so
+        # the caller sees failed, not silent wrong-shape pushes.
+        payload["push_type"] = "liveactivity"
+        payload["payload"] = la_payload
     headers = {"authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -175,6 +212,28 @@ async def effective_relay() -> tuple[str | None, str | None]:
     url = cfg.get("url") or settings.apns_relay_url
     token = cfg.get("token") or settings.apns_relay_token
     return url, token
+
+
+async def send_live_activity_start(payload: dict, title: str, body: str) -> dict:
+    """Fan a prebuilt ActivityKit start payload out to every registered
+    push-to-start token — own APNs key preferred, hosted relay otherwise.
+    iOS-only by nature; prunes dead tokens like send_to_all. title/body
+    ride along for the relay's logging/quota surface only."""
+    rows = await db.list_live_activity_tokens("start")
+    if not rows:
+        return {"sent": 0, "dead": [], "failed": 0}
+    if settings.apns_configured:
+        res = await _push_tokens(rows, title, body,
+                                 payload=payload, push_type="liveactivity")
+    else:
+        url, relay_token = await effective_relay()
+        if not (url and relay_token):
+            return {"sent": 0, "dead": [], "failed": len(rows)}
+        res = await _push_via_relay([r["token"] for r in rows], title, body,
+                                    url, relay_token, la_payload=payload)
+    for tok in res.get("dead", []):
+        await db.remove_live_activity_token(tok)
+    return res
 
 
 async def push_configured() -> bool:

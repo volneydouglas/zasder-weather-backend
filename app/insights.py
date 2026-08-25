@@ -35,12 +35,37 @@ log = logging.getLogger("zasder.insights")
 LEDGER_TIERS = (80.0, 90.0, 95.0, 100.0, 105.0, 110.0)
 DEGREE_DAY_BASE_F = 65.0
 
-# Cold ledger: days whose LOW reached at or below each tier. The lines are
-# the horticultural ones (45 chill / 36 frost likely / 32 freeze / 28 hard
-# freeze / 25 severe); the station's own p10-of-lows rides alongside for
-# the same Seattle-vs-Chandler reason as the heat ledger's p90.
-COLD_TIERS = (45.0, 36.0, 32.0, 28.0, 25.0)
+# Cold ledger: days whose LOW reached at or below each tier. CLIMATE-
+# ADAPTIVE since 1.7 (reviewer feedback, 2026-08-22): the fixed
+# horticultural ladder (45 chill / 36 frost / 32 freeze / 28 hard freeze /
+# 25 severe) is perfect for Chandler and useless for Minneapolis, where
+# every winter night piles into every column while the -10° nights people
+# actually remember have no column at all. Tiers are picked from the
+# station's own p10-of-lows so the ledger answers "how unusually cold was
+# this year HERE" everywhere. Freeze-free season stays anchored at 32°
+# regardless — it measures season LENGTH, not frequency, and 32° is what
+# the software actually computes (air-temperature freeze, not frost).
+COLD_TIERS_WARM      = (45.0, 36.0, 32.0, 28.0, 25.0)
+COLD_TIERS_TEMPERATE = (32.0, 20.0, 10.0, 0.0, -10.0)
+COLD_TIERS_COLD      = (20.0, 10.0, 0.0, -10.0, -20.0)
+COLD_TIERS_ARCTIC    = (0.0, -10.0, -20.0, -30.0, -40.0)
 FREEZE_F = 32.0
+
+
+def cold_tiers_for(p10_low: float | None) -> tuple[float, ...]:
+    """Tier ladder for this station's climate, bucketed by its own
+    10th-percentile low. Buckets, not a formula: the reviewer's per-climate
+    sets are hand-tuned to what residents find remarkable, and a smooth
+    formula loses the semantic anchors (36 frost / 32 freeze / 28 hard
+    freeze) exactly where they matter. None (no history yet) reads warm —
+    the shipped default, so a brand-new station changes nothing."""
+    if p10_low is None or p10_low >= 32:
+        return COLD_TIERS_WARM
+    if p10_low >= 10:
+        return COLD_TIERS_TEMPERATE
+    if p10_low >= -10:
+        return COLD_TIERS_COLD
+    return COLD_TIERS_ARCTIC
 
 # Rain gap: a day "rained" when it recorded at least one bucket tip. Fixed
 # line, no location-specific threshold — same generalization stance as the
@@ -403,6 +428,10 @@ async def assemble(mac: str) -> dict[str, Any]:
     p90, p99 = _percentile(highs, 0.90), _percentile(highs, 0.99)
     lows = sorted(d[1] for d in days if d[1] is not None)
     p10_low = _percentile(lows, 0.10)
+    # Adaptivity needs a real climatology: a station seeded mid-winter (or
+    # five test rows) would otherwise flap onto a cold ladder and flip back
+    # months later. Under ~2 months of days, keep the shipped warm ladder.
+    cold_tiers = cold_tiers_for(p10_low if len(lows) >= 60 else None)
 
     def day_rain(d) -> float:
         if d[5] is not None:
@@ -422,12 +451,13 @@ async def assemble(mac: str) -> dict[str, Any]:
         yr = years.setdefault(y, {
             "year": int(y), "days": 0,
             "tiers": {str(int(t)): 0 for t in LEDGER_TIERS},
-            "cold": {str(int(t)): 0 for t in COLD_TIERS},
+            "cold": {str(int(t)): 0 for t in cold_tiers},
             "last_spring_freeze": None, "first_fall_freeze": None,
             "days_p90": 0, "longest_p90_streak": 0, "_streak": 0,
             "hottest": None, "coldest": None,
             "rain_total": 0.0, "rain_series": [],
             "longest_dry_streak": 0, "_dry_streak": 0,
+            "nights_p10": 0, "longest_p10_streak": 0, "_cstreak": 0,
             "cdd": 0.0, "hdd": 0.0,
         })
         yr["days"] += 1
@@ -447,9 +477,19 @@ async def assemble(mac: str) -> dict[str, Any]:
         if lo is not None:
             if yr["coldest"] is None or lo < yr["coldest"][1]:
                 yr["coldest"] = (d[0], lo)
-            for t in COLD_TIERS:
+            for t in cold_tiers:
                 if lo <= t:
                     yr["cold"][str(int(t))] += 1
+            # Cold streak — the P90 heat streak's mirror (same reviewer
+            # round): consecutive nights at or below this station's own
+            # 10th-percentile low, so it adapts to climate by construction.
+            if p10_low is not None and lo <= p10_low:
+                yr["nights_p10"] += 1
+                yr["_cstreak"] += 1
+                yr["longest_p10_streak"] = max(yr["longest_p10_streak"],
+                                               yr["_cstreak"])
+            else:
+                yr["_cstreak"] = 0
             if lo <= FREEZE_F:
                 # Days arrive in date order, so "last one seen in Jan–Jun"
                 # and "first one seen in Jul–Dec" need no extra sorting.
@@ -477,6 +517,7 @@ async def assemble(mac: str) -> dict[str, Any]:
     for yr in years.values():
         yr.pop("_streak", None)
         yr.pop("_dry_streak", None)
+        yr.pop("_cstreak", None)
         yr["rain_total"] = round(yr["rain_total"], 3)
         yr["cdd"] = round(yr["cdd"], 1)
         yr["hdd"] = round(yr["hdd"], 1)
@@ -528,7 +569,7 @@ async def assemble(mac: str) -> dict[str, Any]:
         "p90_high": p90, "p99_high": p99,
         "p10_low": p10_low,
         "ledger_tiers": [int(t) for t in LEDGER_TIERS],
-        "cold_tiers": [int(t) for t in COLD_TIERS],
+        "cold_tiers": [int(t) for t in cold_tiers],
         # Rain gap (client renders the dry-streak card only when present).
         "last_rain_day": last_rain_day,
         "last_rain_amount": last_rain_amount,

@@ -306,3 +306,43 @@ def test_daily_series_endpoint(insights_on):
 def test_daily_series_gated_by_flag(client):
     r = client.get("/api/insights/daily?mac=" + MAC, headers=_H)
     assert r.status_code == 404
+
+
+def test_cold_tiers_adapt_to_station_climate():
+    """Reviewer feedback (2026-08-22): fixed horticultural tiers are useless
+    in Minneapolis — every winter night piles into every column. Buckets by
+    the station's own p10 low; None (thin history) keeps the warm default."""
+    from app.insights import cold_tiers_for
+    assert cold_tiers_for(None) == (45.0, 36.0, 32.0, 28.0, 25.0)
+    assert cold_tiers_for(40.0) == (45.0, 36.0, 32.0, 28.0, 25.0)   # Chandler
+    assert cold_tiers_for(32.0) == (45.0, 36.0, 32.0, 28.0, 25.0)   # edge: warm
+    assert cold_tiers_for(15.0) == (32.0, 20.0, 10.0, 0.0, -10.0)   # Denver-ish
+    assert cold_tiers_for(0.0) == (20.0, 10.0, 0.0, -10.0, -20.0)   # Minneapolis
+    assert cold_tiers_for(-25.0) == (0.0, -10.0, -20.0, -30.0, -40.0)  # Fairbanks
+
+
+def test_cold_streak_mirrors_heat_streak(insights_on):
+    """Cold streak = consecutive nights at or below the station's own p10
+    low — the P90 heat streak's mirror, adaptive by construction. Seed 61
+    days (past the adaptivity floor) with a 3-night cold snap well below
+    the rest."""
+    client = insights_on
+    jan1 = _recent_jan1()
+    # The 61-day window must sit ENTIRELY in the past (CodeRabbit, PR
+    # #27): _recent_jan1 only guards Jan 1 itself, but jan1+60d reaches
+    # Mar 1 — a suite run between ~Jan 11 and Mar 1 seeded future rows,
+    # ingest clamped them to now, and the three snap nights collapsed
+    # onto one day (the exact _past_mid_july failure mode, at the other
+    # end of the window).
+    if jan1 + dt.timedelta(days=61) > dt.datetime.now(dt.timezone.utc):
+        jan1 = jan1.replace(year=jan1.year - 1)
+    for i in range(61):
+        # Mild lows around 50, except a 3-night snap at 20.
+        low = 20.0 if i in (30, 31, 32) else 50.0 + (i % 5)
+        _post(client, jan1 + dt.timedelta(days=i), low)
+    body = client.get("/api/insights?mac=" + MAC, headers=_H).json()
+    # p10 of 61 lows (3 at 20, rest 50-54) lands on 50 → the snap is the
+    # only sub-p10 run.
+    y = body["years"][0]
+    assert y["longest_p10_streak"] == 3
+    assert y["nights_p10"] >= 3

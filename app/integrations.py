@@ -136,6 +136,25 @@ async def store(provider: str, values: dict[str, Any]) -> None:
         await db.set_kv(_kv_key(provider, field), val)
 
 
+def _check_station_id(configured: Any, stations: list[dict[str, Any]],
+                      field: str) -> str | None:
+    """Is the configured station id one the credentials can actually see?
+
+    None (valid, or nothing configured — station_id is optional for Tempest
+    where the poller takes the first station) or a human message NAMING the
+    ids the account really has, so the fix is in the error. Ids compare as
+    strings: the API returns ints, the kv store holds text."""
+    if configured in (None, ""):
+        return None
+    ids = [str(s.get("station_id")) for s in stations
+           if s.get("station_id") is not None]
+    if str(configured) in ids:
+        return None
+    have = ", ".join(ids) if ids else "none visible to these credentials"
+    return (f"{field} {configured} is not on this account "
+            f"(available: {have})")
+
+
 async def probe(provider: str) -> str | None:
     """One cheap authenticated upstream call with the effective credentials.
     Returns None when they work, else a short human-readable reason. Wrong
@@ -158,11 +177,20 @@ async def probe(provider: str) -> str | None:
         elif provider == "weatherlink":
             from .weatherlink_client import WeatherLinkClient
             client = WeatherLinkClient(eff["api_key"], eff["api_secret"])
-            await client.list_stations()
+            stations = await client.list_stations()
+            return _check_station_id(eff.get("station_id"), stations,
+                                     "station_id")
         else:
             from .tempest_client import TempestClient
             client = TempestClient(eff["token"])
-            await client.stations()
+            stations = await client.stations()
+            # A valid token with a WRONG station id used to pass this probe
+            # and read "On" in the app while the poller failed every cycle —
+            # Doren typed 170964 (not his station) and it looked connected
+            # for a day (2026-08-21, finding #20). The id must be one the
+            # token can actually see.
+            return _check_station_id(eff.get("station_id"), stations,
+                                     "station_id")
         return None
     except Exception as e:               # noqa: BLE001 — reported, not lost
         return str(e) or type(e).__name__

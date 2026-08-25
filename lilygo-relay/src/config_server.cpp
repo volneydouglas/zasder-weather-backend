@@ -106,6 +106,19 @@ void loadFromNvs() {
   }
 }
 
+void adoptIngestToken(const String &token) {
+  // The server's assignment arrives over the TLS channel the board already
+  // authenticated on, so adopting it is no more trusting than the POST
+  // that carried it. NVS write first, then the live variable — a reboot
+  // between the two lines must come up with the NEW token, not a half
+  // state (the reverse order could post once with a token that was never
+  // persisted and then forget it).
+  prefs.putString("ingest_token", token);
+  ingestToken = token;
+  Serial.println("[token-upgrade] adopted a per-device token from the "
+                 "server (revocable in the app under Device tokens)");
+}
+
 void wipeIngestToken() {
   // Wipe ONLY the stale token — keep provisioned=true so the board stays
   // locked. checkAuth() still authorizes re-provisioning via the setup
@@ -320,7 +333,19 @@ static void handleProvision() {
       // Skip any userinfo@ prefix; what's left must start with a host, not
       // a bare :port.
       String host = hostPort.substring(hostPort.lastIndexOf('@') + 1);
-      if (!schemeOk || host.length() == 0 || host[0] == ':') {
+      // Charset check (R6): a host containing a space or control char
+      // passed provisioning and then failed hours later at POST time —
+      // the exact deferred-failure this validation exists to prevent.
+      // Hostname alphabet + ':' for the port + '[]' for IPv6 literals.
+      bool hostCharsOk = host.length() > 0;
+      for (unsigned int i = 0; i < host.length() && hostCharsOk; i++) {
+        char c = host[i];
+        if (!(isalnum((unsigned char) c) || c == '.' || c == '-' ||
+              c == ':' || c == '[' || c == ']')) {
+          hostCharsOk = false;
+        }
+      }
+      if (!schemeOk || host.length() == 0 || host[0] == ':' || !hostCharsOk) {
         server.send(400, "text/plain",
                     "backend_url must be a full https://host URL (the "
                     "firmware posts over TLS; a plain-http backend needs a "

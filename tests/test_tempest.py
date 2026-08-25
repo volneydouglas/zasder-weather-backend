@@ -393,3 +393,20 @@ async def test_poller_401_lands_in_source_status_without_the_token(monkeypatch):
         "the failed tick never reached source_status"
     assert secret not in snap, "token leaked into /api/sources"
     assert "token=" not in snap, "token query leaked into /api/sources"
+
+
+def test_build_payload_maps_battery_volts_to_flag():
+    """Tempest "battery" is VOLTS; build_payload maps it onto the relay
+    convention (device.battery_outdoor: normal/low, 2.40 V line) so ingest's
+    _battery_flag → battout path lights the app's existing battery UI. An
+    observation without the field must not invent one (absent is not zero)."""
+    healthy = dict(OBS, battery=2.61)
+    p = build_payload(173303, healthy)
+    assert p["device"]["battery_outdoor"] == "normal"
+
+    sagging = dict(OBS, battery=2.33)
+    p = build_payload(173303, sagging)
+    assert p["device"]["battery_outdoor"] == "low"
+
+    p = build_payload(173303, OBS)          # no battery key at all
+    assert "battery_outdoor" not in p["device"]

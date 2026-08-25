@@ -95,7 +95,10 @@ def _num(d: dict, key: str):
     aren't reporting (out of range, transmitter offline). Coerce to None
     rather than letting null/None/strings sneak through."""
     v = d.get(key)
-    return v if isinstance(v, (int, float)) else None
+    # bool excluded (R6): isinstance(True, int) is True, so a malformed
+    # `"temp": true` reached SQLite as 1.0 — the backend's own _finite
+    # excludes bools for exactly this reason.
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
 _txid_warned = False
@@ -164,6 +167,12 @@ def to_observation(
     """Transform a WLL JSON snapshot into the /ingest/custom payload shape.
     Returns None if there's nothing usable (WLL booted but ISS hasn't been
     heard, or WLL returned an error)."""
+    if not isinstance(wll, dict):
+        # R6: syntactically-valid non-object JSON (a captive portal's list,
+        # say) raised AttributeError on .get and cost the tick a traceback
+        # instead of the documented "returns None if nothing usable".
+        log.warning("wll returned non-object JSON (%s)", type(wll).__name__)
+        return None
     err = wll.get("error")
     if err:
         log.warning("wll returned error: %s", err)
@@ -177,7 +186,21 @@ def to_observation(
         ts = int(data.get("ts") or 0) or int(time.time())
     except (TypeError, ValueError):
         ts = int(time.time())
-    iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Sanity-bound NUMERIC garbage too (R6): a huge ts raised "year must be
+    # in 1..9999" OUT of the fromtimestamp below (killing every tick while
+    # the gateway clock stayed broken), and a tiny/negative one posted
+    # 1969/1970 stamps the backend 400s — logged here as "check
+    # INGEST_TOKEN", sending the operator to debug credentials while every
+    # reading was silently lost. Bounds mirror the backend's own policy:
+    # >15 min future or before ~2001 = broken clock, not data — use now.
+    now_s = int(time.time())
+    if ts > now_s + 15 * 60 or ts < 1_000_000_000:
+        log.warning("wll ts %s is implausible — using server time", ts)
+        ts = now_s
+    try:
+        iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError, OSError):
+        iso = datetime.fromtimestamp(now_s, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     outdoor: dict = {}
     wind: dict = {}
@@ -237,6 +260,14 @@ def to_observation(
     device: dict = {"id": mac}
     if name:     device["name"] = name
     if location: device["location"] = location
+    # ISS transmitter battery (trans_battery_flag: 0 = ok, 1 = low), mapped
+    # onto the same device.battery_outdoor convention the other relays post
+    # so the backend's ingest turns it into battout and the app's battery
+    # icon + low-battery notable work for Davis stations too (1.7).
+    if iss is not None:
+        flag = _num(iss, "trans_battery_flag")
+        if flag is not None:
+            device["battery_outdoor"] = "low" if flag else "normal"
 
     return {
         "device": device,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html as _html
 import math
+import time
 from typing import Any
 
 # Core chartable/tile fields. key = API field name (as stored + returned by
@@ -58,12 +59,66 @@ def _fmt(v: float | None, unit: str) -> str:
     return f"{v:.2f} {unit}"
 
 
+def _axis_html(lo: float, hi: float, unit: str,
+               py, height: int) -> tuple[str, str, str]:
+    """(svg gridlines, HTML y-labels, HTML time row) for a 24h chart.
+
+    Volney, 2026-08-21: "a chart without x and y legend markers" — the old
+    footer was the lo/hi VALUE pair laid out horizontally, which read as a
+    broken time axis. Now: two horizontal gridlines with value labels at
+    thirds of the range (labels are HTML overlays, NOT svg <text> — the
+    charts stretch with preserveAspectRatio="none", which would distort
+    glyphs), and the bottom row is an actual time axis.
+    """
+    span = (hi - lo) or 1.0
+    grid, labels = [], []
+    for frac in (1 / 3, 2 / 3):
+        v = lo + span * frac
+        y = py(v)
+        grid.append(f'<line x1="0" y1="{y}" x2="100%" y2="{y}" '
+                    f'class="chart-grid"/>')
+        pct = round(y * 100.0 / height, 1)
+        labels.append(f'<span class="chart-yl" style="top:{pct}%">'
+                      f'{_fmt(v, "")}{_esc(unit)}</span>')
+    time_row = ('<div class="chart-axis"><span>24h ago</span>'
+                '<span>12h</span><span>now</span></div>')
+    return "".join(grid), "".join(labels), time_row
+
+
+def _extreme_markers(pts: list[tuple[int, float]],
+                     px, py, width: int, height: int,
+                     unit: str) -> str:
+    """Dots + value labels at the series' actual max and min (Volney,
+    2026-08-22: gridline thirds gave structure but "we still cannot see
+    the real values"). HTML overlays, not svg shapes — circles stretch
+    into ellipses under preserveAspectRatio="none". The peak's label sits
+    below its dot and the trough's above, so neither leaves the plot."""
+    if len(pts) < 2:
+        return ""
+    hi_t, hi_v = max(pts, key=lambda p: p[1])
+    lo_t, lo_v = min(pts, key=lambda p: p[1])
+    if hi_v == lo_v:
+        return ""
+    out = []
+    for (t, v), is_hi in ((( hi_t, hi_v), True), ((lo_t, lo_v), False)):
+        x = min(max(px(t) * 100.0 / width, 6.0), 94.0)
+        y = py(v) * 100.0 / height
+        out.append(f'<span class="chart-dot" '
+                   f'style="left:{x:.1f}%;top:{y:.1f}%"></span>')
+        vy = "chart-xl-below" if is_hi else "chart-xl-above"
+        out.append(f'<span class="chart-xl {vy}" '
+                   f'style="left:{x:.1f}%;top:{y:.1f}%">'
+                   f'{_fmt(v, unit) if unit else _fmt(v, "")}</span>')
+    return "".join(out)
+
+
 def svg_chart(points: list[tuple[int, float]], color: str,
               width: int = 640, height: int = 120,
               overlay: list[tuple[int, float]] | None = None,
               overlay_color: str = "#ff5a5f",
               primary_label: str | None = None,
-              overlay_label: str | None = None) -> str:
+              overlay_label: str | None = None,
+              unit: str = "") -> str:
     """Inline SVG area+line chart for a (timestamp_ms, value) series.
 
     An optional `overlay` series (same units, e.g. feels-like on the temp
@@ -94,9 +149,11 @@ def svg_chart(points: list[tuple[int, float]], color: str,
 
     line = poly(pts)
     area = f"{px(pts[0][0])},{height} {line} {px(pts[-1][0])},{height}"
+    grid, ylabels, time_row = _axis_html(lo, hi, unit, py, height)
     svg = [
         f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
         f'class="chart-svg" role="img">',
+        grid,
         f'<polygon points="{area}" fill="{color}" fill-opacity="0.14"/>',
     ]
     if len(ov) >= 2:
@@ -118,11 +175,203 @@ def svg_chart(points: list[tuple[int, float]], color: str,
             f'<span class="lg"><i style="background:{overlay_color}"></i>{_esc(overlay_label or "")}</span>'
             f'</div>'
         )
+    markers = _extreme_markers(pts + ov, px, py, width, height, unit)
+    return (f'<div class="chart-plot">{"".join(svg)}{ylabels}{markers}</div>'
+            + legend + time_row)
+
+
+# ── Multi-station overlay charts (1.7, Volney's ask) ─────────────────────
+# When the page shows 2+ stations, a compare block leads: the "coolest"
+# overlays first (temp, feels like, humidity, pressure), every station on
+# one axis per field, then the per-station blocks as before.
+
+# Distinct per-station hues, tuned to read on BOTH themes (mid-brightness,
+# well-separated). Cycles if someone shares more than six stations.
+STATION_COLORS = ["#ff9e33", "#4cb2ff", "#3ddc97", "#b39dff",
+                  "#ff5a8f", "#ffd24c"]
+
+OVERLAY_FIELDS: list[tuple[str, str, str]] = [
+    ("tempf",      "Temperature", "°F"),
+    ("feelsLike",  "Feels like",  "°F"),
+    ("humidity",   "Humidity",    "%"),
+    ("baromrelin", "Pressure",    "inHg"),
+]
+
+
+def svg_multi_chart(series_list: list[tuple[str, str, list[tuple[int, float]]]],
+                    width: int = 640, height: int = 130,
+                    unit: str = "") -> str:
+    """N same-unit series on one axis: (label, color, points) each. Lines
+    only — stacked area fills over each other read as mud. Series with
+    fewer than 2 points are dropped rather than drawn as specks."""
+    drawn = [(label, color, [(t, v) for t, v in pts if v is not None])
+             for label, color, pts in series_list]
+    drawn = [(label, color, pts) for label, color, pts in drawn if len(pts) >= 2]
+    if len(drawn) < 2:
+        return ""
+    ys = [v for _, _, pts in drawn for _, v in pts]
+    ts = [t for _, _, pts in drawn for t, _ in pts]
+    lo, hi = min(ys), max(ys)
+    span = (hi - lo) or 1.0
+    t0, t1 = min(ts), max(ts)
+    tspan = (t1 - t0) or 1
+    pad = 4.0
+
+    def px(t: int) -> float:
+        return round(width * (t - t0) / tspan, 1)
+
+    def py(v: float) -> float:
+        return round((height - pad) - ((v - lo) / span) * (height - pad * 2), 1)
+
+    grid, ylabels, time_row = _axis_html(lo, hi, unit, py, height)
+    all_pts = [p for _, _, pts in drawn for p in pts]
+    svg = [f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
+           f'class="chart-svg" role="img">', grid]
+    for _, color, pts in drawn:
+        line = " ".join(f"{px(t)},{py(v)}" for t, v in pts)
+        svg.append(f'<polyline points="{line}" fill="none" stroke="{color}" '
+                   f'stroke-width="1.8" stroke-linejoin="round"/>')
+    svg.append("</svg>")
+    legend = ('<div class="chart-legend">'
+              + "".join(f'<span class="lg"><i style="background:{color}"></i>'
+                        f'{_esc(label)}</span>'
+                        for label, color, _ in drawn)
+              + "</div>")
+    markers = _extreme_markers(all_pts, px, py, width, height, unit)
+    return (f'<div class="chart-plot">{"".join(svg)}{ylabels}{markers}</div>'
+            + legend + time_row)
+
+
+def _age_text(ms: float) -> str:
+    s_ = max(0, int(time.time() - ms / 1000))
+    if s_ < 60:
+        return f"{s_}s ago"
+    if s_ < 3600:
+        return f"{s_ // 60}m ago"
+    return f"{s_ // 3600}h ago"
+
+
+def render_now_strip(stations: list[dict[str, Any]],
+                     location: str | None, tz_name: str = "UTC") -> str:
+    """The "Right now" composite strip (Volney picked option A,
+    2026-08-22): one compact band opening multi-station pages so a small
+    embed frame — Doren's 520x390 iframe — shows a temperature, not the
+    compare block's chart headers. Big temp + feels come from the PRIMARY
+    station; each chip comes from the FRESHEST station reporting that
+    field (the app's composite-tile philosophy: real readings, never
+    cross-backyard averages), with the source station named in the chip's
+    tooltip. Single-station pages skip it — their station header already
+    opens the page.
+    """
+    if len(stations) < 2:
+        return ""
+    primary = stations[0]
+    po = primary.get("obs") or {}
+    temp = _num(po.get("tempf"))
+    feels = _num(po.get("feelsLike"))
+    temp_html = f"{round(temp)}°" if temp is not None else "—"
+    feels_html = (f'<div class="cc-feels">feels {round(feels)}°</div>'
+                  if feels is not None and (temp is None or abs(feels - temp) >= 1)
+                  else "")
+
+    def freshest(field: str):
+        """(value, station_name) — newest observation carrying the field."""
+        best = None
+        for st in stations:
+            o = st.get("obs") or {}
+            v = _num(o.get(field))
+            ts = _num(o.get("dateutc"))
+            if v is None or ts is None:
+                continue
+            if best is None or ts > best[2]:
+                best = (v, st.get("name") or "", ts)
+        return (best[0], best[1]) if best else (None, "")
+
+    chips = []
+    for key in ("humidity", "windspeedmph", "baromrelin", "dailyrainin"):
+        label, unit, color = {
+            "humidity":     ("Humidity", "%",    "#4cb2ff"),
+            "windspeedmph": ("Wind",     "mph",  "#39c9d6"),
+            "baromrelin":   ("Pressure", "inHg", "#b39dff"),
+            "dailyrainin":  ("Rain today", "in", "#5aa0ff"),
+        }[key]
+        v, src = freshest(key)
+        title = f' title="from {_esc(src)}"' if src else ""
+        chips.append(
+            f'<div class="cc-chip"{title}>'
+            f'<span class="cc-k">{_esc(label)}</span>'
+            f'<span class="cc-v" style="color:{color}">{_fmt(v, unit)}</span></div>')
+
+    # Second row (Volney, 2026-08-22, looking at Doren's single-station
+    # embed): a compact version of the Today board — the PRIMARY station's
+    # 24h numbers, matching the hero the way the single-station page's
+    # board matches its header. Not cross-station: "hottest reading in the
+    # yard at 4:47 PM" and "this station's 24h high" are different claims,
+    # and the second one is the board's.
+    today = []
+    stats = primary.get("summary") or {}
+    def tcell(label: str, value: str, sub: str = "") -> None:
+        sub_html = f'<span class="cc-k">{_esc(sub)}</span>' if sub else ""
+        today.append(f'<div class="cc-chip"><span class="cc-k">{_esc(label)}</span>'
+                     f'<span class="cc-v now-today-v">{_esc(value)}</span>{sub_html}</div>')
+    if stats.get("hi"):
+        ts, v = stats["hi"]
+        tcell("24h High", f"{round(v)}°", _local_time(ts, tz_name))
+    if stats.get("lo"):
+        ts, v = stats["lo"]
+        tcell("24h Low", f"{round(v)}°", _local_time(ts, tz_name))
+    if stats.get("gust_max") is not None:
+        tcell("Max Gust", f'{stats["gust_max"]:.0f} mph')
+    if stats.get("press_delta") is not None:
+        tcell("Press Δ 24h", f'{stats["press_delta"]:+.2f} inHg')
+    today_html = (f'<div class="cc-chips now-today">{"".join(today)}</div>'
+                  if today else "")
+
+    ages = [_num((st.get("obs") or {}).get("dateutc")) for st in stations]
+    ages = [a for a in ages if a is not None]
+    meta_bits = [f"{len(stations)} stations"]
+    if location:
+        meta_bits.append(_esc(location))
+    if ages:
+        meta_bits.append("updated " + _age_text(max(ages)))
     return (
-        "".join(svg) + legend
-        + f'<div class="chart-axis"><span>{_fmt(lo, "")}</span>'
-          f'<span>{_fmt(hi, "")}</span></div>'
-    )
+        f'<section class="station now-strip">'
+        f'  <div class="cc">'
+        f'    <div class="cc-main">'
+        f'      <div class="cc-name">RIGHT NOW'
+        f'<span class="cc-loc"> · {" · ".join(meta_bits)}</span></div>'
+        f'      <div class="cc-temp now-temp">{temp_html}</div>{feels_html}'
+        f'      <div class="cc-chips">{"".join(chips)}</div>'
+        f'      {today_html}'
+        f'    </div>'
+        f'  </div>'
+        f'</section>')
+
+
+def render_compare(stations: list[dict[str, Any]]) -> str:
+    """The multi-station lead block. Empty string when it has nothing to
+    say — fewer than two stations, or fewer than two with data for every
+    candidate field (each chart decides for itself)."""
+    if len(stations) < 2:
+        return ""
+    charts = []
+    for field, label, unit in OVERLAY_FIELDS:
+        series_list = [
+            (s["name"], STATION_COLORS[i % len(STATION_COLORS)],
+             s.get("series", {}).get(field) or [])
+            for i, s in enumerate(stations)
+        ]
+        body = svg_multi_chart(series_list, unit=unit)
+        if not body:
+            continue
+        charts.append(f'<div class="chart"><div class="chart-title">'
+                      f'{_esc(label)} <span class="chart-unit">{unit} · '
+                      f'all stations · 24h</span></div>{body}</div>')
+    if not charts:
+        return ""
+    return (f'<div class="station station-compare">'
+            f'<div class="cc-name">Side by side</div>'
+            f'<div class="charts">{"".join(charts)}</div></div>')
 
 
 # ── Wind rose ────────────────────────────────────────────────────────────
@@ -377,7 +626,8 @@ def render_station(name: str, obs: dict[str, Any] | None,
                              overlay_color="#ff5a5f",
                              primary_label="Temp", overlay_label="Feels like")
         else:
-            body = svg_chart(series.get(key, []), meta["color"])
+            body = svg_chart(series.get(key, []), meta["color"],
+                             unit=meta["unit"])
         charts.append(
             f'<div class="chart"><div class="chart-title">{_esc(meta["label"])} '
             f'<span class="chart-unit">· last 24h · {_esc(meta["unit"])}</span></div>'
@@ -486,10 +736,13 @@ def render_records(records: dict[str, Any] | None, tz_name: str) -> str:
 def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                      tz_name: str = "UTC",
                      app_url: str = "", location: str | None = None) -> str:
-    """Full dashboard section for all selected stations."""
+    """Full dashboard section for all selected stations. With 2+ stations a
+    side-by-side compare block leads (temp/feels/humidity/pressure, every
+    station on one axis per field), then the per-station blocks."""
     if not stations:
         return '<div class="chart-empty">No station data yet.</div>'
-    return "".join(
+    return (render_now_strip(stations, location, tz_name)
+            + render_compare(stations) + "".join(
         render_station(s["name"], s.get("obs"), s.get("series", {}), fields,
                        wind_samples=s.get("wind_samples"),
                        records=s.get("records"), tz_name=tz_name,
@@ -499,7 +752,7 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                        app_url=app_url if i == 0 else "",
                        location=location if i == 0 else None)
         for i, s in enumerate(stations)
-    )
+    ))
 
 
 # Shared theme tokens for every page that renders the dashboard fragment
@@ -553,6 +806,11 @@ DASHBOARD_CSS = """
     .cc-loc { font-weight:600; letter-spacing:0.4px; text-transform:none;
         color:var(--ink-38); }
     .cc-temp { font-size:56px; font-weight:200; line-height:1; margin-top:2px; }
+    .now-strip { padding-bottom:6px; }
+    .now-temp { font-size:48px; }
+    .now-today { margin-top:8px; padding-top:8px;
+        border-top:1px solid var(--card-edge); }
+    .now-today .now-today-v { color:var(--ink-70); }
     .cc-feels { font-size:13px; color:var(--ink-55); margin-top:2px; }
     .cc-chips { display:flex; flex-wrap:wrap; gap:16px; margin-top:10px; }
     .cc-k { font-size:9px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase;
@@ -566,6 +824,19 @@ DASHBOARD_CSS = """
     .chart-svg { width:100%; height:110px; display:block; }
     .chart-axis { display:flex; justify-content:space-between; font-size:9px;
         color:var(--ink-35); margin-top:2px; }
+    .chart-plot { position:relative; }
+    .chart-plot .chart-grid { stroke:var(--grid); stroke-width:1;
+        vector-effect:non-scaling-stroke; }
+    .chart-yl { position:absolute; left:4px; transform:translateY(-110%);
+        font-size:8.5px; color:var(--ink-35); pointer-events:none; }
+    .chart-dot { position:absolute; width:7px; height:7px; border-radius:50%;
+        background:var(--page-fg); border:1.5px solid var(--page-bg);
+        transform:translate(-50%,-50%); pointer-events:none; }
+    .chart-xl { position:absolute; font-size:9px; font-weight:700;
+        color:var(--ink-70); background:var(--page-bg); border-radius:4px;
+        padding:0 3px; pointer-events:none; white-space:nowrap; }
+    .chart-xl-below { transform:translate(-50%,7px); }
+    .chart-xl-above { transform:translate(-50%,calc(-100% - 7px)); }
     .chart-empty { font-size:12px; color:var(--ink-40); padding:20px 0; }
     .chart-legend { display:flex; gap:14px; margin-top:6px; }
     .chart-legend .lg { display:inline-flex; align-items:center; gap:5px;

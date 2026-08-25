@@ -87,8 +87,15 @@ def _require_ingest_token(authorization: str | None,
         presented = authorization.removeprefix("Bearer ").strip()
     # Constant-time compare (consistent with every other auth gate) so token
     # verification doesn't leak prefix length via a timing side channel.
-    if not expected or not tokens_match(presented, expected):
-        raise HTTPException(status_code=401, detail="invalid ingest token")
+    if expected and tokens_match(presented, expected):
+        return
+    # App-minted per-device tokens (1.7) are valid everywhere the env
+    # INGEST_TOKEN is — a board provisioned with its own token must be able
+    # to discover, not just ingest.
+    if tokens_match(presented, db.ingest_token_cache()):
+        db.touch_ingest_token(presented)
+        return
+    raise HTTPException(status_code=401, detail="invalid ingest token")
 
 
 def _require_api_token(authorization: str | None) -> None:

@@ -336,7 +336,14 @@ def test_reviewer_token_cannot_read_station_coordinates(client):
     row = next(d for d in redacted if d["mac"] == mac)
     assert row.get("location") is None
     info = row.get("info") or {}
-    assert info.get("coords") is None and info.get("location") is None
+    # 1.7 policy change (Volney, 2026-08-23): read-only tokens get TOWN-
+    # ROUNDED coords (1 decimal, ~11 km) instead of none — dropping them
+    # silently broke the sun dial and NWS alerts on every shared install.
+    # The precise values must still never appear (asserted on the raw body
+    # above); the label stays gone entirely.
+    assert (info.get("coords") or {}).get("coords") == {"lat": 33.3,
+                                                        "lon": -111.8}
+    assert info.get("location") is None
     # ...but the station is still listed, or the demo shows an empty app.
     seen = client.get("/api/devices", headers=READ_ONLY).json()
     assert any(d["mac"] == mac for d in seen)

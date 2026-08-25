@@ -472,8 +472,19 @@ def test_public_dashboard_svg_chart_feels_overlay():
     assert svg.count("polyline") == 2        # temp + feels lines
     assert "stroke-dasharray" in svg         # overlay is dashed
     assert "Feels like" in svg and "chart-legend" in svg
-    # Axis spans BOTH series (feels hits 97, temp bottoms at 88).
-    assert "97" in svg and "88" in svg
+    # Real axes (Volney's ask): two y-gridlines labeled at thirds of the
+    # range, and a TIME bottom row instead of the old lo/hi pair that read
+    # as a broken time axis. The thirds also prove the axis spans BOTH
+    # series: [88..97] thirds are 91 and 94 — only right when the overlay's
+    # 97 stretched the range.
+    assert svg.count("chart-grid") == 2
+    assert "91.00" in svg and "94.00" in svg
+    assert "24h ago" in svg and "now" in svg
+    # Extreme-point markers carry the REAL values (round 2 of the axis
+    # work: thirds alone left "we still cannot see the real values").
+    # Max 97 comes from the OVERLAY series — the marker must scan both.
+    assert svg.count("chart-dot") == 2
+    assert "97.00" in svg and "88.00" in svg
 
 
 def test_public_dashboard_wind_rose():
@@ -1080,3 +1091,30 @@ def test_short_or_placeholder_guest_tokens_are_refused():
     with _pytest.raises(ValidationError):
         Settings(api_token="p" * 64,
                  guest_api_tokens="replace-with-a-real-token-please-okay")
+
+
+class TestIntegrationStationIdCheck:
+    """Doren's finding #20: a valid Tempest token with a WRONG station id
+    passed the live check and read 'On' while the poller failed every
+    cycle. The probe now verifies the id is one the credentials can see,
+    and the error NAMES the ids the account really has."""
+
+    def _check(self, *a):
+        from app.integrations import _check_station_id
+        return _check_station_id(*a)
+
+    def test_valid_id_passes(self):
+        assert self._check("170965", [{"station_id": 170965}], "station_id") is None
+
+    def test_unconfigured_passes(self):
+        assert self._check(None, [{"station_id": 1}], "station_id") is None
+        assert self._check("", [{"station_id": 1}], "station_id") is None
+
+    def test_wrong_id_names_the_real_ones(self):
+        msg = self._check("170964", [{"station_id": 170965},
+                                     {"station_id": 99}], "station_id")
+        assert "170964" in msg and "170965" in msg and "99" in msg
+
+    def test_no_stations_at_all(self):
+        msg = self._check("170964", [], "station_id")
+        assert "none visible" in msg

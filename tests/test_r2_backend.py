@@ -136,7 +136,7 @@ def test_device_down_alert_retries_when_delivery_fails(client, monkeypatch):
 
     calls = {"n": 0}
     delivered = {"v": False}
-    async def fake_deliver(cfg, subj, body, pt, pb):
+    async def fake_deliver(cfg, subj, body, pt, pb, **kw):
         calls["n"] += 1
         return delivered["v"]
     async def fake_push_configured():
@@ -200,6 +200,26 @@ def test_rule_cleared_requires_margin():
     # equalTo 50 (±0.5 trigger band): needs to leave band by the margin.
     assert alerts.rule_cleared("equalTo", 50.0, 50.8, 1.0) is False
     assert alerts.rule_cleared("equalTo", 50.0, 51.6, 1.0) is True
+
+def test_rearm_transition_requires_continuous_dwell():
+    """The dwell clock behind wind-chatter suppression (Doren, 2026-08-23:
+    instantaneous wind poked over a 10 mph rule every ~8 min while lulls
+    re-armed it through the deadband — one breezy afternoon, alerts all
+    afternoon). Re-arm needs the value clear for the WHOLE window,
+    continuously."""
+    dwell = 15 * 60_000
+    # Not cleared: never re-arms, and any running clock resets.
+    assert alerts.rearm_transition(False, None, 0, dwell) == (False, None)
+    assert alerts.rearm_transition(False, 1_000, 999_000, dwell) == (False, None)
+    # First cleared tick starts the clock, no re-arm yet.
+    assert alerts.rearm_transition(True, None, 5_000, dwell) == (False, 5_000)
+    # Still clearing but short of the window: clock holds, no re-arm.
+    assert alerts.rearm_transition(True, 5_000, 5_000 + dwell - 1, dwell) \
+        == (False, 5_000)
+    # Window complete: re-arm, clock cleared.
+    assert alerts.rearm_transition(True, 5_000, 5_000 + dwell, dwell) \
+        == (True, None)
+
 
 def test_smart_cleared_requires_margin():
     kw = dict(frost_f=35.0, heat_f=105.0, drop_inhg=0.06)

@@ -149,6 +149,16 @@ def build_payload(station_id: int, obs: dict[str, Any],
     label = name or station.get("name")
     if label:
         device["name"] = label
+    # Sensor battery ("battery", VOLTS — a Tempest runs ~2.3-2.8 V on its
+    # solar charge). WeatherFlow's own bands: ≥2.455 V full performance,
+    # below ~2.39 V the station starts shedding features. 2.40 V is the low
+    # line here, mapped onto the same device.battery_outdoor convention the
+    # SDR/Davis relays post, so ingest._battery_flag turns it into battout
+    # and the app's existing battery icon + low-battery notable just work
+    # (1.7 — Volney: low-battery warning "if the device supports it").
+    batt = num(obs, "battery")
+    if batt is not None:
+        device["battery_outdoor"] = "low" if batt < 2.40 else "normal"
     # No `location`: Tempest has no city field, and `public_name` is just a
     # copy of `name` — setting it would render "Chaucer Drive / Chaucer Drive".
     # Tempest hands us the station's coordinates, which almost no other source

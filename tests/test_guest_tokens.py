@@ -174,3 +174,63 @@ def test_minted_token_alerts_hide_recipients(client):
         "share token sees the operator's alert recipients"
     assert client.get("/api/alerts",
                       headers=H).json()["recipients"] == ["operator@example.com"]
+
+
+# ── 1.7 management additions: rename, re-share reveal, last-used ──────────
+
+def test_rename_relabels_and_clears(client):
+    minted = _mint(client, label="Son's phone")
+    tid = minted["id"]
+    r = client.patch(f"/api/guest-tokens/{tid}", headers=H,
+                     json={"label": "Son's iPad"})
+    assert r.status_code == 200 and r.json()["label"] == "Son's iPad"
+    rows = client.get("/api/guest-tokens", headers=H).json()["tokens"]
+    assert [t["label"] for t in rows if t["id"] == tid] == ["Son's iPad"]
+    # Null label clears back to unnamed.
+    assert client.patch(f"/api/guest-tokens/{tid}", headers=H,
+                        json={"label": None}).status_code == 200
+    rows = client.get("/api/guest-tokens", headers=H).json()["tokens"]
+    assert [t["label"] for t in rows if t["id"] == tid] == [None]
+    assert client.patch("/api/guest-tokens/zwg_nope1234", headers=H,
+                        json={"label": "x"}).status_code == 404
+    # A guest must not rename shares (same owner-only contract as revoke).
+    gh = {"Authorization": f"Bearer {minted['token']}"}
+    assert client.patch(f"/api/guest-tokens/{tid}", headers=gh,
+                        json={"label": "hax"}).status_code == 403
+
+
+def test_reveal_returns_full_token_for_reshare(client):
+    minted = _mint(client, label="Family")
+    tid, token = minted["id"], minted["token"]
+    r = client.get(f"/api/guest-tokens/{tid}/token", headers=H)
+    assert r.status_code == 200
+    assert r.json()["token"] == token       # byte-exact — it must re-encode
+    assert r.json()["label"] == "Family"    # into the same ZW1 share code
+    assert client.get("/api/guest-tokens/zwg_nope1234/token",
+                      headers=H).status_code == 404
+    # Owner-only: a guest revealing tokens would defeat the whole model.
+    gh = {"Authorization": f"Bearer {token}"}
+    assert client.get(f"/api/guest-tokens/{tid}/token",
+                      headers=gh).status_code == 403
+
+
+def test_last_used_stamps_on_guest_auth_only(client):
+    import time as _t
+    before_ms = int(_t.time() * 1000)
+    minted = _mint(client, label="Watcher")
+    tid = minted["id"]
+    # Fresh mint: never used — null, not an epoch-0 stamp.
+    rows = client.get("/api/guest-tokens", headers=H).json()["tokens"]
+    assert [t["last_used_ms"] for t in rows if t["id"] == tid] == [None]
+    # The list call above authenticated with the OWNER token; owner traffic
+    # must never stamp a share. Now the guest reads once...
+    gh = {"Authorization": f"Bearer {minted['token']}"}
+    assert client.get("/api/devices", headers=gh).status_code == 200
+    # ...and the next owner listing flushes and shows a plausible stamp.
+    rows = client.get("/api/guest-tokens", headers=H).json()["tokens"]
+    stamp = [t["last_used_ms"] for t in rows if t["id"] == tid][0]
+    assert stamp is not None and before_ms <= stamp <= int(_t.time() * 1000)
+    # A second, older-than-current flush must never move the stamp backward:
+    # re-listing without new guest traffic keeps the same value.
+    rows = client.get("/api/guest-tokens", headers=H).json()["tokens"]
+    assert [t["last_used_ms"] for t in rows if t["id"] == tid] == [stamp]

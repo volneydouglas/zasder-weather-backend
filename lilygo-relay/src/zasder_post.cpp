@@ -269,6 +269,13 @@ void zasder_post(const char *rtl433Json,
   if (generic) {
     device["name"] = String(model) + " " + String((unsigned) in["id"].as<uint32_t>());
   }
+  // battery_ok → battery_outdoor (R6 finding 5): the backend maps this to
+  // battout and the app's battery-low tile/notable keys off it — sdr-relay
+  // always sent it, this relay never did, so LilyGO-only stations had an
+  // inert battery indicator end to end. rtl_433 emits 1 = ok, 0 = low.
+  if (in["battery_ok"].is<int>()) {
+    device["battery_outdoor"] = in["battery_ok"].as<int>() ? "normal" : "low";
+  }
   out["timestamp_utc"] = nowIsoUtc();
   out["source"]        = ZASDER_SOURCE_TAG;
 
@@ -429,6 +436,14 @@ void zasder_post(const char *rtl433Json,
   http.setTimeout(8000);
   http.addHeader("Content-Type",  "application/json");
   http.addHeader("Authorization", "Bearer " + ingestToken);
+  // Token auto-upgrade (1.7): while this board rides the SHARED ingest
+  // token (anything not zwi_-shaped), ask the server for an identity of
+  // its own. A 1.7 backend answers with `assign_ingest_token` in the
+  // response; older backends ignore the header entirely. This is how a
+  // fresh flash provisioned with the shared token ends up individually
+  // revocable with zero extra setup.
+  bool wantUpgrade = !ingestToken.startsWith("zwi_");
+  if (wantUpgrade) http.addHeader("X-Token-Upgrade", "request");
   int rc = http.POST(body);
   // One call per POST: the tracker resets the streak on ANY non-401 outcome
   // (2xx, 5xx, transport rc < 0) and fires exactly at the threshold — the
@@ -436,6 +451,19 @@ void zasder_post(const char *rtl433Json,
   bool wipeToken = post401.onResult(rc);
   if (rc >= 200 && rc < 300) {
     Serial.printf("[posted %d] %s %u\n", rc, model, (unsigned) id);
+    if (wantUpgrade) {
+      // Body is a small JSON ack; the assignment field appears only when
+      // the server minted (or re-delivers) this board's own token.
+      // ArduinoJson over substring-scraping: a token value could in
+      // principle contain any base64-ish run a regex would misbite on.
+      JsonDocument ack;
+      if (deserializeJson(ack, http.getString()) == DeserializationError::Ok) {
+        const char *assigned = ack["assign_ingest_token"];
+        if (assigned && *assigned) {
+          ZasderConfigServer::adoptIngestToken(String(assigned));
+        }
+      }
+    }
   } else if (rc == 401) {
     Serial.printf("[post-fail 401] (consecutive=%d)\n",
                   wipeToken ? MAX_CONSECUTIVE_401 : post401.consecutive());

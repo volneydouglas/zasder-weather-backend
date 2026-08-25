@@ -72,5 +72,9 @@ extern bool forwardAll;
 
 void loadFromNvs();  // populates backendUrl + ingestToken from NVS
 void wipeIngestToken();  // for the 401-auto-recovery path
+// Token auto-upgrade (1.7): the server handed this board its own
+// per-device token in an ingest response — persist it and use it from
+// the next POST on. See zasder_post.cpp for the handshake.
+void adoptIngestToken(const String &token);
 
 }  // namespace ZasderConfigServer

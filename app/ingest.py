@@ -35,6 +35,7 @@ import json as _json
 import logging
 import math
 import re
+import secrets as _secrets
 import time
 import weakref
 from typing import Annotated, Any
@@ -788,15 +789,27 @@ def _is_gust_glitch(gust: float | None, speed: float | None,
     return gust > speed * max_factor
 
 
-def _require_ingest_token(token: str, client_host: str | None = None) -> None:
-    if not tokens_match(token, settings.ingest_token):
-        # Log the rejection (rain/gust drops already log; auth failures were
-        # the one silent denial). One line per failed request is bounded by
-        # the body-size middleware + normal request handling, and gives the
-        # operator the "why is my board's data missing?" answer.
-        log.warning("ingest auth failed from %s (token %s)",
-                    client_host or "?", "present" if token else "missing")
-        raise HTTPException(status_code=401, detail="invalid ingest token")
+def _require_ingest_token(token: str, client_host: str | None = None) -> str:
+    """Authenticate and say WHICH credential class matched — "shared" (the
+    INGEST_TOKEN env secret) or "minted" (a per-device token). The token
+    auto-upgrade below keys off the distinction: only shared-token devices
+    are offered an identity of their own."""
+    if tokens_match(token, settings.ingest_token):
+        return "shared"
+    # App-minted per-device tokens (1.7): each board/poller can carry its
+    # own revocable credential, so rotating or revoking one no longer
+    # unpairs every other device (security review finding 4). The stamp
+    # feeds the "last used" column the management UI shows.
+    if tokens_match(token, db.ingest_token_cache()):
+        db.touch_ingest_token(token)
+        return "minted"
+    # Log the rejection (rain/gust drops already log; auth failures were
+    # the one silent denial). One line per failed request is bounded by
+    # the body-size middleware + normal request handling, and gives the
+    # operator the "why is my board's data missing?" answer.
+    log.warning("ingest auth failed from %s (token %s)",
+                client_host or "?", "present" if token else "missing")
+    raise HTTPException(status_code=401, detail="invalid ingest token")
 
 
 def _token_from_header(authorization: str | None,
@@ -1290,16 +1303,84 @@ def _truncate_source(payload_obj: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── Token auto-upgrade (1.7) ─────────────────────────────────────────────
+# A device on the SHARED token opts in by sending `X-Token-Upgrade: request`
+# (the firmware sends it whenever its stored token isn't zwi_-shaped). The
+# server mints a per-device token labeled after the station and hands it
+# back in the ingest response — the one channel the device already trusts
+# (server-authenticated TLS) and is already authenticated on. Delivery is
+# idempotent: the SAME token comes back on every flagged post until the
+# device first authenticates with it (adoption), and again later if the
+# device loses its storage and falls back to the shared token — so a wiped
+# board self-heals onto its original identity. This is also how NEW users
+# get per-device tokens from the first boot, with nothing to set up.
+
+async def _token_upgrade_step(kind: str, presented: str, mac: str,
+                              wants_upgrade: bool) -> str | None:
+    """Returns the token to embed as `assign_ingest_token`, or None."""
+    if kind == "minted":
+        # Adoption: this mac is now using the token we assigned it.
+        # Cache lookup first — the common case (no pending assignment)
+        # must cost a dict miss, not a query, at board cadence. The
+        # constant-time compare is the invariant-suite bright line for
+        # presented credentials, even though both sides here already
+        # passed digest verification upstream.
+        assigned = db.unadopted_assignment_token(mac)
+        if assigned is not None and tokens_match(presented, assigned):
+            await db.mark_ingest_assignment_adopted(mac, int(time.time() * 1000))
+            log.info("token upgrade adopted by %s", mac)
+        return None
+    if not wants_upgrade:
+        return None
+    now_ms = int(time.time() * 1000)
+    existing = await db.get_ingest_assignment(mac)
+    # Bound auto-minting (CodeRabbit, PR #27): a shared-token holder can
+    # post arbitrary device ids, and each would otherwise mint a PERSISTED
+    # credential that survives an INGEST_TOKEN rotation — defeating the
+    # rotation story and growing ingest_tokens without limit. Re-delivery
+    # of an existing assignment stays allowed at the cap (it mints
+    # nothing); the cap itself is generous next to any real fleet.
+    if existing is None and await db.count_ingest_assignments() >= 50:
+        log.warning("token upgrade refused for %s: assignment cap reached",
+                    mac)
+        return None
+    if existing and existing["token"] in db.ingest_token_cache():
+        # Re-deliver (pre-adoption retries, or NVS-loss recovery). If the
+        # operator REVOKED the assigned token, fall through and mint fresh
+        # — a revoked credential must never be resurrected.
+        return existing["token"]
+    token = "zwi_" + _secrets.token_hex(16)
+    name_row = await db.get_device_name(mac)
+    label = f"{name_row or mac} (auto)"
+    await db.add_ingest_token(token, label, now_ms)
+    await db.set_ingest_assignment(mac, token, now_ms)
+    log.info("token upgrade minted for %s (%s)", mac, label)
+    return token
+
+
 # Token in header so it never appears in proxy/access logs.
 @router.post("/ingest/custom")
 async def ingest_custom_header(
     request: Request,
     authorization: Annotated[str | None, Header()] = None,
     x_ingest_token: Annotated[str | None, Header(alias="X-Ingest-Token")] = None,
+    x_token_upgrade: Annotated[str | None, Header(alias="X-Token-Upgrade")] = None,
 ) -> dict[str, Any]:
-    _require_ingest_token(_token_from_header(authorization, x_ingest_token),
-                          request.client.host if request.client else None)
-    return await _do_ingest(await _parse_json_body(request))
+    presented = _token_from_header(authorization, x_ingest_token)
+    kind = _require_ingest_token(
+        presented, request.client.host if request.client else None)
+    result = await _do_ingest(await _parse_json_body(request))
+    mac = result.get("mac")
+    # No credential for a device probation hasn't admitted (CodeRabbit,
+    # PR #27): _do_ingest 200s quarantined posts (so boards don't count
+    # them toward the 401-wipe heuristic), but a quarantined MAC must not
+    # walk away with a persisted token.
+    if mac and not result.get("quarantined"):
+        assigned = await _token_upgrade_step(
+            kind, presented, mac, wants_upgrade=bool(x_token_upgrade))
+        if assigned:
+            result["assign_ingest_token"] = assigned
+    return result
 
 # (Legacy path-form `/ingest/custom/{token}` was removed 2026-05-21. The
 # only consumer was the retired hub-relay container; tokens in URLs leak

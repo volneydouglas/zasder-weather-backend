@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any
 
 from . import db
@@ -68,8 +69,27 @@ class Poller:
             mac = d.get("macAddress") or d.get("mac")
             if not mac:
                 continue
-            await db.upsert_device(mac, d)
             last: dict[str, Any] | None = d.get("lastData")
+            # R6: /ingest/custom sanity-bounds timestamps; this poller
+            # stored lastData verbatim, so an AWN console with a broken
+            # clock could post a far-future dateutc — devices.last_seen_ms
+            # jumps ahead (silencing the staleness monitor) and future rows
+            # pollute records windows. Same policy as ingest: clamp small
+            # future skew to now, drop far-past rows.
+            if last and isinstance(last.get("dateutc"), (int, float)):
+                from .ingest import _FUTURE_SKEW_MS, _PAST_HORIZON_MS
+                now_ms = int(time.time() * 1000)
+                ts = last["dateutc"]
+                if ts > now_ms + _FUTURE_SKEW_MS:
+                    log.warning("%s dateutc %.1f min in the future — "
+                                "clamping to server time", mac,
+                                (ts - now_ms) / 60000)
+                    last = dict(last, dateutc=now_ms)
+                    d = dict(d, lastData=last)
+                elif ts < now_ms - _PAST_HORIZON_MS:
+                    log.warning("%s dateutc too far past — dropping row", mac)
+                    last = None
+            await db.upsert_device(mac, d)
             if last:
                 added = await db.insert_observations(mac, [last])
                 stored += added

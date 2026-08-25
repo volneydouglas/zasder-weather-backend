@@ -8,6 +8,61 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.7.0] — 2026-08-25
+
+### Added
+- **Rain-start nowcast** (opt-in, `PUT /api/alerts {"rain_start": true}`):
+  polls Open-Meteo's 15-minute precipitation model for your primary
+  station's location and sends one alert when rain is expected within the
+  hour — your station then confirms the real thing. On iOS 17.2+ the same
+  event starts a **Live Activity**: a Lock Screen / Dynamic Island
+  countdown to the onset, self-expiring after the event. Push-to-start
+  tokens register at `POST /api/push/live-activity-token`.
+- **Per-device ingest tokens.** Mint a revocable credential per sending
+  device (`/api/ingest-tokens`: create/list/rename/reveal/revoke) — valid
+  everywhere `INGEST_TOKEN` is, never as an API token. Revoking one board
+  no longer unpairs the fleet, and the shared token keeps working.
+- **Token auto-upgrade.** A device posting with the shared token can send
+  `X-Token-Upgrade: request` and receives its own token in the ingest
+  response — idempotent per device, self-healing after a device wipe,
+  capped, and never issued to devices still in probation. The LilyGO
+  firmware in this repo does this automatically on fresh flashes.
+- **Alert history.** `GET /api/alerts/recent` lists what fired and when
+  (device-down, rules, smart, storm, nowcast), backed by a capped
+  `alert_log` table.
+- **Alert rule editing.** `PATCH /api/alerts/rules/{id}` updates a rule's
+  threshold or target station in place, resetting its trigger state.
+- **Storm-summary controls.** Per-station mute
+  (`PUT /api/devices/{mac}/alert {"storm_summary": false}`) and a
+  delivery-channel choice (`storm_channels`: push/email/both). Summaries
+  now include the gust front that arrives ahead of the rain window.
+- **Read-only capability probe.** `GET /api/session` reports
+  `can_write` + `forecast_source` so apps on a share token hide
+  owner-only controls; limited reads get town-rounded coordinates
+  (1 decimal) so sun times and NWS alerts work for guests.
+- Database backup endpoints, rollup-derived rain periods for
+  daily-counter stations (with request caching), NCEI climate normals,
+  heat/cold distribution insight bands, and an Open-Meteo minutely
+  proxy.
+
+### Changed
+- **Threshold alerts re-arm only after 15 minutes of continuous
+  clearance** — instantaneous wind samples used to re-arm a rule through
+  the deadband and fire every few minutes all afternoon.
+- Records/summary aggregates ignore non-numeric values stored by upstream
+  glitches; the AWN poller sanity-bounds timestamps like `/ingest/custom`.
+- The hosted push relay accepts an optional `push_type`/`payload` for
+  Live Activity delivery (older relays reject the new fields loudly).
+
+### Fixed
+- An `Infinity` alert-rule threshold could persist and permanently break
+  `GET /api/alerts/rules`; rule creation now validates finiteness.
+- An intermittent 500 on the backup endpoints (a filesystem race on
+  SQLite's WAL sidecars), and a backup interrupted by a restart no longer
+  wedges the job in "running" forever.
+- Deleting a device now clears its storm tracker and probation state — a
+  re-registered station no longer inherits an open storm.
+
 ## [1.6.2] — 2026-08-21
 
 ### Added

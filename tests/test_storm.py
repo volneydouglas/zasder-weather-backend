@@ -169,7 +169,7 @@ def wired(temp_env: str, monkeypatch):
 
     sent: list[tuple[str, str]] = []
 
-    async def fake_deliver(cfg, subject, body, title, push_body, email_ok=True):
+    async def fake_deliver(cfg, subject, body, title, push_body, email_ok=True, **kw):
         sent.append((title, push_body))
         return True
 

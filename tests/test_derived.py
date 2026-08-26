@@ -147,6 +147,12 @@ def test_forecast_snapshots_store_and_prune(client, monkeypatch):
     devices = [{"mac": "AA", "info": {"coords": {"coords":
                {"lat": 33.3, "lon": -111.9}}}}]
     now = int(time.time() * 1000)
+    # An ancient run, older than the 400-day retention: the write below
+    # must sweep it (the "prune" this test's name promised but never
+    # exercised — TEST_GAP_AUDIT).
+    asyncio.run(db.insert_forecast_snapshots(
+        "open-meteo", now - 401 * 86_400_000,
+        [{"valid_date": "2020-01-01", "lead_days": 0}]))
     asyncio.run(fs.check(devices, now))
 
     async def rows():
@@ -155,7 +161,8 @@ def test_forecast_snapshots_store_and_prune(client, monkeypatch):
                 "SELECT * FROM forecast_snapshots ORDER BY valid_date"
             )).fetchall()]
     stored = asyncio.run(rows())
-    assert len(stored) == 2
+    assert len(stored) == 2, "the ancient run must be pruned on write"
+    assert all(r["valid_date"] != "2020-01-01" for r in stored)
     assert stored[0]["provider"] == "open-meteo"
     assert stored[0]["tmax_f"] == 108.1
     assert stored[1]["pop"] == 55

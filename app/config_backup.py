@@ -120,7 +120,9 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
     if not isinstance(payload, dict):
         raise RestoreError("that file isn't a backend configuration backup")
     version = payload.get("version")
-    if not isinstance(version, int):
+    # bool is an int subclass, so {"version": true} would sail through an
+    # isinstance check alone (TEST_GAP_AUDIT R3-137d).
+    if not isinstance(version, int) or isinstance(version, bool):
         raise RestoreError("that file isn't a backend configuration backup")
     if version > FORMAT_VERSION:
         raise RestoreError(

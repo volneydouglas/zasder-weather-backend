@@ -213,8 +213,9 @@ def test_apply_update_round_trips_the_full_machine_config(wired, monkeypatch):
     assert cfg["services"] == [{"internal_port": 8000}], "services dropped"
     assert cfg["mounts"] == [{"volume": "vol_data", "path": "/data"}], \
         "volume mount dropped — the database would detach"
-    # The deploy token goes through verbatim, interior space included.
-    assert posted["auth"] == "Bearer FlyV1 fm2_testtoken"
+    # Macaroon deploy tokens go out under the FlyV1 scheme (the Bearer wrap
+    # broke one-tap updates on every setup-script server — 2026-08-26).
+    assert posted["auth"] == "FlyV1 fm2_testtoken"
 
 
 def test_apply_update_holds_on_empty_or_unreadable_config(wired, monkeypatch):
@@ -279,3 +280,24 @@ def test_image_exists_registry_challenge_flow(wired, monkeypatch):
         401, headers={"www-authenticate": "Bearer nonsense"}))
     assert asyncio.run(
         self_update.image_exists("registry.example.io/x/y", "1.6.0")) is False
+
+
+def test_auth_header_scheme_split(wired):
+    """Deploy tokens are macaroons and go out as FlyV1 — the Bearer wrap
+    broke one-tap updates on every setup-script server (found live on the
+    2026-08-26 field test). OAuth tokens stay Bearer."""
+    _, self_update = wired
+    h = self_update._auth_header
+    # Raw macaroon → FlyV1.
+    assert h("fm2_abc") == "FlyV1 fm2_abc"
+    # flyctl output stored verbatim (setup-fly.sh does this): no double scheme.
+    assert h("FlyV1 fm2_abc") == "FlyV1 fm2_abc"
+    # Comma-joined discharge set rides the first token's type.
+    assert h("fm2_abc,fo1_xyz") == "FlyV1 fm2_abc,fo1_xyz"
+    # Older restricted-token prefixes count as macaroons too.
+    assert h("fm1r_abc") == "FlyV1 fm1r_abc"
+    # OAuth/account tokens keep Bearer, prefix stripped if present.
+    assert h("fo1_xyz") == "Bearer fo1_xyz"
+    assert h("Bearer fo1_xyz") == "Bearer fo1_xyz"
+    # Whitespace never leaks into the header.
+    assert h("  FlyV1  fm2_abc  ") == "FlyV1 fm2_abc"

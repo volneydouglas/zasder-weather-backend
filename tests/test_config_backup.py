@@ -100,6 +100,15 @@ def test_restore_rejects_a_foreign_file(client):
     assert "configuration backup" in r.json()["detail"]
 
 
+def test_restore_rejects_a_boolean_version(client):
+    """bool is an int subclass, so {"version": true} passed the isinstance
+    guard for three review rounds (R3-137d, closed via TEST_GAP_AUDIT)."""
+    r = client.post("/api/config/restore", headers=H,
+                    json={"version": True, "alert_prefs": {}})
+    assert r.status_code == 400
+    assert "configuration backup" in r.json()["detail"]
+
+
 def test_restore_rejects_a_newer_format(client):
     r = client.post("/api/config/restore", headers=H,
                     json={"version": 99, "alert_prefs": {}})

@@ -8,6 +8,16 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.8.2] — 2026-08-26
+
+### Fixed
+- One-tap and automatic self-updates now authenticate correctly against the
+  Fly Machines API. Deploy tokens (`fly tokens create deploy`) are macaroon
+  tokens, which Fly accepts under the `FlyV1` scheme; the updater was
+  sending them as `Bearer`, so the update step could fail with an auth error
+  on servers provisioned by `setup-fly.sh`. Either token form stored in
+  `FLY_API_TOKEN` (with or without the `FlyV1 ` prefix) now works.
+
 ## [1.8.1] — 2026-08-26
 
 ### Fixed

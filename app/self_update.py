@@ -69,6 +69,27 @@ def _fly_token() -> str | None:
     return os.environ.get("FLY_API_TOKEN", "").strip() or None
 
 
+# Deploy tokens (`fly tokens create deploy`) are macaroons — 'fm2_...' or a
+# comma-joined discharge set — and Fly's API takes those under the FlyV1
+# scheme, not Bearer; flyctl makes exactly this split. Setup scripts store
+# the flyctl output verbatim, which already carries a 'FlyV1 ' prefix, so
+# strip any scheme before choosing one. Bearer stays for OAuth tokens.
+_MACAROON_PREFIXES = ("fm1r", "fm1a", "fm2")
+
+
+def _auth_header(token: str) -> str:
+    tok = token.strip()
+    lowered = tok.lower()
+    for scheme in ("flyv1 ", "bearer "):
+        if lowered.startswith(scheme):
+            tok = tok[len(scheme):].strip()
+            lowered = tok.lower()
+    first = tok.split(",", 1)[0].strip()
+    if first.partition("_")[0] in _MACAROON_PREFIXES:
+        return f"FlyV1 {tok}"
+    return f"Bearer {tok}"
+
+
 def _image_repo() -> str:
     return (os.environ.get("AUTO_UPDATE_IMAGE_REPO", "").strip()
             or _DEFAULT_IMAGE_REPO)
@@ -176,7 +197,7 @@ async def apply_update(tag: str) -> bool:
         return False
     image = f"{_image_repo()}:{tag}"
     base = f"https://api.machines.dev/v1/apps/{app_name}/machines/{machine_id}"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": _auth_header(token)}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             cur = await client.get(base, headers=headers)

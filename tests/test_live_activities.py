@@ -141,6 +141,11 @@ def test_heat_day_lifecycle(client, monkeypatch):
     from app import db, heat_watch
     cfg = _cfg()
     now = int(time.time() * 1000)
+    # Pin the local hour: this test exercises the TEMPERATURE close, and
+    # with the suite's UTC timezone it flaked whenever wall-clock+21min
+    # crossed 22:00 local (the local-hour close fired first — caught live
+    # at 21:47 UTC, 2026-08-26). The 22:00 close has its own test below.
+    monkeypatch.setattr(heat_watch, "_local_hour", lambda now_ms: 12)
 
     def dev(t):
         return [{"mac": "AA:BB:CC:00:00:04", "name": "Hot",
@@ -171,6 +176,31 @@ def test_heat_day_lifecycle(client, monkeypatch):
     assert heats[-1]["aps"]["event"] == "end"
     # The running high survived the silent tick between pushes.
     assert heats[-1]["aps"]["content-state"]["hiF"] == 104.0
+    assert asyncio.run(heat_watch._get_state()) == {}
+
+
+def test_heat_day_local_hour_close(client, monkeypatch):
+    """The 22:00 local close: still hot, no temperature break — the day
+    ends anyway (R7 missing-test item, now that the lifecycle test pins
+    the hour away)."""
+    calls = _fake_apns(monkeypatch)
+    from app import heat_watch
+    cfg = _cfg()
+    now = int(time.time() * 1000)
+    hour = {"v": 12}
+    monkeypatch.setattr(heat_watch, "_local_hour", lambda now_ms: hour["v"])
+
+    def dev(t):
+        return [{"mac": "AA:BB:CC:00:00:05", "name": "Hot",
+                 "lastData": {"tempf": t}}]
+
+    async def run():
+        await heat_watch.check(cfg, dev(102.0), now)          # opens
+        hour["v"] = 22
+        await heat_watch.check(cfg, dev(101.0), now + 60_000)  # still hot
+    asyncio.run(run())
+    heats = [p for a, p in calls["update"] if a == "heat"]
+    assert len(heats) == 1 and heats[0]["aps"]["event"] == "end"
     assert asyncio.run(heat_watch._get_state()) == {}
 
 

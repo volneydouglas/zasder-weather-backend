@@ -487,6 +487,30 @@ def _parse_json_col(raw: Any) -> dict[str, Any]:
     return _scrub_nonfinite(parsed) if isinstance(parsed, dict) else {}
 
 
+# Above this, the idx_obs_chart rebuild runs inline at boot (fast, and the
+# covering index never disappears); past it, boot defers to a background
+# task so startup stays inside health-check windows (v1.8.1).
+_CHART_INDEX_INLINE_MAX_ROWS = 200_000
+_CHART_INDEX_REBUILD_NEEDED = False
+
+
+def chart_index_rebuild_needed() -> bool:
+    return _CHART_INDEX_REBUILD_NEEDED
+
+
+async def rebuild_chart_index() -> None:
+    """The deferred big-archive rebuild: drop + recreate idx_obs_chart with
+    the current column set. Interrupted runs are safe — the next boot's
+    probe sees the missing/stale index and defers again."""
+    global _CHART_INDEX_REBUILD_NEEDED
+    async with connect() as db:
+        await db.execute("DROP INDEX IF EXISTS idx_obs_chart")
+        await db.execute("CREATE INDEX idx_obs_chart ON observations ("
+                         + ", ".join(_CHART_INDEX_COLS) + ")")
+        await db.commit()
+    _CHART_INDEX_REBUILD_NEEDED = False
+
+
 def _index_columns(create_sql: str) -> set[str]:
     """Column names parsed from a stored `CREATE INDEX ... (a, b, c)`
     statement. Used by the idx_obs_chart rebuild probe in init_db."""
@@ -742,9 +766,22 @@ async def init_db() -> None:
         # substrings: "tempf" is a substring of "tempinf" (and "humidity" of
         # "humidityin"), so a stale index missing tempf passed the probe.
         if row and row[0] and not set(_CHART_INDEX_COLS) <= _index_columns(row[0]):
-            await db.execute("DROP INDEX idx_obs_chart")
-            await db.execute("CREATE INDEX idx_obs_chart ON observations ("
-                             + ", ".join(_CHART_INDEX_COLS) + ")")
+            n = (await (await db.execute(
+                "SELECT COUNT(*) FROM observations")).fetchone())[0]
+            if n <= _CHART_INDEX_INLINE_MAX_ROWS:
+                await db.execute("DROP INDEX idx_obs_chart")
+                await db.execute("CREATE INDEX idx_obs_chart ON observations ("
+                                 + ", ".join(_CHART_INDEX_COLS) + ")")
+            else:
+                # DEFER on big archives (v1.8.1): the inline rebuild on a
+                # 1.15M-row box outlived Fly's health-check window, the
+                # machine was killed mid-CREATE, and every restart began
+                # again — the 1.8.0 upgrade crash-looped Doren's guest
+                # instance. The lifespan kicks rebuild_chart_index() after
+                # startup instead; charts run uncovered (slow, correct)
+                # until it lands.
+                global _CHART_INDEX_REBUILD_NEEDED
+                _CHART_INDEX_REBUILD_NEEDED = True
         await db.commit()
 
         # Probe for SQLite's math functions once — they drive the circular mean

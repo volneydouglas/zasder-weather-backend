@@ -404,3 +404,42 @@ def test_webhook_task_reaper_consumes_exceptions(client):
     # exception() after the reaper ran: already consumed, not raising into
     # the "never retrieved" warning path.
     assert isinstance(task.exception(), RuntimeError)
+
+
+def test_chart_index_rebuild_defers_on_big_archives(client, monkeypatch):
+    """v1.8.1: the idx_obs_chart rebuild must not run inline at boot on a
+    large archive — the 1.8.0 upgrade crash-looped a 1.15M-row box when
+    the CREATE INDEX outlived the platform health-check window. Above the
+    threshold init_db only FLAGS the rebuild; rebuild_chart_index() then
+    restores the covering index with the full column set."""
+    import asyncio
+    from app import db
+
+    async def run():
+        # Sabotage: drop a column from the index so the probe sees stale.
+        async with db.connect() as conn:
+            await conn.execute("DROP INDEX idx_obs_chart")
+            await conn.execute(
+                "CREATE INDEX idx_obs_chart ON observations (mac, dateutc_ms)")
+            await conn.commit()
+        monkeypatch.setattr(db, "_CHART_INDEX_INLINE_MAX_ROWS", -1)
+        db._CHART_INDEX_REBUILD_NEEDED = False
+        await db.init_db()
+        deferred = db.chart_index_rebuild_needed()
+        async with db.connect() as conn:
+            row = await (await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
+            )).fetchone()
+        still_stale = not set(db._CHART_INDEX_COLS) <= db._index_columns(row[0])
+        await db.rebuild_chart_index()
+        async with db.connect() as conn:
+            row = await (await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
+            )).fetchone()
+        rebuilt = set(db._CHART_INDEX_COLS) <= db._index_columns(row[0])
+        return deferred, still_stale, rebuilt, db.chart_index_rebuild_needed()
+    deferred, still_stale, rebuilt, flag_after = asyncio.run(run())
+    assert deferred, "big archive must defer, not rebuild inline"
+    assert still_stale, "boot must NOT have rebuilt inline"
+    assert rebuilt, "the background rebuild restores the covering index"
+    assert flag_after is False

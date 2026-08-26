@@ -63,6 +63,23 @@ async def lifespan(app: FastAPI):
     build_guard.assert_build_variant()
     await db.init_db()
     app.state.started_at = time.time()
+    # Big-archive chart-index rebuild runs AFTER startup (v1.8.1): inline
+    # at boot it outlived Fly's health-check window on a 1.15M-row box and
+    # the 1.8.0 upgrade crash-looped. Strong ref on app.state; charts are
+    # slower-but-correct until it completes, and an interrupted run just
+    # defers again next boot.
+    if db.chart_index_rebuild_needed():
+        async def _rebuild_chart_index() -> None:
+            try:
+                t0 = time.time()
+                log.info("chart index rebuild starting in background "
+                         "(large archive)")
+                await db.rebuild_chart_index()
+                log.info("chart index rebuilt in %.0fs", time.time() - t0)
+            except Exception:
+                log.exception("background chart index rebuild failed")
+        app.state.chart_index_task = asyncio.create_task(
+            _rebuild_chart_index())
     # Declare every source up front, configured or not. "Not set up" and "set
     # up but broken" are the two answers a self-hoster needs to tell apart,
     # and they look identical from outside.

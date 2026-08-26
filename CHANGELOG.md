@@ -8,6 +8,16 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.8.1] — 2026-08-26
+
+### Fixed
+- Upgrading a large archive no longer risks a startup crash-loop: the
+  one-time chart-index rebuild that 1.8.0 ran during boot could outlive
+  a platform health-check window on million-row databases (the machine
+  was killed mid-CREATE and restarted into the same rebuild forever).
+  Archives past ~200k rows now boot immediately and rebuild the index
+  in the background; charts are slower but correct until it completes.
+
 ## [1.8.0] — 2026-08-26
 
 ### Added

@@ -19,7 +19,7 @@ def test_status_is_presence_only_and_owner_gated(client):
     r = client.get("/api/integrations", headers=H)
     assert r.status_code == 200
     provs = r.json()["providers"]
-    assert set(provs) == {"awn", "weatherlink", "tempest"}
+    assert set(provs) == {"awn", "weatherlink", "tempest", "airgradient"}
     for p in provs.values():
         assert p["configured"] is False        # conftest blanks every cred
     # Read-only tokens must not even see WHICH providers are configured.

@@ -17,7 +17,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Reques
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               PlainTextResponse)
+                               PlainTextResponse, StreamingResponse)
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
@@ -452,6 +452,7 @@ async def embed_page(
   post();
 }})();
 </script>
+{_pd.SPINNER_HTML}
 </body>
 </html>"""
     return HTMLResponse(page)
@@ -467,13 +468,16 @@ async def status_page() -> HTMLResponse:
     now_ms = int(time.time() * 1000)
     rows = []
     total_obs = 0
+    # (Counts served via _cached_observation_count below — the raw COUNT(*)
+    # per device cost ~6s of cold index I/O on a 1.7GB DB, on EVERY
+    # anonymous hit of `/`. Live-measured on Volney's box, 2026-08-26.)
     # Find the freshest non-null tempf across all devices for the sanity-check
     # tile. "Freshest" = highest dateutc_ms in the observations table, scoped
     # to rows that actually have a tempf value (a few SDR-coalesced posts can
     # land without it if the message-type cycle hasn't seen temp yet).
     latest_temp: dict | None = None
     for d in devices:
-        n = await db.observation_count(d["mac"])
+        n = await _cached_observation_count(d["mac"])
         total_obs += n
         last_seen_ms = d.get("lastSeen")
         last_seen_label = "—"
@@ -531,6 +535,38 @@ async def status_page() -> HTMLResponse:
 # HTML for slightly less than the refresh interval: the page can't show anything
 # newer than its own refresh cadence anyway, so this costs no freshness and makes
 # the only unauthenticated compute path flat under load.
+# Row counts for the status page: cosmetic inventory stats that cost real
+# I/O (COUNT(*) over a 300k-row mac walks cold index pages every request —
+# each request opens a fresh SQLite connection, so the page cache never
+# warms). Stale-while-refresh: past the TTL the OLD count is served
+# instantly and one background task recounts; only a mac never counted
+# blocks. Reset by the test fixture like its dashboard sibling.
+_OBS_COUNT_CACHE: dict[str, tuple[float, int]] = {}
+_OBS_COUNT_TTL_S = 600
+_OBS_COUNT_TASKS: set = set()
+
+
+async def _cached_observation_count(mac: str) -> int:
+    now = time.time()
+    hit = _OBS_COUNT_CACHE.get(mac)
+    if hit is not None and now - hit[0] < _OBS_COUNT_TTL_S:
+        return hit[1]
+    if hit is not None:
+        async def _recount() -> None:
+            try:
+                _OBS_COUNT_CACHE[mac] = (time.time(),
+                                         await db.observation_count(mac))
+            except Exception:
+                log.exception("count refresh failed for %s", mac)
+        task = asyncio.create_task(_recount())
+        _OBS_COUNT_TASKS.add(task)
+        task.add_done_callback(_OBS_COUNT_TASKS.discard)
+        return hit[1]
+    n = await db.observation_count(mac)
+    _OBS_COUNT_CACHE[mac] = (time.time(), n)
+    return n
+
+
 _PUBLIC_DASH_CACHE: tuple[float, str] | None = None
 _PUBLIC_DASH_TTL_S = 100
 # Serve-stale ceiling. A cold build takes ~7s on a large history (measured
@@ -662,8 +698,15 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
     fields = pd.resolve_fields(settings.public_dashboard_fields)
     sel = (eff["macs"] or "").strip()
     by_mac = {d["mac"]: d for d in devices}
+    # Air monitors stay off the PUBLIC page entirely — the page renders
+    # weather-station blocks and has no air-quality treatment yet, so a
+    # monitor block is junk however it got selected. Volney's kv carried
+    # the monitor macs EXPLICITLY (the app's sharing screen wrote the full
+    # device list), which is why an honor-explicit-listings filter still
+    # rendered them (2026-08-26). Revisit when the page grows an AQI block.
+    weather = [d for d in devices if not db.is_air_monitor_device(d)]
     if sel.lower() == "all":
-        macs = [d["mac"] for d in devices]
+        macs = [d["mac"] for d in weather] or [(weather or devices)[0]["mac"]]
     elif sel:
         # Match on the separator-stripped uppercase form so the operator can
         # write the MAC colonized or compact, lower or upper case. Walk the
@@ -672,11 +715,16 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
         # (Volney, 2026-08-21). dict.fromkeys dedups while preserving order.
         def _compact(m: str) -> str:
             return m.upper().replace("-", "").replace(":", "")
-        by_compact = {_compact(d["mac"]): d["mac"] for d in devices}
+        by_compact = {_compact(d["mac"]): d["mac"] for d in weather}
         want = dict.fromkeys(_compact(m) for m in sel.split(",") if m.strip())
-        macs = [by_compact[w] for w in want if w in by_compact] or [devices[0]["mac"]]
+        # Fallback prefers a weather station too: a kv list naming ONLY
+        # monitor macs empties the filter, and devices[0] could re-select
+        # the very block this hunk removes (R8 S5).
+        macs = ([by_compact[w] for w in want if w in by_compact]
+                or [(weather or devices)[0]["mac"]])
     else:
-        macs = [devices[0]["mac"]]  # primary = first device
+        # primary = first WEATHER station (monitor-first fleets fall back).
+        macs = [(weather or devices)[0]["mac"]]
 
     start_ms = now_ms - 24 * 3600 * 1000
     stations = []
@@ -763,6 +811,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     # Public dashboard on ⇒ swap the app screenshots for the live charts + an
     # App Store link, add its CSS, and auto-refresh the page.
     from . import public_dashboard as _pd
+    _spinner = _pd.SPINNER_HTML
     theme_css = _pd.THEME_CSS
     if dashboard_html:
         dashboard_css = _pd.DASHBOARD_CSS
@@ -901,6 +950,7 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
       · <a href="https://github.com/volneydouglas/zasder-weather-backend">source</a>
     </footer>
   </div>
+  {_spinner}
 </body>
 </html>"""
 
@@ -1492,6 +1542,14 @@ class AlertPrefsIn(BaseModel):
     # 1.7 storm-summary channels: 'push' | 'email' | 'both'; "" clears back
     # to legacy delivery (push always, email by email_scope).
     storm_channels: str | None = None
+    # 1.8 heat-day Live Activity: opt-in toggle + threshold (°F).
+    heat_day: bool | None = None
+    heat_day_threshold_f: float | None = Field(default=None, ge=70, le=130)
+    # 1.8 quiet hours (minutes of local day, wrap-around allowed) and the
+    # daily digest hour. -1 clears.
+    quiet_start_min: int | None = Field(default=None, ge=-1, le=1439)
+    quiet_end_min: int | None = Field(default=None, ge=-1, le=1439)
+    digest_hour: int | None = Field(default=None, ge=-1, le=23)
 
 
 class DeviceAlertIn(BaseModel):
@@ -1559,6 +1617,12 @@ async def _alerts_state() -> dict[str, Any]:
         # Rain-start nowcast (1.7) — same effective-value + source shape.
         "rain_start": cfg.rain_start,
         "rain_start_source": "app" if prefs.get("rain_start") is not None else "env",
+        # Heat-day Live Activity (1.8).
+        "heat_day": cfg.heat_day,
+        "heat_day_threshold_f": cfg.heat_day_threshold_f,
+        "quiet_start_min": cfg.quiet_start_min,
+        "quiet_end_min": cfg.quiet_end_min,
+        "digest_hour": cfg.digest_hour,
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -1633,6 +1697,23 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
         fields["storm_summary"] = 1 if body.storm_summary else 0
     if body.rain_start is not None:
         fields["rain_start"] = 1 if body.rain_start else 0
+    if body.heat_day is not None:
+        fields["heat_day"] = 1 if body.heat_day else 0
+    if body.heat_day_threshold_f is not None:
+        fields["heat_day_threshold_f"] = body.heat_day_threshold_f
+    # Quiet hours are a PAIR: in_quiet_hours engages only when both ends
+    # are set, so a one-sided write got a 200 and a feature that never
+    # fires (R7 finding 5). Require both in one request (either real
+    # values or the -1 clear).
+    if (body.quiet_start_min is None) != (body.quiet_end_min is None):
+        raise HTTPException(
+            status_code=400,
+            detail="quiet_start_min and quiet_end_min must be set together "
+                   "(use -1 for both to clear)")
+    for f in ("quiet_start_min", "quiet_end_min", "digest_hour"):
+        v = getattr(body, f)
+        if v is not None:
+            fields[f] = None if v < 0 else v
     if body.storm_quiet_minutes is not None:
         fields["storm_quiet_minutes"] = body.storm_quiet_minutes
     if body.storm_min_total_in is not None:
@@ -1998,6 +2079,35 @@ async def push_register(body: PushRegisterIn) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+class PushUnregisterIn(BaseModel):
+    token: str | None = Field(default=None, min_length=8, max_length=512,
+                              pattern=r"^[\x21-\x7e]+$")
+    # R10 U2: the Live Activity tokens this device remembers minting —
+    # unregistering only the APNs token left the old server able to start
+    # storm/heat Activities on a device that moved on.
+    live_activity_tokens: list[str] = Field(default_factory=list,
+                                            max_length=64)
+
+
+@app.post("/api/push/unregister",
+          dependencies=[Depends(require_write_token)])
+async def push_unregister(body: PushUnregisterIn) -> JSONResponse:
+    """Best-effort mirror of the register endpoints: the app's Disconnect
+    & reset calls this before forgetting the server, so the old server
+    stops pushing at a device that moved on. Idempotent — unknown tokens
+    still answer ok (nothing to stop)."""
+    removed = False
+    if body.token:
+        removed = await db.delete_push_token(body.token)
+    la_removed = 0
+    for t in body.live_activity_tokens[:64]:
+        if isinstance(t, str) and 8 <= len(t) <= 512:
+            if await db.delete_live_activity_token(t):
+                la_removed += 1
+    return JSONResponse({"ok": True, "removed": removed,
+                         "live_activity_removed": la_removed})
+
+
 class LiveActivityTokenIn(BaseModel):
     # Same bound + shape rationale as PushRegisterIn: ActivityKit tokens
     # are hex, but Apple documents no fixed length — printable ASCII with
@@ -2005,6 +2115,8 @@ class LiveActivityTokenIn(BaseModel):
     token: str = Field(min_length=8, max_length=512, pattern=r"^[\x21-\x7e]+$")
     env: str | None = None
     kind: str = "start"
+    # 1.8: which Activity an 'update' token belongs to.
+    activity: str | None = None
 
 
 @app.post("/api/push/live-activity-token",
@@ -2013,12 +2125,196 @@ async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONRespons
     """Push-to-start token for the rain-start Live Activity (1.7, nowcast
     phase 2). The app re-posts whenever iOS rotates it; idempotent upsert,
     same lifecycle as /api/push/register."""
-    if body.kind != "start":
+    if body.kind not in ("start", "update", "widgets"):
         raise HTTPException(status_code=400,
-                            detail="only kind 'start' is supported")
+                            detail="kind must be 'start', 'update' or 'widgets'")
+    activity = None
+    if body.kind == "update":
+        # 1.8: per-activity update tokens for the live-tracking Activities.
+        if body.activity not in ("rain", "storm", "heat"):
+            raise HTTPException(
+                status_code=400,
+                detail="update tokens need activity rain|storm|heat")
+        activity = body.activity
+    elif body.kind == "widgets":
+        # iOS 26 push-updated widgets: an extension-wide reload token, no
+        # activity dimension.
+        activity = None
+    else:
+        # Push-to-start tokens are ALSO per-attributes-type (1.8). A 1.7
+        # app omits the field — those are rain-start registrations.
+        if body.activity is not None and body.activity not in (
+                "rain", "storm", "heat"):
+            raise HTTPException(status_code=400, detail="unknown activity")
+        activity = body.activity or "rain"
     env = body.env if body.env in ("sandbox", "production") else None
-    await db.register_live_activity_token(body.token, body.kind, env)
+    await db.register_live_activity_token(body.token, body.kind, env,
+                                          activity=activity)
     return JSONResponse({"ok": True})
+
+
+_SHARE_FIELDS = {
+    "pwsweather": ("station_id", "api_key"),
+    "windy": ("api_key", "station"),
+    "weathercloud": ("wid", "key"),
+    "cwop": ("station_id",),
+}
+
+
+@app.get("/api/sharing", dependencies=[Depends(require_write_token)])
+async def sharing_status() -> JSONResponse:
+    """1.8 upload fan-out: per-target enabled + health. Credentials are
+    write-only — the response says whether each is SET, never its value
+    (the integrations-sheet rule)."""
+    from . import share_targets as st
+    out = {}
+    for t in st.TARGETS:
+        cfg = await st.get_config(t)
+        status = await st.get_status(t)
+        out[t] = {
+            "enabled": bool(cfg.get("enabled")),
+            "fields": {f: bool((str(cfg.get(f) or "")).strip())
+                       for f in _SHARE_FIELDS[t]},
+            "last_ok_ms": status.get("last_ok_ms"),
+            "last_error": status.get("last_error"),
+            "last_error_ms": status.get("last_error_ms"),
+        }
+    return JSONResponse(out)
+
+
+class SharePut(BaseModel):
+    enabled: bool | None = None
+    station_id: str | None = Field(default=None, max_length=64)
+    api_key: str | None = Field(default=None, max_length=128)
+    # -1 = clear (R8 S2): an int field can never arrive as the "" the
+    # merge loop treats as clear, so a set station index was un-removable.
+    station: int | None = Field(default=None, ge=-1, le=255)
+    wid: str | None = Field(default=None, max_length=64)
+    key: str | None = Field(default=None, max_length=128)
+
+
+@app.put("/api/sharing/{target}", dependencies=[Depends(require_write_token)])
+async def sharing_put(target: str, body: SharePut) -> JSONResponse:
+    """Merge-per-field like the integrations PUT: omitted = unchanged,
+    "" clears. Enabling with missing credentials is refused loudly —
+    a target that can only fail is worse than one that is off."""
+    from . import share_targets as st
+    if target not in st.TARGETS:
+        raise HTTPException(status_code=404, detail="unknown target")
+    cfg = await st.get_config(target)
+    for f in _SHARE_FIELDS[target]:
+        v = getattr(body, f, None)
+        if v is not None:
+            if f == "station" and v == -1:
+                cfg.pop(f, None)
+                continue
+            sv = str(v).strip()
+            if sv:
+                cfg[f] = v if f == "station" else sv
+            else:
+                cfg.pop(f, None)
+    if body.enabled is not None:
+        if body.enabled:
+            missing = [f for f in _SHARE_FIELDS[target]
+                       if f != "station" and not str(cfg.get(f) or "").strip()]
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"missing credentials: {', '.join(missing)}")
+        cfg["enabled"] = body.enabled
+    await st.set_config(target, cfg)
+    return JSONResponse({"ok": True, "enabled": bool(cfg.get("enabled"))})
+
+
+class WebhookIn(BaseModel):
+    url: str = Field(min_length=12, max_length=500)
+
+
+@app.post("/api/webhooks", dependencies=[Depends(require_write_token)])
+async def webhook_create(body: WebhookIn) -> JSONResponse:
+    """1.8 outbound webhooks. The secret is returned ONCE, at creation —
+    the row never reveals it again (same one-shot rule as tokens)."""
+    from . import webhooks as wh
+    try:
+        # Threadpool: the validator resolves DNS (socket.getaddrinfo, a
+        # blocking call with no timeout) — on the event loop it would stall
+        # every request behind a slow resolver (CodeRabbit, PR #32).
+        # Starlette's pool, NOT asyncio.to_thread: the default executor's
+        # worker outlives the TestClient loop and interpreter shutdown then
+        # joins it forever — the suite hung at exit ~half the time.
+        from starlette.concurrency import run_in_threadpool
+        await run_in_threadpool(wh.validate_webhook_url, body.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    row = await db.create_webhook(body.url)
+    return JSONResponse(row)
+
+
+class WebhookPatch(BaseModel):
+    enabled: bool
+
+
+@app.patch("/api/webhooks/{hook_id}",
+           dependencies=[Depends(require_write_token)])
+async def webhook_patch(hook_id: str, body: WebhookPatch) -> JSONResponse:
+    if not await db.set_webhook_enabled(hook_id, body.enabled):
+        raise HTTPException(status_code=404, detail="webhook not found")
+    return JSONResponse({"ok": True, "id": hook_id, "enabled": body.enabled})
+
+
+@app.get("/api/webhooks", dependencies=[Depends(require_write_token)])
+async def webhook_list() -> JSONResponse:
+    rows = await db.list_webhooks()
+    return JSONResponse({"webhooks": [
+        {"id": r["id"], "url": r["url"], "enabled": bool(r["enabled"]),
+         "created_ms": r["created_ms"], "last_ok_ms": r["last_ok_ms"],
+         "last_error": r["last_error"]} for r in rows]})
+
+
+@app.delete("/api/webhooks/{wid}", dependencies=[Depends(require_write_token)])
+async def webhook_delete(wid: str) -> JSONResponse:
+    if not await db.delete_webhook(wid):
+        raise HTTPException(status_code=404, detail="unknown webhook")
+    return JSONResponse({"ok": True})
+
+
+class StormWatchStartIn(BaseModel):
+    mac: str = Field(min_length=1, max_length=64)
+
+
+@app.post("/api/storm/watch/start",
+          dependencies=[Depends(require_write_token)])
+async def storm_watch_start(body: StormWatchStartIn) -> JSONResponse:
+    """1.8 Storm Watch manual trigger (Volney: light onset sits below the
+    rain threshold exactly when you're watching the sky). Opens a real
+    storm episode at NOW — the summary covers from this mark, the Live
+    Activity starts on the next monitor tick, and the normal quiet-window
+    machinery closes it (a false alarm self-cleans as a silent close)."""
+    devices = await db.list_devices()
+    device = next((d for d in devices if d["mac"] == body.mac), None)
+    if device is None:
+        raise HTTPException(status_code=404, detail="unknown device")
+    # Global toggle first: with storm summaries off, on_open_tick and the
+    # summary checker both no-op — the endpoint would 200, open an episode,
+    # and nothing would ever start or close it (R7 watch finding 6).
+    from .alerts import effective_config
+    if not (await effective_config()).storm_summary:
+        raise HTTPException(
+            status_code=409,
+            detail="storm summaries are turned off — enable them under "
+                   "Alerts & Notifications first")
+    # Honor the per-station opt-out: a station whose storm summaries are
+    # switched off must not be startable by hand either — the summary and
+    # Live Activity machinery would run for a station the user silenced
+    # (CodeRabbit, PR #32).
+    prefs = await db.get_device_alert_prefs()
+    if (prefs.get(body.mac) or {}).get("storm_summary") is False:
+        raise HTTPException(
+            status_code=409,
+            detail="storm summaries are turned off for this station")
+    from . import storm_watch
+    res = await storm_watch.manual_start(body.mac, device)
+    return JSONResponse(res)
 
 
 class PushRelayIn(BaseModel):
@@ -2094,6 +2390,7 @@ class AlertRuleIn(BaseModel):
     comparator: str
     threshold: float
     target_mac: str | None = None     # None = any device
+    severity: str = "minor"           # minor | standard | urgent (1.8)
 
 
 @app.get("/api/alerts/rules", dependencies=[Depends(require_token)])
@@ -2120,8 +2417,13 @@ async def create_rule(body: AlertRuleIn) -> JSONResponse:
     if not math.isfinite(body.threshold):
         raise HTTPException(status_code=400,
                             detail="threshold must be a finite number")
+    from .alerts import RULE_SEVERITIES
+    if body.severity not in RULE_SEVERITIES:
+        raise HTTPException(status_code=400,
+                            detail=f"severity must be one of {list(RULE_SEVERITIES)}")
     mac = _format_mac(body.target_mac) if body.target_mac else None
-    rule = await db.create_alert_rule(mac, body.field, body.comparator, body.threshold)
+    rule = await db.create_alert_rule(mac, body.field, body.comparator,
+                                      body.threshold, severity=body.severity)
     return JSONResponse(rule)
 
 
@@ -2132,6 +2434,7 @@ class AlertRulePatch(BaseModel):
     enabled: bool | None = None
     threshold: float | None = None
     target_mac: str | None = None
+    severity: str | None = None       # minor | standard | urgent (1.8)
 
 
 @app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_write_token)])
@@ -2140,12 +2443,18 @@ async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
     from .ingest import _format_mac
     if body.threshold is not None and not math.isfinite(body.threshold):
         raise HTTPException(status_code=400, detail="threshold must be finite")
+    if body.severity is not None:
+        from .alerts import RULE_SEVERITIES
+        if body.severity not in RULE_SEVERITIES:
+            raise HTTPException(status_code=400,
+                                detail=f"severity must be one of {list(RULE_SEVERITIES)}")
     set_target = body.target_mac is not None
     tgt = (_format_mac(body.target_mac)
            if set_target and body.target_mac != "" else None)
     rule = await db.update_alert_rule(rule_id, enabled=body.enabled,
                                       threshold=body.threshold,
-                                      target_mac=tgt, set_target=set_target)
+                                      target_mac=tgt, set_target=set_target,
+                                      severity=body.severity)
     if rule is None:
         raise HTTPException(status_code=404, detail="rule not found")
     return JSONResponse(rule)
@@ -2214,6 +2523,118 @@ async def get_current(mac: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="no data for device")
     await _fill_rain_periods(mac, obs)
     return JSONResponse(obs)
+
+
+@app.get("/api/devices/{mac}/derived", dependencies=[Depends(require_token)])
+async def get_derived(mac: str) -> JSONResponse:
+    """Derived metrics from the latest observation (1.8, Pillar C): wet
+    bulb, Delta-T, frost point, fire-weather indices, density altitude,
+    the WMO pressure tendency, and what the barometer thinks (Zambretti).
+    Fields appear only when their inputs exist — absent is not zero."""
+    from . import derived
+    from .ingest import _format_mac
+    mac = _format_mac(mac)
+    obs = await db.latest_observation(mac)
+    if not obs:
+        raise HTTPException(status_code=404, detail="no data for device")
+
+    def n(key):
+        v = obs.get(key)
+        try:
+            f = float(v)
+            return f if math.isfinite(f) else None
+        except (TypeError, ValueError):
+            return None
+
+    t, rh = n("tempf"), n("humidity")
+    out: dict[str, Any] = {}
+
+    def put(key, v, digits=1):
+        if v is not None:
+            out[key] = round(v, digits)
+
+    put("wetBulbF", derived.wet_bulb_f(t, rh))
+    put("deltaTC", derived.delta_t_c(t, rh))
+    put("frostPointF", derived.frost_point_f(t, rh))
+    put("fosbergFwi", derived.fosberg_fwi(t, rh, n("windspeedmph")), 0)
+    put("chandlerBurningIndex", derived.chandler_burning_index(t, rh), 0)
+    dew = n("dewPoint") if obs.get("dewPoint") is not None \
+        else derived.dew_point_f(t, rh)
+    put("densityAltitudeFt",
+        derived.density_altitude_ft(t, dew, n("baromabsin")), 0)
+
+    # Barometer story: 3h tendency + Zambretti from sea-level pressure.
+    slp = n("baromrelin")
+    obs_ms = obs.get("dateutc")
+    if slp is not None and isinstance(obs_ms, (int, float)):
+        # Freshness floor (R7 R4): a "3h" tendency whose anchor predates a
+        # multi-hour outage is mislabeled and feeds Zambretti garbage.
+        past = await db.value_at_or_before(mac, "baromrelin",
+                                           int(obs_ms) - 3 * 3_600_000,
+                                           max_age_ms=3 * 3_600_000)
+        if past is not None:
+            delta = slp - past
+            tend = derived.pressure_tendency_code(delta)
+            if tend is not None:
+                code, word = tend
+                out["pressureTendency"] = {
+                    "code": code, "word": word,
+                    "delta3hInHg": round(delta, 3),
+                }
+                says = derived.zambretti(slp * 33.8639, word)
+                if says is not None:
+                    out["barometerSays"] = says
+    return JSONResponse(out)
+
+
+@app.get("/api/devices/{mac}/export.csv",
+         dependencies=[Depends(require_token)])
+async def export_csv(mac: str, start_ms: int | None = None,
+                     end_ms: int | None = None) -> StreamingResponse:
+    """CSV export (1.8, Pillar B) — the non-negotiable data-ownership
+    baseline: every stored column for a station over a date range,
+    streamed so a decade of rows never has to fit in memory. Defaults to
+    the last 30 days; empty cells are empty, never zero."""
+    from .ingest import _format_mac
+    mac_n = _format_mac(mac)
+    now_ms = int(time.time() * 1000)
+    end = int(end_ms) if end_ms is not None else now_ms
+    start = int(start_ms) if start_ms is not None else end - 30 * 86_400_000
+    if start >= end:
+        raise HTTPException(status_code=400, detail="start_ms must precede end_ms")
+
+    cols = await db.observation_columns()
+
+    async def rows():
+        import csv as _csv
+        import io as _io
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["timestamp_utc"] + cols)
+        yield buf.getvalue()
+        cursor = start
+        while True:
+            batch = await db.observation_rows(mac_n, cursor, end, limit=5000)
+            if not batch:
+                break
+            buf = _io.StringIO()
+            w = _csv.writer(buf)
+            for r in batch:
+                ts = datetime.fromtimestamp(
+                    r["dateutc_ms"] / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                w.writerow([ts] + [
+                    "" if r.get(c) is None else r[c] for c in cols])
+            yield buf.getvalue()
+            cursor = batch[-1]["dateutc_ms"] + 1
+
+    # The filename lands in a quoted Content-Disposition header, and
+    # _format_mac passes non-MAC input through unchanged — strip anything
+    # that could escape the quotes (CodeRabbit, PR #32).
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", mac_n.replace(":", ""))[:32]
+    fname = f"zasder-{safe_id}-{start}-{end}.csv"
+    return StreamingResponse(rows(), media_type="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 @app.get("/api/devices/{mac}/history", dependencies=[Depends(require_token)])

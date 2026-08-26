@@ -73,6 +73,27 @@ def build_live_activity_start(attributes_type: str, attributes: dict,
     }}
 
 
+def build_live_activity_update(content_state: dict, now_s: int,
+                                event: str = "update",
+                                stale_s: int | None = None,
+                                dismiss_s: int | None = None,
+                                alert: tuple[str, str] | None = None) -> dict:
+    """ActivityKit update/end payload (1.8, Storm Watch / Heat Day). Unlike
+    the one-shot start above, these Activities track live station numbers,
+    so the server pushes fresh content-state to each activity's own update
+    token. `alert` (title, body) makes an update audible — used only for
+    the final "storm ended" beat; routine number refreshes stay silent."""
+    aps: dict = {"timestamp": now_s, "event": event,
+                 "content-state": content_state}
+    if stale_s is not None:
+        aps["stale-date"] = stale_s
+    if dismiss_s is not None:
+        aps["dismissal-date"] = dismiss_s
+    if alert is not None:
+        aps["alert"] = {"title": alert[0], "body": alert[1]}
+    return {"aps": aps}
+
+
 def _resolve_env(t: dict) -> tuple[str | None, bool]:
     """(env, came_from_the_token) for one token row.
 
@@ -102,6 +123,9 @@ async def _push_tokens(tokens: list[dict], title: str, body: str,
     topic = settings.apns_topic
     if push_type == "liveactivity":
         topic = f"{topic}.push-type.liveactivity"
+    elif push_type == "widgets":
+        # iOS 26 push-updated widgets: same mandatory-suffix rule.
+        topic = f"{topic}.push-type.widgets"
     headers = {
         "authorization": f"bearer {_provider_jwt()}",
         "apns-topic": topic,
@@ -161,7 +185,8 @@ async def _push_tokens(tokens: list[dict], title: str, body: str,
 
 async def _push_via_relay(tokens: list[str], title: str, body: str,
                           url: str, token: str,
-                          la_payload: dict | None = None) -> dict:
+                          la_payload: dict | None = None,
+                          push_type: str = "liveactivity") -> dict:
     """Send through a shared relay instead of signing locally. For self-hosters
     who don't run their own APNs key: the relay holds the key, fans out to
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
@@ -182,7 +207,7 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
         # alongside; a pre-1.7 relay rejects unknown fields loudly rather
         # than delivering it as a mangled alert (Pydantic extra=forbid), so
         # the caller sees failed, not silent wrong-shape pushes.
-        payload["push_type"] = "liveactivity"
+        payload["push_type"] = push_type
         payload["payload"] = la_payload
     headers = {"authorization": f"Bearer {token}"}
     try:
@@ -214,12 +239,13 @@ async def effective_relay() -> tuple[str | None, str | None]:
     return url, token
 
 
-async def send_live_activity_start(payload: dict, title: str, body: str) -> dict:
-    """Fan a prebuilt ActivityKit start payload out to every registered
-    push-to-start token — own APNs key preferred, hosted relay otherwise.
-    iOS-only by nature; prunes dead tokens like send_to_all. title/body
-    ride along for the relay's logging/quota surface only."""
-    rows = await db.list_live_activity_tokens("start")
+async def send_live_activity_start(payload: dict, title: str, body: str,
+                                   activity: str = "rain") -> dict:
+    """Fan a prebuilt ActivityKit start payload out to every push-to-start
+    token registered for `activity` — the tokens are per-attributes-type,
+    so cross-sending starts the wrong Activity. Own APNs key preferred,
+    hosted relay otherwise; prunes dead tokens like send_to_all."""
+    rows = await db.list_live_activity_tokens("start", activity=activity)
     if not rows:
         return {"sent": 0, "dead": [], "failed": 0}
     if settings.apns_configured:
@@ -231,6 +257,56 @@ async def send_live_activity_start(payload: dict, title: str, body: str) -> dict
             return {"sent": 0, "dead": [], "failed": len(rows)}
         res = await _push_via_relay([r["token"] for r in rows], title, body,
                                     url, relay_token, la_payload=payload)
+    for tok in res.get("dead", []):
+        await db.remove_live_activity_token(tok)
+    return res
+
+
+async def send_live_activity_update(activity: str, payload: dict,
+                                    title: str, body: str) -> dict:
+    """Fan an ActivityKit update payload out to every update token
+    registered for `activity` ('rain' | 'storm' | 'heat'). Same transport
+    split and dead-token pruning as send_live_activity_start."""
+    rows = await db.list_live_activity_tokens("update", activity=activity)
+    if not rows:
+        return {"sent": 0, "dead": [], "failed": 0}
+    if settings.apns_configured:
+        res = await _push_tokens(rows, title, body,
+                                 payload=payload, push_type="liveactivity")
+    else:
+        url, relay_token = await effective_relay()
+        if not (url and relay_token):
+            return {"sent": 0, "dead": [], "failed": len(rows)}
+        res = await _push_via_relay([r["token"] for r in rows], title, body,
+                                    url, relay_token, la_payload=payload)
+    for tok in res.get("dead", []):
+        await db.remove_live_activity_token(tok)
+    return res
+
+
+async def send_widget_refresh() -> dict:
+    """iOS 26 push-updated widgets: tell every registered widget push token
+    that content changed, so the Lock/Home Screen refreshes on the server's
+    schedule instead of WidgetKit's guesses. The payload is the documented
+    minimal shape; the OS treats it as a reload hint, not a notification."""
+    rows = await db.list_live_activity_tokens("widgets")
+    if not rows:
+        return {"sent": 0, "dead": [], "failed": 0}
+    payload = {"aps": {"content-changed": True}}
+    # The relay's schema requires non-empty title/body (they feed its
+    # logging/quota surface); a reload hint has no user-facing text, so
+    # these placeholders never render anywhere.
+    if settings.apns_configured:
+        res = await _push_tokens(rows, "widgets", "refresh", payload=payload,
+                                 push_type="widgets")
+    else:
+        url, relay_token = await effective_relay()
+        if not (url and relay_token):
+            return {"sent": 0, "dead": [], "failed": len(rows)}
+        res = await _push_via_relay([r["token"] for r in rows],
+                                    "widgets", "refresh",
+                                    url, relay_token, la_payload=payload,
+                                    push_type="widgets")
     for tok in res.get("dead", []):
         await db.remove_live_activity_token(tok)
     return res

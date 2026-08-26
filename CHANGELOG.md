@@ -8,6 +8,65 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.8.0] — 2026-08-26
+
+### Added
+- Smart weather alerts: rapid temperature drops, wind ramps, sustained
+  pipe-freeze cold, and gust-front (outflow) signatures — edge-triggered
+  with re-arm deadbands, and co-firing kinds group into a single "front
+  passage" notification. First-frost-of-the-season one-shot per station.
+- Per-rule urgency on threshold alerts (minor / standard / urgent):
+  urgent breaks quiet hours; minor stays quiet overnight and rides the
+  daily digest. Severity is stored on the alert history and carried in
+  webhook payloads.
+- Quiet hours (below-warning pushes hold overnight) and a daily digest
+  email summarizing everything that fired since the last one.
+- NWS alert relay: severe/extreme government alerts push through your
+  own channels, deduplicated globally across co-located stations.
+- Lightning proximity alerts (episode-based, closer-strike re-alerts,
+  30-minute all-clear) for lightning-capable stations.
+- Station health watchdogs: sensor batteries (low + recovered), sensors
+  gone quiet, pegged-humidity and seized-anemometer flatline detection.
+- Storm Watch and Heat Day Live Activity feeds, including a manual
+  storm-watch start endpoint for light-onset storms.
+- Community upload fan-out: PWSWeather, Windy, WeatherCloud, and CWOP
+  with per-target cadence and last-send health on each row.
+- Outbound webhooks: every alert POSTs HMAC-signed JSON to registered
+  https endpoints (SSRF-guarded), with pause/resume.
+- CSV export: every stored column for a station over a range, streamed.
+- Derived metrics endpoint: wet bulb, frost point, Delta-T, Fosberg and
+  Chandler fire indices, density altitude, pressure tendency, and the
+  Zambretti forecaster.
+- Forecast snapshots stored as issued (~6h cadence) for future accuracy
+  scoring.
+- AirGradient air-quality integration: one account token polls every
+  monitor; each location becomes its own device with PM1/PM2.5/PM10,
+  CO2, and TVOC/NOx index columns. Air monitors are excluded from
+  weather-station machinery (uploads, forecast location, NWS polling,
+  public page) by design.
+- Read-only MCP server (`mcp/`): ask an AI assistant about your
+  stations, current conditions, derived metrics, records, and recent
+  alerts over the token-gated API.
+- iOS 26 push-updated widgets support and per-activity Live Activity
+  token scoping.
+
+### Changed
+- The status page's per-device row counts are cached (stale-while-
+  refresh), taking the anonymous front page from seconds to ~0.2s warm.
+- Uploads, forecast snapshots, and widget refresh nudges run
+  independently of email/push configuration, and registered webhooks
+  count as an alert delivery channel of their own.
+- Delta-based alerts and the pressure tendency skip windows that span a
+  station outage instead of computing across the gap.
+
+### Fixed
+- CWOP connects survive blackholed IPs in the APRS-IS rotation and run
+  on uvloop; humidity is clamped to the encodable range.
+- Wet bulb reads as the dry-bulb temperature at saturation instead of
+  vanishing in fog and rain.
+- One malformed stored coordinate no longer skips NWS polling for every
+  station, and forecast snapshots tolerate the same.
+
 ## [1.7.1] — 2026-08-25
 
 ### Fixed

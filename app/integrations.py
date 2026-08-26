@@ -35,12 +35,15 @@ PROVIDERS: dict[str, list[tuple[str, bool, type]]] = {
                     ("station_id", False, int)],
     "tempest": [("token", True, str), ("station_id", False, int),
                 ("name", False, str)],
+    # AirGradient (1.8): one account token covers every monitor; each
+    # location becomes its own device, so there is nothing else to configure.
+    "airgradient": [("token", True, str)],
 }
 
 # Which source_status slug each provider reports under (the names the
 # status page has always used).
 _STATUS_SLUG = {"awn": "ambientweather", "weatherlink": "davis-cloud",
-                "tempest": "tempest"}
+                "tempest": "tempest", "airgradient": "airgradient"}
 
 
 def _kv_key(provider: str, field: str) -> str:
@@ -55,9 +58,11 @@ def _env_values(provider: str) -> dict[str, Any]:
         return {"api_key": settings.weatherlink_api_key,
                 "api_secret": settings.weatherlink_api_secret,
                 "station_id": settings.weatherlink_station_id}
-    return {"token": settings.tempest_token,
-            "station_id": settings.tempest_station_id,
-            "name": settings.tempest_name}
+    if provider == "tempest":
+        return {"token": settings.tempest_token,
+                "station_id": settings.tempest_station_id,
+                "name": settings.tempest_name}
+    return {"token": settings.airgradient_token}
 
 
 def _required(provider: str) -> list[str]:
@@ -180,7 +185,7 @@ async def probe(provider: str) -> str | None:
             stations = await client.list_stations()
             return _check_station_id(eff.get("station_id"), stations,
                                      "station_id")
-        else:
+        elif provider == "tempest":
             from .tempest_client import TempestClient
             client = TempestClient(eff["token"])
             stations = await client.stations()
@@ -191,6 +196,13 @@ async def probe(provider: str) -> str | None:
             # token can actually see.
             return _check_station_id(eff.get("station_id"), stations,
                                      "station_id")
+        else:
+            from .airgradient_client import AirGradientClient
+            client = AirGradientClient(eff["token"])
+            locations = await client.measures_current()
+            if not locations:
+                return ("token works but no monitors are visible — add a "
+                        "location in the AirGradient dashboard")
         return None
     except Exception as e:               # noqa: BLE001 — reported, not lost
         return str(e) or type(e).__name__
@@ -274,13 +286,19 @@ class IntegrationManager:
             client = WeatherLinkClient(eff["api_key"], eff["api_secret"])
             poller = WeatherlinkPoller(client, eff["station_id"],
                                        settings.weatherlink_poll_interval_seconds)
-        else:
+        elif provider == "tempest":
             from .tempest_client import TempestClient
             from .tempest_poller import TempestPoller
             client = TempestClient(eff["token"])
             poller = TempestPoller(client, eff["station_id"],
                                    settings.tempest_poll_interval_seconds,
                                    eff.get("name"))
+        else:
+            from .airgradient_client import AirGradientClient
+            from .airgradient_poller import AirGradientPoller
+            client = AirGradientClient(eff["token"])
+            poller = AirGradientPoller(
+                client, settings.airgradient_poll_interval_seconds)
         try:
             await poller.start()
         except BaseException:

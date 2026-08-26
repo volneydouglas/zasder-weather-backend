@@ -147,6 +147,8 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
     # server). Stations without coords never nowcast.
     target = None
     for d in devices:
+        if db.is_air_monitor_device(d):
+            continue
         info = d.get("info") or {}
         coords = (info.get("coords") or {}).get("coords") or {}
         lat, lon = coords.get("lat"), coords.get("lon")

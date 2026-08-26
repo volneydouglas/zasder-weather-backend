@@ -138,6 +138,9 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # original payload. Carried through as flat lightning_* keys so it lands
     # in data_json today; dedicated columns can follow.
     lightning = _scrub_numbers(normalized.get("lightning"))
+    # Air quality (1.8): the AirGradient poller posts an `air` block
+    # (pm1/pm25/pm10 µg/m³, co2 ppm, tvoc_index/nox_index).
+    air = _scrub_numbers(normalized.get("air"))
 
     ts_iso = normalized.get("timestamp_utc")
     # A non-string timestamp (an epoch int, a dict) hit .endswith() below and
@@ -269,6 +272,11 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "battout":        _battery_flag(dev.get("battery_outdoor")),
         "battin":         _battery_flag(dev.get("battery_hub")),
     }
+    # Air quality fields carry their own names straight through.
+    for key in ("pm1", "pm25", "pm10", "co2", "tvoc_index", "nox_index"):
+        v = air.get(key)
+        if v is not None:
+            flat[key] = v
     # Only the per-interval count is safe to accumulate; the trailing windows
     # keep their names so nothing mistakes them for additive.
     for src, dest in (("strike_count", "lightningcount"),
@@ -363,6 +371,15 @@ _PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
     "monthlyrainin":  (0.0, 400.0),
     "yearlyrainin":   (0.0, 1500.0),
     "uv":             (0.0, 20.0),
+    # Air quality (1.8). Upper bounds sit above any plausible real event
+    # (Sensirion indexes top out at 500; hazardous-wildfire PM peaks ~1000;
+    # 40k ppm CO₂ is IDLH) so a real reading is never clipped.
+    "pm1":            (0.0, 1500.0),
+    "pm25":           (0.0, 1500.0),
+    "pm10":           (0.0, 3000.0),
+    "co2":            (200.0, 40000.0),
+    "tvoc_index":     (0.0, 500.0),
+    "nox_index":      (0.0, 500.0),
     "solarradiation": (0.0, 1800.0),
     # Lightning. Local detectors (Tempest's AS3935-class sensor) top out in
     # the low thousands of strikes/hr even inside a violent storm — the live

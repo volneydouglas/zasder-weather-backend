@@ -18,7 +18,7 @@ from datetime import datetime
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
-from . import apns, db, storm
+from . import apns, db, storm, storm_watch
 from .config import settings
 
 log = logging.getLogger("alerts")
@@ -239,20 +239,123 @@ def build_threshold_message(device_name: str, field: str, value: float,
 # risk, dangerous heat, and a rapid pressure drop. Edge-triggered like the
 # threshold rules (fire once on clear→triggered, re-arm when the condition
 # clears). Pure — the monitor supplies already-computed values.
-SMART_KINDS = ("frost", "heat", "pressure_drop")
+# 1.8 additions: the rate-of-change family (temp_drop / wind_ramp join
+# pressure_drop), a duration alert (pipe_freeze), and single-station
+# outflow detection. "front" is not in this list — it is the GROUPED
+# delivery when several rate alerts fire on the same tick (see
+# _check_smart_alerts), never an independently-evaluated condition.
+# ── severity tiers (1.8, Pillar A) ──────────────────────────────────────
+# Three tiers, the ops-world lesson applied to weather: the CHANNEL is
+# part of the signal. 'warning' = act now (breaks through quiet hours);
+# 'watch' = worth a normal push; 'info' = after-the-fact color that a
+# digest can carry. Unknown kinds default to watch — new alerts should
+# have to EARN silence, not legibility.
+ALERT_SEVERITY: dict[str, str] = {
+    "lightning": "warning",
+    "outflow": "warning",
+    "pipe_freeze": "warning",
+    "nws": "warning",
+    "lightning_clear": "info",
+    "first_frost": "info",
+    "digest": "info",
+    "sensor_recovered": "info",
+    "device_recovered": "info",
+    "battery_recovered": "info",
+}
+
+
+def severity_of(kind: str) -> str:
+    return ALERT_SEVERITY.get(kind, "watch")
+
+
+# Per-rule urgency (1.8, Volney: "high wind urgent, temp over 100 minor").
+# User-facing levels map onto the delivery tiers: urgent breaks quiet
+# hours and wears the red chip; standard is a normal push; minor pushes
+# by day, is MUTED overnight (not queued — history and the morning digest
+# carry it), and rides the digest. Default MINOR — new and
+# existing rules start at the quiet end and get promoted deliberately.
+RULE_SEVERITIES = ("minor", "standard", "urgent")
+_RULE_TIER = {"minor": "info", "standard": "watch", "urgent": "warning"}
+
+
+def rule_tier(severity: str | None) -> str:
+    return _RULE_TIER.get(severity or "minor", "info")
+
+
+def in_quiet_hours(now_ms: int, tz_name: str,
+                   start_min: int | None, end_min: int | None) -> bool:
+    """Local-time quiet window, minutes-of-day, wrap-around aware
+    (22:00→07:00 is the normal shape). None = no quiet hours. Pure."""
+    if start_min is None or end_min is None or start_min == end_min:
+        return False
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = None
+    local = datetime.fromtimestamp(now_ms / 1000, tz)
+    m = local.hour * 60 + local.minute
+    if start_min < end_min:
+        return start_min <= m < end_min
+    return m >= start_min or m < end_min
+
+
+SMART_KINDS = ("frost", "heat", "pressure_drop", "temp_drop", "wind_ramp",
+               "pipe_freeze", "outflow")
 
 
 def smart_condition(kind: str, *, tempf: float | None = None,
                     feels: float | None = None,
                     pressure_delta_3h: float | None = None,
-                    frost_f: float, heat_f: float, drop_inhg: float) -> bool:
+                    frost_f: float, heat_f: float, drop_inhg: float,
+                    dew_point: float | None = None,
+                    wind: float | None = None,
+                    gust: float | None = None,
+                    temp_delta_1h: float | None = None,
+                    wind_delta_1h: float | None = None,
+                    temp_1h_ago: float | None = None,
+                    pressure_delta_10m: float | None = None,
+                    temp_delta_10m: float | None = None,
+                    temp_drop_f: float = 12.0,
+                    wind_ramp_mph: float = 12.0,
+                    pipe_freeze_f: float = 20.0) -> bool:
     if kind == "frost":
-        return tempf is not None and tempf <= frost_f
+        # 1.8 science refinement (Pillar A): radiative frost needs moist-
+        # enough air depositing on a calm night — the published best signal
+        # is cold + dew point near/below freezing + light wind. A windy or
+        # bone-dry cold snap is real cold but not FROST; suppressors only
+        # apply when the reading exists (absent is not a suppressor).
+        if tempf is None or tempf > frost_f:
+            return False
+        if dew_point is not None and dew_point > 37.0:
+            return False
+        if wind is not None and wind > 8.0:
+            return False
+        return True
     if kind == "heat":
         return feels is not None and feels >= heat_f
     if kind == "pressure_drop":
         return (pressure_delta_3h is not None
                 and pressure_delta_3h <= -abs(drop_inhg))
+    if kind == "temp_drop":
+        return (temp_delta_1h is not None
+                and temp_delta_1h <= -abs(temp_drop_f))
+    if kind == "wind_ramp":
+        return (wind is not None and wind_delta_1h is not None
+                and wind >= 15.0 and wind_delta_1h >= abs(wind_ramp_mph))
+    if kind == "pipe_freeze":
+        # Sustained, not instantaneous: both ends of the trailing hour at
+        # or below the burst threshold reads as an hour of hard freeze.
+        return (tempf is not None and temp_1h_ago is not None
+                and tempf <= pipe_freeze_f and temp_1h_ago <= pipe_freeze_f)
+    if kind == "outflow":
+        # Single-station gust-front signature: an abrupt pressure JUMP
+        # with a temperature break and strong gusts, all inside ~10
+        # minutes. Detection of what just hit, never a forecast.
+        return (pressure_delta_10m is not None and temp_delta_10m is not None
+                and gust is not None
+                and pressure_delta_10m >= 0.015      # ≈0.5 hPa jump
+                and temp_delta_10m <= -3.0
+                and gust >= 20.0)
     return False
 
 
@@ -266,13 +369,30 @@ _SMART_REARM_MARGIN_INHG = 0.01
 def smart_cleared(kind: str, *, tempf: float | None = None,
                   feels: float | None = None,
                   pressure_delta_3h: float | None = None,
-                  frost_f: float, heat_f: float, drop_inhg: float) -> bool:
+                  frost_f: float, heat_f: float, drop_inhg: float,
+                  wind: float | None = None,
+                  temp_delta_1h: float | None = None,
+                  pressure_delta_10m: float | None = None,
+                  temp_drop_f: float = 12.0,
+                  pipe_freeze_f: float = 20.0,
+                  **_ignore) -> bool:
     """Re-arm test for a smart alert: the condition must clear by a deadband
     (None = no data = not cleared). Pure — unit-testable."""
     if kind == "frost":
         return tempf is not None and tempf > frost_f + _SMART_REARM_MARGIN_F
     if kind == "heat":
         return feels is not None and feels < heat_f - _SMART_REARM_MARGIN_F
+    if kind == "temp_drop":
+        return (temp_delta_1h is not None
+                and temp_delta_1h > -abs(temp_drop_f) / 2)
+    if kind == "wind_ramp":
+        return wind is not None and wind < 12.0
+    if kind == "pipe_freeze":
+        return (tempf is not None
+                and tempf > pipe_freeze_f + 4.0)
+    if kind == "outflow":
+        return (pressure_delta_10m is not None
+                and pressure_delta_10m < 0.005)
     if kind == "pressure_drop":
         return (pressure_delta_3h is not None
                 and pressure_delta_3h > -abs(drop_inhg) + _SMART_REARM_MARGIN_INHG)
@@ -281,7 +401,8 @@ def smart_cleared(kind: str, *, tempf: float | None = None,
 
 def build_smart_message(kind: str, device_name: str, *,
                         tempf: float | None = None, feels: float | None = None,
-                        pressure_delta_3h: float | None = None) -> tuple[str, str]:
+                        pressure_delta_3h: float | None = None,
+                        **extra) -> tuple[str, str]:
     """(title, body) for a smart alert. Pure — unit-testable."""
     device_name = _clean_name(device_name)
     if kind == "frost":
@@ -297,6 +418,30 @@ def build_smart_message(kind: str, device_name: str, *,
         return (f"{device_name}: Pressure falling fast",
                 f"Pressure fell {drop:.2f} inHg in 3h — a storm may be "
                 f"approaching.")
+    if kind == "temp_drop":
+        drop = abs(extra.get("temp_delta_1h") or 0.0)
+        return (f"{device_name}: Temperature dropping fast",
+                f"Down {drop:.0f}°F in the last hour — a front or outflow "
+                f"is moving through.")
+    if kind == "wind_ramp":
+        return (f"{device_name}: Wind picking up fast",
+                f"Sustained wind jumped to {extra.get('wind') or 0:.0f} mph "
+                f"within the hour.")
+    if kind == "pipe_freeze":
+        return (f"{device_name}: Hard freeze — pipe risk",
+                f"At or below {extra.get('pipe_freeze_f') or 20:.0f}°F for "
+                f"a sustained stretch. Drip vulnerable faucets and check "
+                f"exposed pipes.")
+    if kind == "outflow":
+        return (f"{device_name}: Storm outflow just hit",
+                f"Pressure jumped and the temperature broke with gusts to "
+                f"{extra.get('gust') or 0:.0f} mph — strong winds likely "
+                f"in the next few minutes.")
+    if kind == "front":
+        parts = extra.get("front_parts") or []
+        return (f"{device_name}: Front passage",
+                "Several things moved at once — " + ", ".join(parts) + ". "
+                "One notification instead of a pile.")
     return (f"{device_name}: alert", "")
 
 
@@ -330,6 +475,15 @@ class EffectiveAlertConfig:
     # None = legacy (push always, email iff email_scope='all'), so existing
     # installs keep their exact delivery until the user picks.
     storm_channels: str | None = None
+    # 1.8 heat-day Live Activity: opt-in, with its trigger threshold (°F,
+    # API-native like every stored constant).
+    heat_day: bool = False
+    heat_day_threshold_f: float = 100.0
+    # 1.8 quiet hours (minutes of local day; None = off) + daily digest
+    # hour (local hour to send; None = off).
+    quiet_start_min: int | None = None
+    quiet_end_min: int | None = None
+    digest_hour: int | None = None
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -373,12 +527,26 @@ async def effective_config() -> EffectiveAlertConfig:
                else settings.rain_start_alerts)
     chan = p.get("storm_channels")
     storm_channels = chan if chan in ("push", "email", "both") else None
+    heat_on = bool(p["heat_day"]) if p.get("heat_day") is not None else False
+    try:
+        heat_thr = float(p.get("heat_day_threshold_f") or 100.0)
+    except (TypeError, ValueError):
+        heat_thr = 100.0
+    def _int_or_none(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
     return EffectiveAlertConfig(
         enabled, transport, recipients, float(default_thr), float(repeat),
         smtp_host, smtp_port, smtp_username, smtp_password, smtp_from,
         smtp_tls, smtp_ssl, email_scope,
         storm_on, float(storm_quiet), float(storm_min), rain_on,
-        storm_channels=storm_channels)
+        storm_channels=storm_channels,
+        heat_day=heat_on, heat_day_threshold_f=heat_thr,
+        quiet_start_min=_int_or_none(p.get("quiet_start_min")),
+        quiet_end_min=_int_or_none(p.get("quiet_end_min")),
+        digest_hour=_int_or_none(p.get("digest_hour")))
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -412,11 +580,24 @@ def _send_sync(subject: str, body: str, to_list: list[str],
 
 
 # ───────────────────────── delivery ─────────────────────────
+# Strong refs for in-flight webhook dispatch tasks (fire-and-forget).
+_WEBHOOK_TASKS: set = set()
+
+
+def _reap_webhook_task(task) -> None:
+    """Discard AND consume the exception — an unretrieved task exception
+    logs asyncio noise at GC time (R8 S7)."""
+    _WEBHOOK_TASKS.discard(task)
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        log.warning("webhook dispatch task failed: %s", exc)
+
+
 async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
                    push_title: str, push_body: str,
                    email_ok: bool = True, *,
                    push_ok: bool = True,
-                   kind: str = "alert", mac: str | None = None) -> bool:
+                   kind: str = "alert", mac: str | None = None,
+                   severity: str | None = None) -> bool:
     """Send an alert through every configured channel (email + push). Returns
     True when the alert is HANDLED: at least one channel delivered, or no
     channel had anything to attempt. Shared by device-down + threshold.
@@ -433,6 +614,15 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
     fired as fresh if push was enabled weeks later. Muted is handled, not
     failed; only an ATTEMPTED channel that failed should trigger the
     caller's retry-next-tick path."""
+    # 1.8 quiet hours: below-warning pushes hold their tongue at night.
+    # Email is inherently quiet and unaffected; the alert still lands in
+    # history, so the Recently Triggered list carries the overnight story.
+    eff_severity = severity or severity_of(kind)
+    if (push_ok and eff_severity != "warning"
+            and in_quiet_hours(int(time.time() * 1000), settings.timezone,
+                               getattr(cfg, "quiet_start_min", None),
+                               getattr(cfg, "quiet_end_min", None))):
+        push_ok = False
     delivered = False
     attempted = False
     if cfg.enabled and email_ok:
@@ -456,6 +646,18 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
         except Exception as e:
             attempted = True
             log.exception("alert push send failed: %s", e)
+    # 1.8 webhooks are their own channel: with enabled hooks registered,
+    # scheduling the dispatch counts as delivery — otherwise a failing SMTP
+    # server made the tick retry forever and the perfectly healthy webhook
+    # never heard about the alert at all (CodeRabbit, PR #32 round 2).
+    webhook_channel = False
+    try:
+        from . import webhooks as _wh
+        webhook_channel = bool(await db.list_webhooks(enabled_only=True))
+    except Exception:
+        pass
+    if webhook_channel:
+        delivered = True
     if not attempted and not delivered:
         log.info("alert had no willing channel (muted by scope / no "
                  "recipients) — treating as handled: %s", push_title)
@@ -465,11 +667,29 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
         # retry unhandled alerts next tick (logging those would duplicate),
         # while a muted alert still happened — it lands with delivered=0 and
         # the app's Recent list becomes the only place it's visible at all.
+        ts_ms = int(time.time() * 1000)
         try:
-            await db.log_alert(int(time.time() * 1000), kind, mac,
-                               push_title, push_body, delivered)
+            await db.log_alert(ts_ms, kind, mac,
+                               push_title, push_body, delivered,
+                               severity=eff_severity)
         except Exception as e:
             log.exception("alert history write failed: %s", e)
+        # 1.8 webhooks (Pillar B): every HANDLED alert fans out to the
+        # registered endpoints — muted-by-scope alerts included, because
+        # the automation a webhook feeds is its own delivery channel.
+        try:
+            from . import webhooks
+            # Fire-and-forget (R7): the two-attempt HTTP delivery can take
+            # ~22s and was blocking the 60s monitor tick. Strong ref so the
+            # task isn't GC'd mid-flight; errors land on the hook's row.
+            task = asyncio.create_task(
+                webhooks.dispatch_alert(kind, mac, push_title,
+                                        push_body, ts_ms,
+                                        severity=eff_severity))
+            _WEBHOOK_TASKS.add(task)
+            task.add_done_callback(_reap_webhook_task)
+        except Exception as e:
+            log.exception("webhook dispatch failed: %s", e)
     return handled
 
 
@@ -492,14 +712,21 @@ class AlertMonitor:
         log.info("alert monitor running every %ds (transport configured=%s)",
                  interval, settings.transport_configured)
         while not self._stop.is_set():
-            try:
-                await self._tick()
-            except Exception as e:
-                log.exception("alert tick failed: %s", e)
+            # Sleep FIRST: a tick at t=0 raced every short-lived process —
+            # at boot no data has arrived yet, and in tests the startup
+            # tick ran on a loop that died mid-flight, orphaning its
+            # aiosqlite threads (the suite's exit hang) and racing
+            # monkeypatches. Nothing time-critical lives in the first 60s.
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
+            if self._stop.is_set():
+                break
+            try:
+                await self._tick()
+            except Exception as e:
+                log.exception("alert tick failed: %s", e)
 
     async def _tick(self) -> None:
         # Persist guest-token last-used stamps every tick, not only when the
@@ -519,13 +746,41 @@ class AlertMonitor:
         except Exception as e:
             log.warning("ingest last-used flush failed: %s", e)
         cfg = await effective_config()
-        # Run if EITHER channel can deliver — email (cfg.enabled) or push
-        # (local APNs key or a configured relay, env or app-managed).
-        if not cfg.enabled and not await apns.push_configured():
-            return
         now_ms = int(time.time() * 1000)
-        repeat_ms = int(cfg.repeat_hours * 3600 * 1000)
         devices = await db.list_devices()
+        # Gate decided HERE, applied after the egress block below — the
+        # decision must not drift from the tick's start (a background tick
+        # racing a test's monkeypatch found the widened window).
+        alerts_open = (cfg.enabled or await apns.push_configured()
+                       or bool(await db.list_webhooks(enabled_only=True)))
+        # ── Pillar B egress + widget nudges run FIRST, independent of the
+        # alert-transport gate below (R7 R1): community uploads, forecast
+        # snapshots and widget refreshes are their own delivery surfaces —
+        # a PWSWeather-only setup with email and push unconfigured used to
+        # get zero uploads, silently. Each is try/except-bounded so a bad
+        # one can't take alerting down with it.
+        from . import widget_push
+        try:
+            await widget_push.check(devices, now_ms)
+        except Exception:
+            log.exception("widget push failed")
+        from . import forecast_snapshots
+        try:
+            await forecast_snapshots.check(devices, now_ms)
+        except Exception:
+            log.exception("forecast snapshot failed")
+        from . import share_targets
+        try:
+            await share_targets.check(devices, now_ms)
+        except Exception:
+            log.exception("share fan-out failed")
+        # Run the ALERT sections when any alert channel can deliver: email,
+        # push, or an enabled webhook (1.8 — webhooks carry every handled
+        # alert, so they count as a channel; _deliver treats muted email+push
+        # as handled and the dispatch still fans out).
+        if not alerts_open:
+            return
+        repeat_ms = int(cfg.repeat_hours * 3600 * 1000)
         states = await db.get_alert_states()
         dev_prefs = await db.get_device_alert_prefs()
         for d in devices:
@@ -573,6 +828,32 @@ class AlertMonitor:
         # ── smart (derived) alerts: frost / heat / rapid pressure drop
         if settings.smart_alerts:
             await self._check_smart_alerts(cfg, devices, now_ms)
+            # 1.8 seasonal one-shots (first frost of the season).
+            await self._check_seasonal_events(cfg, devices, now_ms)
+            # 1.8 lightning proximity + the NWS 30-minute all-clear.
+            # Guarded like nws_watch below: an exception here must not
+            # abort the digest/storm/nowcast half of the tick.
+            from . import lightning_watch
+            try:
+                await lightning_watch.check(cfg, devices, now_ms, _deliver)
+            except Exception:
+                log.exception("lightning watch failed")
+            # 1.8 station health: battery flags, sensors gone quiet,
+            # flatlined readings (Pillar D).
+            from . import health_watch
+            try:
+                await health_watch.check(cfg, devices, now_ms, _deliver)
+            except Exception:
+                log.exception("health watch failed")
+        # ── NWS relay (1.8): severe weather through OUR channels, not
+        # just the foregrounded app. Warning tier — breaks quiet hours.
+        from . import nws_watch
+        try:
+            await nws_watch.check(cfg, devices, now_ms, _deliver)
+        except Exception:
+            log.exception("nws watch failed")
+        # ── daily digest (1.8): the morning paper for the alert log.
+        await self._maybe_send_digest(cfg, now_ms)
         # ── storm summary: one report per event, after the rain stops. Not
         # gated on smart_alerts — it is a different kind of thing, and the
         # rain counter it watches needs no derived inputs.
@@ -584,6 +865,11 @@ class AlertMonitor:
         from . import nowcast
         await nowcast.check(cfg, devices, now_ms,
                             functools.partial(_deliver, kind="rain_start"))
+        # ── heat-day Live Activity (1.8): all-day island presence on hot
+        # days. Opt-in, internally throttled, best-effort like the storm
+        # watch — a push failure never touches the alert pipeline.
+        from . import heat_watch
+        await heat_watch.check(cfg, devices, now_ms)
 
     async def _check_threshold_rules(self, cfg, devices, now_ms: int) -> None:
         rules = await db.list_alert_rules(enabled_only=True)
@@ -615,7 +901,8 @@ class AlertMonitor:
                     delivered = await _deliver(
                         cfg, f"[Zasder Weather] {title}", body, title, body,
                         email_ok=cfg.email_scope == "all",
-                        kind="rule", mac=d["mac"])
+                        kind="rule", mac=d["mac"],
+                        severity=rule_tier(rule.get("severity")))
                     if delivered:
                         await db.upsert_rule_state(rule["id"], d["mac"], 1, now_ms)
                         log.info("threshold alert fired: rule %s (%s) on %s value=%.3f",
@@ -745,6 +1032,11 @@ class AlertMonitor:
                                                     value, obs_ms)
                         log.info("storm summary sent for %s: %.2fin over %.1fh",
                                  dname, summary.total_in, summary.duration_hours)
+                        # 1.8 Storm Watch: final Activity beat, silent —
+                        # the summary notification just rang.
+                        await storm_watch.on_closed(
+                            cfg, d, started, last_rain, now_ms, field,
+                            reported=True)
                     else:
                         log.warning("storm summary delivery failed for %s; "
                                     "will retry next tick", mac)
@@ -752,6 +1044,8 @@ class AlertMonitor:
                 # Not worth reporting: close it silently so a drizzle does
                 # not leave an event open forever.
                 await db.upsert_storm_state(mac, None, None, field, value, obs_ms)
+                await storm_watch.on_closed(cfg, d, started, last_rain,
+                                            now_ms, field, reported=False)
                 continue
 
             # R6: with storm_summary default-on this unconditional upsert
@@ -765,10 +1059,115 @@ class AlertMonitor:
                     state.get("counter_ms")):
                 await db.upsert_storm_state(mac, started, last_rain, field,
                                             value, obs_ms)
+            # 1.8 Storm Watch: an open episode drives the Live Activity
+            # (start once per episode, then throttled updates). Runs after
+            # the close paths above, so a closing tick never re-opens it.
+            if started is not None:
+                await storm_watch.on_open_tick(cfg, d, started, now_ms, field)
+
+    async def _maybe_send_digest(self, cfg, now_ms: int) -> None:
+        """Daily digest (1.8, Pillar A): one morning email carrying
+        everything the alert log collected since the last digest — the
+        home for info-tier events and whatever quiet hours held back.
+        Sends once per local day, at/after the configured hour, only
+        when the email transport exists."""
+        if cfg.digest_hour is None or not cfg.enabled or not cfg.recipients:
+            return
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = None
+        local = datetime.fromtimestamp(now_ms / 1000, tz)
+        if local.hour < int(cfg.digest_hour):
+            return
+        raw = await db.get_kv("alerts.digest.last_ms")
+        try:
+            last = int(raw) if raw else 0
+        except ValueError:
+            last = 0
+        if last:
+            last_local = datetime.fromtimestamp(last / 1000, tz)
+            if last_local.date() >= local.date():
+                return                        # already sent today
+        rows = await db.alerts_since(last or (now_ms - 86_400_000))
+        rows = [r for r in rows if r["kind"] != "digest"]
+        if not rows:
+            await db.set_kv("alerts.digest.last_ms", str(now_ms))
+            return
+        lines = []
+        for r in rows:
+            t = datetime.fromtimestamp(r["ts_ms"] / 1000, tz)
+            lines.append(f"  {t.strftime('%a %H:%M')}  {r['title']}")
+        subject = (f"[Zasder Weather] Daily digest — "
+                   f"{len(rows)} alert{'s' if len(rows) != 1 else ''}")
+        body = ("Everything your stations reported since the last digest:\n\n"
+                + "\n".join(lines)
+                + "\n\nFull history lives in the app's Alerts tab.\n")
+        try:
+            await asyncio.to_thread(_send_sync, subject, body,
+                                    cfg.recipients, cfg)
+            await db.set_kv("alerts.digest.last_ms", str(now_ms))
+            log.info("daily digest sent: %d alerts", len(rows))
+        except Exception:
+            log.exception("digest send failed; will retry next tick")
+
+    async def _check_seasonal_events(self, cfg, devices, now_ms: int) -> None:
+        """One-shot seasonal markers (1.8, Pillar A): the first freezing
+        reading after August 1 fires exactly once per station per season —
+        trivially cheap, and the gardeners' favorite. Season key rolls on
+        Aug 1 so a January frost belongs to the season that began the
+        previous fall."""
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = None
+        local = datetime.fromtimestamp(now_ms / 1000, tz)
+        season = local.year if local.month >= 8 else local.year - 1
+        for d in devices:
+            if db.is_air_monitor_device(d):
+                continue
+            last = d.get("lastData") or {}
+            # Freshness gate (the health-watcher rule): a station that died
+            # on a cold night keeps a freezing lastData forever, and firing
+            # off it days later would also burn the once-per-season key.
+            obs_ms = last.get("dateutc")
+            # Inverted guard on purpose: a blob with NO numeric timestamp is
+            # unverifiable and must also skip — otherwise arbitrarily old
+            # data fires and burns the once-per-season key (R7 finding 3).
+            # abs(): a FUTURE timestamp (broken device clock that slipped
+            # past ingest's skew clamp via a poller path) must not read as
+            # "fresh" — it would fire and burn the seasonal key early.
+            if (not isinstance(obs_ms, (int, float))
+                    or abs(now_ms - obs_ms) > 30 * 60_000):
+                continue
+            try:
+                tempf = float(last.get("tempf"))
+            except (TypeError, ValueError):
+                continue
+            if tempf > 32.5:
+                continue
+            mac = d["mac"]
+            key = f"seasonal.first_frost.{mac}.{season}"
+            if await db.get_kv(key):
+                continue
+            dname = _clean_name(d.get("name") or mac)
+            title = f"{dname}: First frost of the season"
+            body = (f"{tempf:g}°F — the season's first freezing reading. "
+                    f"Tender plants and hoses, this is your notice.")
+            if await _deliver(cfg, f"[Zasder Weather] {title}", body,
+                              title, body,
+                              email_ok=cfg.email_scope == "all",
+                              kind="first_frost", mac=mac):
+                await db.set_kv(key, str(now_ms))
+                log.info("first frost of season %s on %s", season, dname)
 
     async def _check_smart_alerts(self, cfg, devices, now_ms: int) -> None:
         """Frost / heat / rapid-pressure-drop alerts, edge-triggered per device."""
         states = await db.get_smart_alert_states()
+        # Weather smart alerts skip air monitors: the outdoor AirGradient
+        # reports a real tempf, and without this every frost/heat/front
+        # would fire twice for the same yard.
+        devices = [d for d in devices if not db.is_air_monitor_device(d)]
         cutoff_ms = now_ms - 3 * 3600 * 1000   # 3h ago, for pressure tendency
 
         def _f(v) -> float | None:
@@ -777,50 +1176,126 @@ class AlertMonitor:
             except (TypeError, ValueError):
                 return None
 
+        # The rate family groups: when several of these newly fire on the
+        # SAME tick for the SAME station, that is one weather event (a
+        # front) — deliver one notification, not a pile (Pillar A).
+        _FRONT_FAMILY = ("pressure_drop", "temp_drop", "wind_ramp", "outflow")
+        _FRONT_LABEL = {"pressure_drop": "pressure falling fast",
+                        "temp_drop": "temperature dropping",
+                        "wind_ramp": "wind ramping up",
+                        "outflow": "a pressure-jump outflow"}
         for d in devices:
             mac = d["mac"]
             last = d.get("lastData") or {}
             tempf = _f(last.get("tempf"))
             feels = _f(last.get("feelsLike"))
+            dew = _f(last.get("dewPoint"))
+            wind = _f(last.get("windspeedmph"))
+            gust = _f(last.get("windgustmph"))
             cur_p = _f(last.get("baromrelin"))
             # Pressure change over the last 3h (needs a historical reading).
             delta = None
             if cur_p is not None:
-                past_p = await db.value_at_or_before(mac, "baromrelin", cutoff_ms)
+                # max_age 2× the window (R7 R4): after a station outage the
+                # anchor would otherwise be days old and the "3h" delta a lie.
+                past_p = await db.value_at_or_before(
+                    mac, "baromrelin", cutoff_ms, max_age_ms=3 * 3_600_000)
                 if past_p is not None:
                     delta = cur_p - past_p
+            # 1.8 rate windows: 1h for fronts, 10min for outflow signatures.
+            h1 = now_ms - 3_600_000
+            m10 = now_ms - 600_000
+            temp_1h_ago = await db.value_at_or_before(
+                mac, "tempf", h1, max_age_ms=3_600_000) \
+                if tempf is not None else None
+            temp_delta_1h = (tempf - temp_1h_ago
+                             if tempf is not None and temp_1h_ago is not None
+                             else None)
+            wind_1h_ago = await db.value_at_or_before(
+                mac, "windspeedmph", h1, max_age_ms=3_600_000) \
+                if wind is not None else None
+            wind_delta_1h = (wind - wind_1h_ago
+                             if wind is not None and wind_1h_ago is not None
+                             else None)
+            p_10m_ago = await db.value_at_or_before(
+                mac, "baromrelin", m10, max_age_ms=1_200_000) \
+                if cur_p is not None else None
+            pressure_delta_10m = (cur_p - p_10m_ago
+                                  if cur_p is not None and p_10m_ago is not None
+                                  else None)
+            t_10m_ago = await db.value_at_or_before(
+                mac, "tempf", m10, max_age_ms=1_200_000) \
+                if tempf is not None else None
+            temp_delta_10m = (tempf - t_10m_ago
+                              if tempf is not None and t_10m_ago is not None
+                              else None)
 
+            kw = dict(
+                tempf=tempf, feels=feels, pressure_delta_3h=delta,
+                frost_f=settings.smart_alert_frost_f,
+                heat_f=settings.smart_alert_heat_f,
+                drop_inhg=settings.smart_alert_pressure_drop_inhg,
+                dew_point=dew, wind=wind, gust=gust,
+                temp_delta_1h=temp_delta_1h, wind_delta_1h=wind_delta_1h,
+                temp_1h_ago=temp_1h_ago,
+                pressure_delta_10m=pressure_delta_10m,
+                temp_delta_10m=temp_delta_10m,
+                temp_drop_f=settings.smart_alert_temp_drop_f,
+                wind_ramp_mph=settings.smart_alert_wind_ramp_mph,
+                pipe_freeze_f=settings.smart_alert_pipe_freeze_f)
+
+            # Evaluate everything first so grouping can see the whole tick.
+            fresh: list[str] = []
             for kind in SMART_KINDS:
-                cond = smart_condition(
-                    kind, tempf=tempf, feels=feels, pressure_delta_3h=delta,
-                    frost_f=settings.smart_alert_frost_f,
-                    heat_f=settings.smart_alert_heat_f,
-                    drop_inhg=settings.smart_alert_pressure_drop_inhg)
+                cond = smart_condition(kind, **kw)
                 prev = states.get((mac, kind), 0)
                 if cond and not prev:
-                    dname = d.get("name") or mac
-                    title, body = build_smart_message(
-                        kind, dname, tempf=tempf, feels=feels,
-                        pressure_delta_3h=delta)
-                    # Persist triggered=1 only after delivery (same as threshold
-                    # rules) so a transport failure retries next tick.
-                    if await _deliver(cfg, f"[Zasder Weather] {title}", body,
-                                      title, body,
-                                      email_ok=cfg.email_scope == "all",
-                                      kind=kind, mac=mac):
-                        await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
-                        log.info("smart alert fired: %s on %s", kind, dname)
-                    else:
-                        log.warning("smart alert %s delivery failed for %s; "
-                                    "will retry next tick", kind, mac)
-                elif not cond and prev and smart_cleared(
-                        kind, tempf=tempf, feels=feels, pressure_delta_3h=delta,
-                        frost_f=settings.smart_alert_frost_f,
-                        heat_f=settings.smart_alert_heat_f,
-                        drop_inhg=settings.smart_alert_pressure_drop_inhg):
-                    # Re-arm only once the condition clears by a deadband, so a
-                    # value wobbling on the boundary can't re-fire every tick.
+                    fresh.append(kind)
+                elif not cond and prev and smart_cleared(kind, **kw):
+                    # Re-arm only once the condition clears by a deadband, so
+                    # a value wobbling on the boundary can't re-fire per tick.
                     await db.upsert_smart_alert_state(mac, kind, 0, now_ms)
+
+            dname = d.get("name") or mac
+            front = [k for k in fresh if k in _FRONT_FAMILY]
+            if len(front) >= 2:
+                title, body = build_smart_message(
+                    "front", dname,
+                    front_parts=[_FRONT_LABEL[k] for k in front])
+                # The group inherits its LOUDEST member's tier: outflow is
+                # warning ("strong winds in minutes") and grouping it with
+                # a watch-tier sibling must not demote it below the
+                # quiet-hours line (R7 R5).
+                tier = ("warning" if any(severity_of(k) == "warning"
+                                         for k in front) else None)
+                if await _deliver(cfg, f"[Zasder Weather] {title}", body,
+                                  title, body,
+                                  email_ok=cfg.email_scope == "all",
+                                  kind="front", mac=mac,
+                                  severity=tier):
+                    for k in front:
+                        await db.upsert_smart_alert_state(mac, k, 1, now_ms)
+                    log.info("front passage (%s) on %s",
+                             "+".join(front), dname)
+                fresh = [k for k in fresh if k not in front]
+
+            for kind in fresh:
+                title, body = build_smart_message(
+                    kind, dname, tempf=tempf, feels=feels,
+                    pressure_delta_3h=delta, temp_delta_1h=temp_delta_1h,
+                    wind=wind, gust=gust,
+                    pipe_freeze_f=settings.smart_alert_pipe_freeze_f)
+                # Persist triggered=1 only after delivery (same as threshold
+                # rules) so a transport failure retries next tick.
+                if await _deliver(cfg, f"[Zasder Weather] {title}", body,
+                                  title, body,
+                                  email_ok=cfg.email_scope == "all",
+                                  kind=kind, mac=mac):
+                    await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
+                    log.info("smart alert fired: %s on %s", kind, dname)
+                else:
+                    log.warning("smart alert %s delivery failed for %s; "
+                                "will retry next tick", kind, mac)
 
 
 def _device_threshold(mac: str, dev_prefs: dict, default_min: float) -> float | None:

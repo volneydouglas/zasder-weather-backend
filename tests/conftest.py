@@ -64,7 +64,9 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
                 # is typed int like WEATHERLINK_STATION_ID — blanking the
                 # token alone disables the poller, and "" would fail
                 # Settings validation.)
-                "TEMPEST_TOKEN", "GUEST_API_TOKENS"):
+                # 1.8: AirGradient joined config — same live-poller trap
+                # as TEMPEST_TOKEN, and the token also rides the polled URL.
+                "TEMPEST_TOKEN", "AIRGRADIENT_TOKEN", "GUEST_API_TOKENS"):
         monkeypatch.setenv(var, "")
     # Module-level caches must not leak across tests (the public dashboard HTML
     # and the per-MAC records cache are process-global by design). Reset only a
@@ -79,10 +81,36 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._PUBLIC_DASH_LOCK = None     # rebound to each test's event loop
         _m._PUBLIC_DASH_REFRESHING = False   # a test's leaked flag would
         _m._PUBLIC_DASH_REFRESH_TASK = None  # silently disable SWR forever
+        _m._OBS_COUNT_CACHE.clear()
         _m._RECORDS_CACHE.clear()
         _m._RECORDS_LOCKS.clear()
         _m._DB_BACKUP_JOB = {"state": "idle"}
         _m._DB_BACKUP_TASK = None
+    # 1.8 modules keep small process-global throttles; same isolation rule.
+    _wp = sys.modules.get("app.widget_push")
+    if _wp is not None:
+        _wp._reset_for_tests()
+    _st = sys.modules.get("app.share_targets")
+    if _st is not None:
+        _st._reset_for_tests()
+    _nw = sys.modules.get("app.nws_watch")
+    if _nw is not None:
+        _nw._reset_for_tests()
+    # Forecast snapshots now run on EVERY tick regardless of alert
+    # transport (R7 R1) — without this stub, any tick-running test whose
+    # device carries coords makes a REAL Open-Meteo call (15s timeout ×
+    # many tests = the suite "hanging"). Tests that want the fetch
+    # monkeypatch it back explicitly.
+    import app.forecast_snapshots as _fs   # import NOW: the tick imports
+    # it lazily, so a sys.modules.get here missed the first test and let
+    # one real Open-Meteo call through per run (intermittent hang).
+
+    async def _no_fetch(lat, lon):  # noqa: ANN001
+        return None
+    _fs._fetch_daily = _no_fetch
+    _hw = sys.modules.get("app.health_watch")
+    if _hw is not None:
+        _hw._reset_for_tests()
     # app.db's guest last-used stamps are process-global for the same reason
     # (written by the sync auth dep, flushed on list) — a stale stamp from
     # one test must not flush into another test's database.

@@ -160,6 +160,12 @@ class Settings(BaseSettings):
     tempest_token: str | None = None
     tempest_station_id: int | None = None
     tempest_poll_interval_seconds: int = 60
+
+    # AirGradient cloud (1.8): account API token; every location on the
+    # account is polled. App-stored credentials (Settings → Integrations)
+    # win over these, the standard kv-over-env rule.
+    airgradient_token: str | None = None
+    airgradient_poll_interval_seconds: int = 120
     # Friendly name for the synthetic device row; falls back to the Tempest
     # station's own name when unset.
     tempest_name: str | None = None
@@ -357,6 +363,10 @@ class Settings(BaseSettings):
     smart_alert_frost_f: float = 35.0          # tempf at/below → frost risk
     smart_alert_heat_f: float = 105.0          # feelsLike at/above → heat danger
     smart_alert_pressure_drop_inhg: float = 0.06  # baromrelin fall over 3h → storm
+    # 1.8 Pillar A rate-of-change + duration alerts, API-native units.
+    smart_alert_temp_drop_f: float = 12.0       # tempf fall over 1h → front
+    smart_alert_wind_ramp_mph: float = 12.0     # sustained rise over 1h
+    smart_alert_pipe_freeze_f: float = 20.0     # sustained hard freeze
 
     # Storm summary — one notification AFTER the rain stops, reporting the
     # whole event (Doren's request, 2026-08-17). On by default because it is

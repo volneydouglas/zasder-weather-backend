@@ -3627,9 +3627,13 @@ def test_rule_patch_edits_threshold_and_target(client):
                      json={"target_mac": ""})
     assert r.json()["target_mac"] is None
 
-    # Guard rails.
-    assert client.patch(f"/api/alerts/rules/{rid}", headers=H,
-                        json={"threshold": float("inf")}).status_code in (400, 422)
+    # Guard rails. Raw body, not json=: the SERVER guard is what's under
+    # test, and strict client encoders (httpx2) refuse to serialize inf
+    # before the request ever leaves — the exact hostile shape must go
+    # over the wire verbatim.
+    assert client.patch(f"/api/alerts/rules/{rid}",
+                        headers={**H, "Content-Type": "application/json"},
+                        content='{"threshold": Infinity}').status_code in (400, 422)
     assert client.patch("/api/alerts/rules/99999", headers=H,
                         json={"enabled": True}).status_code == 404
 
@@ -3716,3 +3720,17 @@ def test_public_dashboard_single_background_refresh(client, monkeypatch):
         assert builds == [], "second stale hit must not schedule a second build"
     finally:
         _m._PUBLIC_DASH_REFRESHING = False
+
+
+def test_corner_spinner_on_public_pages(client, monkeypatch):
+    """The decorative corner sun (Doren's retired preloader, 2026-08-25)
+    rides both public shells — non-blocking by construction, so the only
+    thing to pin is that it's present, hidden from AT, and click-through."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    for path in ("/", "/embed"):
+        page = client.get(path).text
+        assert 'id="zw-spin"' in page, f"spinner missing from {path}"
+        assert 'aria-hidden="true"' in page
+        assert "pointer-events:none" in page
+        assert "prefers-reduced-motion" in page

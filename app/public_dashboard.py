@@ -866,3 +866,60 @@ DASHBOARD_CSS = """
     .rec-v { font-size:19px; font-weight:600; margin-top:3px; }
     .rec-d { font-size:10px; color:var(--ink-40); margin-top:2px; }
 """
+
+
+# A tiny corner anemometer whose cup wheel spins while the page is
+# working (Volney's pick from four options, 2026-08-25) — visible during
+# the initial load, faded out once the page settles, and woken back up for
+# the last moment before the auto-refresh navigates. Purely decorative:
+# fixed-position, pointer-events none, aria-hidden, so it can never block
+# or shift content. Born 2026-08-25, the day 1.7.1's instant embed made
+# Doren retire his hand-made site preloader ("I loved seeing the icon I
+# made though!") — the page keeps a little something to look at.
+# The color var carries a fallback because the status page can render
+# without the dashboard token set.
+SPINNER_HTML = """
+<style>
+  #zw-spin { position:fixed; right:10px; bottom:10px; width:24px; height:24px;
+             pointer-events:none; z-index:9; opacity:.55;
+             transition:opacity .6s ease;
+             color:var(--ink-40, rgba(128,138,148,.8)); }
+  #zw-spin.zw-done { opacity:0; }
+  #zw-spin svg { width:100%; height:100%; display:block; }
+  #zw-spin .zw-wheel { transform-box: view-box; transform-origin: 50% 50%;
+                       animation: zw-rot 1.6s linear infinite; }
+  @media (prefers-reduced-motion: reduce) { #zw-spin .zw-wheel { animation:none; } }
+  @keyframes zw-rot { to { transform: rotate(360deg); } }
+</style>
+<div id="zw-spin" aria-hidden="true">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+       stroke-linecap="round">
+    <path d="M12 12v9M8.5 21h7"/>
+    <g class="zw-wheel">
+      <path d="M12 12L12 7M12 12L7.7 14.5M12 12L16.3 14.5"/>
+      <circle cx="12" cy="6.2" r="1.8" fill="currentColor" stroke="none"/>
+      <circle cx="7" cy="14.9" r="1.8" fill="currentColor" stroke="none"/>
+      <circle cx="17" cy="14.9" r="1.8" fill="currentColor" stroke="none"/>
+    </g>
+  </svg>
+</div>
+<script>
+(function () {
+  var s = document.getElementById("zw-spin");
+  if (!s) return;
+  function settle() { setTimeout(function () { s.classList.add("zw-done"); }, 700); }
+  if (document.readyState === "complete") settle();
+  else window.addEventListener("load", settle);
+  // Back-forward cache restores skip 'load' — fade again on return.
+  window.addEventListener("pageshow", function (e) { if (e.persisted) settle(); });
+  // Wake just before the page's own auto-refresh navigates, so the spin
+  // covers the reload gap instead of appearing after it.
+  var meta = document.querySelector('meta[http-equiv="refresh"]');
+  var secs = meta ? parseInt(meta.getAttribute("content"), 10) : 0;
+  if (secs > 3) {
+    setTimeout(function () { s.classList.remove("zw-done"); }, (secs - 2) * 1000);
+  }
+  window.addEventListener("pagehide", function () { s.classList.remove("zw-done"); });
+})();
+</script>
+"""

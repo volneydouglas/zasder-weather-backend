@@ -314,3 +314,55 @@ class SelfUpdater:
         await db.set_kv(_KV_LAST_ATTEMPT, json.dumps(
             {"tag": latest, "ms": now_ms}))
         await apply_update(tag)
+
+
+# ── graceful major upgrades (1.9) ───────────────────────────────────────
+
+async def upgrade_manifest_allows(latest: str, current: str) -> bool:
+    """True when the TARGET release vouches that upgrading from `current`
+    needs no manual steps, unlocking the one-tap major-version path.
+
+    The same-major-only gate exists because a major CAN carry manual
+    steps — but a major that doesn't (schema auto-migrates, config
+    unchanged) shouldn't strand the whole fleet on bin/upgrade.sh. The
+    vouching travels WITH the release: `upgrade.json` at the tagged
+    repo root, {"seamless_from": "X.Y.Z"} — this release installs
+    hands-free from any version at or above that.
+
+    Fetched from raw.githubusercontent.com, not the GitHub API — the API
+    rate-limits Fly's shared egress IPs (the updates.py lesson); raw
+    file serving doesn't. Absent file, unreachable network, unparseable
+    body: all fail CLOSED — the classic 409 stands and the operator
+    follows the release notes.
+
+    AUTO_UPDATE deliberately does NOT consult this: an unattended
+    upgrade across an era boundary should have a human pressing the
+    button once, vouched or not (eligible() stays same-major)."""
+    from .updates import _repo, parse_version
+    url = (f"https://raw.githubusercontent.com/{_repo()}"
+           f"/v{latest}/upgrade.json")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return False
+            manifest = r.json()
+    except Exception as e:  # noqa: BLE001 — any failure means "no vouch"
+        log.info("upgrade manifest fetch failed (%s); majors stay gated", e)
+        return False
+    floor = manifest.get("seamless_from") if isinstance(manifest, dict) else None
+    if not isinstance(floor, str):
+        return False
+    # Fail CLOSED on an unparseable floor (CodeRabbit): parse_version
+    # returns (0,) for garbage, and current >= (0,) is always true — a
+    # typo'd manifest would silently lift the major gate.
+    import re as _re
+    if not _re.fullmatch(r"v?\d+(\.\d+)*", floor.strip()):
+        log.info("upgrade manifest seamless_from %r is unparseable; "
+                 "majors stay gated", floor)
+        return False
+    ok = parse_version(current) >= parse_version(floor)
+    if ok:
+        log.info("release v%s vouches seamless upgrade from >= %s — "
+                 "major gate lifted for this apply", latest, floor)
+    return ok

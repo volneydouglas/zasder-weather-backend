@@ -257,9 +257,10 @@ def test_digest_sends_once_per_day(client, monkeypatch):
     from zoneinfo import ZoneInfo
 
     sent = []
-    monkeypatch.setattr(al, "_send_sync",
-                        lambda subject, body, to, cfg: sent.append((subject,
-                                                                    body)))
+    monkeypatch.setattr(
+        al, "_send_sync",
+        lambda subject, body, to, cfg, html=None: sent.append(
+            (subject, body, html)))
     cfg = SimpleNamespace(enabled=True, recipients=["v@z.com"],
                           digest_hour=7, smtp_host="h", smtp_port=465,
                           smtp_username=None, smtp_password=None,
@@ -284,18 +285,21 @@ def test_digest_sends_once_per_day(client, monkeypatch):
                            "Lightning all clear", "", 1)
         mon = al.AlertMonitor()
         # Before the digest hour: nothing.
-        await mon._maybe_send_digest(cfg, ms_at(6))
+        await mon._maybe_send_digest(cfg, [], ms_at(6))
         assert sent == []
-        # At/after the hour: one digest with both lines.
-        await mon._maybe_send_digest(cfg, ms_at(8))
+        # At/after the hour: one report with both alert lines.
+        await mon._maybe_send_digest(cfg, [], ms_at(8))
         # Same day again: no repeat.
-        await mon._maybe_send_digest(cfg, ms_at(11))
+        await mon._maybe_send_digest(cfg, [], ms_at(11))
 
     asyncio.run(run())
     assert len(sent) == 1
-    subject, body = sent[0]
+    subject, body, html = sent[0]
     assert "2 alerts" in subject
     assert "Wind Gust alert" in body and "Lightning all clear" in body
+    # 1.9: the weather-report HTML rides as the alternative.
+    assert html is not None and "Wind Gust alert" in html
+    assert "zasder" in html
 
 
 def test_nws_relay_pushes_severe_once(client, monkeypatch):
@@ -495,7 +499,7 @@ def test_urgent_rule_breaks_quiet_hours_minor_does_not(client, monkeypatch):
     pushes = []
     async def fake_push_configured():
         return True
-    async def fake_send_to_all(title, body):
+    async def fake_send_to_all(title, body, interruption_level=None):
         pushes.append(title)
         return {"sent": 1}
     monkeypatch.setattr(apns, "push_configured", fake_push_configured)
@@ -732,3 +736,81 @@ def test_manual_storm_start_respects_optout(client):
                json={"monitor": True, "storm_summary": True})
     r = client.post("/api/storm/watch/start", headers=H, json={"mac": mac})
     assert r.status_code == 200
+
+
+def test_rule_severity_ladder_includes_major():
+    """1.9: the middle ground. major maps to its OWN tier — quiet-hours
+    exempt but not Time Sensitive."""
+    from app.alerts import RULE_SEVERITIES, rule_tier
+    assert RULE_SEVERITIES == ("minor", "standard", "major", "urgent")
+    assert rule_tier("major") == "major"
+    assert rule_tier("urgent") == "warning"
+    assert rule_tier("standard") == "watch"
+    assert rule_tier(None) == "info"
+
+
+def test_quiet_hours_tier_ladder(client, monkeypatch):
+    """1.9 delivery matrix during quiet hours: warning goes through AND
+    rides Time Sensitive; major goes through as a NORMAL push; watch and
+    info hold their tongue."""
+    import asyncio
+    from types import SimpleNamespace
+    import app.alerts as al
+
+    monkeypatch.setattr(al, "in_quiet_hours", lambda *a: True)
+    calls: list = []
+
+    async def fake_send(title, body, interruption_level=None):
+        calls.append(interruption_level)
+        return {"sent": 1}
+
+    async def configured():
+        return True
+    monkeypatch.setattr(al.apns, "send_to_all", fake_send)
+    monkeypatch.setattr(al.apns, "push_configured", configured)
+    cfg = SimpleNamespace(enabled=False, recipients=[],
+                          quiet_start_min=22 * 60, quiet_end_min=7 * 60)
+
+    def run(sev):
+        calls.clear()
+        asyncio.run(al._deliver(cfg, "s", "b", "t", "pb",
+                                email_ok=False, kind="rule", severity=sev))
+        return list(calls)
+
+    assert run("warning") == ["time-sensitive"]
+    assert run("major") == [None]
+    assert run("watch") == []
+    assert run("info") == []
+
+
+def test_outside_quiet_hours_only_warning_is_time_sensitive(client, monkeypatch):
+    """By day everything pushes, but ONLY the warning tier is stamped
+    Time Sensitive — major/standard/minor stay normal notifications."""
+    import asyncio
+    from types import SimpleNamespace
+    import app.alerts as al
+
+    monkeypatch.setattr(al, "in_quiet_hours", lambda *a: False)
+    calls: list = []
+
+    async def fake_send(title, body, interruption_level=None):
+        calls.append(interruption_level)
+        return {"sent": 1}
+
+    async def configured():
+        return True
+    monkeypatch.setattr(al.apns, "send_to_all", fake_send)
+    monkeypatch.setattr(al.apns, "push_configured", configured)
+    cfg = SimpleNamespace(enabled=False, recipients=[],
+                          quiet_start_min=None, quiet_end_min=None)
+
+    def run(sev):
+        calls.clear()
+        asyncio.run(al._deliver(cfg, "s", "b", "t", "pb",
+                                email_ok=False, kind="rule", severity=sev))
+        return list(calls)
+
+    assert run("warning") == ["time-sensitive"]
+    assert run("major") == [None]
+    assert run("watch") == [None]
+    assert run("info") == [None]    # by day, even info delivers (CodeRabbit)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import html as _html
 import math
 import logging
@@ -70,14 +71,28 @@ async def lifespan(app: FastAPI):
     # defers again next boot.
     if db.chart_index_rebuild_needed():
         async def _rebuild_chart_index() -> None:
-            try:
-                t0 = time.time()
-                log.info("chart index rebuild starting in background "
-                         "(large archive)")
-                await db.rebuild_chart_index()
-                log.info("chart index rebuilt in %.0fs", time.time() - t0)
-            except Exception:
-                log.exception("background chart index rebuild failed")
+            # A few in-process retries (R11): a transient failure — briefly
+            # locked database, disk-pressure hiccup — used to leave the
+            # rebuild flag set with nothing re-attempting until the next
+            # boot, so charts ran uncovered for the process's whole life.
+            # Spaced retries also narrow the window where a kill leaves the
+            # index missing entirely (the init_db probe now catches that
+            # case at next boot regardless).
+            for attempt in range(3):
+                try:
+                    if attempt:
+                        await asyncio.sleep(60 * attempt)
+                    t0 = time.time()
+                    log.info("chart index rebuild starting in background "
+                             "(large archive, attempt %d)", attempt + 1)
+                    await db.rebuild_chart_index()
+                    log.info("chart index rebuilt in %.0fs", time.time() - t0)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("background chart index rebuild failed "
+                                  "(attempt %d/3)", attempt + 1)
         app.state.chart_index_task = asyncio.create_task(
             _rebuild_chart_index())
     # Declare every source up front, configured or not. "Not set up" and "set
@@ -119,6 +134,23 @@ async def lifespan(app: FastAPI):
     # BACKGROUND on purpose: a full rebuild of a 1M-row archive takes
     # minutes, and running it inline here failed a deploy's health checks
     # once already (2026-08-20).
+    # 1.9: Insights defaults ON (Volney, field test 2026-08-27 — "why is
+    # it not on by default?"), so a server that just gained it over
+    # existing history must also SELF-backfill: empty rollup tables beside
+    # a populated observations table get the dirty nonce here, and the
+    # same background heal below runs the one-time rebuild nobody should
+    # have to know about. Fresh installs skip it (no observations yet).
+    if settings.insights and not await db.get_kv("rollups_dirty"):
+        async with db.connect() as _c:
+            has_rollups = await (await _c.execute(
+                "SELECT 1 FROM daily_rollups LIMIT 1")).fetchone()
+            has_obs = await (await _c.execute(
+                "SELECT 1 FROM observations LIMIT 1")).fetchone()
+        if has_obs and not has_rollups:
+            import time as _time
+            await db.set_kv("rollups_dirty", str(_time.time_ns()))
+            log.info("insights enabled over existing history — scheduling "
+                     "the one-time background rollup rebuild")
     if settings.insights and await db.get_kv("rollups_dirty"):
         from . import insights as _insights
 
@@ -130,6 +162,58 @@ async def lifespan(app: FastAPI):
                 log.exception("background rollup rebuild failed — records "
                               "stay on the raw path until one succeeds")
         app.state.rollup_heal_task = asyncio.create_task(_heal_rollups())
+
+    # 1.9 column backfill: when the migration added the field-survey
+    # columns to an existing database, fill them from data_json in
+    # background chunks — a foreground full-table UPDATE at boot is
+    # minutes of lock + a database-sized WAL (the chart-index lesson).
+    app.state.colfill_task = None
+    if await db.colfill_pending():
+        async def _colfill() -> None:
+            await asyncio.sleep(30)
+            log.info("1.9 column backfill starting (chunked, background)")
+            while True:
+                try:
+                    more = await db.backfill_extra_columns_chunk()
+                except Exception:
+                    log.exception("column backfill chunk failed — retrying "
+                                  "in 10 minutes")
+                    await asyncio.sleep(600)
+                    continue
+                if not more:
+                    log.info("1.9 column backfill complete")
+                    return
+                await asyncio.sleep(1)     # yield; ingest goes first
+        app.state.colfill_task = asyncio.create_task(_colfill())
+
+    # History retention (1.9, opt-in): a daily pass runs BOTH aging jobs —
+    # row thinning past the detail window and data_json trimming past the
+    # (usually shorter) payload window. Always started: the knobs are
+    # app-managed at runtime (env is only the fallback), so the effective
+    # values are re-read every cycle rather than frozen at boot. Off-thread
+    # (sqlite3 sync, chunked commits); guarded inside (rollups, colfill).
+    async def _retention_daily() -> None:
+        from . import maintenance
+        await asyncio.sleep(120)
+        while True:
+            try:
+                eff = await maintenance.effective_retention()
+                if eff["detail_days"] > 0:
+                    summary = await asyncio.to_thread(
+                        maintenance.thin_history, True, None,
+                        eff["detail_days"])
+                    if summary.get("rows_deleted") or summary.get("rows_slimmed"):
+                        log.info("history thinning: %s", summary)
+                if eff["json_days"] > 0:
+                    summary = await asyncio.to_thread(
+                        maintenance.trim_json, True, None, eff["json_days"])
+                    if summary.get("rows_slimmed"):
+                        log.info("json trimming: %s", summary)
+            except Exception:
+                log.exception("history retention pass failed — nothing "
+                              "ages out until a pass succeeds")
+            await asyncio.sleep(24 * 3600)
+    app.state.history_thin_task = asyncio.create_task(_retention_daily())
 
     # Daily "is there a newer release?" check → status-page banner + /api/version.
     update_checker = UpdateChecker(app)
@@ -153,6 +237,21 @@ async def lifespan(app: FastAPI):
         log.info("MQTT publisher started (broker %s:%s)",
                  settings.mqtt_host, settings.mqtt_port)
 
+    # AirGradient LAN poller (1.9): env-only — a backend that can see the
+    # monitors' LAN is a local install, where env is the native config.
+    # Independent of the IntegrationManager (which owns the app-managed
+    # cloud credentials).
+    ag_local = None
+    if (settings.airgradient_local_hosts or "").strip():
+        from .airgradient_client import AirGradientLocalClient
+        from .airgradient_poller import AirGradientLocalPoller
+        ag_local = AirGradientLocalPoller(
+            AirGradientLocalClient(),
+            settings.airgradient_local_hosts.split(","),
+            settings.airgradient_poll_interval_seconds)
+        await ag_local.start()
+        app.state.airgradient_local = ag_local
+
     try:
         yield
     finally:
@@ -167,6 +266,18 @@ async def lifespan(app: FastAPI):
         await update_checker.stop()
         await self_updater.stop()
         if mqtt_pub is not None: await mqtt_pub.stop()
+        if ag_local is not None: await ag_local.stop()
+        # Cancel AND await: a cancelled-but-unawaited task finalizes at GC,
+        # which can land after the event loop closes — every test boot then
+        # logs "Event loop is closed" from the task's teardown (CI noise,
+        # and the same would greet every real shutdown).
+        reapers = [t for t in (getattr(app.state, "history_thin_task", None),
+                               getattr(app.state, "colfill_task", None))
+                   if t is not None]
+        for t in reapers:
+            t.cancel()
+        if reapers:
+            await asyncio.gather(*reapers, return_exceptions=True)
 
 
 # /docs, /redoc, /openapi.json are exposed by default in FastAPI and
@@ -228,6 +339,51 @@ if _ALLOWED_HOSTS != ["*"]:
 #    an anonymous malformed/chunked request can't stream unbounded data into
 #    memory. See app/limits.py. Covers the /static mount too.
 app.add_middleware(BodySizeLimitMiddleware)
+
+
+class EcowittTokenScrub:
+    """Pure-ASGI scrub for /ingest/ecowitt's query-string credential
+    (CodeRabbit, PR #33): Ecowitt hardware can only carry the token in the
+    URL, and uvicorn's default access logger prints the query string — so
+    the live ingest token would land in the server logs on every upload.
+    This moves the token into the X-Ingest-Token header (the route's
+    preferred channel) and redacts it in scope['query_string'] BEFORE the
+    app runs; uvicorn formats its access line from this same scope dict at
+    response time, so the logged line shows token=REDACTED."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        # rstrip: a gateway configured with a trailing slash 307s, and
+        # uvicorn logs the ORIGINAL query string of that redirect — the
+        # exact leak this middleware exists to prevent, triggered by the
+        # most likely misconfiguration (R11).
+        if (scope.get("type") == "http"
+                and scope.get("path", "").rstrip("/") == "/ingest/ecowitt"
+                and b"token=" in scope.get("query_string", b"")):
+            from urllib.parse import parse_qsl, urlencode
+            pairs = parse_qsl(scope["query_string"].decode("latin-1"),
+                              keep_blank_values=True)
+            token = next((v for k, v in pairs if k == "token"), "")
+            if token:
+                try:
+                    encoded = token.encode("latin-1")
+                except UnicodeEncodeError:
+                    # A non-latin-1 token can't be a valid credential; skip
+                    # the header (the route will 401) instead of 500ing
+                    # before auth (CodeRabbit).
+                    encoded = None
+                if encoded is not None:
+                    scope["headers"] = list(scope.get("headers", [])) + [
+                        (b"x-ingest-token", encoded)]
+            scope["query_string"] = urlencode(
+                [(k, "REDACTED" if k == "token" else v)
+                 for k, v in pairs]).encode("latin-1", errors="replace")
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(EcowittTokenScrub)
 
 
 @app.middleware("http")
@@ -345,6 +501,48 @@ def require_write_token(request: Request,
         raise HTTPException(status_code=401, detail="invalid token")
 
 
+def require_shared_write(request: Request,
+                         authorization: Annotated[str | None, Header()] = None) -> None:
+    """STATION-OPS dep (1.9 write-share tier): the owner's api_token OR an
+    app-minted WRITE share token (zww_, guest_tokens.can_write=1).
+
+    Scope discipline: routes opt IN to this dependency one by one, and the
+    security invariants pin the exact set — station operations only
+    (rename/relocate a device, per-device alert toggles, threshold rules,
+    push registration for the holder's own phone, a storm-watch start).
+    Everything administrative — token minting, credentials, backups,
+    restores, updates, retention, webhooks, integrations, device deletion
+    — stays on require_write_token (owner only). A new mutating route
+    defaults to OWNER; widening it to this tier is a deliberate, reviewed
+    edit, never an accident. One route splits FIELDS by tier:
+    /wu-station admits shared writers for the station-ID mapping but
+    refuses its credential fields in-handler (R12 W1).
+
+    Every write-share authentication is ATTRIBUTED: the token's last-used
+    stamp advances and a write_audit row (label + token tail + method +
+    path) is queued — the per-device attribution the tier requires."""
+    try:
+        presented = _extract_bearer(authorization)
+    except HTTPException:
+        _log_auth_failure(request)
+        raise
+    if tokens_match(presented, settings.write_tokens):
+        return                                   # the owner; not audited
+    if tokens_match(presented, db.write_guest_token_cache()):
+        db.touch_guest_token(presented)
+        db.record_write_audit(presented, request.method,
+                              request.url.path)
+        return
+    if tokens_match(presented,
+                    settings.valid_api_tokens | db.guest_token_cache()):
+        raise HTTPException(
+            status_code=403,
+            detail="this access token is read-only — ask the station's "
+                   "owner for a link that can make changes")
+    _log_auth_failure(request)
+    raise HTTPException(status_code=401, detail="invalid token")
+
+
 def _is_reviewer(authorization: str | None) -> bool:
     """True when the presented bearer is the read-only reviewer/demo token."""
     return tokens_match(_extract_bearer(authorization), settings.reviewer_api_token)
@@ -403,7 +601,13 @@ async def api_version() -> JSONResponse:
                                               "latest": None,
                                               "update_available": False,
                                               "checked_ms": None, "enabled": False})
-    return JSONResponse(info)
+    # 1.9: volume used/free for the disk holding the database, so the apps
+    # can put "· 2.1 GB free" next to the version and tint it when space
+    # runs short. Same openness class as the version itself — how full a
+    # disk is says nothing about the weather data on it. Computed per
+    # request (one statvfs); null when the path can't be statted.
+    from . import disk_watch
+    return JSONResponse({**info, "disk": disk_watch.snapshot()})
 
 
 @app.get("/embed", response_class=HTMLResponse)
@@ -467,6 +671,24 @@ async def embed_page(
   }}
   window.addEventListener("load", post);
   post();
+  /* Re-broadcast on a timer (field test 2026-08-28): WordPress/Divi
+     "delay JS until interaction" optimizers attach the parent's
+     listener LATE, after every post above already fired — and with
+     static content ResizeObserver never fires again, so the iframe
+     stayed at its fallback height forever (Doren's blank band under
+     the records). Re-posting is a few bytes; the parent ignores
+     repeats. Every 3s for the first 30s catches late listeners, then
+     every 60s as a keep-alive until the page's own auto-refresh. */
+  var ticks = 0;
+  var timer = setInterval(function () {{
+    ticks += 1;
+    last = 0;
+    post();
+    if (ticks === 10) {{
+      clearInterval(timer);
+      setInterval(function () {{ last = 0; post(); }}, 60000);
+    }}
+  }}, 3000);
 }})();
 </script>
 {_pd.SPINNER_HTML}
@@ -590,9 +812,16 @@ _PUBLIC_DASH_TTL_S = 100
 # on Doren's 1.15M-row box, 2026-08-25 — his "embed takes 10sec" report),
 # and with only the 100s TTL the first visitor after every quiet spell paid
 # it. Between TTL and this ceiling the stale page is served instantly and a
-# single background task rebuilds; past the ceiling we block like a cold
-# build, because a quarter-hour-old "live" dashboard is a lie, not a cache.
-_PUBLIC_DASH_STALE_MAX_S = 15 * 60
+# single background task rebuilds. The ceiling was 15 minutes on the
+# theory that an older "live" page is a lie — but a sporadically-visited
+# embed lands PAST 15 minutes on nearly every visit, so its owner ate the
+# blocking build almost every time ("cards not loading", Doren, live
+# 2026-08-28: broken at 9:49pm, loaded on the 9:50 retry — the build had
+# just finished). The page prints "updated Xm ago" and auto-refreshes
+# every 2 minutes, so a stale page is HONEST and self-healing; a blank
+# frame with a spinner reads as broken. Ceiling now 24h: blocking builds
+# happen only on the first visit after a restart.
+_PUBLIC_DASH_STALE_MAX_S = 24 * 3600
 _PUBLIC_DASH_REFRESHING = False
 # Strong ref: asyncio only weakly holds tasks, and a GC'd refresh task
 # would silently never fill the cache.
@@ -1165,6 +1394,10 @@ async def api_config_restore(payload: Annotated[dict[str, Any], Body()]) -> dict
 
 class GuestTokenBody(BaseModel):
     label: str | None = Field(default=None, max_length=64)
+    # 1.9: mint the WRITE tier instead. Never changeable after mint — an
+    # upgrade path would turn every leaked read link into a latent write
+    # link; the owner mints a new zww_ link deliberately instead.
+    write: bool = False
 
 
 @app.post("/api/guest-tokens", dependencies=[Depends(require_write_token)])
@@ -1174,12 +1407,21 @@ async def api_create_guest_token(body: GuestTokenBody | None = None) -> dict[str
     exactly two write-gated places: this response, and the deliberate
     re-share reveal below (added 1.7 so one person's several devices can
     reuse one token)."""
-    token = "zwg_" + secrets.token_hex(16)
     label = (body.label or "").strip() if body and body.label else None
+    can_write = bool(body and body.write)
+    if can_write and not label:
+        # The tier's contract is per-person attribution: an unnamed write
+        # link makes the audit trail say "somebody". Refuse up front.
+        raise HTTPException(status_code=400,
+                            detail="write links need a name — the change "
+                                   "log records who did what")
+    token = ("zww_" if can_write else "zwg_") + secrets.token_hex(16)
     now_ms = int(time.time() * 1000)
-    await db.add_guest_token(token, label or None, now_ms)
+    await db.add_guest_token(token, label or None, now_ms,
+                             can_write=can_write)
     return {"token": token, "id": token[:db.GUEST_TOKEN_ID_LEN],
-            "label": label or None, "created_ms": now_ms}
+            "label": label or None, "created_ms": now_ms,
+            "can_write": can_write}
 
 
 @app.get("/api/guest-tokens", dependencies=[Depends(require_write_token)])
@@ -1196,8 +1438,17 @@ async def api_list_guest_tokens() -> dict[str, Any]:
     # NOT the reviewer; it's an app-minted share.
     return {"tokens": [{"id": r["token"][:db.GUEST_TOKEN_ID_LEN],
                         "label": r["label"], "created_ms": r["created_ms"],
-                        "last_used_ms": r["last_used_ms"]}
+                        "last_used_ms": r["last_used_ms"],
+                        "can_write": bool(r.get("can_write"))}
                        for r in rows]}
+
+
+@app.get("/api/write-audit", dependencies=[Depends(require_write_token)])
+async def api_write_audit(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    """The write-share change log (1.9), newest first: who (label + token
+    tail), did what (method + path), when. Owner-only — the audit exists
+    FOR the owner, and its rows name the other holders."""
+    return {"entries": await db.list_write_audit(limit)}
 
 
 @app.patch("/api/guest-tokens/{token_id}", dependencies=[Depends(require_write_token)])
@@ -1339,17 +1590,26 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
     if not latest or not is_newer(latest, __version__):
         raise HTTPException(status_code=409,
                             detail=f"already up to date (v{__version__})")
-    if parse_version(latest)[0] != parse_version(__version__)[0]:
-        raise HTTPException(
-            status_code=409,
-            detail=f"v{latest} is a major upgrade and may carry manual "
-                   "steps — follow the release notes to upgrade")
+    # Token check BEFORE the vouch fetch (R12): the manifest lookup is a
+    # network round-trip (up to 10s), and a token-less instance — the
+    # default for one-tap users mid-repair — was paying it just to receive
+    # the 409 this cheap local check produces instantly.
     if not self_update._fly_token():
         raise HTTPException(
             status_code=409,
             detail="no deploy token on this instance — create one with "
                    "`fly tokens create deploy` and set it as the "
                    "FLY_API_TOKEN secret, then try again")
+    if parse_version(latest)[0] != parse_version(__version__)[0]:
+        # 1.9: a major may still one-tap when the TARGET release vouches
+        # (upgrade.json's seamless_from covers this server's version) —
+        # otherwise the fleet-stranding 409 the gate has always been.
+        # Fails closed on any fetch/parse trouble.
+        if not await self_update.upgrade_manifest_allows(latest, __version__):
+            raise HTTPException(
+                status_code=409,
+                detail=f"v{latest} is a major upgrade and may carry manual "
+                       "steps — follow the release notes to upgrade")
     repo = self_update._image_repo()
     if not await self_update.image_exists(repo, latest):
         raise HTTPException(
@@ -1364,6 +1624,113 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
     return {"ok": True, "applying": latest,
             "note": "the server restarts into the new release; "
                     "re-check /api/version shortly"}
+
+
+class RetentionIn(BaseModel):
+    """Merge-per-field like the sharing PUT: omitted = unchanged, -1 =
+    forget the app override (env value takes over), 0 = off. Floors keep
+    fat-finger values from eating history: row thinning can't be set
+    tighter than 90 days, JSON trimming than 7."""
+    detail_days: int | None = Field(default=None, ge=-1, le=3650)
+    json_days: int | None = Field(default=None, ge=-1, le=3650)
+
+
+@app.get("/api/history-retention",
+         dependencies=[Depends(require_write_token)])
+async def get_history_retention() -> JSONResponse:
+    from . import maintenance
+    eff = await maintenance.effective_retention()
+    eff["colfill_pending"] = await db.colfill_pending()
+    for kv_key, out_key in (("history_thin_before_ms", "thin_watermark_ms"),
+                            ("history_json_before_ms", "json_watermark_ms")):
+        raw = await db.get_kv(kv_key)
+        eff[out_key] = int(raw) if raw and str(raw).isdigit() else None
+    return JSONResponse(eff)
+
+
+@app.put("/api/history-retention",
+         dependencies=[Depends(require_write_token)])
+async def put_history_retention(body: RetentionIn) -> JSONResponse:
+    from . import maintenance
+    for name, floor in (("detail_days", 90), ("json_days", 7)):
+        v = getattr(body, name)
+        if v is not None and 0 < v < floor:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{name} must be 0 (off) or at least {floor}")
+    raw = await db.get_kv(maintenance._RETENTION_KV_KEY)
+    stored: dict[str, Any] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                stored = parsed
+        except ValueError:
+            pass
+    for name in ("detail_days", "json_days"):
+        v = getattr(body, name)
+        if v is None:
+            continue
+        if v == -1:
+            stored.pop(name, None)
+        else:
+            stored[name] = v
+    # Cross-check the RESULT, not just each field (R11): thinning blanks
+    # data_json on every row it keeps, so an effective json_days above
+    # detail_days claims to keep JSON longer than thinning actually
+    # allows — the payload is silently gone at the thinning boundary.
+    def _eff(name: str, env_v: int) -> int:
+        v = stored.get(name)
+        return v if isinstance(v, int) else env_v
+    eff_detail = _eff("detail_days", settings.history_detail_days)
+    eff_json = _eff("json_days", settings.history_json_detail_days)
+    if eff_detail > 0 and eff_json > eff_detail:
+        raise HTTPException(
+            status_code=400,
+            detail=f"json_days ({eff_json}) cannot exceed detail_days "
+                   f"({eff_detail}) — row thinning already blanks JSON "
+                   "for everything past its window")
+    await db.set_kv(maintenance._RETENTION_KV_KEY,
+                    json.dumps(stored) if stored else None)
+    eff = await maintenance.effective_retention()
+    eff["colfill_pending"] = await db.colfill_pending()
+    return JSONResponse(eff)
+
+
+@app.get("/api/storage", dependencies=[Depends(require_write_token)])
+async def api_storage() -> JSONResponse:
+    """Where the disk actually goes (1.9): file sizes, per-table bytes
+    (when this sqlite exposes dbstat) and row counts, the observations
+    data_json split, and the thinning state. Companion to /api/version's
+    free-space number — that says HOW full, this says WITH WHAT. Read-only
+    but a real scan on a big database (seconds) — off the event loop."""
+    from . import maintenance
+    eff = await maintenance.effective_retention()
+    return JSONResponse(await asyncio.to_thread(
+        maintenance.storage_breakdown, None, eff["detail_days"]))
+
+
+@app.post("/api/update/check", dependencies=[Depends(require_write_token)])
+async def api_update_check() -> JSONResponse:
+    """On-demand release check (1.9). The background check runs at boot and
+    then daily, so a release published an hour ago reads "up to date" for
+    up to a day — this lets the app's "Check for updates now" ask right
+    now. Same single GitHub-redirect lookup the daily check makes; the
+    result lands in the same app.state, so /api/version and the status
+    banner agree immediately."""
+    checker = getattr(app.state, "update_checker", None)
+    from . import updates as _updates
+    if checker is None or not _updates._enabled():
+        raise HTTPException(status_code=409,
+                            detail="the update check is disabled on this "
+                                   "server (UPDATE_CHECK=0)")
+    if not await checker._check_once():
+        raise HTTPException(status_code=502,
+                            detail="couldn't reach GitHub to check — "
+                                   "try again in a minute")
+    from . import disk_watch
+    return JSONResponse({**app.state.update_info,
+                         "disk": disk_watch.snapshot()})
 
 
 # ── Cloud-source integrations (Settings → Integrations) ──────────────────
@@ -1783,7 +2150,7 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     return JSONResponse(await _alerts_state())
 
 
-@app.put("/api/devices/{mac}/alert", dependencies=[Depends(require_write_token)])
+@app.put("/api/devices/{mac}/alert", dependencies=[Depends(require_shared_write)])
 async def put_device_alert(mac: str, body: DeviceAlertIn) -> JSONResponse:
     from .ingest import _format_mac
     if body.monitor is not None:
@@ -1809,7 +2176,7 @@ class DeviceLocationIn(BaseModel):
     label: str | None = None
 
 
-@app.put("/api/devices/{mac}/location", dependencies=[Depends(require_write_token)])
+@app.put("/api/devices/{mac}/location", dependencies=[Depends(require_shared_write)])
 async def put_device_location(mac: str, body: DeviceLocationIn) -> JSONResponse:
     """Set a device's location (iOS per-device Location setting). Overrides the
     ingest-time default; the top-ordered device drives the forecast + sun dial."""
@@ -1855,19 +2222,50 @@ async def get_wu_station(mac: str) -> JSONResponse:
     return JSONResponse(_wu_station_view(norm, await db.get_wu_station(norm)))
 
 
-@app.put("/api/devices/{mac}/wu-station", dependencies=[Depends(require_write_token)])
-async def put_wu_station(mac: str, body: WUStationIn) -> JSONResponse:
+@app.put("/api/devices/{mac}/wu-station", dependencies=[Depends(require_shared_write)])
+async def put_wu_station(mac: str, body: WUStationIn,
+                         authorization: Annotated[str | None,
+                                                  Header()] = None) -> JSONResponse:
     """Associate a Weather Underground station ID with a device — the WU
     importer's target mapping and (1.5) the live-upload config. Omitted
     fields are left unchanged; "" clears. Clearing the station ID drops the
-    upload key + toggle with it (see db.set_wu_station)."""
+    upload key + toggle with it (see db.set_wu_station).
+
+    TIER SPLIT (R12 W1): the route is on the write-share tier for the
+    station-ID mapping only. upload_key / upload_enabled are CREDENTIALS —
+    a zww_ holder who could set them would redirect the owner's live feed
+    to their own WU station, and the redirect would survive revoking the
+    share (revocation drops the token, not wu_station_map). Owner only."""
     from .ingest import _format_mac
+    is_owner = tokens_match(_extract_bearer(authorization),
+                            settings.write_tokens)
+    if ((body.upload_key is not None or body.upload_enabled is not None)
+            and not is_owner):
+        raise HTTPException(
+            status_code=403,
+            detail="the WU upload key and forwarding toggle are owner-only "
+                   "— a write share can only set the station-ID mapping")
     norm = _format_mac(mac)
     # Known devices only (same check as start_wu_import): a typo'd MAC would
     # otherwise create a wu_station_map row for a nonexistent device that
     # silently attaches to whatever registers under that MAC later.
     if not any(d["mac"] == norm for d in await db.list_devices()):
         raise HTTPException(status_code=404, detail=f"unknown device {norm}")
+    # R13 X1: clearing the station ID cascades to deleting the whole row —
+    # upload key included (set_wu_station's documented semantics). That's
+    # fine for a pure mapping, but when the owner has configured the
+    # upload credential, a shared writer's clear would DESTROY it (the key
+    # is write-only, so only the owner can re-enter it). Refuse; the
+    # mapping stays shared-writable whenever no credential is at stake.
+    if not is_owner and body.wu_station_id is not None \
+            and not body.wu_station_id.strip():
+        prior = await db.get_wu_station(norm)
+        if prior and (prior["upload_key"] or prior["upload_enabled"]):
+            raise HTTPException(
+                status_code=403,
+                detail="clearing this station mapping would delete the "
+                       "owner's WU upload credential — ask the owner to "
+                       "clear it")
     kwargs: dict[str, Any] = {}
     if body.wu_station_id is not None:
         kwargs["station_id"] = body.wu_station_id.strip().upper() or None
@@ -1957,6 +2355,98 @@ async def get_insights_daily(mac: str = Query(...),
     return JSONResponse(await insights.daily_series(_format_mac(mac), days))
 
 
+@app.get("/api/devices/{mac}/daily-series",
+         dependencies=[Depends(require_token)])
+async def get_daily_series(
+    mac: str,
+    days: int = Query(366, ge=7, le=3700),
+    end_day: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+) -> JSONResponse:
+    """Year-span chart data (1.9): one row per LOCAL DAY from the rollups
+    — min/max/mean temp, rain, peak gust — so a year (or a decade) of
+    chart never touches raw rows. /history keeps its 745-hour cap for
+    raw detail; this is the coarser series above it. Days beyond the
+    station's history simply aren't in the result. Opt-in with Insights
+    (the rollups ARE the data source)."""
+    from . import climate, insights
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    from datetime import date as _date, timedelta as _td
+    from .ingest import _format_mac
+    norm = _format_mac(mac)
+    try:
+        # Default end = today in the STATION timezone (the clock that
+        # names rollup days) — a UTC host is a day ahead of Phoenix for
+        # part of every evening (CodeRabbit, PR #33).
+        end = _date.fromisoformat(end_day) if end_day else climate.local_today()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"bad end_day: {e}")
+    first = end - _td(days=days - 1)
+    rows = await climate._rollup_rows(norm, first.isoformat(), end.isoformat())
+    series = []
+    for r in rows:
+        d = climate._day_stats(r)
+        series.append([d["day"], d["tmin"], d["tmax"],
+                       round(d["mean"], 1) if d["mean"] is not None else None,
+                       d["rain"], d["gust"]])
+    return JSONResponse({"mac": norm, "days": days,
+                         "end_day": end.isoformat(),
+                         # [day, tmin, tmax, mean, rain_in, gust_mph]
+                         "series": series})
+
+
+@app.get("/api/devices/{mac}/climate", dependencies=[Depends(require_token)])
+async def get_climate(mac: str,
+                      year: int = Query(..., ge=1970, le=2100)) -> JSONResponse:
+    """Climate summary (1.9, WeeWX parity): twelve month rows (mean/
+    extremes with dates, rain, HDD/CDD/GDD) + annual totals + the running
+    water year — all from rollups. Degree days use the NOAA (max+min)/2
+    convention, base 65; GDD base 50 cap 86 (computed now, surfaced by
+    the agriculture pack later)."""
+    from . import climate
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    from .ingest import _format_mac
+    return JSONResponse(await climate.year_summary(_format_mac(mac), year))
+
+
+@app.get("/api/devices/{mac}/storms", dependencies=[Depends(require_token)])
+async def get_storms(mac: str,
+                     limit: int = Query(10, ge=1, le=50)) -> JSONResponse:
+    """Recent closed storm episodes (1.9) — the structured stats behind
+    each delivered storm summary, newest first, for the Storm Report
+    share card. Only storms recorded since 1.9 appear; older summaries
+    live in the alert history as text."""
+    from .ingest import _format_mac
+    return JSONResponse({"storms": await db.list_storms(_format_mac(mac),
+                                                        limit)})
+
+
+@app.get("/api/devices/{mac}/reports/noaa",
+         dependencies=[Depends(require_token)])
+async def get_noaa_report(
+    mac: str,
+    year: int = Query(..., ge=1970, le=2100),
+    month: int | None = Query(None, ge=1, le=12),
+) -> PlainTextResponse:
+    """The classic NOAA-style fixed-width climate report (1.9, the WeeWX
+    flagship): month given → day rows; omitted → month rows for the
+    year. text/plain by design — it's the report every long-time station
+    owner already knows by shape."""
+    from . import climate
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    from .ingest import _format_mac
+    norm = _format_mac(mac)
+    dev = next((d for d in await db.list_devices() if d["mac"] == norm), None)
+    name = (dev or {}).get("name") or norm
+    if month is not None:
+        text = await climate.noaa_month_report(norm, name, year, month)
+    else:
+        text = await climate.noaa_year_report(norm, name, year)
+    return PlainTextResponse(text)
+
+
 @app.post("/api/insights/rebuild", dependencies=[Depends(require_write_token)])
 async def rebuild_insights(mac: str | None = Query(None)) -> JSONResponse:
     """Recompute rollups from raw history — run once after enabling INSIGHTS
@@ -1983,6 +2473,9 @@ class WUImportIn(BaseModel):
     start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     end_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     dry_run: bool = False
+    # 1.9: re-import days the ledger says are already done (the default
+    # skips them — no quota spent, and thinned history stays thinned).
+    force: bool = False
 
 
 @app.post("/api/import/wu", dependencies=[Depends(require_write_token)])
@@ -2015,7 +2508,7 @@ async def start_wu_import(body: WUImportIn) -> JSONResponse:
                             detail="no api_key given and no server-stored WU "
                                    "key (PUT /api/config/wu-key first)")
     if not wu_import.start_import(mac, station, api_key, start, end,
-                                  body.dry_run):
+                                  body.dry_run, force=body.force):
         raise HTTPException(status_code=409, detail="an import is already running")
     return JSONResponse({"ok": True, "mac": mac, "wu_station_id": station,
                          "days": (end - start).days + 1, "dry_run": body.dry_run})
@@ -2043,7 +2536,7 @@ _TEST_ALERT_TS: float | None = None
 _TEST_ALERT_MIN_INTERVAL_S = 60.0
 
 
-@app.post("/api/alerts/test", dependencies=[Depends(require_write_token)])
+@app.post("/api/alerts/test", dependencies=[Depends(require_shared_write)])
 async def test_alert() -> JSONResponse:
     """Send a one-off test email to the current recipients — lets the app's
     setup screen verify delivery end to end. Throttled to one attempt per
@@ -2087,7 +2580,7 @@ class PushRegisterIn(BaseModel):
     platform: str = "ios"
 
 
-@app.post("/api/push/register", dependencies=[Depends(require_write_token)])
+@app.post("/api/push/register", dependencies=[Depends(require_shared_write)])
 async def push_register(body: PushRegisterIn) -> JSONResponse:
     """The iOS app posts its APNs device token here after the user grants
     notification permission. Idempotent (upsert)."""
@@ -2107,7 +2600,7 @@ class PushUnregisterIn(BaseModel):
 
 
 @app.post("/api/push/unregister",
-          dependencies=[Depends(require_write_token)])
+          dependencies=[Depends(require_shared_write)])
 async def push_unregister(body: PushUnregisterIn) -> JSONResponse:
     """Best-effort mirror of the register endpoints: the app's Disconnect
     & reset calls this before forgetting the server, so the old server
@@ -2137,7 +2630,7 @@ class LiveActivityTokenIn(BaseModel):
 
 
 @app.post("/api/push/live-activity-token",
-          dependencies=[Depends(require_write_token)])
+          dependencies=[Depends(require_shared_write)])
 async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONResponse:
     """Push-to-start token for the rain-start Live Activity (1.7, nowcast
     phase 2). The app re-posts whenever iOS rotates it; idempotent upsert,
@@ -2158,10 +2651,13 @@ async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONRespons
         # activity dimension.
         activity = None
     else:
-        # Push-to-start tokens are ALSO per-attributes-type (1.8). A 1.7
-        # app omits the field — those are rain-start registrations.
+        # Push-to-start tokens are APP-WIDE — one per device, every
+        # attributes type hands the app the same token, so the activity
+        # label here is observability only (the lookup ignores it for
+        # starts; see db.list_live_activity_tokens, proven live
+        # 2026-08-27). "morning" joined in 1.9.
         if body.activity is not None and body.activity not in (
-                "rain", "storm", "heat"):
+                "rain", "storm", "heat", "morning"):
             raise HTTPException(status_code=400, detail="unknown activity")
         activity = body.activity or "rain"
     env = body.env if body.env in ("sandbox", "production") else None
@@ -2300,7 +2796,7 @@ class StormWatchStartIn(BaseModel):
 
 
 @app.post("/api/storm/watch/start",
-          dependencies=[Depends(require_write_token)])
+          dependencies=[Depends(require_shared_write)])
 async def storm_watch_start(body: StormWatchStartIn) -> JSONResponse:
     """1.8 Storm Watch manual trigger (Volney: light onset sits below the
     rain threshold exactly when you're watching the sky). Opens a real
@@ -2407,7 +2903,7 @@ class AlertRuleIn(BaseModel):
     comparator: str
     threshold: float
     target_mac: str | None = None     # None = any device
-    severity: str = "minor"           # minor | standard | urgent (1.8)
+    severity: str = "minor"           # minor | standard | major | urgent (major 1.9)
 
 
 @app.get("/api/alerts/rules", dependencies=[Depends(require_token)])
@@ -2415,7 +2911,7 @@ async def list_rules() -> JSONResponse:
     return JSONResponse(await db.list_alert_rules())
 
 
-@app.post("/api/alerts/rules", dependencies=[Depends(require_write_token)])
+@app.post("/api/alerts/rules", dependencies=[Depends(require_shared_write)])
 async def create_rule(body: AlertRuleIn) -> JSONResponse:
     from .alerts import THRESHOLD_FIELDS, THRESHOLD_COMPARATORS
     from .ingest import _format_mac
@@ -2451,10 +2947,10 @@ class AlertRulePatch(BaseModel):
     enabled: bool | None = None
     threshold: float | None = None
     target_mac: str | None = None
-    severity: str | None = None       # minor | standard | urgent (1.8)
+    severity: str | None = None       # minor | standard | major | urgent (major 1.9)
 
 
-@app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_write_token)])
+@app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_shared_write)])
 async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
     import math
     from .ingest import _format_mac
@@ -2477,7 +2973,7 @@ async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
     return JSONResponse(rule)
 
 
-@app.delete("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_write_token)])
+@app.delete("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_shared_write)])
 async def delete_rule(rule_id: int) -> JSONResponse:
     if not await db.delete_alert_rule(rule_id):
         raise HTTPException(status_code=404, detail="rule not found")

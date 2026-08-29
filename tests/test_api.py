@@ -673,7 +673,7 @@ def test_deliver_email_scope_gates_email_not_push(client, monkeypatch):
     pushed = []
     monkeypatch.setattr(alerts_mod, "_send_sync",
                         lambda *a, **k: sent_emails.append(a))
-    async def fake_push(title, body):
+    async def fake_push(title, body, interruption_level=None):
         pushed.append(title)
         return {"sent": 1, "pruned": 0, "total": 1}
     from app import apns
@@ -890,7 +890,7 @@ def test_apns_send_to_all_routes_via_env_relay(client, monkeypatch):
     monkeypatch.setattr(apns.settings, "apns_relay_url", "https://relay.example/api/relay/push")
     monkeypatch.setattr(apns.settings, "apns_relay_token", "rtok")
     seen = {}
-    async def fake_relay(tokens, title, body, url, token):
+    async def fake_relay(tokens, title, body, url, token, **kw):
         seen.update(tokens=list(tokens), url=url, token=token)
         return {"sent": len(tokens), "dead": [], "failed": 0}
     monkeypatch.setattr(apns, "_push_via_relay", fake_relay)
@@ -920,7 +920,7 @@ def test_send_to_all_uses_db_relay(client, monkeypatch):
     client.put("/api/push/relay", headers=H, json={
         "relay_url": "https://weather.zasder.com/api/relay/push", "relay_token": "dbtok"})
     seen = {}
-    async def fake_relay(tokens, title, body, url, token):
+    async def fake_relay(tokens, title, body, url, token, **kw):
         seen.update(url=url, token=token)
         return {"sent": len(tokens), "dead": [], "failed": 0}
     monkeypatch.setattr(apns, "_push_via_relay", fake_relay)
@@ -3674,9 +3674,37 @@ def test_public_dashboard_serves_stale_while_revalidating(client, monkeypatch):
     assert len(builds) == 1
 
 
+def test_quarter_hour_old_embed_still_serves_instantly(client, monkeypatch):
+    """R-field 2026-08-28 (Doren): a sporadically-visited embed lands past
+    the old 15-minute ceiling on nearly EVERY visit, so its owner ate the
+    blocking cold build almost every time — "cards not loading" at
+    9:49pm, loaded on the 9:50 retry. The page says "updated Xm ago" and
+    auto-refreshes, so hours-old-but-instant beats fresh-but-blank."""
+    import time as _time
+    from app import main as _m
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+
+    builds = []
+
+    async def fake_build(devices, now_ms):
+        builds.append(now_ms)
+        return "<html>rebuilt</html>"
+
+    monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
+    twenty_min = _time.time() - 20 * 60
+    _m._PUBLIC_DASH_CACHE = (twenty_min, "<html>stale-20m</html>")
+
+    page = client.get("/embed").text
+    assert "stale-20m" in page, \
+        "a 20-minute-old page must serve instantly, not block on a build"
+    assert builds, "the background rebuild must still be scheduled"
+
+
 def test_public_dashboard_blocks_past_stale_ceiling(client, monkeypatch):
-    """Past _PUBLIC_DASH_STALE_MAX_S the cache is a lie, not a shortcut —
-    the request must block on a fresh build exactly like a cold start."""
+    """Past _PUBLIC_DASH_STALE_MAX_S (now 24h — effectively only the first
+    visit after a restart) the request blocks on a fresh build exactly
+    like a cold start."""
     import time as _time
     from app import main as _m
     from app.config import settings
@@ -3734,3 +3762,81 @@ def test_corner_spinner_on_public_pages(client, monkeypatch):
         assert 'aria-hidden="true"' in page
         assert "pointer-events:none" in page
         assert "prefers-reduced-motion" in page
+
+
+def test_rule_api_accepts_major_severity(client):
+    """R13: 'major' end to end through the rule API — a regression to a
+    hardcoded three-element validator would pass every existing test."""
+    H = {"Authorization": "Bearer test-api-token"}
+    r = client.post("/api/alerts/rules", headers=H,
+                    json={"field": "windgustmph", "comparator": "above",
+                          "threshold": 40, "severity": "major"})
+    assert r.status_code == 200, r.text
+    rid = r.json()["id"]
+    rows = client.get("/api/alerts/rules", headers=H).json()
+    assert next(x for x in rows if x["id"] == rid)["severity"] == "major"
+    r = client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                     json={"severity": "urgent"})
+    assert r.status_code == 200
+    r = client.patch(f"/api/alerts/rules/{rid}", headers=H,
+                     json={"severity": "apocalyptic"})
+    assert r.status_code == 400
+
+
+def test_send_to_all_stamps_level_on_own_key_path(client, monkeypatch):
+    """R13: the LOCAL-key path must actually put interruption-level into
+    the aps payload — the relay path is pinned elsewhere, and nothing
+    asserted this half."""
+    import asyncio
+    from app import apns, db
+
+    # apns_configured is a read-only property — patch it on the CLASS.
+    monkeypatch.setattr(type(apns.settings), "apns_configured",
+                        property(lambda self: True))
+    monkeypatch.setattr(apns.settings, "apns_env", "production")
+    asyncio.run(db.register_push_token("a" * 64, "ios", "production"))
+
+    seen = {}
+
+    async def capture(tokens, title, body, payload=None, push_type="alert"):
+        seen["payload"] = payload
+        return {"sent": len(tokens), "dead": [], "failed": 0}
+    monkeypatch.setattr(apns, "_push_tokens", capture)
+
+    asyncio.run(apns.send_to_all("t", "b",
+                                 interruption_level="time-sensitive"))
+    assert seen["payload"]["aps"]["interruption-level"] == "time-sensitive"
+
+    asyncio.run(apns.send_to_all("t", "b"))
+    assert "interruption-level" not in seen["payload"]["aps"]
+
+
+def test_warning_kind_fallback_is_time_sensitive(client, monkeypatch):
+    """R13: _deliver's severity_of(kind) FALLBACK branch — the delivery-
+    matrix tests all pass severity= explicitly, so a broken fallback
+    (lightning arriving as a normal push) sailed through."""
+    import asyncio
+    from types import SimpleNamespace
+    import app.alerts as al
+
+    monkeypatch.setattr(al, "in_quiet_hours", lambda *a: False)
+    calls = []
+
+    async def fake_send(title, body, interruption_level=None):
+        calls.append(interruption_level)
+        return {"sent": 1}
+
+    async def configured():
+        return True
+    monkeypatch.setattr(al.apns, "send_to_all", fake_send)
+    monkeypatch.setattr(al.apns, "push_configured", configured)
+    cfg = SimpleNamespace(enabled=False, recipients=[],
+                          quiet_start_min=None, quiet_end_min=None)
+    # NO severity argument: the kind map must supply "warning".
+    asyncio.run(al._deliver(cfg, "s", "b", "t", "pb",
+                            email_ok=False, kind="lightning"))
+    assert calls == ["time-sensitive"]
+    calls.clear()
+    asyncio.run(al._deliver(cfg, "s", "b", "t", "pb",
+                            email_ok=False, kind="brand_new_kind"))
+    assert calls == [None]     # unknown kinds default to watch — normal push

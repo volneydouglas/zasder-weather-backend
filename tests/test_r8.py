@@ -443,3 +443,59 @@ def test_chart_index_rebuild_defers_on_big_archives(client, monkeypatch):
     assert still_stale, "boot must NOT have rebuilt inline"
     assert rebuilt, "the background rebuild restores the covering index"
     assert flag_after is False
+
+
+def test_chart_index_missing_entirely_is_rebuild_worthy(client, monkeypatch):
+    """R11 V3: a kill between the deferred rebuild's DROP and CREATE leaves
+    NO index at all. The probe must treat missing as rebuild-worthy — the
+    old `row and row[0]` guard skipped it, and the SCHEMA script's
+    unconditional CREATE then rebuilt it INLINE during executescript,
+    resurrecting the 1.8.0 boot crash-loop on big archives. Small archives
+    rebuild inline; big ones defer with the index still absent."""
+    import asyncio
+    from app import db
+
+    async def run():
+        # Simulate the interrupted deferred rebuild: index gone entirely.
+        async with db.connect() as conn:
+            await conn.execute("DROP INDEX idx_obs_chart")
+            await conn.commit()
+        # Small archive: init_db recreates it inline, full column set.
+        db._CHART_INDEX_REBUILD_NEEDED = False
+        await db.init_db()
+        async with db.connect() as conn:
+            row = await (await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
+            )).fetchone()
+        inline_ok = (row is not None
+                     and set(db._CHART_INDEX_COLS) <= db._index_columns(row[0]))
+        inline_flag = db.chart_index_rebuild_needed()
+
+        # Big archive: missing index defers; boot must NOT build it inline.
+        async with db.connect() as conn:
+            await conn.execute("DROP INDEX idx_obs_chart")
+            await conn.commit()
+        monkeypatch.setattr(db, "_CHART_INDEX_INLINE_MAX_ROWS", -1)
+        db._CHART_INDEX_REBUILD_NEEDED = False
+        await db.init_db()
+        deferred = db.chart_index_rebuild_needed()
+        async with db.connect() as conn:
+            row = await (await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
+            )).fetchone()
+        still_missing = row is None
+        await db.rebuild_chart_index()
+        async with db.connect() as conn:
+            row = await (await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
+            )).fetchone()
+        rebuilt = (row is not None
+                   and set(db._CHART_INDEX_COLS) <= db._index_columns(row[0]))
+        return inline_ok, inline_flag, deferred, still_missing, rebuilt
+
+    inline_ok, inline_flag, deferred, still_missing, rebuilt = asyncio.run(run())
+    assert inline_ok, "small archive: missing index must be recreated inline"
+    assert inline_flag is False
+    assert deferred, "big archive: missing index must defer, not build inline"
+    assert still_missing, "boot must not have built the index inline"
+    assert rebuilt

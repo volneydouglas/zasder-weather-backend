@@ -6,6 +6,8 @@ import asyncio
 import os
 import time
 
+import pytest
+
 os.environ.setdefault("API_TOKEN", "test-api-token-0123456789abcdef0123")
 
 from app.airgradient_poller import build_payload, synth_mac  # noqa: E402
@@ -122,3 +124,107 @@ def test_error_messages_never_carry_the_token():
         httpx.HTTPStatusError("boom", request=req, response=resp))
     assert "SECRET-TOKEN" not in str(err)
     assert "401" in str(err)
+
+
+# ── LAN path (1.9): build_local_payload + the local client ──────────────
+
+def _local_measures(**over):
+    """A live-verified I-9PSL local /measures/current shape."""
+    d = {"wifi": -48, "serialno": "84fce612345c", "rco2": 612,
+         "pm01": 3.0, "pm02": 5.0, "pm10": 6.0,
+         "atmp": 27.3, "atmpCompensated": 26.8,
+         "rhum": 33.0, "rhumCompensated": 35.0,
+         "tvocIndex": 61.0, "noxIndex": 1.0,
+         "boot": 4, "firmware": "3.1.1", "model": "I-9PSL"}
+    d.update(over)
+    return d
+
+
+def test_local_payload_prefers_compensated_and_maps_indoor():
+    from app.airgradient_poller import build_local_payload
+    p = build_local_payload(_local_measures(), "2026-08-27T01:00:00+00:00")
+    assert p["device"]["id"] == "84fce612345c"     # the monitor's own MAC
+    assert p["device"]["model"] == "I-9PSL"
+    assert p["timestamp_utc"] == "2026-08-27T01:00:00+00:00"
+    # atmpCompensated 26.8 °C → 80.2 °F; rhumCompensated wins over rhum.
+    assert p["indoor"]["tempf"] == 80.2
+    assert p["indoor"]["humidity"] == 35
+    assert "outdoor" not in p
+    assert p["air"] == {"pm1": 3.0, "pm25": 5.0, "pm10": 6.0, "co2": 612.0,
+                        "tvoc_index": 61.0, "nox_index": 1.0}
+
+
+def test_local_payload_o_series_maps_outdoor_unknown_maps_indoor():
+    from app.airgradient_poller import build_local_payload
+    p = build_local_payload(_local_measures(model="O-1PST"), "2026-08-27T01:00:00+00:00")
+    assert "outdoor" in p and "indoor" not in p
+    # Unknown model errs indoor — never impersonate an outdoor station.
+    p = build_local_payload(_local_measures(model=None), "2026-08-27T01:00:00+00:00")
+    assert "indoor" in p and "outdoor" not in p
+
+
+def test_local_payload_missing_readings_stay_omitted():
+    """The local API OMITS missing readings (verified live) — absent is
+    not zero, and a CO2-less model must not invent one."""
+    from app.airgradient_poller import build_local_payload
+    m = {"serialno": "84fce612345c", "atmp": 20.0, "model": "I-9PSL"}
+    p = build_local_payload(m, "2026-08-27T01:00:00+00:00")
+    assert "air" not in p
+    assert p["indoor"] == {"tempf": 68.0}
+    # No serial → no device row to key — skip, don't guess.
+    assert build_local_payload({"atmp": 20.0}, "x") is None
+    # Nothing usable at all → None (wifi/boot alone is not a reading).
+    assert build_local_payload({"serialno": "84fce612345c",
+                                "boot": 9}, "x") is None
+
+
+def test_local_client_errors_name_host_and_class_only(monkeypatch):
+    import asyncio
+    import httpx
+    from app.airgradient_client import AirGradientError, AirGradientLocalClient
+
+    real = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda *a, **kw: real(transport=httpx.MockTransport(handler), **kw))
+    with pytest.raises(AirGradientError) as e:
+        asyncio.run(AirGradientLocalClient().measures_current("192.168.1.40"))
+    assert "192.168.1.40" in str(e.value) and "500" in str(e.value)
+
+
+def test_local_poll_tick_stores_a_row(client, monkeypatch):
+    """One real tick end to end: LAN fetch (mocked transport) → transform
+    → ingest → stored row + airgradient-local success accounting."""
+    import asyncio
+    import httpx
+    from app import db, source_status
+    from app.airgradient_client import AirGradientLocalClient
+    from app.airgradient_poller import AirGradientLocalPoller
+
+    real = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "192.168.1.40"
+        return httpx.Response(200, json=_local_measures())
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda *a, **kw: real(transport=httpx.MockTransport(handler), **kw))
+
+    async def run():
+        poller = AirGradientLocalPoller(AirGradientLocalClient(),
+                                        ["192.168.1.40"], 3600)
+        await poller.start()
+        await asyncio.sleep(0.05)
+        await poller.stop()
+        return await db.latest_observation("84:FC:E6:12:34:5C")
+
+    obs = asyncio.run(run())
+    assert obs is not None and obs["co2"] == 612.0
+    row = next(r for r in source_status.snapshot()
+               if r["name"] == "airgradient-local")
+    assert row["last_error"] is None and row["last_rows"] == 1

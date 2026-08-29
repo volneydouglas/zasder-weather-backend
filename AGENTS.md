@@ -42,7 +42,7 @@ app/                         FastAPI source (the Python package)
   weatherlink_*.py           Davis WeatherLink cloud poller
   discovery.py               /ingest/discovery + /api/discoveries
   capture.py                 Optional raw-POST capture for debugging
-  insights.py                Opt-in statistics rollups + /api/insights (INSIGHTS=1)
+  insights.py                Statistics rollups + /api/insights (default on since 1.9)
   wu_import.py               Weather Underground history import (/api/import/wu)
   wu_upload.py               Live WU forwarding — re-posts ingested readings
                              to wunderground.com per device (app-managed via
@@ -50,6 +50,15 @@ app/                         FastAPI source (the Python package)
   forecast_twc.py            TWC forecast source (needs a WU key)
   config_backup.py           /api/config/backup + /api/config/restore
   source_status.py           Per-ingest-source health for /api/sources
+  ecowitt.py                 /ingest/ecowitt — Ecowitt "Customized" upload (Path G)
+  alerts.py                  Alert monitor — device-down, thresholds, smart
+                             alerts, storm summaries, morning report digest
+  storm.py                   Storm episode tracking + summary messages
+  climate.py                 /api/devices/{mac}/climate + NOAA report (rides the rollups)
+  normals.py                 NOAA/NCEI 1991-2020 climate normals (US only)
+  maintenance.py             History aging — thinning + JSON trimming
+  self_update.py / updates.py  One-tap + automatic updates, release check
+  airgradient_*.py           AirGradient air-quality integration (cloud + LAN)
   static/                    Status page HTML
 tests/                       pytest suite — run with `pytest -q`
 Dockerfile                   python:3.12-slim → uvicorn
@@ -61,6 +70,11 @@ pytest.ini
 wll-poller/                  Path E — Davis WeatherLink Live LAN poller
                              (pure-stdlib Python; docker compose or systemd
                              on a LAN host; posts to /ingest/custom)
+
+weewx-bridge/                Path H — WeeWX extension POSTing archive
+                             records to /ingest/custom (weectl install)
+
+mcp/                         Read-only MCP server over the token-gated API
 
 lilygo-relay/                ESP32 firmware (PlatformIO)
   src/
@@ -105,9 +119,26 @@ Q: What hardware does the user have?
 │   → Use Path D (LilyGO 915 MHz SDR). Need 1× LilyGO T3 LoRa32 V1.6.1.
 │   → If WH32B indoor sensor: same LilyGO covers it via merge into outdoor.
 │
+├─ WeatherFlow Tempest
+│   → Use Path F (Tempest cloud poller). Free personal token from
+│     tempestwx.com; TEMPEST_TOKEN + TEMPEST_STATION_ID, or configure
+│     from the app (Settings → Integrations).
+│
+├─ Ecowitt gateway/console (GW1000–GW3000, HP2551-class) on the LAN
+│   → Use Path G: point the gateway's "Customized" upload at
+│     /ingest/ecowitt?token=<INGEST_TOKEN>. The gateway is HTTP-only —
+│     works directly against local Docker; a Fly backend needs a small
+│     TLS-terminating forwarder on the LAN (README has a Caddyfile).
+│     No extra hardware, no vendor cloud.
+│
+├─ Station already running under WeeWX (any of its 70+ families)
+│   → Use Path H: `weectl extension install` the weewx-bridge/
+│     extension, set server_url + ingest_token under
+│     [StdRESTful][[Zasder]], restart WeeWX. See weewx-bridge/README.md.
+│
 └─ Multiple sensors / mix
-    → Any combination of A+B+C+D+E works. They all post into the same
-      backend and show up as separate device rows in the iOS app.
+    → Any combination of A+B+C+D+E+F+G+H works. They all post into the
+      same backend and show up as separate device rows in the iOS app.
 
 Q: Where do they want the backend?
 ├─ Hosted (cloud)
@@ -130,14 +161,21 @@ Q: Where do they want the backend?
 | `WEATHERLINK_API_KEY` + `_SECRET` + `_STATION_ID` | Path B only | All three required together. |
 | `TEMPEST_TOKEN` + `TEMPEST_STATION_ID` | Path F only | Both required together; `TEMPEST_NAME`/`TEMPEST_POLL_INTERVAL_SECONDS` optional. App-stored Integrations values win over env. |
 | `REVIEWER_API_TOKEN` | Optional | Secondary token for App Store reviewer. |
-| `GUEST_API_TOKENS` | Optional | Comma-separated read-only tokens (family sharing): reads only, PII stripped. Each ≥32 chars, distinct from privileged tokens, placeholders rejected at boot. The app can also mint/revoke these per person. |
+| `GUEST_API_TOKENS` | Optional | Comma-separated read-only tokens (family sharing): reads only, PII stripped. Each ≥32 chars, distinct from privileged tokens, placeholders rejected at boot. The app can also mint/revoke these per person — including write-tier share links (1.9, app-minted only; audited at `GET /api/write-audit`). |
+| `HISTORY_DETAIL_DAYS` + `HISTORY_KEEP_INTERVAL_MINUTES` | Optional | Opt-in history thinning past N days (needs the insights rollups, on by default; rollups keep daily extremes). App-stored retention (`PUT /api/history-retention`) wins over env. |
+| `HISTORY_JSON_DETAIL_DAYS` | Optional | Drop each old row's raw JSON payload (most of its bytes) while keeping every row's typed columns. Non-destructive half of history aging. |
+| `WATER_YEAR_START_MONTH` | Optional | Water-year start for `/api/devices/{mac}/climate`. Default 10 (October); 1 = calendar year. |
+| `AIRGRADIENT_LOCAL_HOSTS` | Optional | Comma-separated AirGradient monitor hosts/IPs for cloud-free LAN polling (local Docker installs). Cloud-token integration is app-managed instead. |
+| `AUTO_UPDATE` + `FLY_API_TOKEN` | Optional | Self-updating Fly instance (app-scoped deploy token, `FlyV1` macaroon or `Bearer` both accepted). Never crosses a major version. |
+| `PUBLIC_DASHBOARD` (+ `_MACS`, `_FIELDS`) | Optional | `1` replaces the status page screenshots with a live server-rendered dashboard; `/embed` serves it frameable for iframes. |
+| `SMART_ALERTS` | Optional | `1` enables threshold-free weather-intelligent alerts (frost, dangerous heat, pressure drop, temp drops, wind ramps, gust fronts). |
 | `STORM_SUMMARY` (+ `_QUIET_MINUTES`, `_MIN_TOTAL_IN`) | Optional | One report after the rain stops. Default on (0.05 in floor, 30 min quiet); app-saved values win over env. |
 | `TIMEZONE` | Optional | IANA zone (e.g. `America/Phoenix`). Defaults UTC. |
 | `WEATHERLINK_POLL_INTERVAL_SECONDS` | Optional | Default 60. Min 15. |
 | `WEATHERLINK_YEARLY_RAIN_BASELINE_IN` | Optional | Inches to add to Davis's reported yearly rain (mid-year install). |
 | `SHARED_BAROMETER_SOURCE_MAC` | Optional | For cross-device pressure tile fallback. |
 | `WU_API_KEY` | Optional | Weather Underground PWS-owner key (free for uploading stations). Powers the TWC forecast source + the WU history import (`/api/import/wu`). An app-stored key (`PUT /api/config/wu-key`) takes precedence. |
-| `INSIGHTS` | Optional | `1` enables server-side statistics rollups + `GET /api/insights`. On existing data, run `POST /api/insights/rebuild` once to backfill. Default off (endpoint 404s). |
+| `INSIGHTS` | Optional | Server-side statistics rollups + `GET /api/insights`. ON by default since 1.9 (climate endpoints and history thinning ride the rollups); a needed backfill self-schedules on boot. Set `0` to disable (endpoints 404). |
 | `INGEST_MAX_RAIN_RATE_IN_PER_HR` | Optional | Rain-glitch guard on `/ingest/custom`: drop a reading whose cumulative rain jumps faster than this (default 2.0 in/hr; 0 disables). |
 | `INGEST_GUST_MAX_FACTOR` + `INGEST_GUST_MIN_MPH` | Optional | Gust-glitch guard on `/ingest/custom`: null a gust above `_MIN_MPH` (default 30) that exceeds `_MAX_FACTOR` × sustained wind (default 4.0; 0 disables). |
 | `INGEST_MIN_INTERVAL_SECONDS` | Optional | History-write throttle for high-cadence sources; readings within N s of the last stored row skip history (live view unaffected; new-field posts always stored). Default 0 = store everything. |

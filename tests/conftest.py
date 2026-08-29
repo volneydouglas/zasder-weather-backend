@@ -29,6 +29,10 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     monkeypatch.setenv("DATABASE_PATH", db_path)
     monkeypatch.setenv("API_TOKEN", "test-api-token")
     monkeypatch.setenv("INGEST_TOKEN", "test-ingest-token")
+    # Insights defaults ON since 1.9; the suite pins it OFF so the many
+    # tick/route tests keep their deterministic pre-1.9 world, and tests
+    # that want rollups opt in explicitly (monkeypatch settings.insights).
+    monkeypatch.setenv("INSIGHTS", "0")
     monkeypatch.setenv("CAPTURE_TOKEN", "test-capture-token")
     monkeypatch.setenv("REVIEWER_API_TOKEN", "test-reviewer-token")
     # Deterministic local-time math (insights rollups, records periods):
@@ -108,6 +112,15 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     async def _no_fetch(lat, lon):  # noqa: ANN001
         return None
     _fs._fetch_daily = _no_fetch
+    # Disk watch (1.9) reads the HOST machine's real volume — a developer
+    # laptop past 85% used makes every tick fire disk_low and skews any
+    # test that counts _deliver calls. Pin a healthy fake; disk tests
+    # monkeypatch their own stats back in. Import NOW for the same lazy-
+    # import reason as forecast_snapshots above.
+    import app.disk_watch as _dw
+    _dw.snapshot = lambda: {"total_bytes": 8 * 1024**3,
+                            "free_bytes": 4 * 1024**3,
+                            "used_pct": 50.0}
     _hw = sys.modules.get("app.health_watch")
     if _hw is not None:
         _hw._reset_for_tests()
@@ -121,6 +134,11 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # R5-33 rollup cache: a value computed against one test's DB must
         # not answer for the next test's — same isolation rule as above.
         _d._DAILY_ROLLUP_CACHE.clear()
+        # 1.9 write-audit buffer + auth-time label cache (R12): a pending
+        # audit row from one test must not flush into another test's
+        # database, and a stale token→label entry must not attribute it.
+        _d._WRITE_AUDIT_PENDING.clear()
+        _d._GUEST_LABEL_CACHE.clear()
     yield db_path
     shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -136,7 +154,12 @@ def client(temp_env: str):
     # app.wu_upload holds process-global throttle/health dicts (and must be
     # reloaded BEFORE app.ingest, which imports it at module top) — the
     # app.insights precedent for modules with per-test state.
-    for mod in ["app.config", "app.db", "app.insights", "app.wu_upload",
+    # app.maintenance holds `from .config import settings` and (1.9) runs
+    # against settings.database_path — left out of this list it kept the
+    # FIRST test's (deleted) tmpdir path, the same stale-object trap the
+    # apns/relay entries document.
+    for mod in ["app.config", "app.maintenance",
+                "app.db", "app.insights", "app.wu_upload",
                 "app.capture", "app.ingest", "app.discovery",
                 "app.alerts", "app.apns", "app.relay", "app.integrations",
                 "app.main"]:

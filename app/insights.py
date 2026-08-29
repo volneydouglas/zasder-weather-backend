@@ -256,19 +256,39 @@ async def rebuild(mac: str | None = None) -> dict[str, int]:
         _REBUILD_LOCK = asyncio.Lock()
     async with _REBUILD_LOCK:
         from . import db as dbmod
-        # Snapshot BEFORE the scan: the clear below is conditional on the
-        # marker still holding this exact value, so a repair that sets a
-        # fresh nonce mid-rebuild (rows the scan already passed) survives
-        # the clear and stays dirty for the next rebuild (CodeRabbit,
-        # 2026-08-20).
+        # Rebuild-in-progress guard (R11 V6): thin_history refuses while
+        # rollups_dirty is set, and that refusal is the ONLY thing keeping
+        # the daily retention pass from advancing the thin watermark UNDER
+        # this scan — the scan snapshots the watermark once, so concurrent
+        # thinning would let it fold bucket-sampled survivors into the very
+        # daily rows it just cleared: permanent, silent min/max loss. If the
+        # flag is already set (a repair marked it) that refusal is already
+        # in force; otherwise set a nonce of our own for the scan's duration.
+        # CONDITIONAL acquire, then re-read (R12 W6): a plain get→set had a
+        # gap where a repair's own dirty marker landed between the two and
+        # got clobbered by the guard nonce — whose success-path clear then
+        # removed it, leaving stale rollups behind a clean flag. INSERT OR
+        # IGNORE never overwrites; whatever the re-read returns is what the
+        # conditional clear below is measured against.
+        import time as _time
+        nonce = f"rebuild-guard-{_time.time_ns()}"
+        async with dbmod.connect() as db:
+            await db.execute(
+                "INSERT INTO server_kv (k, v) VALUES ('rollups_dirty', ?) "
+                "ON CONFLICT(k) DO NOTHING", (nonce,))
+            await db.commit()
         pre = await dbmod.get_kv("rollups_dirty")
+        we_set_guard = pre == nonce
         out = await _rebuild_locked(mac)
-        if mac is None and pre is not None:
+        if pre is not None and (mac is None or we_set_guard):
             # A successful FULL rebuild is the one thing that makes dirty
             # rollups trustworthy again (records() falls back to raw scans
             # while the flag is set — R5-14/R5-15). A single-mac rebuild
-            # can't clear it: the flag is global and the other stations'
-            # ledgers are still stale.
+            # can't clear a PRE-EXISTING marker (the flag is global and the
+            # other stations' ledgers are still stale) — but it always
+            # clears its own in-progress guard, which claimed nothing about
+            # staleness. Conditional on the exact value so a repair that
+            # sets a fresh nonce mid-rebuild survives the clear.
             async with dbmod.connect() as db:
                 await db.execute(
                     "DELETE FROM server_kv WHERE k = 'rollups_dirty' "
@@ -289,12 +309,28 @@ async def _rebuild_locked(mac: str | None) -> dict[str, int]:
         # empty-state hint fires instead. Best-effort: a shutdown may have
         # torn the loop down already.
         try:
+            # Bounded by the thin watermark, same as the scan's own clear
+            # (CodeRabbit, PR #33): for thinned days the rollups are the
+            # ONLY remaining record of those days' extremes — an unbounded
+            # clear here would destroy what the re-run can never rebuild.
+            wm_day = await _thin_watermark_day(dbmod)
             async with dbmod.connect() as db:
                 if mac:
-                    await db.execute("DELETE FROM daily_rollups WHERE mac = ?", (mac,))
+                    if wm_day:
+                        await db.execute(
+                            "DELETE FROM daily_rollups WHERE mac = ? "
+                            "AND day >= ?", (mac, wm_day))
+                    else:
+                        await db.execute(
+                            "DELETE FROM daily_rollups WHERE mac = ?", (mac,))
                     await db.execute("DELETE FROM hour_rollups WHERE mac = ?", (mac,))
                 else:
-                    await db.execute("DELETE FROM daily_rollups")
+                    if wm_day:
+                        await db.execute(
+                            "DELETE FROM daily_rollups WHERE day >= ?",
+                            (wm_day,))
+                    else:
+                        await db.execute("DELETE FROM daily_rollups")
                     await db.execute("DELETE FROM hour_rollups")
                 await db.commit()
             log.warning("insights rebuild failed mid-scan — partial rollups "
@@ -304,15 +340,47 @@ async def _rebuild_locked(mac: str | None) -> dict[str, int]:
         raise
 
 
+async def _thin_watermark_day(dbmod) -> str | None:
+    """The thin watermark as a LOCAL day string, or None when history has
+    never been thinned. daily_rollups rows for days strictly before this
+    were folded from FULL-detail raw that no longer exists — every delete
+    of daily_rollups anywhere in this module must be bounded by it."""
+    wm_raw = await dbmod.get_kv("history_thin_before_ms")
+    wm_ms = int(wm_raw) if wm_raw and str(wm_raw).isdigit() else 0
+    if wm_ms <= 0:
+        return None
+    from datetime import datetime, timezone as _tzu
+    return (datetime.fromtimestamp(wm_ms / 1000, tz=_tzu.utc)
+            .astimezone(_tz()).strftime("%Y-%m-%d"))
+
+
 async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
     tz = _tz()
     processed = 0
+    # History thinning (1.9): days behind the thin watermark keep only
+    # bucket-sampled raw, so their rollup rows — folded from FULL detail at
+    # insert time — are the surviving source of truth for extremes. A
+    # rebuild must PRESERVE those daily rows, never recompute them from
+    # thinned raw. Hour rollups are month x hour-of-day AVERAGES; bucket
+    # sampling leaves averages unbiased, so they rebuild from whatever raw
+    # remains, full-history.
+    wm_day = await _thin_watermark_day(dbmod)
     async with dbmod.connect() as db:
         if mac:
-            await db.execute("DELETE FROM daily_rollups WHERE mac = ?", (mac,))
+            if wm_day:
+                await db.execute(
+                    "DELETE FROM daily_rollups WHERE mac = ? AND day >= ?",
+                    (mac, wm_day))
+            else:
+                await db.execute("DELETE FROM daily_rollups WHERE mac = ?",
+                                 (mac,))
             await db.execute("DELETE FROM hour_rollups WHERE mac = ?", (mac,))
         else:
-            await db.execute("DELETE FROM daily_rollups")
+            if wm_day:
+                await db.execute("DELETE FROM daily_rollups WHERE day >= ?",
+                                 (wm_day,))
+            else:
+                await db.execute("DELETE FROM daily_rollups")
             await db.execute("DELETE FROM hour_rollups")
         if mac:
             macs = [mac]
@@ -350,7 +418,12 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
                     continue
                 p["mac"] = b[0]
                 month, hour = p.pop("_month"), p.pop("_hour")
-                await db.execute(_UPSERT_DAILY, p)
+                # Preserved (thinned) days: their daily rows survived the
+                # delete above and must not be re-folded — the upsert MERGES
+                # (sums add), so folding thinned raw into a full-detail row
+                # would corrupt the averages it exists to protect.
+                if not (wm_day and p["day"] < wm_day):
+                    await db.execute(_UPSERT_DAILY, p)
                 if (hp := _hour_params(b[0], month, hour, p)) is not None:
                     await db.execute(_UPSERT_HOUR, hp)
                 processed += 1

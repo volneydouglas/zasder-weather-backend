@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "config_server.h"
+#include "ingest_id.h"
 #include "post_fsm.h"
 #include "root_ca.h"
 
@@ -103,12 +104,10 @@ static bool hasWeatherFields(const JsonDocument &in) {
 }
 
 static String synthMac(uint8_t typeTag, uint32_t id) {
+  // Layout lives in ingest_id.h (Arduino-free) so the native tests can
+  // pin it — this id is the backend's device primary key.
   char buf[13];
-  snprintf(buf, sizeof(buf), "5D5D%02X%02X%02X%02X",
-           typeTag,
-           (unsigned) ((id >> 16) & 0xFF),
-           (unsigned) ((id >>  8) & 0xFF),
-           (unsigned) ( id        & 0xFF));
+  ZasderId::synthMac(typeTag, id, buf);
   return String(buf);
 }
 

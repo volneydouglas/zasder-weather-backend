@@ -115,6 +115,23 @@ def _battery_flag(v: Any) -> int | None:
     return None
 
 
+# Stored-field names the `batteries`/`extra` passthrough blocks are allowed
+# to set (R11): exactly the channel/battery families those blocks exist for.
+# Every OTHER stored field is owned by a structured block above and must not
+# be reachable through the passthrough — presence-based shadow checks let a
+# poster plant any core metric the source happened to omit.
+_PASSTHROUGH_FAMILY = frozenset(
+    [f"temp{i}f" for i in range(1, 5)]
+    + [f"humidity{i}" for i in range(1, 5)]
+    + [f"soilhum{i}" for i in range(1, 5)]
+    + [f"soiltemp{i}f" for i in range(1, 5)]
+    + [f"leak{i}" for i in range(1, 5)]
+    + [f"leafwetness{i}" for i in range(1, 3)]
+    + [f"batt{i}" for i in range(1, 9)]
+    + ["batt_25", "batt_co2", "batt_lightning", "battin", "battout"])
+_STORED_FIELDS = frozenset(db._FIELD_MAP.values())
+
+
 def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     """Map a normalized observation → the flat-field shape db.insert_observations
     expects (same keys as AmbientWeather's REST response)."""
@@ -141,6 +158,17 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # Air quality (1.8): the AirGradient poller posts an `air` block
     # (pm1/pm25/pm10 µg/m³, co2 ppm, tvoc_index/nox_index).
     air = _scrub_numbers(normalized.get("air"))
+    # Per-sensor batteries (1.9, Ecowitt): a `batteries` block of
+    # ALREADY-NORMALIZED flags (1 = ok, 0 = low — the stored convention)
+    # keyed by the names health_watch's battery watcher reads (batt1-8,
+    # batt_lightning, …). Passed through into the flat row; keys that
+    # match a typed column persist as columns, the rest ride data_json.
+    batteries = _scrub_numbers(normalized.get("batteries"))
+    # Channel sensors (1.9 field survey): extra T/H channels, soil
+    # moisture/temperature, leak detectors, leaf wetness — AWN-native key
+    # names (temp1f, soilhum1, leak1, leafwetness1 …). Same passthrough
+    # rule as batteries.
+    extra = _scrub_numbers(normalized.get("extra"))
 
     ts_iso = normalized.get("timestamp_utc")
     # A non-string timestamp (an epoch int, a dict) hit .endswith() below and
@@ -181,6 +209,10 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
     # but is logically reported as "outdoor barometric"; accept it from
     # either place.
     rel_inhg = press.get("relative_inhg") or ind.get("pressure_inhg")
+    # Sources that report BOTH pressures (Ecowitt sends baromrelin AND
+    # baromabsin) keep the real absolute reading; the rel-for-both stand-in
+    # below is only for sources that never split them (CodeRabbit, PR #33).
+    abs_inhg = press.get("absolute_inhg")
 
     # Per-MAC yearly-rain calibration. Cumulative sensor counters (Atlas
     # rain_in, Fineoffset rain_mm) report lifetime totals, so we subtract
@@ -242,10 +274,15 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "tempinf":        ind.get("tempf"),
         "humidityin":     ind.get("humidity"),
         "baromrelin":     rel_inhg,
-        "baromabsin":     rel_inhg,  # ingest sources rarely split
+        "baromabsin":     abs_inhg if abs_inhg is not None else rel_inhg,
         "windspeedmph":   wind.get("speed_mph"),
         "windgustmph":    wind.get("gust_mph"),
-        "maxdailygust":   wind.get("gust_mph"),  # best-effort; relays don't track daily peak
+        # A source that tracks the true daily peak (Ecowitt's maxdailygust)
+        # posts it as max_daily_gust_mph; the current-gust stand-in is only
+        # for relays that don't (R11).
+        "maxdailygust":   wind.get("max_daily_gust_mph")
+                          if wind.get("max_daily_gust_mph") is not None
+                          else wind.get("gust_mph"),
         # Accept both key shapes: docs/AGENTS say "direction", but the WLL
         # poller has always posted "dir_deg" — reading only one silently
         # dropped Davis wind direction. Explicit None check so 0° (north)
@@ -287,6 +324,20 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         v = lightning.get(src)
         if v is not None:
             flat[dest] = v
+    # Battery flags + channel sensors ride under their own (bounded)
+    # names. The old `k not in flat` guard only blocked keys the source
+    # sent IN THIS ROW — a poster could still use `extra` to plant a core
+    # metric the source omitted (co2, tempf …) into its typed column
+    # (R11). Name-based now: a key that IS a stored field may pass only if
+    # it belongs to the channel/battery family these blocks own; unknown
+    # names still ride data_json as before.
+    for block in (batteries, extra):
+        for k, v in block.items():
+            if (v is not None and k not in flat and isinstance(k, str)
+                    and len(k) <= 24 and k.replace("_", "").isalnum()
+                    and (k in _PASSTHROUGH_FAMILY
+                         or k not in _STORED_FIELDS)):
+                flat[k] = v
     # One choke point for every metric field (timestamps excluded — they were
     # validated above and must stay ints).
     for k, v in flat.items():
@@ -1402,3 +1453,34 @@ async def ingest_custom_header(
 # (Legacy path-form `/ingest/custom/{token}` was removed 2026-05-21. The
 # only consumer was the retired hub-relay container; tokens in URLs leak
 # to proxy/access logs. Use the header form above for all new ingest.)
+
+
+@router.post("/ingest/ecowitt")
+async def ingest_ecowitt(
+    request: Request,
+    token: str = "",
+    authorization: Annotated[str | None, Header()] = None,
+    x_ingest_token: Annotated[str | None, Header(alias="X-Ingest-Token")] = None,
+) -> dict[str, Any]:
+    """Ecowitt "Customized" upload (1.9): the gateway POSTs its documented
+    form-encoded protocol straight to us on the LAN. Point the gateway at
+    this path with `?token=<ingest token>` — Ecowitt firmware can set the
+    upload PATH but never an HTTP header, so the query parameter is the
+    only credential channel this hardware has. That reintroduces a URL-
+    borne token for exactly this route (see the removal note above): a
+    deliberate, hardware-forced exception, scoped to the same INGEST_TOKEN
+    / minted-token check as everything else, and the header forms still
+    win when present so bridges/tests never need the query form. No token
+    auto-upgrade here: the upgrade contract needs X-Token-Upgrade, which
+    this hardware can also never send."""
+    presented = _token_from_header(authorization, x_ingest_token) or token.strip()
+    _require_ingest_token(
+        presented, request.client.host if request.client else None)
+    from . import ecowitt
+    form = await request.form()
+    normalized = ecowitt.normalize(dict(form))
+    if normalized is None:
+        raise HTTPException(
+            status_code=400,
+            detail="not an Ecowitt upload (PASSKEY and dateutc required)")
+    return await _do_ingest(normalized)

@@ -63,3 +63,40 @@ class AirGradientClient:
         if not isinstance(data, list):
             raise AirGradientError("AirGradient response is not a list")
         return [d for d in data if isinstance(d, dict)]
+
+
+class AirGradientLocalClient:
+    """LAN client (1.9): every AirGradient monitor serves its current
+    measures locally, unauthenticated, at
+
+      GET http://airgradient_<serial>.local/measures/current
+
+    For a backend that can actually see the LAN (the docker-compose
+    self-host next to the router — not a Fly instance), this cuts the
+    vendor cloud out entirely. Plain http by design: the monitor's ESP
+    serves no TLS, and the traffic never leaves the LAN. No token exists
+    on this path, so error hygiene is only about not spamming: messages
+    carry the host (operator-configured, not a secret) and failure class."""
+
+    def __init__(self, timeout: float = 10.0) -> None:
+        self._timeout = timeout
+
+    async def measures_current(self, host: str) -> dict[str, Any]:
+        url = f"http://{host}/measures/current"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.json()
+        except httpx.HTTPStatusError as e:
+            raise AirGradientError(
+                f"AirGradient {host}: HTTP {e.response.status_code}") from None
+        except httpx.HTTPError as e:
+            raise AirGradientError(
+                f"AirGradient {host}: {type(e).__name__}") from None
+        except ValueError:
+            raise AirGradientError(
+                f"AirGradient {host}: non-JSON response") from None
+        if not isinstance(data, dict):
+            raise AirGradientError(f"AirGradient {host}: unexpected shape")
+        return data

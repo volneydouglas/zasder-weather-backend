@@ -24,12 +24,19 @@ H_GUEST = {"Authorization": "Bearer test-guest-token"}
 # ── route inventory ────────────────────────────────────────────────────
 
 def _routes():
-    """(guard, method, path, file) for every declared route."""
+    """(guard, method, path, file) for every declared route.
+
+    Matches @x.api_route(..., methods=[...]) too (R12 W4): the catch-all
+    routes in capture.py are declared that way, and the old verb-only
+    regex made them invisible to EVERY sweep in this file — a future
+    mutating api_route would have passed the whole audit green."""
     out = []
     for f in sorted(APP.glob("*.py")):
         lines = f.read_text().splitlines()
         for i, line in enumerate(lines):
-            m = re.match(r"\s*@(?:app|router)\.(get|post|put|patch|delete)\(", line)
+            m = re.match(
+                r"\s*@(?:app|router)\.(get|post|put|patch|delete|api_route)\(",
+                line)
             if not m:
                 continue
             chunk, j = [], i
@@ -39,7 +46,9 @@ def _routes():
             dec = " ".join(chunk)
             pm = re.search(r'"([^"]+)"', dec)
             path = pm.group(1) if pm else "?"
-            if "require_write_token" in dec:
+            if "require_shared_write" in dec:
+                guard = "SHARED-WRITE"
+            elif "require_write_token" in dec:
                 guard = "WRITE"
             elif "require_token" in dec:
                 guard = "READ"
@@ -47,7 +56,18 @@ def _routes():
                 guard = "DEPENDS"
             else:
                 guard = "NO-DEP"
-            out.append((guard, m.group(1).upper(), path, f.name))
+            if m.group(1) == "api_route":
+                # One row per declared HTTP method, so the mutating-guard
+                # sweeps see api_route POSTs exactly like @app.post ones.
+                # Both quote styles (CodeRabbit): methods=['POST'] is valid
+                # Python, and a double-quote-only match would have recorded
+                # it as GET — sliding it past the mutating sweeps.
+                methods = re.findall(
+                    r'["\'](GET|POST|PUT|PATCH|DELETE)["\']', dec)
+                for meth in (methods or ["GET"]):
+                    out.append((guard, meth, path, f.name))
+            else:
+                out.append((guard, m.group(1).upper(), path, f.name))
     return out
 
 
@@ -123,7 +143,11 @@ def _handler_body(path: str, method: str, fname: str | None = None) -> str:
                 if not isinstance(dec, ast.Call):
                     continue
                 fn = dec.func
-                if not (isinstance(fn, ast.Attribute) and fn.attr == method.lower()):
+                # api_route declares its verbs in methods=[...] (R12 W4) —
+                # resolve it for any of them.
+                if not (isinstance(fn, ast.Attribute)
+                        and (fn.attr == method.lower()
+                             or fn.attr == "api_route")):
                     continue
                 if not (dec.args and isinstance(dec.args[0], ast.Constant)
                         and dec.args[0].value == path):
@@ -245,7 +269,8 @@ def test_a_guest_token_can_read(guest_client):
 # success — the exact vacuous-guard failure this module exists to prevent
 # (CodeRabbit, 2026-08-20). Collection fails loudly instead.
 _WRITE_CASES = sorted({(m, p) for g, m, p, _ in _routes()
-                       if g == "WRITE" and m in {"POST", "PUT", "PATCH", "DELETE"}})
+                       if g in ("WRITE", "SHARED-WRITE")
+                       and m in {"POST", "PUT", "PATCH", "DELETE"}})
 assert _WRITE_CASES, "route scan found no write routes — scanner broke"
 
 
@@ -288,3 +313,111 @@ def test_private_routes_reject_guest_and_reviewer_tokens(guest_client, path):
     assert guest_client.get(path, headers=H_PRIMARY).status_code == 200, (
         f"{path} rejected the primary token — the negative assertions above "
         "would pass even if the route were broken")
+
+
+# ── the write-share tier (1.9) ─────────────────────────────────────────
+# Two-sided pin: the EXACT set of routes a zww_ token may mutate, and the
+# proof that it can reach those and ONLY those. A new mutating route
+# defaults to owner-only; joining this list is a deliberate, reviewed
+# edit — that is the whole point of require_shared_write being opt-in.
+
+SHARED_WRITE_BY_DESIGN = {
+    ("PUT", "/api/devices/{mac}/alert"),
+    ("PUT", "/api/devices/{mac}/location"),
+    ("PUT", "/api/devices/{mac}/wu-station"),
+    ("POST", "/api/alerts/test"),
+    ("POST", "/api/alerts/rules"),
+    ("PATCH", "/api/alerts/rules/{rule_id}"),
+    ("DELETE", "/api/alerts/rules/{rule_id}"),
+    ("POST", "/api/push/register"),
+    ("POST", "/api/push/unregister"),
+    ("POST", "/api/push/live-activity-token"),
+    ("POST", "/api/storm/watch/start"),
+}
+
+
+def test_shared_write_surface_is_exactly_the_designed_set():
+    actual = {(m, p) for g, m, p, _ in _routes() if g == "SHARED-WRITE"}
+    assert actual == SHARED_WRITE_BY_DESIGN, (
+        "the write-share route surface changed — additions/removals here "
+        f"are a security decision, not a refactor. diff: "
+        f"extra={actual - SHARED_WRITE_BY_DESIGN}, "
+        f"missing={SHARED_WRITE_BY_DESIGN - actual}")
+    # Nothing administrative may ever join: the admin route FAMILIES are
+    # categorically outside this tier. Prefix-matched, not substring — a
+    # station-ops path may legitimately contain the word "token"
+    # (/api/push/live-activity-token is the holder's own phone).
+    forbidden_prefixes = ("/api/guest-tokens", "/api/ingest-tokens",
+                          "/api/config", "/api/backup", "/api/update",
+                          "/api/history-retention", "/api/webhooks",
+                          "/api/integrations", "/api/sharing",
+                          "/api/import", "/api/write-audit")
+    for method, path in actual:
+        assert not path.startswith(forbidden_prefixes), (
+            f"{path} is an administrative surface and must stay owner-only")
+        assert (method, path) != ("DELETE", "/api/devices/{mac}"), (
+            "device deletion purges history — owner-only, always")
+
+
+@pytest.fixture
+def write_share_client(temp_env):
+    """A client plus a freshly minted zww_ token."""
+    import importlib, sys
+    for mod in ["app.config", "app.db", "app.insights", "app.wu_upload",
+                "app.capture", "app.ingest", "app.meter", "app.discovery",
+                "app.alerts", "app.apns", "app.relay", "app.integrations",
+                "app.main"]:
+        if mod in sys.modules:
+            importlib.reload(sys.modules[mod])
+    from fastapi.testclient import TestClient
+    from app.main import app
+    with TestClient(app) as c:
+        r = c.post("/api/guest-tokens", headers=H_PRIMARY,
+                   json={"label": "Invariant Suite", "write": True})
+        assert r.status_code == 200
+        yield c, r.json()["token"]
+
+
+_OWNER_ONLY_CASES = sorted({(m, p) for g, m, p, _ in _routes()
+                            if g == "WRITE"
+                            and m in {"POST", "PUT", "PATCH", "DELETE"}})
+assert _OWNER_ONLY_CASES, "route scan found no owner-only writes — scanner broke"
+
+
+@pytest.mark.parametrize("method,path", _OWNER_ONLY_CASES)
+def test_a_write_share_token_cannot_reach_owner_routes(write_share_client,
+                                                       method, path):
+    """The tier boundary itself: a write link must never mint tokens, touch
+    credentials/backups/updates, or delete a device. 403 (valid but not
+    permitted), never 200."""
+    client, token = write_share_client
+    url = path.replace("{mac}", "AA:BB:CC:DD:EE:FF") \
+              .replace("{rule_id}", "1").replace("{token_id}", "zwg_00000000") \
+              .replace("{wid}", "x").replace("{hook_id}", "x") \
+              .replace("{provider}", "awn").replace("{target}", "wu")
+    r = client.request(method, url,
+                       headers={"Authorization": f"Bearer {token}"}, json={})
+    assert r.status_code in (401, 403), (
+        f"{method} {path} accepted a write-SHARE token ({r.status_code})")
+
+
+_SHARED_CASES = sorted(SHARED_WRITE_BY_DESIGN)
+
+
+@pytest.mark.parametrize("method,path", _SHARED_CASES)
+def test_a_write_share_token_reaches_every_station_ops_route(
+        write_share_client, method, path):
+    """The positive half, or the negative half proves nothing: on every
+    designed station-ops route the zww_ token must get PAST auth — any
+    status except 401/403 (validation 422s and unknown-mac 404s are the
+    handler speaking, which means auth admitted us)."""
+    client, token = write_share_client
+    url = path.replace("{mac}", "AA:BB:CC:DD:EE:FF").replace("{rule_id}", "1")
+    r = client.request(method, url,
+                       headers={"Authorization": f"Bearer {token}"}, json={})
+    # Membership in an expected set, not `not in (401, 403)` (R12): a 500
+    # from a crashing handler used to count as "kept its route".
+    assert r.status_code in (200, 201, 204, 400, 404, 409, 422), (
+        f"{method} {path} answered {r.status_code} to the write-share "
+        "token — 401/403 means the tier lost a designed route; 5xx means "
+        "the handler is broken, which this sweep must not paper over")

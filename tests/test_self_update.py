@@ -140,15 +140,25 @@ def test_update_apply_endpoint_guards(client, monkeypatch):
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "up to date" in r.json()["detail"]
 
-    main.app.state.update_info = {"latest": "999.0.0", "update_available": True}
-    r = client.post("/api/update/apply", headers=H)
-    assert r.status_code == 409 and "major" in r.json()["detail"]
-
+    # Deploy-token check now precedes the major gate (R12): the vouch
+    # fetch is a network round-trip, and a token-less instance shouldn't
+    # pay it for a foregone 409 — so a major bump WITHOUT a token reads
+    # "deploy token", not "major".
     main.app.state.update_info = {"latest": "1.999.0", "update_available": True}
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "deploy token" in r.json()["detail"]
 
     monkeypatch.setenv("FLY_API_TOKEN", "x" * 20)
+    # The graceful-majors vouch fetch (8fe6556) reaches for the real tag on
+    # GitHub — mock it CLOSED like the neighboring vouch test, or this arm
+    # makes a live HTTPS call on every run and can't tell "gate worked"
+    # from "fetch failed" (R12 W5).
+    monkeypatch.setattr(self_update, "upgrade_manifest_allows", _async_false)
+    main.app.state.update_info = {"latest": "999.0.0", "update_available": True}
+    r = client.post("/api/update/apply", headers=H)
+    assert r.status_code == 409 and "major" in r.json()["detail"]
+
+    main.app.state.update_info = {"latest": "1.999.0", "update_available": True}
     monkeypatch.setattr(self_update, "image_exists", _async_false)
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "no published image" in r.json()["detail"]
@@ -301,3 +311,128 @@ def test_auth_header_scheme_split(wired):
     assert h("Bearer fo1_xyz") == "Bearer fo1_xyz"
     # Whitespace never leaks into the header.
     assert h("  FlyV1  fm2_abc  ") == "FlyV1 fm2_abc"
+
+
+def test_update_check_endpoint(client, monkeypatch):
+    """POST /api/update/check (1.9) runs the daily lookup ON DEMAND — a
+    release published an hour ago otherwise reads "up to date" for a day.
+    Success returns the same shape /api/version serves (disk included);
+    a GitHub miss is a 502 the caller can retry; write-gated."""
+    from app import main
+    H = {"Authorization": "Bearer test-api-token"}
+
+    checker = main.app.state.update_checker
+
+    async def fake_check():
+        main.app.state.update_info = {
+            "version": "1.8.2", "latest": "1.9.0",
+            "update_available": True, "checked_ms": 123, "enabled": True}
+        return True
+
+    monkeypatch.setattr(checker, "_check_once", fake_check)
+    r = client.post("/api/update/check", headers=H)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["update_available"] is True and body["latest"] == "1.9.0"
+    assert "disk" in body
+
+    async def fake_fail():
+        return False
+
+    monkeypatch.setattr(checker, "_check_once", fake_fail)
+    assert client.post("/api/update/check", headers=H).status_code == 502
+
+    monkeypatch.setenv("UPDATE_CHECK", "0")
+    r = client.post("/api/update/check", headers=H)
+    assert r.status_code == 409 and "disabled" in r.json()["detail"]
+
+    assert client.post("/api/update/check").status_code == 401
+
+
+# ── graceful major upgrades (1.9): the vouching manifest ────────────────
+
+def _manifest_handler(status=200, body=None):
+    import httpx as _hx
+
+    def handler(request):
+        assert "raw.githubusercontent.com" in str(request.url)
+        assert str(request.url).endswith("/upgrade.json")
+        # R12 sub-ledger: the manifest must come from the TARGET release's
+        # tag — fetching main's copy would let a future release vouch for
+        # a past one.
+        assert "/v2.0.0/" in str(request.url)
+        if body is None:
+            return _hx.Response(status)
+        return _hx.Response(status, json=body)
+    return handler
+
+
+def test_manifest_vouching_matrix(wired, monkeypatch):
+    """seamless_from at or below the running version lifts the gate; above
+    it, absent, unreachable, or malformed all fail CLOSED."""
+    _, su = wired
+
+    def allows(status=200, body=None, current="1.9.2"):
+        _mock_httpx(monkeypatch, _manifest_handler(status, body))
+        return asyncio.run(su.upgrade_manifest_allows("2.0.0", current))
+
+    assert allows(body={"seamless_from": "1.9.0"}) is True
+    assert allows(body={"seamless_from": "1.0.0"}) is True
+    # This server is too old for the vouch — release notes it is.
+    assert allows(body={"seamless_from": "1.9.0"}, current="1.7.1") is False
+    assert allows(status=404) is False                    # no manifest
+    assert allows(body={"wrong": "shape"}) is False       # malformed
+    assert allows(body={"seamless_from": 190}) is False   # non-string
+    # Unparseable floors fail CLOSED (R12): parse_version returns (0,) for
+    # garbage, and current >= (0,) is always true — before the regex guard
+    # (96abd2d) every one of these silently lifted the major gate.
+    assert allows(body={"seamless_from": "soon"}) is False
+    assert allows(body={"seamless_from": "2.x"}) is False
+    assert allows(body={"seamless_from": ""}) is False
+    # The v-prefixed spelling of a valid floor still counts.
+    assert allows(body={"seamless_from": "v1.9.0"}) is True
+
+    def boom(request):
+        raise __import__("httpx").ConnectError("offline")
+    _mock_httpx(monkeypatch, boom)
+    assert asyncio.run(su.upgrade_manifest_allows("2.0.0", "1.9.2")) is False
+
+
+def test_update_apply_major_gate_honors_the_vouch(client, monkeypatch):
+    """End to end through POST /api/update/apply: an unvouched major keeps
+    the classic 409; a vouched one clears the MAJOR gate and proceeds to
+    the next guard (published image — proving the gate is what lifted).
+    A deploy token is present throughout: the token check runs BEFORE the
+    vouch fetch now (R12), so a token-less instance never pays the network
+    round-trip for a foregone 409."""
+    from app import main, self_update
+    H = {"Authorization": "Bearer test-api-token"}
+    monkeypatch.setenv("FLY_API_TOKEN", "x" * 20)
+    main.app.state.update_info = {"latest": "2.0.0", "update_available": True}
+
+    async def no_vouch(latest, current):
+        return False
+    monkeypatch.setattr(self_update, "upgrade_manifest_allows", no_vouch)
+    r = client.post("/api/update/apply", headers=H)
+    assert r.status_code == 409 and "major" in r.json()["detail"]
+
+    async def vouched(latest, current):
+        assert latest == "2.0.0"
+        return True
+
+    async def no_image(repo, tag):
+        return False
+    monkeypatch.setattr(self_update, "upgrade_manifest_allows", vouched)
+    monkeypatch.setattr(self_update, "image_exists", no_image)
+    r = client.post("/api/update/apply", headers=H)
+    assert r.status_code == 409 and "no published image" in r.json()["detail"]
+
+
+def test_auto_update_still_never_crosses_majors(wired):
+    """AUTO_UPDATE deliberately ignores the manifest: unattended upgrades
+    stay same-major; era changes get a human pressing the button once."""
+    _, su = wired
+    now = 1_000 * 3_600_000
+    ok, _why = su.eligible("2.0.0", "1.9.2", now - 99 * 3_600_000, now,
+                           48 * 3_600_000)
+    assert ok is False

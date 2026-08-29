@@ -48,9 +48,23 @@ def _provider_jwt() -> str:
     return tok
 
 
-def build_payload(title: str, body: str) -> dict:
-    """Standard alert aps payload."""
-    return {"aps": {"alert": {"title": title, "body": body}, "sound": "default"}}
+# The interruption levels this backend will ever stamp on a push (1.9).
+# "time-sensitive" needs the app's Time Sensitive entitlement and breaks
+# through Focus modes; "active" is the platform default. "critical" is
+# deliberately absent — that's an Apple-granted entitlement we don't hold.
+INTERRUPTION_LEVELS = ("active", "time-sensitive")
+
+
+def build_payload(title: str, body: str,
+                  interruption_level: str | None = None) -> dict:
+    """Standard alert aps payload. `interruption_level` is only stamped
+    when it's a non-default level we know — an unknown string must not
+    reach Apple, and omitting the key IS "active"."""
+    aps: dict = {"alert": {"title": title, "body": body}, "sound": "default"}
+    if interruption_level in INTERRUPTION_LEVELS and \
+            interruption_level != "active":
+        aps["interruption-level"] = interruption_level
+    return {"aps": aps}
 
 
 def build_live_activity_start(attributes_type: str, attributes: dict,
@@ -186,11 +200,13 @@ async def _push_tokens(tokens: list[dict], title: str, body: str,
 async def _push_via_relay(tokens: list[str], title: str, body: str,
                           url: str, token: str,
                           la_payload: dict | None = None,
-                          push_type: str = "liveactivity") -> dict:
+                          push_type: str = "liveactivity",
+                          interruption_level: str | None = None) -> dict:
     """Send through a shared relay instead of signing locally. For self-hosters
     who don't run their own APNs key: the relay holds the key, fans out to
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
-    body, env} — the relay enforces that shape."""
+    body, env} (+ the optional constrained interruption_level, 1.9) — the
+    relay enforces that shape."""
     env = (settings.apns_env or "").strip()
     if env not in _HOSTS:
         # Same refuse-to-guess semantics as _resolve_env on the own-key path:
@@ -202,6 +218,11 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
                   settings.apns_env, len(tokens))
         return {"sent": 0, "dead": [], "failed": len(tokens)}
     payload = {"tokens": tokens, "title": title, "body": body, "env": env}
+    if (interruption_level in INTERRUPTION_LEVELS
+            and interruption_level != "active"):
+        # Only when non-default: a pre-1.9 relay (extra=forbid) rejects
+        # unknown fields, so plain pushes must stay byte-identical.
+        payload["interruption_level"] = interruption_level
     if la_payload is not None:
         # Live Activity through the relay: the raw ActivityKit payload rides
         # alongside; a pre-1.7 relay rejects unknown fields loudly rather
@@ -213,6 +234,14 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(url, headers=headers, json=payload)
+            if (r.status_code == 422 and "interruption_level" in payload):
+                # Pre-1.9 relay: degrade to a NORMAL push rather than no
+                # push at all — an urgent alert that arrives quietly beats
+                # one that never arrives.
+                log.warning("relay rejected interruption_level (pre-1.9 "
+                            "relay?) — retrying as a standard push")
+                payload.pop("interruption_level")
+                r = await client.post(url, headers=headers, json=payload)
     except Exception as e:
         log.warning("relay push failed: %s", e)
         return {"sent": 0, "dead": [], "failed": len(tokens)}
@@ -242,9 +271,11 @@ async def effective_relay() -> tuple[str | None, str | None]:
 async def send_live_activity_start(payload: dict, title: str, body: str,
                                    activity: str = "rain") -> dict:
     """Fan a prebuilt ActivityKit start payload out to every push-to-start
-    token registered for `activity` — the tokens are per-attributes-type,
-    so cross-sending starts the wrong Activity. Own APNs key preferred,
-    hosted relay otherwise; prunes dead tokens like send_to_all."""
+    token. Start tokens are APP-WIDE (one per device; iOS hands every
+    attributes type the same token — proven live 2026-08-27), so the
+    lookup ignores `activity`; the payload's attributes-type is what
+    picks WHICH Activity starts. Own APNs key preferred, hosted relay
+    otherwise; prunes dead tokens like send_to_all."""
     rows = await db.list_live_activity_tokens("start", activity=activity)
     if not rows:
         return {"sent": 0, "dead": [], "failed": 0}
@@ -254,11 +285,25 @@ async def send_live_activity_start(payload: dict, title: str, body: str,
     else:
         url, relay_token = await effective_relay()
         if not (url and relay_token):
-            return {"sent": 0, "dead": [], "failed": len(rows)}
+            # No channel is a NO-OP, not a failure (R16): send_to_all
+            # already reads this state as "nothing to deliver to", and a
+            # failed:N here made the morning-report retry loop re-run the
+            # whole digest every tick until midnight on servers whose
+            # push channel lapsed but whose tokens remained.
+            log.info("live activity send skipped: tokens registered but "
+                     "no push channel configured")
+            return {"sent": 0, "dead": [], "failed": 0}
         res = await _push_via_relay([r["token"] for r in rows], title, body,
                                     url, relay_token, la_payload=payload)
-    for tok in res.get("dead", []):
-        await db.remove_live_activity_token(tok)
+    # Prune failures must not clobber a successful send (R16): APNs has
+    # already accepted the deliveries, and an exception here would read
+    # as sent_any=False upstream — next tick re-sends and STACKS cards,
+    # the exact hole the per-half retry stamps exist to close.
+    try:
+        for tok in res.get("dead", []):
+            await db.remove_live_activity_token(tok)
+    except Exception:
+        log.exception("dead live-activity token prune failed (send stands)")
     return res
 
 
@@ -276,11 +321,25 @@ async def send_live_activity_update(activity: str, payload: dict,
     else:
         url, relay_token = await effective_relay()
         if not (url and relay_token):
-            return {"sent": 0, "dead": [], "failed": len(rows)}
+            # No channel is a NO-OP, not a failure (R16): send_to_all
+            # already reads this state as "nothing to deliver to", and a
+            # failed:N here made the morning-report retry loop re-run the
+            # whole digest every tick until midnight on servers whose
+            # push channel lapsed but whose tokens remained.
+            log.info("live activity send skipped: tokens registered but "
+                     "no push channel configured")
+            return {"sent": 0, "dead": [], "failed": 0}
         res = await _push_via_relay([r["token"] for r in rows], title, body,
                                     url, relay_token, la_payload=payload)
-    for tok in res.get("dead", []):
-        await db.remove_live_activity_token(tok)
+    # Prune failures must not clobber a successful send (R16): APNs has
+    # already accepted the deliveries, and an exception here would read
+    # as sent_any=False upstream — next tick re-sends and STACKS cards,
+    # the exact hole the per-half retry stamps exist to close.
+    try:
+        for tok in res.get("dead", []):
+            await db.remove_live_activity_token(tok)
+    except Exception:
+        log.exception("dead live-activity token prune failed (send stands)")
     return res
 
 
@@ -323,12 +382,16 @@ async def push_configured() -> bool:
     return bool(url and token)
 
 
-async def send_to_all(title: str, body: str) -> dict:
+async def send_to_all(title: str, body: str,
+                      interruption_level: str | None = None) -> dict:
     """Push to every registered token, split by platform:
       * iOS tokens → local APNs key (preferred) or the hosted relay.
       * Android tokens → FCM (HTTP v1).
     Prunes dead tokens from whichever path reports them. No-op per platform
-    when that platform's push isn't configured."""
+    when that platform's push isn't configured.
+
+    `interruption_level` (1.9): "time-sensitive" for the urgent tier —
+    iOS-only, FCM ignores it (Android priority is a separate scheme)."""
     from . import fcm
     own = settings.apns_configured
     relay_url, relay_token = await effective_relay()
@@ -346,7 +409,9 @@ async def send_to_all(title: str, body: str) -> dict:
 
     # iOS
     if ios and own:
-        res = await _push_tokens(ios, title, body)
+        res = await _push_tokens(
+            ios, title, body,
+            payload=build_payload(title, body, interruption_level))
         sent += res.get("sent", 0)
         failed += res.get("failed", 0)
         dead += res.get("dead", [])
@@ -369,7 +434,8 @@ async def send_to_all(title: str, body: str) -> dict:
             sendable.append(t)
         if sendable:
             res = await _push_via_relay([t["token"] for t in sendable], title,
-                                        body, relay_url, relay_token)  # type: ignore[arg-type]
+                                        body, relay_url, relay_token,  # type: ignore[arg-type]
+                                        interruption_level=interruption_level)
             sent += res.get("sent", 0)
             failed += res.get("failed", 0)
             # Prune only tokens whose env was their OWN stored value. For a
@@ -393,9 +459,15 @@ async def send_to_all(title: str, body: str) -> dict:
         sent += res.get("sent", 0); failed += res.get("failed", 0)
         dead += res.get("dead", [])
 
-    for tok in dead:
-        await db.remove_push_token(tok)
-        pruned += 1
+    # Same prune isolation as the live-activity path (R16): the sends
+    # above already happened; a transient DB error must not turn them
+    # into a reported non-delivery.
+    try:
+        for tok in dead:
+            await db.remove_push_token(tok)
+            pruned += 1
+    except Exception:
+        log.exception("dead push-token prune failed (sends stand)")
 
     if sent == 0 and failed == 0 and pruned == 0:
         return {"sent": 0, "skipped": "no push channel for the registered tokens"}

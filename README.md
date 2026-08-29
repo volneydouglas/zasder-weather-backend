@@ -37,7 +37,10 @@ as separate device rows in the iOS app.
 | **B. Davis WeatherLink cloud** | Davis Vantage Vue / Pro 2 + WeatherLink Console (any) | 1–5 min cadence (subscription-tier dependent) | Davis VP2 + 6313 Console works only via cloud — the new console doesn't broadcast in the legacy unencrypted protocol. |
 | **C. LilyGO 433 MHz** | LilyGO T3 LoRa32 V1.6.1 board (~$20), AcuRite Atlas — or any 433 MHz OOK station via **discovery mode** | ~16s real-time | Captures AcuRite Atlas first-class; `forward_all=1` additionally posts any decoded 433 MHz weather station (LaCrosse, Oregon Scientific, AcuRite towers/5-in-1, Auriol, TFA, … ~180 protocols). |
 | **D. LilyGO 915 MHz** | Second LilyGO board, Fine Offset / AmbientWeather WS-2000 outdoor + WH32B indoor — or other 915 MHz FSK stations via **discovery mode** | ~16s real-time | Captures Fineoffset family (FSK) first-class; merges WH32B indoor data into the outdoor station's tile grid. |
+| **E. Davis WeatherLink Live LAN** | A WLL gateway + any always-on LAN host (Pi, Mac, NAS) | ~2s freshness | The better Davis path when the WLL and a small host share a LAN — no API key, no cloud round-trip. |
 | **F. WeatherFlow Tempest cloud** | A Tempest station (no extra hardware) | 60s cadence | Free personal access token from tempestwx.com. Also configurable from the app: Settings → Integrations. |
+| **G. Ecowitt gateway LAN** | Any Ecowitt gateway/console (GW1000–GW3000, HP2551-class) | 16s+ | The gateway POSTs its "Customized" upload straight to the backend — no vendor cloud, no extra hardware. HTTP-only firmware: direct against local Docker; a cloud backend needs a small LAN forwarder. |
+| **H. WeeWX bridge** | A station already running under WeeWX (70+ families) | your archive interval | One extension forwards every archive record; WeeWX keeps doing everything it does today. |
 
 Board to buy for C/D: **LilyGO T3 LoRa32 V1.6.1** from the
 [official LilyGO store](https://lilygo.cc/products/lora3) — variant
@@ -287,6 +290,57 @@ No terminal? The app can configure this instead: **Settings →
 Integrations → WeatherFlow Tempest** — app-stored values win over these
 env values.
 
+## Path G — Ecowitt gateway (LAN, direct — no relay needed)
+
+Every Ecowitt gateway and console (GW1000 through GW3000, HP2551-class
+displays) can POST its readings straight to your backend — no vendor
+cloud, no extra hardware, nothing to install. In the WSView Plus app (or
+the gateway's web UI): **… → Customized**, then set
+
+- **Protocol**: Ecowitt
+- **Server / IP**: your backend's LAN hostname or IP (no `http://`)
+- **Path**: `/ingest/ecowitt?token=<your INGEST_TOKEN>`
+- **Port**: 8080 (the docker-compose default), **Upload interval**: 16s
+  or higher
+
+**The gateway speaks plain HTTP only — it cannot do TLS.** That means
+this path works directly against a backend on your own network (the
+docker-compose setup above), but NOT against an HTTPS-only host like a
+Fly deploy: pointed at port 443 every upload fails silently, and port 80
+just gets a redirect the firmware won't follow. For a cloud-hosted
+backend, run any small TLS-terminating forwarder on the LAN and aim the
+gateway at it — a one-line Caddyfile does it:
+
+```
+:8081
+reverse_proxy https://your-app.fly.dev {
+	header_up Host your-app.fly.dev
+}
+```
+
+The token rides the path because Ecowitt firmware cannot send HTTP
+headers — treat that URL like the credential it contains, and remember
+the gateway→backend hop is cleartext on your LAN. Readings
+arrive in US-native units (the storage convention, no conversion loss),
+per-sensor battery flags are normalized into the health watcher, and on
+dual-rain stations (say a WS90's haptic sensor plus a WH40 tipping
+gauge) the tipping gauge wins wherever both report — haptic rain
+phantom-tips when the mast gets bumped.
+
+## Path H — already running WeeWX? Bridge it over
+
+If WeeWX already runs your station — any of its 70+ supported station
+families — one small extension sends every archive record to your backend
+too. WeeWX keeps doing everything it does today.
+
+```sh
+weectl extension install /path/to/weewx-bridge   # WeeWX 5
+```
+
+Then set `server_url` and `ingest_token` under `[StdRESTful] [[Zasder]]`
+in `weewx.conf` and restart WeeWX. Full details in
+**[weewx-bridge/README.md](weewx-bridge/README.md)**.
+
 ## Path E — Davis WeatherLink LIVE (LAN, local poller)
 
 If your Davis station has a **WeatherLink Live** gateway (the small box that
@@ -383,7 +437,20 @@ override the env defaults and take effect within a minute, no redeploy.
 
 **Threshold alerts** (e.g. "temp above 100°F", "any rain") are stored
 server-side too, via `/api/alerts/rules`, and evaluated against incoming data
-so they fire even when the app is closed.
+so they fire even when the app is closed. Each rule carries an urgency —
+**minor / standard / major / urgent** (1.9 adds major): minor holds during
+quiet hours and rides the daily digest, standard always pushes except
+during quiet hours, major ignores quiet hours, and urgent additionally
+arrives Time Sensitive on iOS (breaks through Focus — for alerts worth
+waking up for).
+
+**Morning report** (1.9): pick a digest hour in the app (Settings →
+Notifications) and each morning you get a full weather report —
+yesterday's highs, lows, rain, and gusts per station, the overnight alert
+log, and today's outlook — as a formatted HTML email plus a compact push.
+With the iOS app installed, the same report also lands as a lock-screen
+Live Activity card that dismisses itself by mid-morning. The email half
+needs the SMTP config above; the phone half works on push alone.
 
 ## Push notifications (optional)
 
@@ -407,6 +474,25 @@ account and is the simplest default — push is an optional upgrade:
   each registered token's platform.
 
 See `.env.example` for the blocks. Leave all of it unset to use email only.
+
+## Sharing your station (optional)
+
+The iOS app can mint **share links** so family or a co-op can see (or help
+run) your station without holding your API token:
+
+- **Read links** — full dashboard, charts, and history, but read-only and
+  with your infrastructure hidden (no SMTP identity, no token lists, no
+  backups). Revocable one by one from the app.
+- **Write links** (1.9) — everything a read link shows, plus station
+  operations: rename or relocate a device, toggle per-device alerts, edit
+  threshold rules, register the holder's own phone for push, start a
+  storm watch. Everything administrative — tokens, credentials, backups,
+  updates, retention, device deletion — stays owner-only. Every write is
+  attributed: `GET /api/write-audit` shows who changed what and when
+  (label + token tail, never the credential itself).
+
+Guest read tokens can also be provisioned by env (`GUEST_API_TOKENS`) for
+setups without the app.
 
 ## Public dashboard (optional)
 
@@ -449,14 +535,36 @@ palette can pin it: `/embed?theme=light` or `/embed?theme=dark`. Every other pag
 anti-framing headers — `/embed` is the one page designed to be framed.
 Live example: <https://weather.zasder.com/embed>.
 
-## Records
+## Records & climate
 
 `GET /api/devices/{mac}/records` returns per-metric highs & lows — with the
-local time each was set — over **today / this month / this year / all-time**
-(temperature, feels-like, dew point, humidity, pressure, wind, gust, UV, solar,
-rain). Results are cached 15 minutes per device. When the public dashboard is
-on, an all-time **Records** strip (hottest, coldest, peak gust, wettest day,
-high/low pressure) is rendered under the charts.
+local time each was set — over **today / past week / this month / this year /
+all-time** (temperature, feels-like, dew point, humidity, pressure, wind,
+gust, UV, solar, rain). Results are cached 15 minutes per device. When the
+public dashboard is on, an all-time **Records** strip (hottest, coldest, peak
+gust, wettest day, high/low pressure) is rendered under the charts.
+
+Three climate endpoints (1.9) answer the longer
+questions from the same rollups: `/api/devices/{mac}/climate?year=` gives
+twelve month rows (means, extremes with dates, rain, heating/cooling/
+growing degree days) plus annual totals and the running **water year**
+(`WATER_YEAR_START_MONTH`, default October — set `1` for calendar year);
+`/api/devices/{mac}/daily-series` serves one row per local day for
+year-span charts; and `/api/devices/{mac}/reports/noaa?year=[&month=]`
+renders the classic NOAA-style fixed-width climate report as plain text.
+
+## History retention (optional)
+
+By default every reading is kept forever. On multi-year archives you can
+opt into aging: raw rows older than `HISTORY_DETAIL_DAYS` are thinned to
+one per `HISTORY_KEEP_INTERVAL_MINUTES`, and/or each row's raw JSON
+payload (most of its bytes) is dropped past `HISTORY_JSON_DETAIL_DAYS`
+while every charted field keeps its typed column. Daily rollups preserve
+every day's true extremes either way, so records and climate stay exact.
+The iOS app manages the same settings at `GET/PUT /api/history-retention`
+(app-stored values win over env), and `GET /api/storage` shows where the
+database's bytes actually live. See `.env.example` for the knobs and
+floors.
 
 ## Smart alerts (optional)
 
@@ -470,6 +578,17 @@ threshold alerts:
   `SMART_ALERT_PRESSURE_DROP_INHG` (0.06 inHg) over 3 hours → storm approaching.
 
 Each fires once when the condition starts and re-arms when it clears.
+
+## AirGradient air quality (optional)
+
+Have an [AirGradient](https://www.airgradient.com/) monitor? One account
+token (app: **Settings → Integrations → AirGradient**) polls every monitor
+on the account; each location becomes its own device with PM1/PM2.5/PM10,
+CO2, and TVOC/NOx columns. Air monitors stay out of the weather-station
+machinery (uploads, forecast location, NWS polling, public page) by
+design. A LAN-local backend can skip the cloud entirely (1.9): set
+`AIRGRADIENT_LOCAL_HOSTS` to the monitors' hostnames/IPs and the backend
+reads their local API directly.
 
 ## Prometheus & Grafana (optional)
 
@@ -525,6 +644,14 @@ and if you want the deploy *capability* gone too, not just unused, remove the
 token: `fly secrets unset FLY_API_TOKEN --app <your-app>`.
 The full knob list (delay hours, image repository) is in `.env.example`.
 
+**Major versions** (1.9+): the one-tap update in the app normally stops at
+a major-version boundary, because a major can carry manual steps. A release
+that needs none *vouches* for itself (an `upgrade.json` at its tag stating
+the oldest version it installs onto hands-free), and the one-tap path then
+works across the boundary too. Unvouched majors keep the classic
+follow-the-release-notes flow, and automatic updates never cross a major
+either way.
+
 To upgrade, from the repo directory:
 
 ```sh
@@ -564,10 +691,12 @@ published image from
 ## What's in this repo
 
 ```
-app/                    FastAPI app — pollers, /ingest/custom, /api/*, status page
+app/                    FastAPI app — pollers, ingest routes, /api/*, status page
 tests/                  pytest suite (run `pytest -q`)
 lilygo-relay/           ESP32+SX1276 firmware (PlatformIO project)
 wll-poller/             Davis WeatherLink Live LAN poller (Path E)
+weewx-bridge/           WeeWX extension → /ingest/custom (Path H)
+mcp/                    Read-only MCP server — your stations, readable by an AI assistant
 bin/setup-fly.sh        Path-based Fly.io setup (sources → app, volume, secrets, summary)
 bin/setup-local.sh      Guided local Docker setup (tokens, .env, docker compose up)
 bin/doctor.sh           Health checklist (auth, /healthz, tokens, volume, pollers, data)
@@ -592,10 +721,16 @@ calls these. Public-readable status page at `/`.
 | GET | `/api/devices/{mac}/current` | Composite latest-non-null per field |
 | GET | `/api/devices/{mac}/history?hours=24` | Time series, auto-bucketed for 3d/7d/30d. Optional `end_ms=` sets the window END (epoch ms) to page back through older/imported history |
 | GET | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg/median + when |
-| GET | `/api/devices/{mac}/records` | All-time / yearly / monthly / today highs & lows per metric, with when each was set |
+| GET | `/api/devices/{mac}/records` | All-time / yearly / monthly / weekly / today highs & lows per metric, with when each was set |
+| GET | `/api/devices/{mac}/climate?year=` | Monthly climate rows (means, extremes, rain, degree days) + annual totals + water year |
+| GET | `/api/devices/{mac}/daily-series` | One row per local day (min/max/mean temp, rain, peak gust) for year-span charts |
+| GET | `/api/devices/{mac}/reports/noaa?year=[&month=]` | Classic NOAA-style fixed-width climate report, plain text |
+| GET | `/api/devices/{mac}/storms` | Recent closed storm episodes — the structured stats behind each storm summary |
+| GET/PUT | `/api/history-retention` | History-aging settings (thin/JSON windows) — app-stored values win over the `HISTORY_*` env vars |
+| GET | `/api/write-audit` | Attribution log for write-share links: who changed what, when (owner-only) |
 | GET | `/api/sources` | Health of each ingest source (last success, last error) — tells a dead API key from dead hardware |
-| GET | `/api/insights?mac=` | Server-side statistics rollups. Needs `INSIGHTS=1`; on existing data run the rebuild below once |
-| POST | `/api/insights/rebuild` | One-time rollup backfill after enabling `INSIGHTS` (optional `?mac=`) |
+| GET | `/api/insights?mac=` | Server-side statistics rollups (on by default since 1.9; `INSIGHTS=0` disables) |
+| POST | `/api/insights/rebuild` | Force a rollup rebuild (optional `?mac=`) — normally unneeded, a backfill self-schedules on boot |
 | POST | `/api/import/wu` | Start a Weather Underground history import into a device (`dry_run` supported); progress at GET `/api/import/wu/status` |
 | GET/PUT | `/api/config/wu-key` | Server-stored WU API key (write-only — GET reports only configured/source; falls back to the `WU_API_KEY` env var) |
 | GET/PUT | `/api/devices/{mac}/wu-station` | WU station ID associated with a device — the import target mapping, plus live WU forwarding: `upload_key` (the WU *station* key, write-only — GET reports only `upload_key_set`) and `upload_enabled` turn on per-reading uploads to wunderground.com, keeping a WU station alive when MyAcurite/other forwarding shuts down. Upload health appears in `/api/sources` (`wu_upload` block) |
@@ -608,7 +743,10 @@ calls these. Public-readable status page at `/`.
 | POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
 | POST | `/api/push/register` | Register a push token (iOS APNs or Android FCM — `platform` field) |
 | GET/PUT | `/api/push/relay` | App-managed relay config (URL + token); token write-only, never returned. PUT enforces `https://` + rejects private/loopback hosts |
+| GET | `/api/storage` | Where the database's bytes live: per-table sizes, the data_json split, thinning state |
+| POST | `/api/update/check` | Run the daily release check right now (the background check is once a day) |
 | POST | `/ingest/custom` | Source posts a normalized observation. `Authorization: Bearer <INGEST_TOKEN>` |
+| POST | `/ingest/ecowitt` | Ecowitt gateway "Customized" upload (form-encoded; imperial or metric consoles both work — metric keys are converted on ingest). Set the gateway's path to `/ingest/ecowitt?token=<INGEST_TOKEN>` — Ecowitt firmware can't send headers |
 | POST | `/ingest/discovery` | Source posts a `(model, id)` RF sighting |
 | GET | `/api/discoveries?since_hours=24` | Long-tail RF device survey |
 

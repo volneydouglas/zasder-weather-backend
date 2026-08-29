@@ -100,7 +100,7 @@ def test_front_group_keeps_outflow_warning_tier(client, monkeypatch):
     async def fake_push_configured():
         return True
 
-    async def fake_send_to_all(title, body):
+    async def fake_send_to_all(title, body, interruption_level=None):
         pushes.append(title)
         return {"sent": 1}
     monkeypatch.setattr(apns, "push_configured", fake_push_configured)

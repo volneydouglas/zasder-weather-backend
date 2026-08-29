@@ -244,12 +244,16 @@ def build_threshold_message(device_name: str, field: str, value: float,
 # outflow detection. "front" is not in this list — it is the GROUPED
 # delivery when several rate alerts fire on the same tick (see
 # _check_smart_alerts), never an independently-evaluated condition.
-# ── severity tiers (1.8, Pillar A) ──────────────────────────────────────
-# Three tiers, the ops-world lesson applied to weather: the CHANNEL is
-# part of the signal. 'warning' = act now (breaks through quiet hours);
-# 'watch' = worth a normal push; 'info' = after-the-fact color that a
-# digest can carry. Unknown kinds default to watch — new alerts should
-# have to EARN silence, not legibility.
+# ── severity tiers (1.8, Pillar A; 'major' added 1.9) ───────────────────
+# The ops-world lesson applied to weather: the CHANNEL is part of the
+# signal. 'warning' = act now (breaks through quiet hours AND arrives
+# Time Sensitive on iOS, punching Focus modes); 'major' = the 1.9 middle
+# ground — delivered during quiet hours but as a NORMAL notification, so
+# the phone's own Focus rules still apply (Volney: "for people that want
+# to know during quiet hours but not always time sensitive related");
+# 'watch' = worth a normal push, muted overnight; 'info' = after-the-fact
+# color that a digest can carry. Unknown kinds default to watch — new
+# alerts should have to EARN silence, not legibility.
 ALERT_SEVERITY: dict[str, str] = {
     "lightning": "warning",
     "outflow": "warning",
@@ -261,6 +265,7 @@ ALERT_SEVERITY: dict[str, str] = {
     "sensor_recovered": "info",
     "device_recovered": "info",
     "battery_recovered": "info",
+    "disk_recovered": "info",
 }
 
 
@@ -268,14 +273,20 @@ def severity_of(kind: str) -> str:
     return ALERT_SEVERITY.get(kind, "watch")
 
 
-# Per-rule urgency (1.8, Volney: "high wind urgent, temp over 100 minor").
-# User-facing levels map onto the delivery tiers: urgent breaks quiet
-# hours and wears the red chip; standard is a normal push; minor pushes
-# by day, is MUTED overnight (not queued — history and the morning digest
-# carry it), and rides the digest. Default MINOR — new and
-# existing rules start at the quiet end and get promoted deliberately.
-RULE_SEVERITIES = ("minor", "standard", "urgent")
-_RULE_TIER = {"minor": "info", "standard": "watch", "urgent": "warning"}
+# Per-rule urgency (1.8, Volney: "high wind urgent, temp over 100 minor";
+# 'major' added 1.9). User-facing levels map onto the delivery tiers:
+# urgent breaks quiet hours AND arrives Time Sensitive (punches Focus);
+# major breaks quiet hours as a normal notification; standard is a normal
+# push; minor pushes by day, is MUTED overnight (not queued — history and
+# the morning digest carry it), and rides the digest. Default MINOR — new
+# and existing rules start at the quiet end and get promoted deliberately.
+RULE_SEVERITIES = ("minor", "standard", "major", "urgent")
+_RULE_TIER = {"minor": "info", "standard": "watch",
+              "major": "major", "urgent": "warning"}
+
+# Tiers that the quiet-hours gate lets through. 'warning' additionally
+# rides Time Sensitive — see _deliver.
+_QUIET_HOURS_EXEMPT = ("warning", "major")
 
 
 def rule_tier(severity: str | None) -> str:
@@ -551,14 +562,18 @@ async def effective_config() -> EffectiveAlertConfig:
 
 # ───────────────────────── SMTP delivery ─────────────────────────
 def _send_sync(subject: str, body: str, to_list: list[str],
-               cfg: EffectiveAlertConfig) -> None:
+               cfg: EffectiveAlertConfig, html: str | None = None) -> None:
     """Blocking SMTP send — run via asyncio.to_thread. Uses the resolved
-    transport (DB over env). STARTTLS (587), implicit SSL (465), or plain."""
+    transport (DB over env). STARTTLS (587), implicit SSL (465), or plain.
+    `html` (1.9, the weather-report digest) rides as a multipart
+    alternative: text stays the fallback for clients that refuse HTML."""
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = cfg.smtp_from or cfg.smtp_username or "zasder-weather@localhost"
     msg["To"] = ", ".join(to_list)
     msg.set_content(body)
+    if html:
+        msg.add_alternative(html, subtype="html")
 
     host, port = cfg.smtp_host, cfg.smtp_port
     user, pw = cfg.smtp_username, cfg.smtp_password
@@ -614,11 +629,12 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
     fired as fresh if push was enabled weeks later. Muted is handled, not
     failed; only an ATTEMPTED channel that failed should trigger the
     caller's retry-next-tick path."""
-    # 1.8 quiet hours: below-warning pushes hold their tongue at night.
-    # Email is inherently quiet and unaffected; the alert still lands in
-    # history, so the Recently Triggered list carries the overnight story.
+    # 1.8 quiet hours (+ 'major' 1.9): below-major pushes hold their
+    # tongue at night; major and warning go through. Email is inherently
+    # quiet and unaffected; the alert still lands in history, so the
+    # Recently Triggered list carries the overnight story.
     eff_severity = severity or severity_of(kind)
-    if (push_ok and eff_severity != "warning"
+    if (push_ok and eff_severity not in _QUIET_HOURS_EXEMPT
             and in_quiet_hours(int(time.time() * 1000), settings.timezone,
                                getattr(cfg, "quiet_start_min", None),
                                getattr(cfg, "quiet_end_min", None))):
@@ -634,7 +650,14 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
             log.exception("alert email send failed: %s", e)
     if push_ok and await apns.push_configured():
         try:
-            res = await apns.send_to_all(push_title, push_body)
+            # Urgent (warning tier) rides Time Sensitive (1.9): the server
+            # already refuses to hold it back; this makes the PHONE treat
+            # it the same way (breaks Focus, needs the app entitlement).
+            # 'major' deliberately does not — it bypasses quiet hours only.
+            level = ("time-sensitive" if eff_severity == "warning"
+                     else None)
+            res = await apns.send_to_all(push_title, push_body,
+                                         interruption_level=level)
             if res.get("sent"):
                 delivered = True
             elif res.get("failed"):
@@ -745,6 +768,13 @@ class AlertMonitor:
             await db.flush_ingest_last_used()
         except Exception as e:
             log.warning("ingest last-used flush failed: %s", e)
+        # Write-share audit rows (1.9): same buffered-sync-dep shape as the
+        # stamps above, same per-tick persistence so a restart loses at
+        # most one minute of attribution.
+        try:
+            await db.flush_write_audit()
+        except Exception as e:
+            log.warning("write-audit flush failed: %s", e)
         cfg = await effective_config()
         now_ms = int(time.time() * 1000)
         devices = await db.list_devices()
@@ -852,8 +882,27 @@ class AlertMonitor:
             await nws_watch.check(cfg, devices, now_ms, _deliver)
         except Exception:
             log.exception("nws watch failed")
-        # ── daily digest (1.8): the morning paper for the alert log.
-        await self._maybe_send_digest(cfg, now_ms)
+        # ── disk space (1.9): server-level, not per-device, and not gated
+        # on smart_alerts — a filling volume is an operational fact, not a
+        # derived-weather opinion. It IS behind the alerts_open gate above
+        # (R11), deliberately: with zero channels the tier must NOT latch
+        # silently, or the operator who configures email next week never
+        # hears the edge that already fired. Edge-triggered inside, so
+        # every-tick is one cheap statvfs, not a nag.
+        from . import disk_watch
+        try:
+            await disk_watch.check(cfg, now_ms, _deliver)
+        except Exception:
+            log.exception("disk watch failed")
+        # ── daily digest (1.8; 1.9 turned it into the morning WEATHER
+        # REPORT — yesterday's numbers per station + outlook + alert log).
+        # Guarded like every sibling watch (R14): the rollup gathering +
+        # forecast fetch grew the failure surface, and an exception here
+        # was aborting storm summaries and the nowcast for the tick.
+        try:
+            await self._maybe_send_digest(cfg, devices, now_ms)
+        except Exception:
+            log.exception("morning report failed")
         # ── storm summary: one report per event, after the rain stops. Not
         # gated on smart_alerts — it is a different kind of thing, and the
         # rain counter it watches needs no derived inputs.
@@ -1030,6 +1079,20 @@ class AlertMonitor:
                                       kind="storm", mac=mac):
                         await db.upsert_storm_state(mac, None, None, field,
                                                     value, obs_ms)
+                        # 1.9 Storm Report card: keep the structured stats
+                        # this summary was built from. Best-effort — a
+                        # failed history write must never unsend a summary.
+                        try:
+                            await db.record_storm(mac, {
+                                "started_ms": summary.started_ms,
+                                "ended_ms": summary.ended_ms,
+                                "total_in": summary.total_in,
+                                "peak_rate_in_hr": summary.peak_rate_in_hr,
+                                "max_gust_mph": summary.max_gust_mph,
+                                "min_tempf": summary.min_tempf,
+                                "max_tempf": summary.max_tempf})
+                        except Exception:
+                            log.exception("storm history write failed")
                         log.info("storm summary sent for %s: %.2fin over %.1fh",
                                  dname, summary.total_in, summary.duration_hours)
                         # 1.8 Storm Watch: final Activity beat, silent —
@@ -1065,18 +1128,27 @@ class AlertMonitor:
             if started is not None:
                 await storm_watch.on_open_tick(cfg, d, started, now_ms, field)
 
-    async def _maybe_send_digest(self, cfg, now_ms: int) -> None:
-        """Daily digest (1.8, Pillar A): one morning email carrying
-        everything the alert log collected since the last digest — the
-        home for info-tier events and whatever quiet hours held back.
-        Sends once per local day, at/after the configured hour, only
-        when the email transport exists."""
-        if cfg.digest_hour is None or not cfg.enabled or not cfg.recipients:
+    async def _maybe_send_digest(self, cfg, devices, now_ms: int) -> None:
+        """Daily digest (1.8; rebuilt 1.9 as the morning WEATHER REPORT —
+        Volney: "like a weather report you see on the nightly news").
+        One email per local day at/after the configured hour: an anchor's
+        headline, yesterday's hi/lo/rain/gust per station off the rollups,
+        today's outlook (best-effort Open-Meteo), and the alert log —
+        which now includes the quiet days, because "nothing fired" is a
+        good report too. HTML in the share-card aesthetic with a plain
+        alternative; both built by app/digest.py."""
+        # digest_hour is the only hard gate now (1.9): a push-only install
+        # (no SMTP) still gets the phone half of the morning report. The
+        # email piece keeps its own transport guard below.
+        if cfg.digest_hour is None:
             return
+        email_ready = bool(cfg.enabled and cfg.recipients)
         try:
             tz = ZoneInfo(settings.timezone)
         except Exception:
-            tz = None
+            # UTC, not system-local (R14): rollup day keys fall back to
+            # UTC (insights._tz), and "yesterday" must agree with them.
+            tz = ZoneInfo("UTC")
         local = datetime.fromtimestamp(now_ms / 1000, tz)
         if local.hour < int(cfg.digest_hour):
             return
@@ -1085,31 +1157,213 @@ class AlertMonitor:
             last = int(raw) if raw else 0
         except ValueError:
             last = 0
+        email_done = False
         if last:
             last_local = datetime.fromtimestamp(last / 1000, tz)
-            if last_local.date() >= local.date():
-                return                        # already sent today
-        rows = await db.alerts_since(last or (now_ms - 86_400_000))
+            email_done = last_local.date() >= local.date()
+        # Each half retries on its OWN stamp (R15): the email stamp alone
+        # gated everything here, so a transient APNs outage during the
+        # phone send could never retry — the email's success stamped the
+        # whole day closed.
+        phone_done = (await db.get_kv("alerts.digest.phone_day")
+                      == local.date().isoformat())
+        if email_done and phone_done:
+            return                            # both halves delivered today
+
+        from . import digest as dg
+
+        # On a phone-retry tick the email stamp has already moved to this
+        # morning (R16): windowing from it would give the retried banner a
+        # different alert count than the email it accompanies. Use the
+        # same trailing day the original report described.
+        window_start = (now_ms - 86_400_000) if email_done \
+            else (last or (now_ms - 86_400_000))
+        rows = await db.alerts_since(window_start)
         rows = [r for r in rows if r["kind"] != "digest"]
-        if not rows:
+        alert_lines = [
+            dg.AlertLine(
+                when=datetime.fromtimestamp(r["ts_ms"] / 1000, tz)
+                    .strftime("%a %H:%M"),
+                title=r["title"],
+                severity=r.get("severity") or severity_of(r["kind"]))
+            for r in rows]
+
+        # Yesterday, per WEATHER station, off the daily rollups — the same
+        # rows the year charts and climate reports trust.
+        from datetime import timedelta as _td
+        from .climate import _rollup_rows
+        yday = (local.date() - _td(days=1)).isoformat()
+        stations: list = []
+        primary_coords: tuple[float, float] | None = None
+        for d in devices:
+            if db.is_air_monitor_device(d):
+                continue
+            rrows = await _rollup_rows(d["mac"], yday, yday)
+            if primary_coords is None:
+                c = (((d.get("info") or {}).get("coords") or {})
+                     .get("coords") or {})
+                if isinstance(c.get("lat"), (int, float)) \
+                        and isinstance(c.get("lon"), (int, float)):
+                    primary_coords = (float(c["lat"]), float(c["lon"]))
+            if not rrows:
+                continue
+            r = rrows[0]
+            stations.append(dg.StationDay(
+                name=d.get("name") or d["mac"],
+                tmax_f=r["tempf_max"], tmin_f=r["tempf_min"],
+                rain_in=r["rain_total"], gust_mph=r["windgustmph_max"],
+                humidity_lo=r["humidity_min"], humidity_hi=r["humidity_max"],
+                uv_max=r["uv_max"]))
+
+        # Nothing to say at all (no alerts, no rollups — INSIGHTS off on a
+        # quiet day): stamp and skip, exactly like the 1.8 behavior.
+        if not rows and not stations:
+            # Both stamps: with per-half retry gating (R15) an unstamped
+            # phone half would re-enter — and re-gather rollups — every
+            # tick for the rest of the day.
+            await db.set_kv("alerts.digest.last_ms", str(now_ms))
+            await db.set_kv("alerts.digest.phone_day",
+                            local.date().isoformat())
+            return
+
+        # Today's outlook — best-effort, ten seconds, the report stands
+        # without it. Same Open-Meteo daily fields the forecast route uses.
+        outlook = None
+        if primary_coords is None and settings.forecast_lat is not None \
+                and settings.forecast_lon is not None:
+            primary_coords = (settings.forecast_lat, settings.forecast_lon)
+        if primary_coords is not None:
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(
+                        "https://api.open-meteo.com/v1/forecast",
+                        params={"latitude": primary_coords[0],
+                                "longitude": primary_coords[1],
+                                "daily": "temperature_2m_max,"
+                                         "temperature_2m_min,"
+                                         "precipitation_probability_max",
+                                "temperature_unit": "fahrenheit",
+                                "forecast_days": 1,
+                                "timezone": settings.timezone})
+                    daily = resp.json().get("daily") or {}
+
+                    def _first(key):
+                        v = daily.get(key) or []
+                        return v[0] if v and isinstance(v[0], (int, float)) \
+                            else None
+                    outlook = dg.Outlook(
+                        hi_f=_first("temperature_2m_max"),
+                        lo_f=_first("temperature_2m_min"),
+                        precip_pct=(int(_first(
+                            "precipitation_probability_max"))
+                            if _first("precipitation_probability_max")
+                            is not None else None))
+            except Exception:
+                outlook = None
+
+        report = dg.Report(
+            date_label=local.strftime("%A, %B %-d"),
+            stations=stations, alerts=alert_lines, outlook=outlook)
+
+        # ── the phone half (1.9, Volney: "a daily digest for your phone
+        # first thing in the morning... like what we do with the storm").
+        # Its OWN daily stamp, separate from the email's: a failed email
+        # retries next tick, and re-sending the Live Activity + push each
+        # retry would stack morning cards on the lock screen.
+        await self._send_morning_phone(report, stations, local, now_ms)
+
+        if email_done:
+            return                  # only the phone half needed a retry
+        if not email_ready:
+            # No SMTP: the phone half above was the whole delivery. Stamp
+            # so the day is done.
             await db.set_kv("alerts.digest.last_ms", str(now_ms))
             return
-        lines = []
-        for r in rows:
-            t = datetime.fromtimestamp(r["ts_ms"] / 1000, tz)
-            lines.append(f"  {t.strftime('%a %H:%M')}  {r['title']}")
-        subject = (f"[Zasder Weather] Daily digest — "
-                   f"{len(rows)} alert{'s' if len(rows) != 1 else ''}")
-        body = ("Everything your stations reported since the last digest:\n\n"
-                + "\n".join(lines)
-                + "\n\nFull history lives in the app's Alerts tab.\n")
+        subject = ("[Zasder Weather] Morning report · "
+                   + local.strftime("%a %b %-d")
+                   + (f" · {len(rows)} alert{'s' if len(rows) != 1 else ''}"
+                      if rows else ""))
         try:
-            await asyncio.to_thread(_send_sync, subject, body,
-                                    cfg.recipients, cfg)
+            await asyncio.to_thread(_send_sync, subject,
+                                    dg.build_text(report),
+                                    cfg.recipients, cfg,
+                                    dg.build_html(report))
             await db.set_kv("alerts.digest.last_ms", str(now_ms))
-            log.info("daily digest sent: %d alerts", len(rows))
+            log.info("morning report sent: %d station(s), %d alert(s)",
+                     len(stations), len(rows))
         except Exception:
             log.exception("digest send failed; will retry next tick")
+
+    async def _send_morning_phone(self, report, stations, local,
+                                  now_ms: int) -> None:
+        """The morning report's lock-screen half: a push-to-start Live
+        Activity (yesterday's numbers + today's outlook, self-dismissing
+        by mid-morning — a newspaper, not a ticker) plus a compact push
+        banner. Best-effort and once per local day; the email is the
+        durable record."""
+        from . import apns, digest as dg
+        stamp = await db.get_kv("alerts.digest.phone_day")
+        today_key = local.date().isoformat()
+        if stamp == today_key:
+            return
+        lead = stations[0] if stations else None
+        # lead None (R15): an alerts-only day (station down overnight but
+        # the log has entries) still gets the compact push — push_text
+        # renders the no-station form — just no Live Activity card, which
+        # needs a station's numbers to draw.
+        title, body = dg.push_text(report)
+        sent_any = False
+        had_targets = False
+        if lead is not None:
+            try:
+                state = {"dateMs": now_ms,
+                         "hiF": lead.tmax_f, "loF": lead.tmin_f,
+                         "rainIn": lead.rain_in, "gustMph": lead.gust_mph,
+                         "todayHiF": report.outlook.hi_f
+                         if report.outlook else None,
+                         "todayLoF": report.outlook.lo_f
+                         if report.outlook else None,
+                         "precipPct": report.outlook.precip_pct
+                         if report.outlook else None}
+                # stale/dismiss ride the SEND time, not the digest hour
+                # (R16, deliberate): a report recovered at 14:00 still
+                # earns its few hours on the lock screen — a late paper
+                # is still that day's paper.
+                payload = apns.build_live_activity_start(
+                    "MorningReportActivityAttributes",
+                    {"stationName": lead.name}, state, title, body,
+                    now_s=now_ms // 1000,
+                    stale_s=(now_ms + 3 * 3_600_000) // 1000,
+                    dismiss_s=(now_ms + 5 * 3_600_000) // 1000)
+                res = await apns.send_live_activity_start(
+                    payload, title, body, activity="morning")
+                sent_any = bool(res.get("sent"))
+                had_targets = bool(res.get("sent") or res.get("failed")
+                                   or res.get("dead"))
+            except Exception:
+                had_targets = True     # the attempt itself died — retry
+                log.exception("morning live activity failed")
+        try:
+            if await apns.push_configured():
+                res = await apns.send_to_all(title, body)
+                sent_any = sent_any or bool(res.get("sent"))
+                had_targets = had_targets or bool(res.get("total"))
+        except Exception:
+            had_targets = True
+            log.exception("morning push failed")
+        # Stamp when something was DELIVERED, or when there was nothing to
+        # deliver to (no tokens — a token-less server must not retry the
+        # same no-op every tick all morning). A total delivery failure
+        # leaves the stamp unset so the next tick retries, matching the
+        # email half and the storm-watch sibling (R15: the old
+        # unconditional stamp lost the whole morning to one transient
+        # APNs outage).
+        if sent_any or not had_targets:
+            await db.set_kv("alerts.digest.phone_day", today_key)
+        if sent_any:
+            log.info("morning phone report sent (%s)",
+                     lead.name if lead else "alerts only")
 
     async def _check_seasonal_events(self, cfg, devices, now_ms: int) -> None:
         """One-shot seasonal markers (1.8, Pillar A): the first freezing

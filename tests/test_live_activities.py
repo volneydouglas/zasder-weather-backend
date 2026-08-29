@@ -280,3 +280,58 @@ def test_widget_push_throttle_and_freshness(client, monkeypatch):
     asyncio.run(run2())
     assert len(sent) == 2
 
+
+
+def test_start_tokens_are_app_wide_not_per_activity(client):
+    """The live failure of 2026-08-27: iOS hands every Activity type the
+    SAME push-to-start token, the PK-token upsert made each registration
+    overwrite the last one's activity label, and the per-activity start
+    lookup then found zero tokens for every type but the last writer —
+    heat days, rain starts, and the morning report silently never
+    appeared while storm watch worked. Starts must ignore the label."""
+    import asyncio
+    from app import db
+
+    # One device: four registrations of the SAME token, one per type —
+    # exactly what LiveActivityRegistrar does on every launch.
+    for activity in ("rain", "storm", "heat", "morning"):
+        r = client.post("/api/push/live-activity-token", headers=AUTH,
+                        json={"token": "e" * 16, "env": "production",
+                              "kind": "start", "activity": activity})
+        assert r.status_code == 200
+
+    for activity in ("rain", "storm", "heat", "morning"):
+        rows = asyncio.run(db.list_live_activity_tokens("start",
+                                                        activity=activity))
+        assert [t["token"] for t in rows] == ["e" * 16], \
+            f"a {activity} start found no token — last-writer-wins again"
+
+    # UPDATE tokens keep their genuine per-running-activity scope.
+    client.post("/api/push/live-activity-token", headers=AUTH,
+                json={"token": "f" * 16, "env": "production",
+                      "kind": "update", "activity": "storm"})
+    heat_updates = asyncio.run(
+        db.list_live_activity_tokens("update", activity="heat"))
+    assert all(t["token"] != "f" * 16 for t in heat_updates)
+
+
+def test_tokens_without_a_channel_is_a_noop_not_a_failure(client):
+    """R16 finding 2: start tokens registered but NO push channel (no
+    APNs key, no relay) must report a no-op — a failed:N here made the
+    morning-report retry re-run the whole digest every tick until
+    midnight."""
+    import asyncio
+
+    from app import apns, db
+
+    async def run():
+        await db.register_live_activity_token("a" * 64, "start", "prod",
+                                              activity="morning")
+        payload = apns.build_live_activity_start(
+            "MorningReportActivityAttributes", {"stationName": "X"},
+            {"hiF": 100.0}, "t", "b", now_s=1, stale_s=2, dismiss_s=3)
+        return await apns.send_live_activity_start(payload, "t", "b",
+                                                   activity="morning")
+
+    res = asyncio.run(run())
+    assert res == {"sent": 0, "dead": [], "failed": 0}, res

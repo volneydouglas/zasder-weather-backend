@@ -171,7 +171,7 @@ def test_deliver_zero_push_recipients_is_noop_success(client, monkeypatch):
     from app import apns
     async def push_on():
         return True
-    async def no_recipients(title, body):
+    async def no_recipients(title, body, interruption_level=None):
         return {"sent": 0, "skipped": "no push channel for the registered tokens"}
     monkeypatch.setattr(apns, "push_configured", push_on)
     monkeypatch.setattr(apns, "send_to_all", no_recipients)

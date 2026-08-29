@@ -124,6 +124,141 @@ def build_payload(loc: dict[str, Any]) -> dict[str, Any] | None:
     return payload
 
 
+SOURCE_LOCAL = "airgradient-local"
+
+
+def _local_pref(m: dict[str, Any], key: str) -> float | None:
+    """Local firmware spells the corrected series `<key>Compensated`
+    (the cloud says `_corrected`); prefer it, fall back to raw."""
+    v = _num(m, f"{key}Compensated")
+    return v if v is not None else _num(m, key)
+
+
+def build_local_payload(m: dict[str, Any],
+                        now_iso: str) -> dict[str, Any] | None:
+    """One monitor's local /measures/current → an /ingest/custom payload.
+
+    The local response has no timestamp — the reading is 'now' by
+    construction, so the caller stamps it. Missing readings arrive
+    OMITTED (verified live 2026-08), and stay omitted here. The device id
+    is `serialno` — the monitor's own MAC, so a station keeps its row
+    across LAN/cloud... it doesn't: the cloud path keys on locationId
+    (5D:5D:07:…). Pick ONE path per monitor and stay on it."""
+    serial = m.get("serialno")
+    if not isinstance(serial, str) or len(serial.strip()) < 6:
+        return None
+    model = m.get("model") if isinstance(m.get("model"), str) else None
+    # O-series is the outdoor family; everything else (I-series, unknown)
+    # maps indoor — an indoor monitor must never impersonate an outdoor
+    # station in records or alerts, and unknown errs the safe way.
+    indoor_unit = not (model or "").upper().startswith("O-")
+
+    temp_f = c_to_f(_local_pref(m, "atmp"))
+    hum = _local_pref(m, "rhum")
+    if hum is not None and hum > 100:
+        hum = 100.0        # same compensation-overshoot clamp as the cloud
+
+    climate: dict[str, Any] = {}
+    if temp_f is not None:
+        climate["tempf"] = temp_f
+    if hum is not None:
+        climate["humidity"] = round(hum)
+
+    air: dict[str, Any] = {}
+    for src, dest in (("pm01", "pm1"), ("pm02", "pm25"), ("pm10", "pm10"),
+                      ("rco2", "co2")):
+        v = _local_pref(m, src)
+        if v is not None:
+            air[dest] = v
+    for src, dest in (("tvocIndex", "tvoc_index"), ("noxIndex", "nox_index")):
+        v = _num(m, src)
+        if v is not None:
+            air[dest] = v
+
+    if not climate and not air:
+        return None
+
+    device: dict[str, Any] = {"id": serial.strip()}
+    if model:
+        device["model"] = model
+    payload: dict[str, Any] = {
+        "device": device,
+        "timestamp_utc": now_iso,
+        # SOURCE_LOCAL, matching the status accounting — rows stamped
+        # "airgradient" while /api/sources tracked "airgradient-local"
+        # made the two paths untraceable to each other (R11).
+        "source": SOURCE_LOCAL,
+    }
+    if climate:
+        payload["indoor" if indoor_unit else "outdoor"] = climate
+    if air:
+        payload["air"] = air
+    return payload
+
+
+class AirGradientLocalPoller:
+    """Background task (1.9): poll each configured LAN host every N seconds
+    and ingest. Env-only (AIRGRADIENT_LOCAL_HOSTS) — a LAN-reachable
+    backend is a docker-compose install, where env is the native config."""
+
+    def __init__(self, client, hosts: list[str], interval_s: int = 120):
+        self._client = client
+        self._hosts = [h.strip() for h in hosts if h.strip()]
+        self._interval_s = max(30, int(interval_s))
+        self._task: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._run(),
+                                         name="airgradient-local-poller")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self._task:
+            await self._task
+
+    async def _run(self) -> None:
+        log.info("airgradient LAN poller: %d host(s) every %ds",
+                 len(self._hosts), self._interval_s)
+        while not self._stop.is_set():
+            stored, reached, first_err = 0, 0, None
+            for host in self._hosts:
+                # Per-host isolation: one unplugged monitor must not skip
+                # its siblings or mark the whole source failed.
+                try:
+                    m = await self._client.measures_current(host)
+                    reached += 1
+                    now_iso = (datetime.now(timezone.utc)
+                               .isoformat(timespec="seconds"))
+                    payload = build_local_payload(m, now_iso)
+                    if payload is None:
+                        continue
+                    result = await ingest._do_ingest(payload)  # type: ignore[attr-defined]
+                    stored += int((result or {}).get("inserted", 0))
+                except Exception as e:
+                    first_err = first_err or str(e)
+                    log.warning("airgradient LAN host %s failed: %s",
+                                host, source_status.redact(str(e)))
+            if reached > 0 and first_err is None:
+                # Rows STORED, not fetched (the tempest_poller lesson).
+                source_status.record_success(SOURCE_LOCAL, rows=stored)
+            elif first_err is not None:
+                # Even with siblings reached: a clean record_success here
+                # cleared last_error and made one unplugged monitor
+                # invisible in /api/sources (R11). Rows from the healthy
+                # hosts still stored above — only the STATUS reports the
+                # partial failure.
+                if reached > 0:
+                    first_err = (f"{reached}/{len(self._hosts)} host(s) ok; "
+                                 f"first failure: {first_err}")
+                source_status.record_failure(SOURCE_LOCAL, first_err)
+            try:
+                await asyncio.wait_for(self._stop.wait(),
+                                       timeout=self._interval_s)
+            except asyncio.TimeoutError:
+                pass
+
+
 class AirGradientPoller:
     """Background task: poll the AirGradient cloud every N seconds and
     ingest every location's current measures."""

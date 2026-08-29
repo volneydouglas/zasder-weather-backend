@@ -325,6 +325,17 @@ def test_apns_build_payload_shape():
     assert apns.build_payload("Title", "Body") == {
         "aps": {"alert": {"title": "Title", "body": "Body"}, "sound": "default"}}
 
+
+def test_apns_build_payload_interruption_level():
+    """1.9 Time Sensitive: stamped only for the one non-default level we
+    know. 'active' means OMIT the key (the platform default), and garbage
+    must never reach Apple as an aps key."""
+    ts = apns.build_payload("T", "B", "time-sensitive")
+    assert ts["aps"]["interruption-level"] == "time-sensitive"
+    assert ts["aps"]["alert"] == {"title": "T", "body": "B"}
+    for level in (None, "active", "critical", "passive", "junk"):
+        assert "interruption-level" not in apns.build_payload("T", "B", level)["aps"], level
+
 def test_apns_make_jwt_structure():
     import jwt as _jwt
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -1118,3 +1129,73 @@ class TestIntegrationStationIdCheck:
     def test_no_stations_at_all(self):
         msg = self._check("170964", [], "station_id")
         assert "none visible" in msg
+
+
+def test_push_via_relay_interruption_level_and_fallback(monkeypatch):
+    """1.9: the relay POST carries interruption_level ONLY when it's the
+    non-default level (a pre-1.9 relay forbids unknown fields, so plain
+    pushes must stay byte-identical) — and when the relay DOES reject it
+    (422), the push degrades to a normal send instead of not arriving."""
+    import asyncio
+    from app import apns as A
+
+    posts: list[dict] = []
+    old_relay = {"on": False}
+
+    class FakeResp:
+        def __init__(self, code, data):
+            self.status_code = code
+            self._d = data
+            self.text = "unknown field" if code == 422 else ""
+
+        def json(self):
+            return self._d
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            posts.append(dict(json))
+            if old_relay["on"] and "interruption_level" in json:
+                return FakeResp(422, {})
+            return FakeResp(200, {"sent": len(json["tokens"]),
+                                  "dead": [], "failed": 0})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(A.settings, "apns_env", "production")
+
+    # Plain push: no field at all.
+    res = asyncio.run(A._push_via_relay(["a" * 64], "t", "b",
+                                        "https://r.example/push", "rk",
+                                        la_payload=None, push_type="alert"))
+    assert res["sent"] == 1
+    assert "interruption_level" not in posts[-1]
+
+    # Time-sensitive against a current relay: field rides along.
+    posts.clear()
+    res = asyncio.run(A._push_via_relay(["a" * 64], "t", "b",
+                                        "https://r.example/push", "rk",
+                                        la_payload=None, push_type="alert",
+                                        interruption_level="time-sensitive"))
+    assert res["sent"] == 1
+    assert posts[-1]["interruption_level"] == "time-sensitive"
+
+    # Time-sensitive against a PRE-1.9 relay: one 422, then a successful
+    # retry without the field — delivered quietly beats not delivered.
+    posts.clear()
+    old_relay["on"] = True
+    res = asyncio.run(A._push_via_relay(["a" * 64], "t", "b",
+                                        "https://r.example/push", "rk",
+                                        la_payload=None, push_type="alert",
+                                        interruption_level="time-sensitive"))
+    assert res["sent"] == 1
+    assert len(posts) == 2
+    assert "interruption_level" in posts[0]
+    assert "interruption_level" not in posts[1]

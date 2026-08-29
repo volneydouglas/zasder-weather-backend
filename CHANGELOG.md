@@ -8,6 +8,89 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.9.0] — 2026-08-29
+
+### Added
+- **Ecowitt gateways post directly** (`POST /ingest/ecowitt`): point any
+  GW1000–GW3000 gateway or console's "Customized" upload at your backend —
+  no vendor cloud, no extra hardware. Metric consoles are converted on
+  ingest, per-sensor battery flags feed the health watcher, and on
+  dual-rain stations the tipping gauge wins over haptic rain (which
+  phantom-tips when the mast gets bumped). See README Path G.
+- **WeeWX bridge** (`weewx-bridge/`): a small extension that POSTs every
+  archive record from an existing WeeWX install to `/ingest/custom` —
+  any of WeeWX's 70+ station families rides along. See README Path H.
+- **AirGradient LAN polling** (`AIRGRADIENT_LOCAL_HOSTS`): LAN-local
+  backends can poll AirGradient monitors' local API directly — no cloud
+  token needed. The cloud-token integration from 1.8 still works
+  everywhere.
+- **Morning report**: at your chosen hour, the daily digest becomes a
+  full weather report — yesterday's numbers per station, the overnight
+  alert log with severity dots, and today's outlook — as a formatted
+  HTML email (plain-text alternative included) plus a compact morning
+  push. With the iOS app, the same report lands as a lock-screen Live
+  Activity card. Set the hour in the app (Settings → Notifications);
+  push-only installs get the phone half without any SMTP config.
+- **Climate endpoints** (ride the insights rollups, on by default):
+  `GET /api/devices/{mac}/climate?year=` — twelve month rows
+  (means, extremes with dates, rain, heating/cooling/growing degree
+  days) plus annual totals and the running water year
+  (`WATER_YEAR_START_MONTH`, default October);
+  `GET /api/devices/{mac}/daily-series` — one row per local day for
+  year-span charts; `GET /api/devices/{mac}/reports/noaa?year=[&month=]`
+  — the classic NOAA-style fixed-width climate report as plain text.
+- **Week records**: `/api/devices/{mac}/records` gains a `week` period —
+  the trailing 7 local days, matching the charts' "7d" grammar.
+- **Storm history**: `GET /api/devices/{mac}/storms` returns the
+  structured stats behind recent storm summaries (total, peak rate,
+  temps, gust, duration), newest first.
+- **Write-access share links**: a second share tier the app can mint —
+  station operations only (rename/relocate a device, alert toggles,
+  threshold rules, push registration for the holder's own phone).
+  Everything administrative stays owner-only, and every write by a
+  shared link is attributed in an audit log (`GET /api/write-audit`:
+  who, what, when — label + token tail, never the credential).
+- **History aging** (all optional, off by default): thin raw rows older
+  than `HISTORY_DETAIL_DAYS` to one per `HISTORY_KEEP_INTERVAL_MINUTES`,
+  and/or drop the raw JSON payload past `HISTORY_JSON_DETAIL_DAYS`
+  while keeping every row's typed columns. Daily rollups keep every
+  day's true extremes either way. App-managed at
+  `GET/PUT /api/history-retention` (app-stored values win over env);
+  `GET /api/storage` breaks down where the database's bytes live.
+- **Major alert tier**: threshold-rule urgency is now
+  minor / standard / major / urgent. Major ignores quiet hours as a
+  normal notification; urgent additionally arrives Time Sensitive
+  (breaks through iOS Focus). Unknown future tiers round-trip verbatim
+  through older clients instead of being downgraded.
+- **Graceful major upgrades**: a release can vouch that it installs
+  hands-free from your version (`upgrade.json`, `seamless_from`), which
+  unlocks the one-tap update path across a major-version boundary.
+  Unvouched majors still require the classic follow-the-release-notes
+  upgrade. Automatic updates never cross majors regardless.
+- **Disk-space visibility**: `/api/version` carries a disk block
+  (total/free/used %), and a `disk_low` alert warns before the volume
+  fills.
+- 37 new typed columns from a field survey (soil temperature probes,
+  leaf wetness, lightning details, and more), so those readings chart
+  and record without the raw-JSON payload. Piezo (haptic) rain folds
+  into the existing rain columns as a fallback.
+- Insights rollups are ON by default (set INSIGHTS=0 to opt out): the
+  climate endpoints, fast records on large archives, and history
+  thinning all ride them, and a needed backfill now self-schedules in
+  the background on boot instead of requiring a manual rebuild call.
+
+### Changed
+- Live Activity push-to-start tokens are stored app-wide, fixing
+  starts for every activity type (storm/heat/rain/morning) — iOS hands
+  every type the same token, and the old per-activity storage let the
+  last registration win.
+- Historical-import column backfill runs in smaller chunks, bounding
+  the write-lock hold on small machines.
+- The storm-summary notification's stat line is restructured to fit a
+  single lock-screen banner line (`Hi 80°F | Lo 70°F | Gust: 25 mph`),
+  and one-sided temperature data (sensor up for only part of the storm)
+  renders instead of being dropped.
+
 ## [1.8.2] — 2026-08-26
 
 ### Fixed

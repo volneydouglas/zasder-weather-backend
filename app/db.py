@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,9 +23,9 @@ _CHART_INDEX_COLS = [
     "windspeedmph", "dew_point", "solarradiation", "hourlyrainin", "winddir",
     "yearlyrainin", "windgustmph", "tempinf", "humidityin", "dailyrainin",
     "lightning_last_1hr",
-    # Air quality (1.8, AirGradient). Adding them here + the SCHEMA CREATE
-    # triggers the init_db rebuild probe, so existing DBs pay one index
-    # rebuild at the upgrade boot (the lightning-backfill precedent).
+    # Air quality (1.8, AirGradient). Adding them here triggers the init_db
+    # rebuild probe, so existing DBs pay one index rebuild at the upgrade
+    # boot (the lightning-backfill precedent).
     "pm25", "pm10", "co2", "tvoc_index", "nox_index",
 ]
 
@@ -76,24 +77,42 @@ CREATE TABLE IF NOT EXISTS observations (
     co2            REAL,
     tvoc_index     REAL,
     nox_index      REAL,
+    -- 1.9 field-survey additions (AWN-native names — the cross-vendor
+    -- survey: AmbientWeather device spec ⊇ Ecowitt protocol; WeeWX's
+    -- wview_extended carries the same families). Promoted to columns so
+    -- their history survives data_json trimming; NULL columns cost ~a
+    -- byte per row. Batteries follow the stored convention (1 ok, 0 low;
+    -- leak: 0 ok, 1 leak, 2 offline).
+    battout        INTEGER,
+    battin         INTEGER,
+    batt1 INTEGER, batt2 INTEGER, batt3 INTEGER, batt4 INTEGER,
+    batt5 INTEGER, batt6 INTEGER, batt7 INTEGER, batt8 INTEGER,
+    batt_25        INTEGER,
+    batt_co2       INTEGER,
+    batt_lightning INTEGER,
+    leak1 INTEGER, leak2 INTEGER, leak3 INTEGER, leak4 INTEGER,
+    temp1f REAL, temp2f REAL, temp3f REAL, temp4f REAL,
+    humidity1 REAL, humidity2 REAL, humidity3 REAL, humidity4 REAL,
+    soilhum1 REAL, soilhum2 REAL, soilhum3 REAL, soilhum4 REAL,
+    soiltemp1f REAL, soiltemp2f REAL, soiltemp3f REAL, soiltemp4f REAL,
+    leafwetness1 REAL, leafwetness2 REAL,
+    lightning_last_3hr     INTEGER,
+    lightning_last_strike_ms INTEGER,
     PRIMARY KEY (mac, dateutc_ms)
 );
 
 CREATE INDEX IF NOT EXISTS idx_obs_mac_date
     ON observations (mac, dateutc_ms DESC);
 
--- Covering index for the chart-history aggregation (db.history bucketed
--- path). Includes every column that query reads so SQLite serves it
--- index-only and never touches the fat data_json-bearing rows — a 7d/3d
--- chart drops from ~9s to <0.1s. The trailing payload columns MUST stay in
--- sync with the bucketed SELECT in db.history(); adding a charted field
--- there without adding it here silently re-introduces the full-row fetch.
-CREATE INDEX IF NOT EXISTS idx_obs_chart
-    ON observations (mac, dateutc_ms, tempf, feels_like, humidity, baromrelin,
-                     uv, windspeedmph, dew_point, solarradiation, hourlyrainin,
-                     winddir, yearlyrainin, windgustmph, tempinf, humidityin,
-                     dailyrainin, lightning_last_1hr,
-                     pm25, pm10, co2, tvoc_index, nox_index);
+-- idx_obs_chart (the covering index for the chart-history aggregation) is
+-- deliberately NOT created here. The init_db probe owns it — missing or
+-- stale, it rebuilds inline on small archives and defers to a background
+-- task on big ones. An unconditional CREATE INDEX IF NOT EXISTS in this
+-- every-boot script rebuilt a missing index INLINE during executescript:
+-- on a 1M+-row archive that outlives Fly's health-check window, the
+-- machine is killed mid-CREATE, and the next boot starts the same build
+-- again — the exact v1.8.0 crash-loop, reachable again whenever the
+-- deferred rebuild's DROP+CREATE is interrupted (R11 V3).
 
 -- Records (db.records) do MIN/MAX + first-occurrence lookups per metric over
 -- the full per-mac history. windgustmph + dailyrainin aren't in idx_obs_chart,
@@ -237,8 +256,10 @@ CREATE TABLE IF NOT EXISTS live_activity_tokens (
     kind         TEXT NOT NULL DEFAULT 'start',
     env          TEXT,
     -- 1.8: kind 'update' rows carry which Activity they update ('rain',
-    -- 'storm', 'heat'); NULL for 'start' rows (push-to-start tokens are
-    -- app-wide, one per device, regardless of attribute type).
+    -- 'storm', 'heat'). On 'start' rows the column holds whichever
+    -- observer registered LAST (the route defaults it to 'rain') — an
+    -- artifact, not a routing key: push-to-start tokens are app-wide,
+    -- one per device, and start lookups ignore this column.
     activity     TEXT,
     created_ms   INTEGER NOT NULL,
     last_seen_ms INTEGER NOT NULL
@@ -299,8 +320,9 @@ CREATE TABLE IF NOT EXISTS alert_rules (
     threshold   REAL NOT NULL,
     enabled     INTEGER NOT NULL DEFAULT 1,
     created_ms  INTEGER NOT NULL,
-    -- 1.8 per-rule urgency: 'minor' | 'standard' | 'urgent' (Volney:
-    -- users pick how loud each rule is). NULL = minor, the default.
+    -- Per-rule urgency (1.8; 'major' added 1.9): 'minor' | 'standard' |
+    -- 'major' | 'urgent' — users pick how loud each rule is. NULL =
+    -- minor, the default.
     severity    TEXT
 );
 
@@ -384,6 +406,35 @@ CREATE TABLE IF NOT EXISTS push_relay (
 -- wu_station_map.upload_key — revocable one by one, single-tenant, and
 -- app-managed without a redeploy. Read-only is enforced where the env
 -- guests are: membership in valid tokens, never in write_tokens.
+-- Historical-import ledger (1.9): one row per (station, day) an importer
+-- has fully processed. Re-runs SKIP ledgered days — both to stop
+-- re-imported "extras" refilling days that history thinning has since
+-- slimmed down, and to stop burning WU API quota re-fetching archives we
+-- already hold. `source` names the importer ("wu"); force re-imports
+-- delete the rows first.
+CREATE TABLE IF NOT EXISTS imported_days (
+    mac         TEXT NOT NULL,
+    day         TEXT NOT NULL,        -- YYYY-MM-DD
+    source      TEXT NOT NULL,
+    imported_ms INTEGER,
+    PRIMARY KEY (mac, day, source)
+);
+
+-- Closed, reported storm episodes (1.9): the structured record behind
+-- the Storm Report share card. Newest 50 per station; the observations
+-- and rollups stay the real archive.
+CREATE TABLE IF NOT EXISTS storm_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac             TEXT NOT NULL,
+    started_ms      INTEGER NOT NULL,
+    ended_ms        INTEGER NOT NULL,
+    total_in        REAL NOT NULL,
+    peak_rate_in_hr REAL,
+    max_gust_mph    REAL,
+    min_tempf       REAL,
+    max_tempf       REAL
+);
+
 CREATE TABLE IF NOT EXISTS guest_tokens (
     token        TEXT PRIMARY KEY,
     label        TEXT,
@@ -392,7 +443,27 @@ CREATE TABLE IF NOT EXISTS guest_tokens (
     -- never seen (or never seen since the column was added) — the UI says
     -- "never used", not "used at epoch 0". Stamped in memory on auth and
     -- flushed when the owner lists tokens; also in the ALTER list below.
-    last_used_ms INTEGER
+    last_used_ms INTEGER,
+    -- 1.9 write-share tier ("zww_" prefix): 1 = may also hit the
+    -- require_shared_write routes (station operations — never token
+    -- minting, credentials, backups, or anything destructive; that set
+    -- is pinned by the security invariants). Every write it makes lands
+    -- in write_audit. Also in the ALTER list below.
+    can_write    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Change audit for write-share tokens (1.9): who changed what, when —
+-- the per-device attribution the second tier requires. token_tail is the
+-- LAST 6 chars (never the credential; the first 12 are the public short
+-- id, so the tail is the one slice that identifies without disclosing
+-- either identifier fully). Bounded: flush prunes beyond the newest 500.
+CREATE TABLE IF NOT EXISTS write_audit (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms      INTEGER NOT NULL,
+    token_tail TEXT NOT NULL,
+    label      TEXT,
+    method     TEXT NOT NULL,
+    path       TEXT NOT NULL
 );
 
 -- App-minted per-device ingest tokens (1.7). The single INGEST_TOKEN env
@@ -551,8 +622,41 @@ _FIELD_MAP: dict[str, str] = {
     "co2": "co2",
     "tvoc_index": "tvoc_index",
     "nox_index": "nox_index",
+    # 1.9 field-survey additions — column name == API name for all of
+    # them (AWN-native, which Ecowitt shares for the channel families).
+    **{c: c for c in (
+        "battout", "battin",
+        "batt1", "batt2", "batt3", "batt4",
+        "batt5", "batt6", "batt7", "batt8",
+        "batt_25", "batt_co2", "batt_lightning",
+        "leak1", "leak2", "leak3", "leak4",
+        "temp1f", "temp2f", "temp3f", "temp4f",
+        "humidity1", "humidity2", "humidity3", "humidity4",
+        "soilhum1", "soilhum2", "soilhum3", "soilhum4",
+        "soiltemp1f", "soiltemp2f", "soiltemp3f", "soiltemp4f",
+        "leafwetness1", "leafwetness2",
+        "lightning_last_3hr", "lightning_last_strike_ms",
+    )},
 }
 _COLUMNS = list(_FIELD_MAP.keys())
+
+# The 1.9 additions with their SQL types — one list drives the CREATE
+# above (keep in sync), the ALTER migration, and the chunked backfill.
+_EXTRA_1_9_COLS: dict[str, str] = {
+    **{c: "INTEGER" for c in (
+        "battout", "battin",
+        "batt1", "batt2", "batt3", "batt4",
+        "batt5", "batt6", "batt7", "batt8",
+        "batt_25", "batt_co2", "batt_lightning",
+        "leak1", "leak2", "leak3", "leak4",
+        "lightning_last_3hr", "lightning_last_strike_ms")},
+    **{c: "REAL" for c in (
+        "temp1f", "temp2f", "temp3f", "temp4f",
+        "humidity1", "humidity2", "humidity3", "humidity4",
+        "soilhum1", "soilhum2", "soilhum3", "soilhum4",
+        "soiltemp1f", "soiltemp2f", "soiltemp3f", "soiltemp4f",
+        "leafwetness1", "leafwetness2")},
+}
 # Numeric columns that can be queried via /summary (use the API field name).
 QUERYABLE_FIELDS = set(_FIELD_MAP.values())
 
@@ -567,15 +671,15 @@ async def init_db() -> None:
         # is effectively a one-time switch re-asserted on every boot.
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
-        # Migrate observations BEFORE the schema script runs: SCHEMA also
-        # creates idx_obs_chart, which lists lightning_last_1hr — on a
-        # pre-1.6 database that is missing that index, the CREATE would
-        # reference a column the table doesn't have yet and fail the boot.
-        # (CREATE TABLE IF NOT EXISTS never adds columns, so this ALTER is
-        # the only path that reaches an existing database — the alert_prefs
-        # lesson.) Fresh databases skip this: the table doesn't exist yet
-        # and SCHEMA below creates it with the columns in place.
+        # Migrate observations BEFORE the schema script runs, and before the
+        # idx_obs_chart probe below — the index lists lightning_last_1hr,
+        # so its CREATE must not run until the column exists on a pre-1.6
+        # database. (CREATE TABLE IF NOT EXISTS never adds columns, so this
+        # ALTER is the only path that reaches an existing database — the
+        # alert_prefs lesson.) Fresh databases skip this: the table doesn't
+        # exist yet and SCHEMA below creates it with the columns in place.
         lightning_backfilled = False
+        added_extra = False
         cur = await db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'")
         if await cur.fetchone():
@@ -598,6 +702,22 @@ async def init_db() -> None:
                 if col not in existing:
                     await db.execute(
                         f"ALTER TABLE observations ADD COLUMN {col} REAL")
+            # 1.9 field survey (batteries, T/H channels, soil, leak, leaf,
+            # the two remaining lightning fields). These DID ride
+            # data_json (AWN poller rows carry the raw AWN keys), so a
+            # backfill is owed — but unlike the bounded lightning one
+            # below, this touches battout on essentially every row, and a
+            # full-table UPDATE at boot on a multi-GB database is minutes
+            # of lock plus a database-sized WAL on a volume that may not
+            # have it (the chart-index lesson, v1.8.1). So: columns now,
+            # backfill CHUNKED in the background — lifespan drives
+            # backfill_extra_columns_chunk() until done.
+            added_extra = False
+            for col, decl in _EXTRA_1_9_COLS.items():
+                if col not in existing:
+                    await db.execute(
+                        f"ALTER TABLE observations ADD COLUMN {col} {decl}")
+                    added_extra = True
             if added_lightning:
                 # One-time backfill from data_json: the poller captured
                 # lightning into the blob before these columns existed
@@ -633,6 +753,14 @@ async def init_db() -> None:
         # flag flip on without a schema step.
         from .insights import SCHEMA as INSIGHTS_SCHEMA
         await db.executescript(INSIGHTS_SCHEMA)
+        if added_extra:
+            # Written AFTER executescript (server_kv exists now). JSON
+            # trimming refuses to run while this is pending — the backfill
+            # reads the very JSON the trim would blank.
+            await db.execute(
+                "INSERT INTO server_kv (k, v) VALUES "
+                "('colfill_1_9_pending', '1'), ('colfill_1_9_cursor', '0') "
+                "ON CONFLICT(k) DO NOTHING")
         if lightning_backfilled:
             # The backfill rewrote observations, but daily_rollups' new
             # lightning_max column stays NULL until a rebuild folds history
@@ -752,10 +880,21 @@ async def init_db() -> None:
         if "last_used_ms" not in existing:
             await db.execute(
                 "ALTER TABLE guest_tokens ADD COLUMN last_used_ms INTEGER")
-        # idx_obs_chart gained windgustmph so the bucketed chart query can serve
-        # wind gust index-only. SQLite won't alter an existing index, so rebuild
-        # it once if the stored definition predates the column (one-time cost at
-        # boot; the app isn't serving yet).
+        # 1.9 write-share links: the second tier. Existing rows read the
+        # DEFAULT 0 = read-only — an upgrade must never widen a token the
+        # owner minted as read-only.
+        if "can_write" not in existing:
+            await db.execute(
+                "ALTER TABLE guest_tokens ADD COLUMN "
+                "can_write INTEGER NOT NULL DEFAULT 0")
+        # idx_obs_chart is owned entirely by this probe (it is NOT in the
+        # SCHEMA script — see the comment there). Rebuild when the stored
+        # definition is stale, AND when the index is missing outright: a
+        # kill between the deferred rebuild's DROP and CREATE leaves no
+        # index at all, and the old `row and row[0]` guard skipped that
+        # case while SCHEMA rebuilt it inline — the v1.8.0 crash-loop
+        # reborn (R11 V3). Fresh databases take the inline branch (zero
+        # rows), so they still get the index right here.
         cur = await db.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_obs_chart'")
         row = await cur.fetchone()
@@ -765,11 +904,14 @@ async def init_db() -> None:
         # full-row fetch it exists to avoid. Compare PARSED column names, not
         # substrings: "tempf" is a substring of "tempinf" (and "humidity" of
         # "humidityin"), so a stale index missing tempf passed the probe.
-        if row and row[0] and not set(_CHART_INDEX_COLS) <= _index_columns(row[0]):
+        index_missing = not (row and row[0])
+        index_stale = (not index_missing
+                       and not set(_CHART_INDEX_COLS) <= _index_columns(row[0]))
+        if index_missing or index_stale:
             n = (await (await db.execute(
                 "SELECT COUNT(*) FROM observations")).fetchone())[0]
             if n <= _CHART_INDEX_INLINE_MAX_ROWS:
-                await db.execute("DROP INDEX idx_obs_chart")
+                await db.execute("DROP INDEX IF EXISTS idx_obs_chart")
                 await db.execute("CREATE INDEX idx_obs_chart ON observations ("
                                  + ", ".join(_CHART_INDEX_COLS) + ")")
             else:
@@ -809,9 +951,19 @@ async def init_db() -> None:
 # single-process app, so those are the only writers. Empty until loaded,
 # which fails closed (an unknown token is rejected, never accepted).
 _GUEST_TOKEN_CACHE: set[str] = set()
+# The write-capable subset (1.9). Two caches, one refresh: membership here
+# is what require_shared_write checks, so a revoked or downgraded token
+# falls out of BOTH views atomically.
+_WRITE_GUEST_CACHE: set[str] = set()
+# token → label, for AUTH-TIME audit attribution (R11/CodeRabbit): the old
+# flush-time lookup by token tail could attribute a write to the wrong
+# share on a suffix collision, and lost the label entirely when the owner
+# revoked or renamed the share before the flush tick.
+_GUEST_LABEL_CACHE: dict[str, str | None] = {}
 
-# The first 12 chars ("zwg_" + 8 hex) identify a token in list/revoke
-# responses without shipping the whole credential back and forth.
+# The first 12 chars ("zwg_"/"zww_" + 8 hex) identify a token in
+# list/revoke responses without shipping the whole credential back and
+# forth.
 GUEST_TOKEN_ID_LEN = 12
 
 
@@ -819,19 +971,26 @@ def guest_token_cache() -> set[str]:
     return _GUEST_TOKEN_CACHE
 
 
+def write_guest_token_cache() -> set[str]:
+    return _WRITE_GUEST_CACHE
+
+
 async def refresh_guest_token_cache() -> None:
-    global _GUEST_TOKEN_CACHE
+    global _GUEST_TOKEN_CACHE, _WRITE_GUEST_CACHE, _GUEST_LABEL_CACHE
     async with connect() as db:
         rows = await (await db.execute(
-            "SELECT token FROM guest_tokens")).fetchall()
+            "SELECT token, can_write, label FROM guest_tokens")).fetchall()
     _GUEST_TOKEN_CACHE = {r["token"] for r in rows}
+    _WRITE_GUEST_CACHE = {r["token"] for r in rows if r["can_write"]}
+    _GUEST_LABEL_CACHE = {r["token"]: r["label"] for r in rows}
 
 
-async def add_guest_token(token: str, label: str | None, now_ms: int) -> None:
+async def add_guest_token(token: str, label: str | None, now_ms: int,
+                          can_write: bool = False) -> None:
     async with connect() as db:
         await db.execute(
-            "INSERT INTO guest_tokens (token, label, created_ms) "
-            "VALUES (?, ?, ?)", (token, label, now_ms))
+            "INSERT INTO guest_tokens (token, label, created_ms, can_write) "
+            "VALUES (?, ?, ?, ?)", (token, label, now_ms, int(can_write)))
         await db.commit()
     await refresh_guest_token_cache()
 
@@ -839,8 +998,8 @@ async def add_guest_token(token: str, label: str | None, now_ms: int) -> None:
 async def list_guest_tokens() -> list[dict[str, Any]]:
     async with connect() as db:
         rows = await (await db.execute(
-            "SELECT token, label, created_ms, last_used_ms FROM guest_tokens "
-            "ORDER BY created_ms")).fetchall()
+            "SELECT token, label, created_ms, last_used_ms, can_write "
+            "FROM guest_tokens ORDER BY created_ms")).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -881,6 +1040,101 @@ async def flush_guest_last_used() -> None:
             _GUEST_LAST_USED.pop(token, None)
 
 
+# ── write-share change audit (1.9) ──────────────────────────────────────
+# Same sync-buffer + async-flush shape as the last-used stamps directly
+# above, for the same reason: the auth dependency runs sync on the request
+# path. Bounded so a scripted write flood can't grow memory: beyond
+# _AUDIT_BUFFER_MAX pending entries the OLDEST are dropped (the table
+# itself is pruned to the newest 500 at flush).
+_WRITE_AUDIT_PENDING: list[tuple[int, str, str | None, str, str]] = []
+_AUDIT_BUFFER_MAX = 200
+_AUDIT_KEEP_ROWS = 500
+# threading.Lock, not asyncio (CodeRabbit): record_write_audit runs in
+# FastAPI's threadpool (sync dependency) while flush drains on the event
+# loop — real cross-thread concurrency. Both the cap-trim and the flush
+# delete from the FRONT of the list, so an overlap at the 200-row cap
+# could drop rows the flush snapshot was about to persist. Held only for
+# list ops — never across an await.
+_WRITE_AUDIT_LOCK = threading.Lock()
+
+
+def record_write_audit(token: str, method: str, path: str) -> None:
+    """Queue one attributed write. Sync + memory-only — called from the
+    auth dependency AFTER the token digest-verified as a write share.
+    The label is captured HERE, at authorization time, from the same cache
+    that authorized the token (R11/CodeRabbit): a flush-time lookup by
+    token tail could mis-attribute on a suffix collision and lost the
+    label when the share was revoked or renamed before the flush tick.
+    Only the token TAIL is persisted — never the credential."""
+    row = (int(time.time() * 1000), token[-6:],
+           _GUEST_LABEL_CACHE.get(token), method, path)
+    with _WRITE_AUDIT_LOCK:
+        _WRITE_AUDIT_PENDING.append(row)
+        dropped = len(_WRITE_AUDIT_PENDING) - _AUDIT_BUFFER_MAX
+        if dropped > 0:
+            del _WRITE_AUDIT_PENDING[:dropped]
+    if dropped > 0:
+        # Loudly (R12): silently losing rows from a log whose whole purpose
+        # is attribution would hide exactly the burst worth investigating.
+        # Outside the lock — logging can block.
+        log.warning("write-audit buffer overflow — dropping %d oldest "
+                    "pending row(s) (a scripted write burst?)", dropped)
+
+
+async def flush_write_audit() -> None:
+    """Persist pending audit rows (labels already captured at auth time)
+    and prune the table to the newest _AUDIT_KEEP_ROWS."""
+    with _WRITE_AUDIT_LOCK:
+        if not _WRITE_AUDIT_PENDING:
+            return
+        pending = _WRITE_AUDIT_PENDING[:]
+        del _WRITE_AUDIT_PENDING[:len(pending)]
+    try:
+        async with connect() as db:
+            for ts_ms, tail, label, method, path in pending:
+                await db.execute(
+                    "INSERT INTO write_audit (ts_ms, token_tail, label, "
+                    "method, path) VALUES (?, ?, ?, ?, ?)",
+                    (ts_ms, tail, label, method, path))
+            # Same "newest" as list_write_audit (R15): pruning by bare id
+            # while listing by ts_ms could delete a newer row and keep an
+            # older one after a concurrent-flush id/ts inversion.
+            await db.execute(
+                "DELETE FROM write_audit WHERE id NOT IN "
+                "(SELECT id FROM write_audit "
+                "ORDER BY ts_ms DESC, id DESC LIMIT ?)",
+                (_AUDIT_KEEP_ROWS,))
+            await db.commit()
+    except Exception:
+        # Re-queue at the FRONT (R14): losing drained rows on a transient
+        # DB error is data loss in an attribution log. The cap-trim in
+        # record_write_audit still bounds memory if the DB stays down.
+        with _WRITE_AUDIT_LOCK:
+            _WRITE_AUDIT_PENDING[:0] = pending
+        raise
+
+
+async def list_write_audit(limit: int = 100) -> list[dict[str, Any]]:
+    """Newest-first audit rows, pending buffer flushed first so the owner
+    always sees writes up to this moment. A flush failure serves the
+    persisted rows rather than 500ing the owner endpoint (R15) — the
+    re-queue keeps the pending rows safe for the next flush."""
+    try:
+        await flush_write_audit()
+    except Exception as e:
+        log.warning("write-audit flush failed; serving persisted rows: %s",
+                    e)
+    async with connect() as db:
+        # id included (R12): it's the one truly unique key — the app's list
+        # identity was ts+tail+path, which collides on a double-tap inside
+        # one millisecond.
+        rows = await (await db.execute(
+            "SELECT id, ts_ms, token_tail, label, method, path "
+            "FROM write_audit ORDER BY ts_ms DESC, id DESC LIMIT ?",
+            (limit,))).fetchall()
+    return [dict(r) for r in rows]
+
+
 async def get_guest_token(token_id: str) -> dict[str, Any] | None:
     """Full row (token value included) by short id — the re-share path."""
     async with connect() as db:
@@ -898,7 +1152,12 @@ async def rename_guest_token(token_id: str, label: str | None) -> int:
             f"WHERE substr(token, 1, {GUEST_TOKEN_ID_LEN}) = ?",
             (label, token_id))
         await db.commit()
-        return cur.rowcount
+    # Refresh like add/revoke do (R12 W3): audit labels are captured from
+    # _GUEST_LABEL_CACHE at auth time now, so a rename that skips the
+    # refresh mis-attributes every later write to the OLD name until an
+    # unrelated mint/revoke or a restart.
+    await refresh_guest_token_cache()
+    return cur.rowcount
 
 
 async def delete_guest_token(token_id: str) -> int:
@@ -2140,9 +2399,11 @@ async def register_live_activity_token(token: str, kind: str,
                                        activity: str | None = None) -> None:
     """Push-to-start / per-activity update registration, same idempotent
     shape as push_tokens — iOS rotates these and the app re-posts whatever
-    it currently holds. `activity` names which Activity the token belongs
-    to (push-to-start tokens are ALSO per-attributes-type); NULL = a 1.7
-    app's rain-start registration."""
+    it currently holds. `activity` names which Activity an UPDATE token
+    belongs to; on 'start' rows it records only which observer registered
+    last (iOS hands every attributes type the SAME start token — proven
+    live 2026-08-27 — so the label is not a routing key and start lookups
+    ignore it). NULL = a 1.7 app's rain-start registration."""
     now = int(time.time() * 1000)
     async with connect() as db:
         await db.execute(
@@ -2163,21 +2424,29 @@ async def register_live_activity_token(token: str, kind: str,
 async def list_live_activity_tokens(kind: str = "start",
                                     activity: str | None = None
                                     ) -> list[dict[str, Any]]:
-    """Tokens for one kind, optionally scoped to one Activity. ActivityKit
-    mints push-to-start tokens PER ATTRIBUTES TYPE, so a storm start must
-    never fan out to a token minted for the rain Activity. Legacy rows
-    (1.7 apps) registered before the discriminator existed are all
-    rain-start tokens — activity IS NULL matches only 'rain'."""
+    """Tokens for one kind; the activity discriminator applies to UPDATE
+    tokens only.
+
+    START tokens are APP-WIDE — one per device, regardless of attributes
+    type (the 1.7 schema comment had this right; PROVEN live 2026-08-27:
+    a phone whose registrar observes four Activity types held exactly ONE
+    start row, because iOS hands every type the same token and the
+    PK-token upsert made each registration overwrite the last one's
+    activity label). The 1.8 scoping built on the opposite premise, so
+    whichever type registered LAST owned the lone token and every other
+    type's start fanned out to zero — heat days, rain starts, and the
+    morning report all silently never appeared while storm watch worked.
+    The payload's attributes-type is what picks WHICH Activity starts;
+    the token just addresses the device. So: kind='start' ignores the
+    activity filter entirely.
+
+    UPDATE tokens are genuinely per-RUNNING-activity and keep the scope —
+    a storm update must never write another activity's content-state."""
     async with connect() as db:
-        if activity is None:
+        if kind == "start" or activity is None:
             rows = await (await db.execute(
                 "SELECT token, env FROM live_activity_tokens WHERE kind = ?",
                 (kind,))).fetchall()
-        elif activity == "rain":
-            rows = await (await db.execute(
-                "SELECT token, env FROM live_activity_tokens "
-                "WHERE kind = ? AND (activity = ? OR activity IS NULL)",
-                (kind, activity))).fetchall()
         else:
             rows = await (await db.execute(
                 "SELECT token, env FROM live_activity_tokens "
@@ -2255,11 +2524,15 @@ async def field_min_max(mac: str, field: str, start_ms: int,
 
 
 async def alerts_since(ts_ms: int) -> list[dict[str, Any]]:
-    """Alert-log rows newer than ts_ms, oldest first — digest material."""
+    """Alert-log rows newer than ts_ms, oldest first — digest material.
+    severity included (R14): the digest's colored dots read it, and
+    without the column every rule alert fell back to the kind map's
+    "watch" blue — urgent rules included."""
     async with connect() as db:
         rows = await (await db.execute(
-            "SELECT ts_ms, kind, mac, title, body, delivered FROM alert_log "
-            "WHERE ts_ms > ? ORDER BY ts_ms", (ts_ms,))).fetchall()
+            "SELECT ts_ms, kind, mac, title, body, delivered, severity "
+            "FROM alert_log WHERE ts_ms > ? ORDER BY ts_ms",
+            (ts_ms,))).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -2504,19 +2777,20 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
     needs_pressure = out.get("baromrelin") is None
     if src_mac and needs_pressure and src_mac != mac:
         async with connect() as db:
+            # Typed columns, not data_json (R11): history trimming blanks
+            # the JSON of older rows, and reading it here silently killed
+            # the fallback once the source's newest barometer row aged past
+            # the trim window — while the columns still held the values.
             src_row = await (await db.execute(
-                "SELECT data_json FROM observations WHERE mac = ? "
+                "SELECT baromrelin, baromabsin, tempinf, humidityin "
+                "FROM observations WHERE mac = ? "
                 "AND baromrelin IS NOT NULL ORDER BY dateutc_ms DESC LIMIT 1",
                 (src_mac,),
             )).fetchone()
         if src_row:
-            src = _parse_json_col(src_row["data_json"])
-            for k in ("baromrelin", "baromabsin"):
-                if out.get(k) is None and src.get(k) is not None:
-                    out[k] = src[k]
-            for k in ("tempinf", "humidityin"):
-                if out.get(k) is None and src.get(k) is not None:
-                    out[k] = src[k]
+            for k in ("baromrelin", "baromabsin", "tempinf", "humidityin"):
+                if out.get(k) is None and src_row[k] is not None:
+                    out[k] = src_row[k]
     _normalize_lightning(out)
     return out
 
@@ -2647,12 +2921,19 @@ async def history(
     """Time-series for a device. Auto-downsamples for windows > 6h so the
     iOS app's 3d/7d charts don't get truncated by the row LIMIT.
 
-    For raw windows: returns the parsed data_json (full source) so the
-    Charts tab + Dashboard's recent-history both see identical shape.
+    For raw windows (≤6h): reads the TYPED COLUMNS (1.9) — all of
+    _COLUMNS, including the 37 promoted survey fields — so trimming the
+    data_json never blanks a short-window chart.
 
     For bucketed windows: returns synthesized rows with AVG()-aggregated
     numeric fields and the bucket-midpoint timestamp. Same dict shape
     the iOS app already reads — just no `_source` (not needed for charts).
+    DELIBERATE asymmetry (R11 V8): the bucketed SELECT serves only the
+    fields the iOS charts actually read, because every column it touches
+    must also live in idx_obs_chart to stay index-covered (see the comment
+    at the SELECT). The 37 promoted columns stay out of the bucketed path
+    until a client consumes them at >6h windows — whoever adds one there
+    must add it to idx_obs_chart in the same change.
 
     Bucketed rows also carry `<field>_min` / `<field>_max` for the
     chartable fields. AVG() alone flattens the true extremes on 3d/7d
@@ -2663,22 +2944,33 @@ async def history(
     """
     bucket_ms = _auto_bucket_ms(end_ms - start_ms)
     if bucket_ms == 0:
+        # Typed columns, not data_json (1.9): every charted field has a
+        # column now, and the JSON is blanked by history trimming — the
+        # old parse returned NOTHING for a short window zoomed into
+        # trimmed territory even though the columns held the data.
+        col_list = ", ".join(_COLUMNS)
         async with connect() as db:
             # DESC + reverse, not ASC: when a short window has more rows than
             # `limit` (two sources at ~16s fill 2000 rows in ~6h), ASC drops the
             # NEWEST rows, so the chart just ends hours early with no hint. Keep
             # the most recent `limit` rows and hand them back oldest-first.
             rows = await (await db.execute(
-                """
-                SELECT data_json FROM observations
+                f"""
+                SELECT dateutc_ms, {col_list} FROM observations
                 WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?
                 ORDER BY dateutc_ms DESC
                 LIMIT ?
                 """,
                 (mac, start_ms, end_ms, limit),
             )).fetchall()
-        parsed = [_normalize_lightning(p) for r in reversed(rows)
-                  if (p := _parse_json_col(r["data_json"]))]
+        parsed = []
+        for r in reversed(rows):
+            p: dict[str, Any] = {"dateutc": r["dateutc_ms"]}
+            for col in _COLUMNS:
+                v = r[col]
+                if v is not None:
+                    p[_FIELD_MAP[col]] = v
+            parsed.append(_normalize_lightning(p))
         _derive_hourly_rain(parsed)
         return parsed
 
@@ -3208,7 +3500,8 @@ _ROLLUP_RECORD_COLS: dict[str, tuple[str | None, str]] = {
 
 async def records(mac: str, tz_name: str = "UTC",
                   fields: list[str] | None = None) -> dict[str, Any]:
-    """Per-metric high/low over today / this month / this year / all-time.
+    """Per-metric high/low over today / past week / this month / this year /
+    all-time.
 
     TODAY is answered from raw observations (one bounded local day), keeping
     exact record times. The LONG periods are answered from `daily_rollups`
@@ -3231,7 +3524,7 @@ async def records(mac: str, tz_name: str = "UTC",
     only quotes their peaks — and rollups are fold-forward accumulators, so
     a data repair must still `insights.rebuild()` (the established lesson)
     for long-period records to heal."""
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
     fields = fields or RECORD_FIELDS
@@ -3244,8 +3537,16 @@ async def records(mac: str, tz_name: str = "UTC",
 
     now_local = datetime.now(tz=tz)
     day0 = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Week is TRAILING (7 local days including today), matching the Charts
+    # "7d" window's grammar rather than a calendar week — a calendar week
+    # shows one day's records every Sunday morning, and whose Sunday depends
+    # on locale. Rebuilt from date components, not day0 - timedelta, so a
+    # DST jump inside the span can't shift the boundary off midnight.
+    week_date = (now_local.date() - timedelta(days=6))
+    week0 = datetime(week_date.year, week_date.month, week_date.day, tzinfo=tz)
     periods = {
         "today": int(day0.timestamp() * 1000),
+        "week":  int(week0.timestamp() * 1000),
         "month": int(day0.replace(day=1).timestamp() * 1000),
         "year":  int(day0.replace(month=1, day=1).timestamp() * 1000),
         "all":   0,
@@ -3434,3 +3735,136 @@ async def _rollup_period_fields(db, mac: str, fields: list[str],
             "maxAt": await _at_day(max_col, hi),
         }
     return pfields
+
+
+# ── historical-import ledger (1.9) ──────────────────────────────────────
+
+async def imported_days(mac: str, source: str) -> set[str]:
+    """Days (YYYY-MM-DD) this importer has fully processed for a station."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT day FROM imported_days WHERE mac = ? AND source = ?",
+            (mac, source))).fetchall()
+    return {r["day"] for r in rows}
+
+
+async def mark_imported_day(mac: str, day: str, source: str) -> None:
+    async with connect() as db:
+        await db.execute(
+            "INSERT INTO imported_days (mac, day, source, imported_ms) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(mac, day, source) DO UPDATE SET "
+            "imported_ms = excluded.imported_ms",
+            (mac, day, source, int(time.time() * 1000)))
+        await db.commit()
+
+
+# (clear_imported_days was removed before it ever shipped: force
+# re-imports BYPASS the ledger for their range instead of clearing it —
+# a range-scoped force must not unledger days outside the range.)
+
+
+# ── 1.9 column backfill (chunked, background) ───────────────────────────
+
+COLFILL_PENDING_KEY = "colfill_1_9_pending"
+_COLFILL_CURSOR_KEY = "colfill_1_9_cursor"
+
+
+def _colfill_update_sql() -> str:
+    """One UPDATE filling every 1.9 column from its same-named data_json
+    key over a rowid window. typeof-gated like the lightning backfill: an
+    unguarded CAST turns junk into 0 and absent must stay NULL. Column
+    names are interpolated, so they get the whitelist guard (never an
+    assert — those vanish under python -O)."""
+    sets = []
+    for col, decl in _EXTRA_1_9_COLS.items():
+        if col not in _FIELD_MAP or _FIELD_MAP[col] != col:
+            raise ValueError(f"refusing to interpolate unknown column {col!r}")
+        expr = f"json_extract(data_json, '$.{col}')"
+        cast = f"CAST({expr} AS INTEGER)" if decl == "INTEGER" else expr
+        sets.append(
+            f"{col} = CASE WHEN {col} IS NOT NULL THEN {col} "
+            f"WHEN typeof({expr}) IN ('integer','real') THEN {cast} END")
+    return ("UPDATE observations SET " + ", ".join(sets)
+            + " WHERE rowid > ? AND rowid <= ?")
+
+
+async def backfill_extra_columns_chunk(rows_per_chunk: int = 20_000) -> bool:
+    """Advance the 1.9 backfill by one rowid window. Returns True while
+    more remains, False once done (flag cleared). Each chunk is one
+    bounded transaction — sized so the write lock is held for roughly a
+    second even on a small Fly machine (the insights-rebuild lesson:
+    ingest must never queue behind a long UPDATE). A ~4M-row database
+    finishes in minutes, spread across the driver's between-chunk
+    sleeps; a restart mid-run resumes from the persisted cursor and
+    already-filled values are never overwritten."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT v FROM server_kv WHERE k = ?",
+            (COLFILL_PENDING_KEY,))).fetchone()
+        if row is None:
+            return False
+        cur_row = await (await db.execute(
+            "SELECT v FROM server_kv WHERE k = ?",
+            (_COLFILL_CURSOR_KEY,))).fetchone()
+        cursor = int(cur_row["v"]) if cur_row and str(cur_row["v"]).isdigit() else 0
+        max_row = (await (await db.execute(
+            "SELECT COALESCE(MAX(rowid), 0) FROM observations")).fetchone())[0]
+        if cursor >= max_row:
+            await db.execute("DELETE FROM server_kv WHERE k IN (?, ?)",
+                             (COLFILL_PENDING_KEY, _COLFILL_CURSOR_KEY))
+            await db.commit()
+            return False
+        hi = min(cursor + rows_per_chunk, max_row)
+        await db.execute(_colfill_update_sql(), (cursor, hi))
+        if hi >= max_row:
+            # Final chunk: clear the flag in the SAME transaction — a
+            # "done" return that leaves it set would deadlock the JSON
+            # trim (which refuses while pending) forever.
+            await db.execute("DELETE FROM server_kv WHERE k IN (?, ?)",
+                             (COLFILL_PENDING_KEY, _COLFILL_CURSOR_KEY))
+            await db.commit()
+            return False
+        await db.execute(
+            "INSERT INTO server_kv (k, v) VALUES (?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            (_COLFILL_CURSOR_KEY, str(hi)))
+        await db.commit()
+        return True
+
+
+async def colfill_pending() -> bool:
+    return await get_kv(COLFILL_PENDING_KEY) is not None
+
+
+# ── storm history (1.9 shareables) ──────────────────────────────────────
+
+async def record_storm(mac: str, s: dict) -> None:
+    """Persist one CLOSED, reported storm episode — the structured stats
+    the Storm Report share card renders. Written at summary delivery
+    (the same moment the notification fires), pruned to the newest 50
+    per station: a share card wants recent storms, not an archive (the
+    raw history and rollups remain the archive)."""
+    async with connect() as db:
+        await db.execute(
+            "INSERT INTO storm_history (mac, started_ms, ended_ms, "
+            "total_in, peak_rate_in_hr, max_gust_mph, min_tempf, max_tempf) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (mac, s["started_ms"], s["ended_ms"], s["total_in"],
+             s.get("peak_rate_in_hr"), s.get("max_gust_mph"),
+             s.get("min_tempf"), s.get("max_tempf")))
+        await db.execute(
+            "DELETE FROM storm_history WHERE mac = ? AND id NOT IN "
+            "(SELECT id FROM storm_history WHERE mac = ? "
+            " ORDER BY ended_ms DESC LIMIT 50)", (mac, mac))
+        await db.commit()
+
+
+async def list_storms(mac: str, limit: int = 10) -> list[dict[str, Any]]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT started_ms, ended_ms, total_in, peak_rate_in_hr, "
+            "max_gust_mph, min_tempf, max_tempf FROM storm_history "
+            "WHERE mac = ? ORDER BY ended_ms DESC LIMIT ?",
+            (mac, limit))).fetchall()
+    return [dict(r) for r in rows]

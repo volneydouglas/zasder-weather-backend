@@ -33,9 +33,19 @@ log = logging.getLogger("normals")
 NCEI_SEARCH = "https://www.ncei.noaa.gov/access/services/search/v1/data"
 NCEI_DATA = "https://www.ncei.noaa.gov/access/services/data/v1"
 _REFRESH_S = 180 * 24 * 3600            # cache heal interval, not a TTL
-_BBOX_DEG = 0.35                        # ~25 mi half-side for station search
+# Progressive search rings, ~5.5 / ~10 / ~25 mi half-sides. The old single
+# 0.35° box took the FIRST station NCEI returned anywhere inside ~50 miles
+# of span — which handed Chandler the Fountain Hills normals: 28 miles out
+# in the McDowell foothills, a genuinely different desert microclimate
+# (Volney, live 2026-08-27). Rings restore closeness bias without needing
+# per-station coordinates the search result doesn't carry: the first hit
+# at the SMALLEST radius wins.
+_BBOX_RINGS_DEG = (0.08, 0.15, 0.35)
 
-_KV_STATION = "normals.station"         # {"key": "lat,lon", "id", "name"}
+# ".v2": the ring fix must re-resolve every cached station choice — the
+# old key would pin the far station forever (the cache is deliberately
+# eternal). Old-key values are simply orphaned.
+_KV_STATION = "normals.station.v2"      # {"key": "lat,lon", "id", "name"}
 _KV_DATA = "normals.data"               # {"station": id, "fetched_ms", "days": {...}}
 
 
@@ -46,28 +56,60 @@ def _coord_key(lat: float, lon: float) -> str:
 
 
 async def _find_station(lat: float, lon: float) -> tuple[str, str] | None:
-    """(station_id, name) of a nearby normals station with daily temperature
-    normals, or None (non-US, ocean, API down). "Nearby" not "nearest": the
-    search result doesn't carry per-station coordinates, and a normals
-    comparison against any station within ~25 mi is honest — the station
-    NAME is shown to the user so nothing is hidden."""
-    bbox = (f"{lat + _BBOX_DEG},{lon - _BBOX_DEG},"
-            f"{lat - _BBOX_DEG},{lon + _BBOX_DEG}")
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(NCEI_SEARCH, params={
-                "dataset": "normals-daily", "bbox": bbox, "limit": 5})
-            r.raise_for_status()
-            body = r.json()
-    except Exception as e:
-        log.warning("normals station search failed: %s", e)
-        return None
-    for result in body.get("results") or []:
-        for st in result.get("stations") or []:
-            covered = {t.get("id"): t.get("coverage")
-                       for t in st.get("dataTypes") or []}
-            if covered.get("DLY-TMAX-NORMAL"):
-                return st.get("id"), st.get("name") or st.get("id")
+    """(station_id, name) of the CLOSEST-ring normals station with daily
+    temperature normals, or None (non-US, ocean, API down). The search
+    result carries no per-station coordinates, so closeness comes from
+    expanding rings: a hit inside ~5 miles beats anything a wider box
+    would return first. The station NAME is shown to the user either way,
+    so the choice is always visible."""
+    for ring in _BBOX_RINGS_DEG:
+        bbox = (f"{lat + ring},{lon - ring},"
+                f"{lat - ring},{lon + ring}")
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(NCEI_SEARCH, params={
+                    "dataset": "normals-daily", "bbox": bbox, "limit": 10})
+                r.raise_for_status()
+                body = r.json()
+        except Exception as e:
+            # continue, not return: a transient failure on an inner ring
+            # must not abandon the wider rings — the whole point of the
+            # progressive search is that SOME ring answers (R11).
+            log.warning("normals station search failed (ring %s): %s",
+                        ring, e)
+            continue
+        try:
+            # Type-guarded walk (CodeRabbit): the whole response is remote
+            # input — a valid-JSON scalar or malformed nested entry raised
+            # OUTSIDE the fetch's except and 500'd the endpoint instead of
+            # trying the wider rings.
+            results = body.get("results") if isinstance(body, dict) else None
+            for result in results or []:
+                if not isinstance(result, dict):
+                    continue
+                stations = result.get("stations")
+                for st in stations if isinstance(stations, list) else []:
+                    if not isinstance(st, dict):
+                        continue
+                    types = st.get("dataTypes")
+                    covered = {t.get("id"): t.get("coverage")
+                               for t in (types if isinstance(types, list)
+                                         else [])
+                               if isinstance(t, dict)}
+                    if covered.get("DLY-TMAX-NORMAL"):
+                        # A covered entry with a junk id must not stop the
+                        # wider-ring search (CodeRabbit).
+                        sid = st.get("id")
+                        if not isinstance(sid, str) or not sid.strip():
+                            continue
+                        sid = sid.strip()   # guard checked stripped; RETURN it (R14)
+                        name = st.get("name")
+                        return sid, (name.strip() if isinstance(name, str)
+                                     and name.strip() else sid)
+        except Exception as e:
+            log.warning("normals station search: malformed NCEI response "
+                        "on ring %s: %s", ring, e)
+            continue
     return None
 
 

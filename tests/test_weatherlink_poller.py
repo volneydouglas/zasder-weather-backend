@@ -120,3 +120,85 @@ def test_field_names_match_ingest_flatten_contract(wl, temp_env):
     assert flat["hourlyrainin"] == 0.1
     assert flat["dailyrainin"] == 0.5
     assert flat["yearlyrainin"] == pytest.approx(10.0)
+
+
+# ── _run failure accounting (1.9 test debt, TEST_GAP_AUDIT Tier 1) ──────
+# Tempest and AirGradient each pin their poller's failure path into
+# source_status; WeatherLink never got the same test — a regression in
+# _run's accounting (or a credential leaking into /api/sources through
+# the error string) would ship green.
+
+async def test_run_failure_lands_in_source_status_without_credentials(
+        wl, monkeypatch):
+    """One REAL _run tick against a mocked 401: the failure must be
+    recorded on davis-cloud, and neither the api-key (rides the URL as a
+    query param) nor the api-secret (a header) may reach the snapshot."""
+    import asyncio
+    import json as _json
+
+    import httpx
+
+    from app import source_status, weatherlink_client
+
+    key, secret = "WL-API-KEY-1234567890", "WL-API-SECRET-0987654321"
+    real = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params.get("api-key") == key       # really sent
+        assert request.headers.get("X-Api-Secret") == secret
+        return httpx.Response(401, json={})
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda *a, **kw: real(transport=httpx.MockTransport(handler), **kw))
+
+    client = weatherlink_client.WeatherLinkClient(key, secret)
+    poller = wl.WeatherlinkPoller(client, 12345, 3600)
+    await poller.start()            # discovery 401s (best-effort)
+    await asyncio.sleep(0.05)       # first _run tick fails and records
+    await poller.stop()
+
+    rows = [r for r in source_status.snapshot()
+            if r.get("name") == "davis-cloud"]
+    assert rows and rows[0]["last_error"], \
+        "the failed tick never reached source_status"
+    assert rows[0]["consecutive_failures"] >= 1
+    snap = _json.dumps(source_status.snapshot())
+    assert key not in snap, "api-key leaked into /api/sources"
+    assert secret not in snap, "api-secret leaked into /api/sources"
+    assert "api-key=" not in snap, "key query leaked into /api/sources"
+
+
+async def test_run_no_iss_data_is_success_with_zero_rows(wl, monkeypatch):
+    """The API answering with no ISS sensor is NOT a failure — it must
+    record success with rows=0 (credentials fine, station contributing
+    nothing), clearing any prior error rather than raising a false alarm."""
+    import asyncio
+
+    import httpx
+
+    from app import source_status, weatherlink_client
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/stations":
+            return httpx.Response(200, json={"stations": []})
+        return httpx.Response(200, json={"sensors": [
+            {"sensor_type": 365, "data": [{"temp_in": 78.0}]}]})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda *a, **kw: real(transport=httpx.MockTransport(handler), **kw))
+
+    client = weatherlink_client.WeatherLinkClient("k" * 20, "s" * 20)
+    poller = wl.WeatherlinkPoller(client, 12345, 3600)
+    await poller.start()
+    await asyncio.sleep(0.05)
+    await poller.stop()
+
+    row = next(r for r in source_status.snapshot()
+               if r.get("name") == "davis-cloud")
+    assert row["last_error"] is None
+    assert row["consecutive_failures"] == 0
+    assert row["last_rows"] == 0
+    assert row["last_success_ms"] is not None

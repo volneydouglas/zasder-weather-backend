@@ -6,7 +6,7 @@ rain, summarising the whole event rather than pinging during it:
     Davis Storm Summary
     Time: 4:08pm - 9:58pm (5.8h)
     Total: 1.21" | Max Rate: 4.00"/h
-    Temps: 70°F | 80°F | Gust: 25 mph
+    Hi 80°F | Lo 70°F | Gust: 25 mph
 
 This is a different shape from every other alert here. Threshold and smart
 alerts are edge-triggered on a value crossing a line; this one is an *event*
@@ -189,8 +189,18 @@ def build_storm_message(device_name: str, s: StormSummary,
     lines.append(totals)
 
     third: list[str] = []
-    if s.min_tempf is not None and s.max_tempf is not None:
-        third.append(f"Temps: {s.min_tempf:.0f}°F | {s.max_tempf:.0f}°F")
+    # Hi first and LABELED, no "Temps:" prefix (Doren's three refinement
+    # rounds, 2026-08-27): Hi/Lo label themselves, and the dropped prefix
+    # keeps the full three-stat line under a lock-screen banner's width.
+    # ONE-SIDED temps render too (R14): a station whose sensor came up
+    # mid-storm has only a max — dropping BOTH silently was absent-is-
+    # not-zero backwards.
+    if s.max_tempf is not None and s.min_tempf is not None:
+        third.append(f"Hi {s.max_tempf:.0f}°F | Lo {s.min_tempf:.0f}°F")
+    elif s.max_tempf is not None:
+        third.append(f"Hi {s.max_tempf:.0f}°F")
+    elif s.min_tempf is not None:
+        third.append(f"Lo {s.min_tempf:.0f}°F")
     if s.max_gust_mph is not None:
         third.append(f"Gust: {s.max_gust_mph:.0f} mph")
     if third:

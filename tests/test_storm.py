@@ -101,7 +101,7 @@ def test_message_matches_the_requested_format():
     lines = body.split("\n")
     assert lines[0].startswith("Time: ") and lines[0].endswith("(5.8h)")
     assert lines[1] == 'Total: 1.21" | Max Rate: 4.00"/h'
-    assert lines[2] == "Temps: 70°F | 80°F | Gust: 25 mph"
+    assert lines[2] == "Hi 80°F | Lo 70°F | Gust: 25 mph"
 
 
 def test_times_are_local_and_lowercase():
@@ -229,7 +229,7 @@ def test_a_storm_opens_accumulates_and_reports(wired):
     assert title == "Davis Storm Summary"
     assert 'Total: 1.20"' in body          # six increments of 0.20
     assert 'Max Rate: 3.00"/h' in body     # max hourlyrainin over the window
-    assert "Temps: 70°F | 76°F" in body
+    assert "Hi 76°F | Lo 70°F" in body
     assert "Gust: 28 mph" in body
 
     # And the event is closed, so it cannot fire twice.
@@ -420,3 +420,85 @@ def test_a_stale_baseline_rebaselines_instead_of_opening_a_storm(wired):
     _run_tick(alerts, mac, wetter, t2)
     state = asyncio.run(db.get_storm_state(mac)) or {}
     assert state.get("started_ms") is not None, "real rain must still open"
+
+
+# ── storm history (1.9 shareables) ──────────────────────────────────────
+
+def test_storm_history_records_and_lists(client):
+    """record_storm keeps the newest 50 per station; the endpoint serves
+    them newest-first with every stat the Storm Report card renders."""
+    import asyncio
+
+    from app import db
+
+    mac = "AA:BB:CC:00:00:99"
+
+    async def seed():
+        for i in range(52):
+            await db.record_storm(mac, {
+                "started_ms": 1_000_000 + i * 10_000,
+                "ended_ms": 1_005_000 + i * 10_000,
+                "total_in": 0.1 * (i + 1),
+                "peak_rate_in_hr": 1.5,
+                "max_gust_mph": 38.0,
+                "min_tempf": 68.0, "max_tempf": 75.0})
+        return await db.list_storms(mac, limit=50)
+
+    rows = asyncio.run(seed())
+    assert len(rows) == 50                      # pruned, newest kept
+    assert rows[0]["total_in"] == pytest.approx(5.2)
+    assert rows[0]["max_gust_mph"] == 38.0
+
+    r = client.get(f"/api/devices/{mac}/storms?limit=3",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    storms = r.json()["storms"]
+    assert len(storms) == 3
+    assert storms[0]["ended_ms"] > storms[1]["ended_ms"]
+    # Read-gated like every station read.
+    assert client.get(f"/api/devices/{mac}/storms").status_code == 401
+
+
+def test_storm_history_serves_null_peak_rate(client):
+    """R12 W2: peak_rate is MAX(hourlyrainin) and SDR/LilyGO stations store
+    NULL there while still recording storms (counter-based detection). The
+    row must store and serve as null — the iOS decode treats the field as
+    optional, and one numeric-coerced 0.0 would be a fake reading."""
+    import asyncio
+
+    from app import db
+
+    asyncio.run(db.record_storm("5D:5D:05:00:00:01", {
+        "started_ms": 1_787_000_000_000, "ended_ms": 1_787_003_600_000,
+        "total_in": 0.42, "peak_rate_in_hr": None,
+        "max_gust_mph": None, "min_tempf": None, "max_tempf": None}))
+    r = client.get("/api/devices/5D:5D:05:00:00:01/storms",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    row = r.json()["storms"][0]
+    assert row["total_in"] == 0.42
+    assert row["peak_rate_in_hr"] is None, \
+        "a rate the station never measured must serve as null, not 0"
+
+
+def test_one_sided_temps_still_render():
+    """R14: a sensor that came up mid-storm has only one of min/max —
+    dropping BOTH silently was absent-is-not-zero backwards."""
+    _, body = storm.build_storm_message(
+        "D", _summary(min_tempf=None), "UTC")
+    assert "Hi 80°F" in body and "Lo" not in body
+    _, body = storm.build_storm_message(
+        "D", _summary(max_tempf=None), "UTC")
+    assert "Lo 70°F" in body and "Hi" not in body
+
+
+def test_stat_line_fits_a_lock_screen_banner():
+    """R14: the "fits one line" promise was pinned by one 32-char fixture,
+    not a budget. Worst realistic case — three-digit sub-zero temps and a
+    three-digit gust — must stay under ~40 chars so "mph" can't wrap."""
+    _, body = storm.build_storm_message(
+        "D", _summary(min_tempf=-40.0, max_tempf=-10.0,
+                      max_gust_mph=199.0), "UTC")
+    stat_line = body.split("\n")[2]
+    assert stat_line == "Hi -10°F | Lo -40°F | Gust: 199 mph"
+    assert len(stat_line) <= 40

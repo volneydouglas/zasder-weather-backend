@@ -8,6 +8,7 @@
 
 #include "auth_logic.h"
 #include "display.h"
+#include "url_logic.h"
 
 namespace ZasderConfigServer {
 
@@ -308,44 +309,19 @@ static void handleProvision() {
     // so "https://host/" would silently become "https://host//ingest/custom".
     while (v.endsWith("/")) v.remove(v.length() - 1);
     if (v.length() > 0) {
-      // Require an https:// URL (http:// too only in a TLS_INSECURE dev
-      // build). The poster always connects through WiFiClientSecure, so a
-      // plain-http URL can never work in production — but it would only
-      // fail hours later at POST time with an opaque TLS error, long after
-      // the operator stopped watching. Reject it now, while they are.
+      // Require a full https://host URL (http:// too only in a
+      // TLS_INSECURE dev build). The poster always connects through
+      // WiFiClientSecure, so a bad URL persists fine and then fails hours
+      // later at POST time with an opaque error — reject it now, while
+      // the operator is watching. The scheme/host/charset decision lives
+      // in url_logic.h (Arduino-free) so the native tests can pin every
+      // rejected shape.
 #if defined(TLS_INSECURE) && TLS_INSECURE
-      bool schemeOk = v.startsWith("https://") || v.startsWith("http://");
+      constexpr bool allowHttp = true;
 #else
-      bool schemeOk = v.startsWith("https://");
+      constexpr bool allowHttp = false;
 #endif
-      // "https://" alone (no host) passes startsWith, and a bare length
-      // check still admits host-less shapes like "https:///path",
-      // "https://?q" and "https://#f" — which persist fine and then fail
-      // hours later at POST time. Parse the authority out and require a
-      // non-empty host (one-shot config path, so the String work is fine).
-      String authority = v.substring(v.startsWith("https://") ? 8 : 7);
-      int authorityEnd = authority.length();
-      for (char delimiter : {'/', '?', '#'}) {
-        int index = authority.indexOf(delimiter);
-        if (index >= 0 && index < authorityEnd) authorityEnd = index;
-      }
-      String hostPort = authority.substring(0, authorityEnd);
-      // Skip any userinfo@ prefix; what's left must start with a host, not
-      // a bare :port.
-      String host = hostPort.substring(hostPort.lastIndexOf('@') + 1);
-      // Charset check (R6): a host containing a space or control char
-      // passed provisioning and then failed hours later at POST time —
-      // the exact deferred-failure this validation exists to prevent.
-      // Hostname alphabet + ':' for the port + '[]' for IPv6 literals.
-      bool hostCharsOk = host.length() > 0;
-      for (unsigned int i = 0; i < host.length() && hostCharsOk; i++) {
-        char c = host[i];
-        if (!(isalnum((unsigned char) c) || c == '.' || c == '-' ||
-              c == ':' || c == '[' || c == ']')) {
-          hostCharsOk = false;
-        }
-      }
-      if (!schemeOk || host.length() == 0 || host[0] == ':' || !hostCharsOk) {
+      if (!ZasderUrl::validBackendUrl(v.c_str(), allowHttp)) {
         server.send(400, "text/plain",
                     "backend_url must be a full https://host URL (the "
                     "firmware posts over TLS; a plain-http backend needs a "

@@ -5,7 +5,7 @@ import sys as _sys
 from typing import ClassVar, Iterable
 from zoneinfo import ZoneInfo as _ZoneInfo
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _log = _logging.getLogger("config")
@@ -166,6 +166,10 @@ class Settings(BaseSettings):
     # win over these, the standard kv-over-env rule.
     airgradient_token: str | None = None
     airgradient_poll_interval_seconds: int = 120
+    # LAN polling (1.9): comma-separated monitor hosts/IPs — e.g.
+    # "airgradient_84fce612345c.local,192.168.1.40". Only useful when the
+    # backend can actually see that LAN (a local docker install).
+    airgradient_local_hosts: str | None = None
     # Friendly name for the synthetic device row; falls back to the Tempest
     # station's own name when unset.
     tempest_name: str | None = None
@@ -238,6 +242,22 @@ class Settings(BaseSettings):
     # and weather changes on minute scales, so 60 is a good fit. 0 = store every
     # reading (default — no behavior change for existing deployments).
     ingest_min_interval_seconds: int = 0
+    # History thinning (1.9): 0 = off (default — deleting data is opt-in).
+    # When set, raw rows older than this many days are thinned to one per
+    # HISTORY_KEEP_INTERVAL_MINUTES and their data_json dropped; daily
+    # rollups keep every day's true extremes. Needs INSIGHTS=1.
+    history_detail_days: int = 0
+    history_keep_interval_minutes: int = 5
+    # data_json trimming (1.9): 0 = off. Blanks the per-row JSON payload
+    # (most of each row's bytes) past this window while KEEPING every row
+    # — every charted/recorded field has a typed column. App-stored
+    # retention settings win over both history_* env values.
+    history_json_detail_days: int = 0
+    # Water-year rain (1.9): month whose 1st starts the hydrology year.
+    # 10 = October, the western-US convention. 1 makes it the calendar
+    # year for operators who don't want the distinction. Bounded at parse
+    # time — an env typo like 13 used to 500 every climate endpoint (R11).
+    water_year_start_month: int = Field(default=10, ge=1, le=12)
 
     # ── Sea-level pressure correction at ingest (opt-in) ─────────────────
     # Some /ingest/custom sensors post ABSOLUTE station pressure (a WH32B
@@ -305,10 +325,14 @@ class Settings(BaseSettings):
     # forecast is fetched here; the app's import key stays per-request.
     wu_api_key: str | None = None
 
-    # Opt-in server-side Insights (statistics rollups + /api/insights).
+    # Server-side Insights (statistics rollups + /api/insights). ON by
+    # default since 1.9 — the climate set, year charts, and history
+    # thinning all ride the rollups, and boot self-schedules the one-time
+    # background rebuild when history predates enablement. INSIGHTS=0
+    # remains the opt-out.
     # Gates BOTH rollup maintenance and the endpoint; enabling on existing
     # data needs POST /api/insights/rebuild (see app/insights.py).
-    insights: bool = False
+    insights: bool = True
 
     public_dashboard: bool = False
     # Which stations to show. Empty/unset = the primary (first) device only.

@@ -172,7 +172,7 @@ def test_relay_mode_does_not_prune_mismatched_or_guessed_env_tokens(client, monk
         "relay_token": "rtok"})
 
     seen = {}
-    async def fake_relay(tokens, title, body, url, token):
+    async def fake_relay(tokens, title, body, url, token, **kw):
         seen["tokens"] = list(tokens)
         return {"sent": 0, "dead": list(tokens), "failed": 0}
     monkeypatch.setattr(apns, "_push_via_relay", fake_relay)

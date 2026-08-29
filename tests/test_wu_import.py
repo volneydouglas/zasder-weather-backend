@@ -131,14 +131,15 @@ def _seed_device(client):
 
 
 def _run_import(monkeypatch, days_payload, mac="AA:BB:CC:DD:EE:FF",
-                dry_run=False, start="2023-04-08", end="2023-04-09"):
+                dry_run=False, start="2023-04-08", end="2023-04-09",
+                force=False):
     async def fake_fetch(client, station_id, day, api_key):
         assert api_key == "k" * 16          # threaded through, never mutated
         return days_payload.get(day, [])
     monkeypatch.setattr(wu_import, "_fetch_day", fake_fetch)
     asyncio.run(wu_import._run(mac, "KAZCHAND668", "k" * 16,
                                dt.date.fromisoformat(start),
-                               dt.date.fromisoformat(end), dry_run))
+                               dt.date.fromisoformat(end), dry_run, force))
     return wu_import.status()
 
 
@@ -151,9 +152,18 @@ def test_import_inserts_and_is_idempotent(client, monkeypatch):
     assert st["done_days"] == 2 and st["rows_seen"] == 3
     assert st["rows_inserted"] == 3
 
-    # Same import again: INSERT OR IGNORE — nothing added.
+    # Same import again: the ledger (1.9) skips both days without a fetch —
+    # a re-run must not refill days history thinning may have slimmed,
+    # and spends zero WU quota.
     st2 = _run_import(monkeypatch, days)
-    assert st2["rows_seen"] == 3 and st2["rows_inserted"] == 0
+    assert st2["skipped_days"] == 2 and st2["rows_seen"] == 0
+    assert st2["rows_inserted"] == 0 and st2["done_days"] == 2
+
+    # force=True refetches through the ledger; INSERT OR IGNORE still
+    # dedupes at the row level — nothing added twice.
+    st3 = _run_import(monkeypatch, days, force=True)
+    assert st3["skipped_days"] == 0 and st3["rows_seen"] == 3
+    assert st3["rows_inserted"] == 0
 
     # The imported rows are queryable through ranged /history.
     end_ms = (1_680_998_694 + 3600) * 1000
@@ -182,8 +192,11 @@ def test_import_records_empty_days_and_auth_error(client, monkeypatch):
     async def denied(client_, station_id, day, api_key):
         raise PermissionError("WU API key rejected (401)")
     monkeypatch.setattr(wu_import, "_fetch_day", denied)
+    # A day the ledger hasn't seen — the run above ledgered 04-08/09 as
+    # processed (empty is processed), so a re-run over those would skip
+    # the fetch entirely and never surface the auth error.
     asyncio.run(wu_import._run("AA:BB:CC:DD:EE:FF", "X", "k" * 16,
-                               dt.date(2023, 4, 8), dt.date(2023, 4, 8), False))
+                               dt.date(2023, 4, 10), dt.date(2023, 4, 10), False))
     st = wu_import.status()
     assert st["error"] == "WU API key rejected (401)"
     assert st["running"] is False

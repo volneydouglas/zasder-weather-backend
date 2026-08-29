@@ -192,7 +192,8 @@ def _init_state(mac: str, station_id: str, start: date, end: date,
         "dry_run": dry_run, "start_date": start.isoformat(),
         "end_date": end.isoformat(), "total_days": (end - start).days + 1,
         "done_days": 0, "rows_seen": 0, "rows_inserted": 0,
-        "empty_days": 0, "current_day": None, "error": None,
+        "empty_days": 0, "skipped_days": 0, "current_day": None,
+        "error": None,
         "started_ms": int(time.time() * 1000), "finished_ms": None,
         "cancelled": False, "calls_made": 0,
         "call_budget": WU_DAILY_CALL_BUDGET, "resume_from": None,
@@ -200,12 +201,28 @@ def _init_state(mac: str, station_id: str, start: date, end: date,
 
 
 async def _run(mac: str, station_id: str, api_key: str,
-               start: date, end: date, dry_run: bool) -> None:
+               start: date, end: date, dry_run: bool,
+               force: bool = False) -> None:
     _init_state(mac, station_id, start, end, dry_run)
     try:
+        # Import ledger (1.9): days already fully processed are SKIPPED —
+        # no API call, no rows. Two reasons: a re-run must not refill days
+        # that history thinning has since slimmed down ("extras"), and WU
+        # quota is too scarce to spend re-fetching archives we hold.
+        # force=True BYPASSES the lookup for this run's range only — it
+        # must not clear the station's ledger, or days outside the forced
+        # range lose their entries and later normal imports refetch them
+        # (CodeRabbit, PR #33). mark_imported_day below re-stamps each
+        # forced day as it completes. Dry runs read but never write.
+        already = await db.imported_days(mac, "wu") if not force else set()
         async with httpx.AsyncClient(timeout=30) as client:
             day = start
             while day <= end:
+                if day.isoformat() in already:
+                    _state["skipped_days"] += 1
+                    _state["done_days"] += 1
+                    day += timedelta(days=1)
+                    continue
                 if _state.get("cancelled"):
                     # Record the first unprocessed day so a cancelled run is
                     # resumable exactly like a quota-paused one.
@@ -255,6 +272,11 @@ async def _run(mac: str, station_id: str, api_key: str,
                     _state["empty_days"] += 1
                 elif not dry_run:
                     _state["rows_inserted"] += await db.insert_observations(mac, rows)
+                if not dry_run:
+                    # Ledger AFTER the insert: a day is "done" only once its
+                    # rows are on disk. Empty days ledger too — WU has
+                    # nothing for them, and re-asking daily costs quota.
+                    await db.mark_imported_day(mac, day.isoformat(), "wu")
                 _state["done_days"] += 1
                 day += timedelta(days=1)
                 if day <= end:
@@ -281,8 +303,10 @@ async def _run(mac: str, station_id: str, api_key: str,
 
 
 def start_import(mac: str, station_id: str, api_key: str,
-                 start: date, end: date, dry_run: bool) -> bool:
-    """Kick off a background import. False if one is already running."""
+                 start: date, end: date, dry_run: bool,
+                 force: bool = False) -> bool:
+    """Kick off a background import. False if one is already running.
+    force=True re-imports days the ledger says are already done."""
     global _task
     if _state.get("running"):
         return False
@@ -295,7 +319,7 @@ def start_import(mac: str, station_id: str, api_key: str,
     # running=True, so this claim is never dropped.
     _init_state(mac, station_id, start, end, dry_run)
     _task = asyncio.create_task(
-        _run(mac, station_id, api_key, start, end, dry_run),
+        _run(mac, station_id, api_key, start, end, dry_run, force),
         name="wu-import")
     return True
 

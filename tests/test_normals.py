@@ -120,3 +120,97 @@ def test_normals_endpoint_absent_without_coords(client):
     # Unknown mac: same honest shape, not a 500.
     r = client.get("/api/devices/11:22:33:44:55:66/normals", headers=_H)
     assert r.json() == {"available": False}
+
+
+def test_ring_search_prefers_the_closest_hit(monkeypatch):
+    """The Fountain Hills lesson (2026-08-27): one wide bbox handed
+    Chandler a foothills station 28 miles out because NCEI returned it
+    first. Rings must take a small-radius hit before ever widening —
+    and still find a station that only the widest ring covers."""
+    import asyncio
+
+    import httpx
+
+    from app import normals
+
+    def station(name):
+        return {"results": [{"stations": [{
+            "id": f"GHCND:{name}", "name": name,
+            "dataTypes": [{"id": "DLY-TMAX-NORMAL", "coverage": 1.0}]}]}]}
+
+    calls: list[float] = []
+    real = httpx.AsyncClient
+
+    def make_handler(hits_by_ring):
+        def handler(request: httpx.Request) -> httpx.Response:
+            # bbox = "latN,lonW,latS,lonE" — recover the half-side.
+            north = float(request.url.params["bbox"].split(",")[0])
+            ring = round(north - 33.30, 2)
+            calls.append(ring)
+            body = hits_by_ring.get(ring) or {"results": []}
+            return httpx.Response(200, json=body)
+        return handler
+
+    # Closest ring has a station: no widening happens.
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: real(
+        transport=httpx.MockTransport(
+            make_handler({0.08: station("CHANDLER HEIGHTS")})), **kw))
+    got = asyncio.run(normals._find_station(33.30, -111.94))
+    assert got == ("GHCND:CHANDLER HEIGHTS", "CHANDLER HEIGHTS")
+    assert calls == [0.08]
+
+    # Only the widest ring has one: still found, after walking out.
+    calls.clear()
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: real(
+        transport=httpx.MockTransport(
+            make_handler({0.35: station("FOUNTAIN HILLS")})), **kw))
+    got = asyncio.run(normals._find_station(33.30, -111.94))
+    assert got == ("GHCND:FOUNTAIN HILLS", "FOUNTAIN HILLS")
+    assert calls == [0.08, 0.15, 0.35]
+
+
+def test_malformed_ncei_responses_widen_the_ring_instead_of_raising(
+        monkeypatch):
+    """R14 carry: the whole search response is remote input. A valid-JSON
+    scalar body, junk nested nodes, and a covered station with a garbage
+    id must each keep the walk alive — the wider ring still answers, and
+    nothing raises out of _find_station."""
+    import asyncio
+
+    import httpx
+
+    from app import normals
+
+    hostile_by_ring = {
+        # Ring 1: valid JSON, wrong shape entirely.
+        0.08: 42,
+        # Ring 2: every node malformed a different way — non-dict result,
+        # non-list stations, non-dict station, junk dataTypes, and a
+        # covered station whose id is whitespace.
+        0.15: {"results": [
+            "not-a-dict",
+            {"stations": "not-a-list"},
+            {"stations": ["not-a-dict",
+                          {"id": 7, "dataTypes": "junk"},
+                          {"id": "   ",
+                           "dataTypes": [{"id": "DLY-TMAX-NORMAL",
+                                          "coverage": 1.0}]}]},
+        ]},
+        # Ring 3: a real station — with padding the guard must strip.
+        0.35: {"results": [{"stations": [{
+            "id": "  GHCND:USW00023183  ", "name": "  PHOENIX AIRPORT  ",
+            "dataTypes": [{"id": "DLY-TMAX-NORMAL", "coverage": 1.0}]}]}]},
+    }
+    real = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        north = float(request.url.params["bbox"].split(",")[0])
+        ring = round(north - 33.30, 2)
+        return httpx.Response(200, json=hostile_by_ring[ring])
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: real(
+        transport=httpx.MockTransport(handler), **kw))
+    got = asyncio.run(normals._find_station(33.30, -111.94))
+    # Stripped id AND name (R14): a padded id must not reach the NCEI
+    # data query verbatim.
+    assert got == ("GHCND:USW00023183", "PHOENIX AIRPORT")

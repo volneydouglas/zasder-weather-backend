@@ -403,6 +403,29 @@ async def test_records_long_periods_come_from_rollups(db_module, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_records_week_period_is_trailing_seven_days(db_module):
+    """1.9: the Week period. Trailing 7 local days including today — the
+    Charts "7d" grammar, not a calendar week (which shows one day's records
+    every Sunday morning, and whose Sunday depends on locale)."""
+    db = db_module
+    await db.init_db()
+    mac = "TE:MP"
+    day0, rows = await _seed_three_days(db, mac)
+
+    out = await db.records(mac)
+    week = out["periods"]["week"]
+    # Boundary: local (UTC here) midnight six days back, so the window spans
+    # exactly 7 day-buckets ending today.
+    assert week["start_ms"] == day0 - 6 * 86_400_000
+    # The 3-day seed sits entirely inside the trailing week, so the week
+    # record equals the all-time record — including day-2's 111.0, which
+    # "today" must NOT see.
+    assert week["fields"]["tempf"]["max"] == 111.0
+    assert week["fields"]["tempf"]["min"] == 76.0
+    assert out["periods"]["today"]["fields"]["tempf"]["max"] == 99.5
+
+
+@pytest.mark.asyncio
 async def test_records_fall_back_when_rollups_do_not_cover(db_module):
     """INSIGHTS enabled late (or never rebuilt) leaves rollups starting
     after the archive does. Answering all-time from those would silently
@@ -632,3 +655,80 @@ async def test_full_rebuild_preserves_a_mid_rebuild_dirty_marker(db_module, monk
     monkeypatch.setattr(insights, "_rebuild_scan", real_scan)
     await insights.rebuild()
     assert await db.get_kv("rollups_dirty") is None
+
+
+@pytest.mark.asyncio
+async def test_rebuild_guards_against_concurrent_thinning(db_module, monkeypatch):
+    """R11 V6: thin_history refuses while rollups_dirty is set — and that
+    refusal is the only thing stopping the daily retention pass from
+    advancing the thin watermark under a running rebuild (the scan
+    snapshots the watermark once; concurrent thinning silently flattens
+    rollup extremes). rebuild() must therefore hold a dirty nonce for the
+    scan's duration, and clear its OWN guard afterwards — even a
+    single-mac rebuild, whose guard claimed nothing about staleness."""
+    from app import insights, maintenance
+    # Patch the settings object MAINTENANCE holds — conftest's per-test
+    # module reloading can leave app.config.settings a newer object than
+    # the one maintenance bound at its import, and patching the newer one
+    # leaves the INSIGHTS gate closed (flaked in full-suite runs only).
+    monkeypatch.setattr(maintenance.settings, "insights", True)
+    db = db_module
+    await db.init_db()
+    mac = "TE:MP"
+    await _seed_three_days(db, mac)
+    assert await db.get_kv("rollups_dirty") is None
+
+    real_scan = insights._rebuild_scan
+    seen: dict = {}
+
+    from app.config import settings as cur_settings
+
+    async def scan_probing_guard(dbmod, mac_):
+        seen["dirty_during_scan"] = await dbmod.get_kv("rollups_dirty")
+        # The actual victim: the retention pass firing mid-scan must refuse.
+        # db_path passed explicitly — maintenance's own settings binding can
+        # be a stale object after conftest's reloads (see the patch above).
+        with pytest.raises(RuntimeError, match="dirty"):
+            maintenance.thin_history(apply=True, detail_days=365,
+                                     keep_minutes=5,
+                                     db_path=cur_settings.database_path)
+        return await real_scan(dbmod, mac_)
+
+    monkeypatch.setattr(insights, "_rebuild_scan", scan_probing_guard)
+    await insights.rebuild(mac)                     # single-mac on purpose
+    assert seen["dirty_during_scan"], "no guard nonce held during the scan"
+    assert await db.get_kv("rollups_dirty") is None, \
+        "the rebuild's own guard must not outlive it"
+
+
+@pytest.mark.asyncio
+async def test_records_week_boundary_is_local_midnight_across_dst(db_module):
+    """R12 sub-ledger: week0 is rebuilt from date components, not
+    day0 - 6 days, so a DST jump inside the trailing week can't shift the
+    boundary an hour off local midnight. Pin the component construction in
+    a DST zone and that the boundary actually filters. (Discriminates only
+    when a transition sits inside the window — the construction it pins is
+    right year-round, same caveat as the rain-tier DST test.)"""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    db = db_module
+    tz = ZoneInfo("America/New_York")
+    await db.init_db()
+    mac = "TE:DS"
+    now = datetime.now(tz)
+    week_date = now.date() - timedelta(days=6)
+    week0 = datetime(week_date.year, week_date.month, week_date.day,
+                     tzinfo=tz)
+    inside = week0 + timedelta(hours=2)
+    outside = week0 - timedelta(hours=2)
+    await db.insert_observations(mac, [
+        {"dateutc": int(outside.timestamp() * 1000), "tempf": 120.0},
+        {"dateutc": int(inside.timestamp() * 1000), "tempf": 95.0},
+        {"dateutc": int(now.timestamp() * 1000) - 60_000, "tempf": 80.0},
+    ])
+    out = await db.records(mac, tz_name="America/New_York")
+    week = out["periods"]["week"]
+    assert week["start_ms"] == int(week0.timestamp() * 1000)
+    # The pre-boundary 120.0 belongs to all-time, never the week.
+    assert week["fields"]["tempf"]["max"] == 95.0
+    assert out["periods"]["all"]["fields"]["tempf"]["max"] == 120.0

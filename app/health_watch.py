@@ -46,7 +46,15 @@ _COVER_MARGIN_MS = 30 * 60_000
 
 _BATT_LOW_FIELDS = ("battout", "battin", "batt1", "batt2", "batt3",
                     "batt4", "batt5", "batt6", "batt7", "batt8",
-                    "wh57batt", "wh65batt", "batt_co2", "batt_25")
+                    "wh57batt", "wh65batt", "batt_co2", "batt_25",
+                    # 1.9: the AWN-native name the Ecowitt adapter maps
+                    # wh57batt onto (AWN cloud rows use it directly too),
+                    # plus every flag the adapter's voltage/binary
+                    # normalizer emits under its vendor name — a low WH40
+                    # beside a healthy WS90 array otherwise alerted nobody
+                    # (CodeRabbit, PR #33).
+                    "batt_lightning", "wh40batt", "wh68batt", "wh80batt",
+                    "wh90batt")
 
 _last_flatline_ms: dict[str, int] = {}
 

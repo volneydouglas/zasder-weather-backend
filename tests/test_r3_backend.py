@@ -125,7 +125,7 @@ def test_wu_import_falls_back_to_server_stored_key(client, monkeypatch):
     assert client.put("/api/config/wu-key", headers=H,
                       json={"api_key": "serverkey123"}).status_code == 200
     captured = {}
-    def fake_start(mac, station, api_key, start, end, dry_run):
+    def fake_start(mac, station, api_key, start, end, dry_run, force=False):
         captured.update(mac=mac, api_key=api_key)
         return True
     monkeypatch.setattr(wu_import, "start_import", fake_start)

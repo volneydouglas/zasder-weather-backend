@@ -57,9 +57,28 @@ Two deployment modes for the backend itself:
   exposing it to the internet (port-forward, tunnel, reverse proxy) is on
   you. Good for "I want all my data on-premise."
 
-The iOS app ([app page](https://zasder.com/weather)) is distributed separately and connects to whichever backend URL you give it.
+The iOS app ([app page](https://zasder.com/weather)) is distributed separately and connects to whichever backend URL you give it — and since app version 1.9 it can also **create the whole backend for you** (first option below).
 
 ## Quickstart: Fly.io (5 minutes)
+
+### Easiest: straight from the iPhone or Mac app — no computer setup at all
+
+The app has a **Guided Setup** that does everything on this page for you
+(app 1.9+ on iOS, 1.8+ on the Mac):
+
+1. Install [Zasder Weather](https://zasder.com/weather) from the App Store.
+2. In the app, choose **Set up a new server**.
+3. Create a free [Fly.io](https://fly.io) account (a card is required for
+   their billing), open **Tokens** in the Fly dashboard, create an **org
+   token**, and paste it into the app.
+4. The app creates the server, storage, and secrets, deploys the backend,
+   connects itself, and walks you through adding your stations.
+
+You never touch a terminal, and the server still runs under **your** Fly
+account — you own it and your data outright. The clone-and-script paths
+below do exactly the same thing and remain fully supported; they're the
+way to go if you're setting up from a Linux box, want local Docker, or
+just prefer a shell.
 
 ### On a Mac: no Terminal required
 

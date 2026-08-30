@@ -878,6 +878,32 @@ DASHBOARD_CSS = """
 # made though!") — the page keeps a little something to look at.
 # The color var carries a fallback because the status page can render
 # without the dashboard token set.
+# The settle script, kept as its own constant so the CSP middleware can
+# allow exactly these bytes by sha256 hash (script-src carries no
+# 'unsafe-inline'; a hash pins the one script we mean to run). The body
+# must stay byte-identical to what lands between the <script> tags —
+# SPINNER_HTML composes it below, and a test hashes the served page to
+# keep the two from drifting.
+SPINNER_SCRIPT = """
+(function () {
+  var s = document.getElementById("zw-spin");
+  if (!s) return;
+  function settle() { setTimeout(function () { s.classList.add("zw-done"); }, 700); }
+  if (document.readyState === "complete") settle();
+  else window.addEventListener("load", settle);
+  // Back-forward cache restores skip 'load' — fade again on return.
+  window.addEventListener("pageshow", function (e) { if (e.persisted) settle(); });
+  // Wake just before the page's own auto-refresh navigates, so the spin
+  // covers the reload gap instead of appearing after it.
+  var meta = document.querySelector('meta[http-equiv="refresh"]');
+  var secs = meta ? parseInt(meta.getAttribute("content"), 10) : 0;
+  if (secs > 3) {
+    setTimeout(function () { s.classList.remove("zw-done"); }, (secs - 2) * 1000);
+  }
+  window.addEventListener("pagehide", function () { s.classList.remove("zw-done"); });
+})();
+"""
+
 SPINNER_HTML = """
 <style>
   #zw-spin { position:fixed; right:10px; bottom:10px; width:24px; height:24px;
@@ -903,23 +929,5 @@ SPINNER_HTML = """
     </g>
   </svg>
 </div>
-<script>
-(function () {
-  var s = document.getElementById("zw-spin");
-  if (!s) return;
-  function settle() { setTimeout(function () { s.classList.add("zw-done"); }, 700); }
-  if (document.readyState === "complete") settle();
-  else window.addEventListener("load", settle);
-  // Back-forward cache restores skip 'load' — fade again on return.
-  window.addEventListener("pageshow", function (e) { if (e.persisted) settle(); });
-  // Wake just before the page's own auto-refresh navigates, so the spin
-  // covers the reload gap instead of appearing after it.
-  var meta = document.querySelector('meta[http-equiv="refresh"]');
-  var secs = meta ? parseInt(meta.getAttribute("content"), 10) : 0;
-  if (secs > 3) {
-    setTimeout(function () { s.classList.remove("zw-done"); }, (secs - 2) * 1000);
-  }
-  window.addEventListener("pagehide", function () { s.classList.remove("zw-done"); });
-})();
-</script>
+<script>""" + SPINNER_SCRIPT + """</script>
 """

@@ -8,6 +8,20 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [1.9.1] — 2026-08-30
+
+### Fixed
+- **The embed's scripts actually run now.** The security policy
+  (`script-src 'self'`, correctly strict since it shipped) silently
+  blocked the public pages' two inline scripts in every browser: the
+  loading spinner never faded once it appeared, and the embed's
+  auto-height messages were never posted — iframes never auto-sized, in
+  any browser, ever. The exact script bodies are now allowed by sha256
+  hash (no `unsafe-inline`), and a test hashes the scripts as actually
+  served so a future edit can't silently regress. If you iframe your
+  `/embed` with the auto-height snippet, it starts working with this
+  release — you can drop any fixed iframe height.
+
 ## [1.9.0] — 2026-08-29
 
 ### Added

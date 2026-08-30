@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import json
 import html as _html
 import math
@@ -386,6 +388,83 @@ class EcowittTokenScrub:
 app.add_middleware(EcowittTokenScrub)
 
 
+# ── Inline-script CSP hashes ─────────────────────────────────────────────
+# script-src deliberately carries no 'unsafe-inline': the public pages are
+# the one place untrusted text (station names, location) meets HTML, so a
+# blanket allowance would hand any markup slip a script foothold. But the
+# pages DO run two inline scripts of our own — the embed's height
+# broadcast and the spinner settle — and 'self' does not cover inline
+# bodies, so browsers silently dropped both for as long as this CSP has
+# existed (the eternally-spinning anemometer, and every auto-height
+# "blank band" report: the messages were simply never posted). Allow
+# exactly those two bodies by sha256 hash; anything else stays blocked.
+
+_EMBED_HEIGHT_SCRIPT = """
+/* Auto-height (1.7): tell the embedding page how tall this content really
+   is, so its iframe can fit exactly instead of guessing a magic number.
+   scrolling="no" clips anything below the frame's bottom edge, and a
+   clipped bottom looks identical to content that never loaded — the
+   50/50 missing-cards report (Doren, 2026-08-23). Fires on load and on
+   every content resize; a no-op when the page isn't framed. The height
+   is not sensitive, so the wildcard target is fine; the companion
+   listener verifies the SOURCE frame before trusting the number. */
+(function () {
+  if (window.parent === window) return;
+  var last = 0;
+  function post() {
+    var h = document.documentElement.scrollHeight;
+    if (Math.abs(h - last) < 2) return;
+    last = h;
+    window.parent.postMessage({ type: "zasder-embed-height", height: h }, "*");
+  }
+  if (window.ResizeObserver) {
+    new ResizeObserver(post).observe(document.documentElement);
+  }
+  window.addEventListener("load", post);
+  post();
+  /* Re-broadcast on a timer (field test 2026-08-28): WordPress/Divi
+     "delay JS until interaction" optimizers attach the parent's
+     listener LATE, after every post above already fired — and with
+     static content ResizeObserver never fires again, so the iframe
+     stayed at its fallback height forever (Doren's blank band under
+     the records). Re-posting is a few bytes; the parent ignores
+     repeats. Every 3s for the first 30s catches late listeners, then
+     every 60s as a keep-alive until the page's own auto-refresh. */
+  var ticks = 0;
+  var timer = setInterval(function () {
+    ticks += 1;
+    last = 0;
+    post();
+    if (ticks === 10) {
+      clearInterval(timer);
+      setInterval(function () { last = 0; post(); }, 60000);
+    }
+  }, 3000);
+})();
+"""
+
+
+def _csp_hash(script_body: str) -> str:
+    """CSP source token for one inline script: sha256 over the exact bytes
+    between the <script> tags, base64 as the spec requires."""
+    digest = hashlib.sha256(script_body.encode("utf-8")).digest()
+    return "'sha256-" + base64.b64encode(digest).decode("ascii") + "'"
+
+
+_CSP_SCRIPT_HASHES: str | None = None
+
+
+def _csp_script_hashes() -> str:
+    # public_dashboard imports lazily elsewhere in this module (import-order
+    # dance at startup); mirror that and cache after the first request.
+    global _CSP_SCRIPT_HASHES
+    if _CSP_SCRIPT_HASHES is None:
+        from . import public_dashboard as _pd
+        _CSP_SCRIPT_HASHES = (_csp_hash(_EMBED_HEIGHT_SCRIPT) + " "
+                              + _csp_hash(_pd.SPINNER_SCRIPT))
+    return _CSP_SCRIPT_HASHES
+
+
 @app.middleware("http")
 async def _security_headers(request: Request, call_next):
     """Add a baseline set of browser security headers to every response.
@@ -405,13 +484,13 @@ async def _security_headers(request: Request, call_next):
         csp = ("default-src 'self'; "
                "img-src 'self' data:; "
                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-               "script-src 'self' https://cdn.jsdelivr.net; "
+               f"script-src 'self' {_csp_script_hashes()} https://cdn.jsdelivr.net; "
                f"connect-src 'self'; {fa}")
     else:
         csp = ("default-src 'self'; "
                "img-src 'self' data:; "
                "style-src 'self' 'unsafe-inline'; "
-               "script-src 'self'; "
+               f"script-src 'self' {_csp_script_hashes()}; "
                f"connect-src 'self'; {fa}")
     response.headers.setdefault("Content-Security-Policy", csp)
     response.headers.setdefault("Strict-Transport-Security",
@@ -648,49 +727,7 @@ async def embed_page(
 <body><div class="wrap">
 {dash}
 </div>
-<script>
-/* Auto-height (1.7): tell the embedding page how tall this content really
-   is, so its iframe can fit exactly instead of guessing a magic number.
-   scrolling="no" clips anything below the frame's bottom edge, and a
-   clipped bottom looks identical to content that never loaded — the
-   50/50 missing-cards report (Doren, 2026-08-23). Fires on load and on
-   every content resize; a no-op when the page isn't framed. The height
-   is not sensitive, so the wildcard target is fine; the companion
-   listener verifies the SOURCE frame before trusting the number. */
-(function () {{
-  if (window.parent === window) return;
-  var last = 0;
-  function post() {{
-    var h = document.documentElement.scrollHeight;
-    if (Math.abs(h - last) < 2) return;
-    last = h;
-    window.parent.postMessage({{ type: "zasder-embed-height", height: h }}, "*");
-  }}
-  if (window.ResizeObserver) {{
-    new ResizeObserver(post).observe(document.documentElement);
-  }}
-  window.addEventListener("load", post);
-  post();
-  /* Re-broadcast on a timer (field test 2026-08-28): WordPress/Divi
-     "delay JS until interaction" optimizers attach the parent's
-     listener LATE, after every post above already fired — and with
-     static content ResizeObserver never fires again, so the iframe
-     stayed at its fallback height forever (Doren's blank band under
-     the records). Re-posting is a few bytes; the parent ignores
-     repeats. Every 3s for the first 30s catches late listeners, then
-     every 60s as a keep-alive until the page's own auto-refresh. */
-  var ticks = 0;
-  var timer = setInterval(function () {{
-    ticks += 1;
-    last = 0;
-    post();
-    if (ticks === 10) {{
-      clearInterval(timer);
-      setInterval(function () {{ last = 0; post(); }}, 60000);
-    }}
-  }}, 3000);
-}})();
-</script>
+<script>{_EMBED_HEIGHT_SCRIPT}</script>
 {_pd.SPINNER_HTML}
 </body>
 </html>"""

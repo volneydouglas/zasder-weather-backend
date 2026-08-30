@@ -3047,6 +3047,44 @@ def test_embed_page_is_framable_and_gated(client, monkeypatch):
     assert "frame-ancestors 'none'" in home.headers["content-security-policy"]
 
 
+def test_inline_scripts_are_csp_hash_allowed(client, monkeypatch):
+    """Every inline <script> the public pages serve must be allowed by a
+    sha256 hash in script-src (there is deliberately no 'unsafe-inline').
+    Before these hashes existed, browsers silently blocked BOTH inline
+    scripts for as long as the CSP has — the spinner never faded and the
+    embed's auto-height messages were never posted (Doren's eternally
+    spinning anemometer + every blank-band report). This test extracts
+    the scripts from the pages as actually served and hashes those exact
+    bytes, so any edit to a script body without a matching hash — or a
+    brand-new inline script — fails here instead of dying silently in
+    every visitor's browser."""
+    import base64 as _b64
+    import hashlib as _hl
+    import re as _re
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    from app import main as m
+    m._PUBLIC_DASH_CACHE = None
+
+    for path in ("/embed", "/", "/status"):
+        r = client.get(path)
+        assert r.status_code == 200
+        csp = r.headers["content-security-policy"]
+        scripts = _re.findall(r"<script>(.*?)</script>", r.text, _re.S)
+        assert scripts, f"{path} serves no inline scripts — test is vacuous"
+        for body in scripts:
+            digest = _hl.sha256(body.encode("utf-8")).digest()
+            token = "'sha256-" + _b64.b64encode(digest).decode() + "'"
+            assert token in csp, \
+                f"{path}: inline script not hash-allowed by CSP: {body[:80]!r}"
+
+    # The embed page must carry the height broadcast specifically — the
+    # script the 1.9 re-broadcast fix lives in.
+    embed = client.get("/embed").text
+    assert "zasder-embed-height" in embed
+
+
 def test_embed_theme_param_and_tokenized_pages(client, monkeypatch):
     """1.6.2: the public pages are themed by CSS tokens (dark default,
     light via prefers-color-scheme), and /embed?theme=light|dark PINS the

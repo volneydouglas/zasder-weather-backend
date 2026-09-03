@@ -218,3 +218,49 @@ async def today(lat: float, lon: float) -> dict[str, Any] | None:
             "normal_high": entry.get("high"), "normal_low": entry.get("low"),
             "mtd_precip_normal": entry.get("mtd_precip"),
             "source": "NOAA/NCEI 1991-2020 U.S. Climate Normals"}
+
+
+async def cached_year(lat: float, lon: float
+                      ) -> tuple[str, dict[str, dict[str, float]]] | None:
+    """(NCEI station name, the cached synthetic year keyed "MM-DD") for this
+    location, from `server_kv` ONLY. Never touches the network.
+
+    `today()` above is the request-path reader and it FETCHES on a cold
+    cache: a station search plus a full-year download, on the request. A
+    story producer runs inside a loop over every producer on every
+    /stories call and cannot afford that, and a producer that blocks on
+    NCEI is a producer that times out the whole feed when NCEI is slow.
+    So the story engine reads whatever `today()` has already cached and
+    declines its "vs normal" line when nothing is there. The cache fills
+    the first time the app opens the Today-vs-normal row, which every
+    install does.
+
+    Age is deliberately not checked: normals change once a decade, the
+    180-day heal interval exists to fix a BAD cache, and an old copy of a
+    1991-2020 normal is the same number as a fresh one.
+    """
+    key = _coord_key(lat, lon)
+    st_raw = await db.get_kv(f"{_KV_STATION}.{key}")
+    if not st_raw:
+        return None
+    try:
+        cached = json.loads(st_raw)
+        if cached.get("key") != key:
+            return None
+        station_id = str(cached["id"])
+        name = cached.get("name") or station_id
+    except (ValueError, TypeError, KeyError):
+        return None
+    data_raw = await db.get_kv(f"{_KV_DATA}.{station_id}")
+    if not data_raw:
+        return None
+    try:
+        data = json.loads(data_raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("station") != station_id:
+        return None
+    days = data.get("days")
+    if not isinstance(days, dict) or not days:
+        return None
+    return str(name), days

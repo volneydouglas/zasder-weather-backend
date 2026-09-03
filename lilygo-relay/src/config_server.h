@@ -35,6 +35,12 @@ void onReconnect();
 // Called by the rest of the firmware to feed the status page.
 void noteIncomingPacket(const char *model, uint32_t id);
 void notePostResult(int httpCode);
+// Heap guard telemetry (see main.cpp): every loop() sample of the largest
+// allocatable block feeds a low-water mark, and each time the guard holds
+// the receiver drain it counts a trip. Both show on /status so a board's
+// worst moment is readable from the LAN, not just its current one.
+void noteHeapSample(size_t maxAlloc);
+void noteHeapGuardTrip(size_t maxAlloc);
 
 // Backend creds — owned here so /provision can update them in-place.
 // main + zasder_post read these directly (extern below).

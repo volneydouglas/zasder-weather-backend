@@ -544,6 +544,163 @@ def test_public_dashboard_records_empty():
     assert _pdash.render_records({"periods": {}}, "UTC") == ""
 
 
+# ── air-quality card (2.0) ──
+
+_AIR_OBS = {"pm25": 12.34, "pm10": 18.2, "co2": 1240, "tvoc_index": 131,
+            "nox_index": 1, "dateutc": 1}
+_AIR_SERIES = {"pm25": [(0, 5.0), (1000, 12.0), (2000, 9.0)]}
+
+
+def test_public_dashboard_weather_station_byte_identical_after_air_work():
+    """The air card must not touch a weather station's bytes. These
+    digests were taken from the same fixtures BEFORE render_station
+    grew its `air` parameter and render_dashboard its weather split."""
+    import hashlib
+
+    def h(s: str) -> str:
+        # First 16 hex of the digest: plenty to pin bytes, and short of
+        # the secret sweep's bare-64-hex rule (bin/secret-patterns.sh).
+        return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+    one = _pdash.render_station(
+        "Davis Vantage Pro 2",
+        {"tempf": 91.4, "feelsLike": 95.0, "humidity": 46},
+        {"tempf": [(0, 90.0), (1, 91.4)], "humidity": [(0, 45.0), (1, 46.0)]},
+        ["tempf", "humidity"])
+    assert h(one) == "da4af0d122c722e5"
+    rose = _pdash.render_station(
+        "Davis", {"tempf": 90.0, "windspeedmph": 5},
+        {"windspeedmph": [(0, 4.0), (1, 6.0), (2, 5.0)],
+         "tempf": [(0, 89.0), (1, 90.0)]},
+        ["tempf", "windspeedmph"],
+        wind_samples=[(225.0, 4.0), (230.0, 6.0), (220.0, 5.0)])
+    assert h(rose) == "9bf50444c9dfffdc"
+    st = [{"name": "Davis Vantage Pro 2",
+           "obs": {"tempf": 91.4, "feelsLike": 95.0, "humidity": 46, "dateutc": 1},
+           "series": {"tempf": [(0, 90.0), (1, 91.4)], "humidity": [(0, 45.0), (1, 46.0)]}},
+          {"name": "Second", "obs": {"tempf": 80.0, "humidity": 50, "dateutc": 2},
+           "series": {"tempf": [(0, 79.0), (1, 80.0)], "humidity": [(0, 51.0), (1, 50.0)]}}]
+    multi = _pdash.render_compare(st) + "".join(
+        _pdash.render_station(s["name"], s["obs"], s["series"], ["tempf", "humidity"],
+                              app_url="https://x" if i == 0 else "",
+                              location="Chandler, AZ" if i == 0 else None)
+        for i, s in enumerate(st))
+    assert h(multi) == "6fd81cf0762a433f"
+    # And the dashboard entry point composes the same pieces for a
+    # weather-only page (the now strip carries a wall-clock age, so it is
+    # compared against itself rather than a digest).
+    full = _pdash.render_dashboard(st, ["tempf", "humidity"], app_url="https://x",
+                                   location="Chandler, AZ")
+    assert full.endswith(multi)
+    assert full.startswith(_pdash.render_now_strip(st, "Chandler, AZ", "UTC")[:200])
+
+
+def test_public_dashboard_air_card_has_only_air_tiles():
+    html = _pdash.render_station("Home Chandler", _AIR_OBS, _AIR_SERIES,
+                                 _pdash.CORE_FIELDS, air=True)
+    assert 'class="station station-air"' in html
+    assert "Home Chandler" in html and "Air quality" in html
+    # PM2.5 hero, one decimal, banded (12.3 is Moderate under the 2024 table).
+    assert "12.3<span" in html and "PM2.5" in html
+    assert ">Moderate</div>" in html and "#ffd24c" in html
+    # The fixed tiles.
+    assert "PM10" in html and "18.2 µg/m³" in html
+    assert "CO2 · elevated" in html and "1240 ppm" in html
+    assert "1000 elevated · 2000 high" in html
+    assert "TVOC index" in html and "NOx index" in html
+    assert "100 typical" in html
+    # PM2.5 chart in the page's chart style.
+    assert "<svg" in html and 'class="chart-title">PM2.5' in html
+    assert "polyline" in html and _pdash.PM25_COLOR in html
+    # And NONE of the weather furniture, whatever `fields` said.
+    assert 'class="cc-temp">' not in html          # weather hero
+    assert "feels " not in html
+    for weather in ("Wind", "Pressure", "Rain", "Records", "Wind rose",
+                    "rose-svg", "Today ", "Humidity", "Temperature"):
+        assert weather not in html, weather
+    assert html.count('class="chart"') == 1
+
+
+def test_public_dashboard_pm25_band_edges():
+    """Every 2024 EPA breakpoint edge, both sides, plus the one-decimal
+    truncation EPA applies before the lookup."""
+    b = _pdash.pm25_band
+    assert b(None) is None
+    assert b(-3)[0] == "Good" and b(0)[0] == "Good"
+    assert b(9.0)[0] == "Good"
+    assert b(9.04)[0] == "Good"        # truncates to 9.0
+    assert b(9.1)[0] == "Moderate"
+    assert b(35.4)[0] == "Moderate"
+    assert b(35.5)[0] == "Unhealthy for sensitive groups"
+    assert b(55.4)[0] == "Unhealthy for sensitive groups"
+    assert b(55.5)[0] == "Unhealthy"
+    assert b(125.4)[0] == "Unhealthy"
+    assert b(125.5)[0] == "Very unhealthy"
+    assert b(225.4)[0] == "Very unhealthy"
+    assert b(225.5)[0] == "Hazardous"
+    assert b(1500)[0] == "Hazardous"
+    # Every band paints a hue the page already uses somewhere.
+    known = set(_pdash.STATION_COLORS) | {m["color"] for m in _pdash.FIELD_META.values()} | {"#ff5a5f"}
+    assert {c for _, _, c in _pdash.PM25_BANDS} <= known
+    assert _pdash.co2_state(None) is None and _pdash.co2_state(999) is None
+    assert _pdash.co2_state(1000) == "elevated" and _pdash.co2_state(1999) == "elevated"
+    assert _pdash.co2_state(2000) == "high"
+
+
+def test_public_dashboard_air_card_temp_humidity_only_when_reported():
+    bare = _pdash.render_air_station("Inside", _AIR_OBS, _AIR_SERIES)
+    assert "Temperature" not in bare and "Humidity" not in bare
+    assert bare.count('class="cc-chip"') == 4
+    outdoor = _pdash.render_air_station(
+        "Outside", {**_AIR_OBS, "tempf": 101.2, "humidity": 18}, _AIR_SERIES)
+    assert "Temperature" in outdoor and "101°F" in outdoor
+    assert "Humidity" in outdoor and "18%" in outdoor
+    assert outdoor.count('class="cc-chip"') == 6
+    # Absent is not zero: a monitor mid-warm-up says so, per tile.
+    warming = _pdash.render_air_station("Booting", {"dateutc": 1}, {})
+    assert "PM2.5 not reported yet" in warming
+    assert warming.count("no reading") == 4
+    assert "no data in the last 24h" in warming
+
+
+def test_public_dashboard_air_card_escapes_station_name():
+    html = _pdash.render_air_station('<script>alert("x")</script>', _AIR_OBS,
+                                     _AIR_SERIES, location='Chandler" onmouseover="alert(1)',
+                                     app_url='https://x/?a=1&b="2"')
+    assert "<script>alert" not in html and "&lt;script&gt;" in html
+    assert 'onmouseover="alert' not in html
+    assert 'href="https://x/?a=1&amp;b=&quot;2&quot;"' in html
+
+
+def test_public_dashboard_air_stations_stay_out_of_now_strip_and_compare():
+    """A page with two weather stations and a monitor: the composite strip
+    counts and the side-by-side charts see only the weather stations; the
+    monitor keeps its place in the page order as an air card, and the
+    first station (whatever kind) carries the app link."""
+    weather = [{"name": "Front", "obs": {"tempf": 91.0, "humidity": 46, "dateutc": 1},
+                "series": {"tempf": [(0, 90.0), (1, 91.0)], "humidity": [(0, 45.0), (1, 46.0)]}},
+               {"name": "Back", "obs": {"tempf": 80.0, "humidity": 90, "dateutc": 2},
+                "series": {"tempf": [(0, 79.0), (1, 80.0)], "humidity": [(0, 91.0), (1, 90.0)]}}]
+    air = {"name": "Airbox", "obs": {**_AIR_OBS, "humidity": 5, "dateutc": 3},
+           "series": _AIR_SERIES, "air": True}
+    page = _pdash.render_dashboard([air] + weather, ["tempf", "humidity"],
+                                   app_url="https://x")
+    assert "2 stations" in page
+    assert page.count('class="station station-air"') == 1
+    # Per-station blocks keep the selection's order (the strip and the
+    # compare legend name the weather stations earlier, by design).
+    def block(name: str) -> int:
+        return page.index(f'<div class="cc-name">{name}')
+    assert block("Airbox") < block("Front") < block("Back")
+    # The strip's freshest humidity chip must NOT be the monitor's 5%.
+    assert 'title="from Airbox"' not in page
+    assert page.count("Get the iOS app") == 1
+    assert block("Airbox") < page.index("Get the iOS app") < block("Front")
+    # Compare legend lists the two weather stations only.
+    legend = page[page.index("Side by side"):page.index("Airbox")]
+    assert "Front" in legend and "Back" in legend and "Airbox" not in legend
+
+
 # ───────────────────── smart (derived) alert logic ─────────────────────
 
 def test_smart_condition_frost():
@@ -1199,3 +1356,25 @@ def test_push_via_relay_interruption_level_and_fallback(monkeypatch):
     assert len(posts) == 2
     assert "interruption_level" in posts[0]
     assert "interruption_level" not in posts[1]
+
+
+def test_public_dashboard_co2_only_monitor_leads_with_co2():
+    """A GoveeLife H5140 has no particle sensor (2.0, Path J): the air card
+    leads with CO2 and its 1000/2000 ppm state, and the 24h chart is CO2,
+    instead of "PM2.5 not reported yet" over a live 620 ppm reading. A
+    monitor WITH PM2.5 is unchanged."""
+    from app import public_dashboard as pd
+    obs = {"co2": 620.0, "tempf": 71.2, "humidity": 44.0}
+    html = pd.render_air_station("Office CO2", obs,
+                                 {"pm25": [], "co2": [(1, 600.0), (2, 640.0)]})
+    assert "620" in html and "ppm CO2" in html and "Fresh air" in html
+    assert "PM2.5 not reported yet" not in html
+    assert "CO2 <span" in html and "last 24h · ppm" in html
+    elevated = pd.render_air_station("Office CO2", {"co2": 1450.0}, {"co2": [(1, 1400.0), (2, 1450.0)]})
+    assert "Elevated" in elevated
+    # With PM2.5 present the particle hero and chart stay.
+    both = pd.render_air_station("Patio", {"pm25": 2.7, "co2": 620.0},
+                                 {"pm25": [(1, 2.0), (2, 3.0)], "co2": [(1, 600.0)]})
+    assert "µg/m³ PM2.5" in both and "last 24h · µg/m³" in both
+    # No readings at all: the old wording, unchanged.
+    assert "PM2.5 not reported yet" in pd.render_air_station("New", {}, {})

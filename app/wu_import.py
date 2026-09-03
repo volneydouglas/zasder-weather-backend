@@ -324,6 +324,25 @@ def start_import(mac: str, station_id: str, api_key: str,
     return True
 
 
+async def stop() -> None:
+    """Shutdown: cancel the import task outright and wait for it, so its
+    database work never outlives the event loop (R18 finding 12). The
+    ledger of finished days means a restarted import resumes where this
+    one stopped; `cancel()` is the operator's graceful, after-this-day
+    stop and stays as it is."""
+    global _task
+    t = _task
+    if t is None or t.done():
+        return
+    t.cancel()
+    try:
+        await t
+    except (asyncio.CancelledError, Exception):
+        pass
+    _state["running"] = False
+    _task = None
+
+
 def cancel() -> bool:
     """Request a graceful stop after the in-flight day. False if idle."""
     if not _state.get("running"):

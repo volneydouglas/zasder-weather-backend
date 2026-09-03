@@ -21,8 +21,10 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <rtl_433_ESP.h>
+#include <pulse_data.h>          // pulse_data_t — sizeof() for the heap guard
 
 #include "config_server.h"
+#include "heap_guard.h"
 #include "improv_serial.h"
 #include "display.h"
 #include "zasder_post.h"
@@ -45,6 +47,80 @@ rtl_433_ESP rtl_433;
 // keeps running (so the loop-stall watchdog never fires and HTTP/status stays
 // up), which silently kills all sensor data. 0 = no packet seen yet.
 static volatile uint32_t g_lastRxMs = 0;
+
+// ── heap guard for rtl_433_ESP's pulse-train path ──────────────────────
+// The crash this closes (2026-09-02, 433 board): `Guru Meditation Error:
+// Core 1 panic'ed (StoreProhibited)` inside rtl_433_ESP::loop(). That loop
+// does heap_caps_calloc(sizeof(pulse_data_t)) — ~9.7 KB, PD_MAX_PULSES=1200
+// ints of pulse + gap — for EVERY pulse train the radio hands it, then
+// memcpy()s into the result without checking for NULL, and queues it (depth
+// 5) for the decoder task. The decoder task is where our callback runs, and
+// the callback is a blocking HTTPS POST (0.3 s warm, seconds on the first
+// TLS handshake, up to 16 s on a stalled socket). While it's blocked, loop()
+// keeps callocing trains: 433.92 MHz is a noisy band (neighbors' sensors,
+// remotes, TPMS) so trains can arrive every few hundred ms, and each is a
+// ~10 KB block whether or not it decodes to anything. After the TLS client
+// is warm the largest free block is ~32 KB of ~66 KB free, so three or
+// four trains stacked behind one slow POST and the next calloc returns NULL
+// — panic, reset, and the same race on the next boot. The 915 board runs
+// the identical firmware and never hit it: FSK at 915 hears far fewer
+// trains. Nothing in the toolchain changed (every PlatformIO package is
+// dated May 21); the trigger is RF traffic + TLS latency, not a rebuild.
+//
+// Guard: before letting the library drain a train, check that the largest
+// allocatable internal block can hold one plus a margin. If not, skip the
+// drain — the two receive buffers hold what they hold and the ISR drops
+// anything beyond, which loses a noise burst instead of the board. A
+// transient dip (a POST in flight) clears itself within a second. If it
+// does NOT clear inside HEAP_GUARD_RESTART_MS the heap is genuinely gone
+// (leak, fragmentation) and a clean esp_restart() beats a panic loop.
+// Both are logged, counted on /status (`heap_guard_trips`,
+// `min_max_alloc`), and reset_reason on the next boot says ESP_RST_SW.
+// The verdict logic lives in heap_guard.h so `pio test -e native` pins it.
+#ifndef HEAP_GUARD_MARGIN_BYTES
+#define HEAP_GUARD_MARGIN_BYTES   4096
+#endif
+#ifndef HEAP_GUARD_RESTART_MS
+#define HEAP_GUARD_RESTART_MS     30000UL
+#endif
+static HeapGuard g_heapGuard(sizeof(pulse_data_t) + HEAP_GUARD_MARGIN_BYTES,
+                             HEAP_GUARD_RESTART_MS);
+
+// Runs rtl_433.loop() only when the heap can take one more pulse train.
+// ESP.getMaxAllocHeap() reports the largest INTERNAL|8BIT block — the
+// library asks for INTERNAL only, so this bounds its calloc from below.
+static void guardedReceiverDrain() {
+  size_t maxAlloc = ESP.getMaxAllocHeap();
+  // Every sample, before the verdict: a smaller block seen while Holding
+  // or about to Restart is exactly the low-water mark /status should show.
+  ZasderConfigServer::noteHeapSample(maxAlloc);
+  switch (g_heapGuard.step(maxAlloc, millis())) {
+    case HeapGuard::Verdict::Recovered:
+      Serial.printf("[heap-guard] recovered after %lu ms, max_alloc=%u\n",
+                    (unsigned long) g_heapGuard.lastHoldMs(), (unsigned) maxAlloc);
+      // fall through
+    case HeapGuard::Verdict::Drain:
+      rtl_433.loop();
+      return;
+    case HeapGuard::Verdict::Hold:
+      ZasderConfigServer::noteHeapGuardTrip(maxAlloc);
+      Serial.printf("[heap-guard] max_alloc=%u < %u needed for a pulse "
+                    "train (free_heap=%u) — holding the receiver drain\n",
+                    (unsigned) maxAlloc, (unsigned) g_heapGuard.need(),
+                    (unsigned) ESP.getFreeHeap());
+      break;
+    case HeapGuard::Verdict::Holding:
+      break;
+    case HeapGuard::Verdict::Restart:
+      Serial.printf("[heap-guard] heap still short after %lu ms "
+                    "(max_alloc=%u free_heap=%u) — restarting cleanly\n",
+                    (unsigned long) HEAP_GUARD_RESTART_MS,
+                    (unsigned) maxAlloc, (unsigned) ESP.getFreeHeap());
+      Serial.flush();
+      esp_restart();
+  }
+  delay(1);   // rtl_433.loop() normally yields a tick here; keep parity
+}
 
 void rtl_433_Callback(char *message) {
   // rtl_433_ESP hands us one JSON object per decoded packet. We don't
@@ -343,9 +419,15 @@ void setup() {
   rtl_433.initReceiver(RF_MODULE_RECEIVER_GPIO, RF_MODULE_FREQUENCY);
   rtl_433.setCallback(rtl_433_Callback, messageBuffer, JSON_MSG_BUFFER);
   rtl_433.enableReceiver();
-  Serial.printf("ready — receiver up, has_token=%d has_url=%d\n",
+  // Heap on the boot line: the 433 build once crash-looped on a NULL from
+  // heap_caps_calloc inside rtl_433_ESP and nothing had logged free heap,
+  // so the only evidence was the panic. max_alloc is the largest single
+  // block — fragmentation shows there long before free_heap hits zero.
+  Serial.printf("ready — receiver up, has_token=%d has_url=%d "
+                "free_heap=%u max_alloc=%u\n",
                 (int) (ZasderConfigServer::ingestToken.length() > 0),
-                (int) (ZasderConfigServer::backendUrl.length()  > 0));
+                (int) (ZasderConfigServer::backendUrl.length()  > 0),
+                (unsigned) ESP.getFreeHeap(), (unsigned) ESP.getMaxAllocHeap());
 
   // Start the independent watchdog last, once everything is up. Pinned to
   // core 0 so it keeps running even if the Arduino loop (core 1) wedges.
@@ -359,7 +441,7 @@ void loop() {
     g_wifiReconnect = false;
     ZasderConfigServer::onReconnect();
   }
-  rtl_433.loop();
+  guardedReceiverDrain();              // rtl_433.loop(), heap permitting
   ZasderConfigServer::loop();
   ZasderDisplay::loop();
   // Improv stays live after provisioning too, so the web flasher can

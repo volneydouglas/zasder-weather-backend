@@ -343,3 +343,50 @@ def test_clean_wind_inconsistent_noop_on_clean_history(db_mod, temp_env):
     res = maintenance.clean_wind_inconsistent(apply=True, db_path=temp_env)
     assert res["bad_rows"] == 0 and res["cleaned"] == 0
     assert res["backup"] is None
+
+
+
+def test_trim_head_backs_up_and_removes_only_the_head_of_one_station(client, monkeypatch, tmp_path):
+    """The sensor that started on a desk: rows before the cutoff go, with a
+    full-row JSONL backup beside the database; the station's later rows and
+    every other station stay; the station's rollups refold from what is
+    left. A dry run removes nothing."""
+    import asyncio, json, glob
+    from app import db, maintenance, insights
+    from app.config import settings
+    monkeypatch.setattr(settings, "insights", True)
+    mac, other = "EC:EC:0F:00:00:01", "AA:BB:CC:00:00:02"
+    base = 1_788_331_741_000
+    hour = 3_600_000
+    asyncio.run(db.insert_observations(mac, [
+        {"dateutc": base, "tempf": 76.5},
+        {"dateutc": base + hour, "tempf": 84.0},
+        {"dateutc": base + 2 * hour, "tempf": 83.0},
+        {"dateutc": base + 3 * hour, "tempf": 82.0},
+    ]))
+    asyncio.run(db.insert_observations(other, [{"dateutc": base, "tempf": 60.0}]))
+    cutoff = base + 90 * 60_000
+    dry = maintenance.trim_head(mac, cutoff, apply=False)
+    assert dry["rows"] == 2 and dry["applied"] is False
+    assert not glob.glob(str(tmp_path / "*trimhead*"))      # a dry run writes no backup
+    done = maintenance.trim_head(mac, cutoff, apply=True)
+    assert done["applied"] and done["removed"] == 2 and done["rebuilt"]
+    lines = open(done["backup"]).read().splitlines()
+    assert len(lines) == 2
+    assert [json.loads(l)["tempf"] for l in lines] == [76.5, 84.0]
+    assert json.loads(lines[0])["mac"] == mac
+
+    async def check():
+        async with db.connect() as conn:
+            left = await (await conn.execute(
+                "SELECT dateutc_ms FROM observations WHERE mac = ? ORDER BY dateutc_ms",
+                (mac,))).fetchall()
+            others = await (await conn.execute(
+                "SELECT COUNT(*) FROM observations WHERE mac = ?", (other,))).fetchone()
+            low = await (await conn.execute(
+                "SELECT MIN(tempf_min) FROM daily_rollups WHERE mac = ?", (mac,))).fetchone()
+        return [r[0] for r in left], others[0], low[0]
+    left, others, low = asyncio.run(check())
+    assert left == [base + 2 * hour, base + 3 * hour]
+    assert others == 1
+    assert low == 82.0                     # the 76.5 desk reading is gone from the rollup

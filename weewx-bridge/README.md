@@ -53,9 +53,10 @@ appears in the app within one archive interval.
   (loopback, private-LAN IPs, `.local` names) — a plain-http URL to a
   routable host would send the ingest token unencrypted, so the bridge
   refuses it at startup. Redirects are refused for the same reason.
-  Note: CGNAT addresses (`100.64.0.0/10`, e.g. Tailscale IPs) only count
-  as private on Python 3.13+; on older Pythons use the host's LAN IP or
-  a MagicDNS `https://` name instead.
+  Note: CGNAT addresses (`100.64.0.0/10`, e.g. Tailscale IPs) are not
+  private to Python's `ipaddress` module on any supported version, so a
+  plain-http URL to a Tailscale IP is refused. Use the host's LAN IP or a
+  MagicDNS `https://` name instead.
 
 ## Tests
 

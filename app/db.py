@@ -1,8 +1,10 @@
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +29,11 @@ _CHART_INDEX_COLS = [
     # rebuild probe, so existing DBs pay one index rebuild at the upgrade
     # boot (the lightning-backfill precedent).
     "pm25", "pm10", "co2", "tvoc_index", "nox_index",
+    # Strike distance (2.0) — the "how close did it get" chart. Same
+    # one-time index rebuild cost at the upgrade boot as the AQI columns
+    # above; it buys the >6h windows, where the bucketed SELECT is the
+    # only path and an uncovered column turns a 7d chart into a ~9s query.
+    "lightning_distance_mi",
 ]
 
 SCHEMA = """
@@ -35,7 +42,13 @@ CREATE TABLE IF NOT EXISTS devices (
     name         TEXT,
     location     TEXT,
     info_json    TEXT,
-    last_seen_ms INTEGER
+    last_seen_ms INTEGER,
+    -- 2.0 operator rename. `name` stays whatever the source posts (an
+    -- Ecowitt gateway only knows its model, so it arrives as "Ecowitt
+    -- (GW3000B)"); this is the override the operator typed, NULL when they
+    -- never did. Every reader goes through effective_device_name() so the
+    -- two can't leak differently per surface.
+    display_name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -432,7 +445,30 @@ CREATE TABLE IF NOT EXISTS storm_history (
     peak_rate_in_hr REAL,
     max_gust_mph    REAL,
     min_tempf       REAL,
-    max_tempf       REAL
+    max_tempf       REAL,
+    -- 2.0 storm-close capture ("The Storm That Broke the Heat"). These are
+    -- the ONLY numbers in this repo that cannot be recomputed later:
+    -- history thinning keeps one observation per bucket beyond the detail
+    -- window, so the minute-by-minute readings either side of a storm are
+    -- gone within days and the before/after pair can never be rebuilt from
+    -- what survives. They are therefore MEASURED AT CLOSE, in the same
+    -- moment the summary is sent, and written here beside the episode.
+    --
+    -- Every one of them is OPTIONAL in the strict sense. Every storm closed
+    -- before 2.0 carries NULL forever, and so does a station with no dew
+    -- sensor or no barometer. NULL means "we did not capture this" — never
+    -- zero, never a placeholder. A consumer that cannot find these fields
+    -- declines to tell the story; see stories.storm_broke_the_heat.
+    --
+    -- The windows are PERMANENT, because a row captured under one
+    -- definition can never be re-measured under another: see
+    -- _STORM_EDGE_MS and _storm_close_capture below for what they are and
+    -- why. Also in the ALTER list.
+    pre_tempf            REAL,   -- hottest reading in the hour BEFORE it opened
+    post_tempf           REAL,   -- coolest reading in the hour AFTER it closed
+    temp_drop_f          REAL,   -- pre − post, signed (°F, a DEPARTURE)
+    pressure_change_inhg REAL,   -- mean(after) − mean(before), signed
+    dew_change_f         REAL    -- mean(after) − mean(before), signed
 );
 
 CREATE TABLE IF NOT EXISTS guest_tokens (
@@ -563,22 +599,114 @@ def _parse_json_col(raw: Any) -> dict[str, Any]:
 # task so startup stays inside health-check windows (v1.8.1).
 _CHART_INDEX_INLINE_MAX_ROWS = 200_000
 _CHART_INDEX_REBUILD_NEEDED = False
+# True for exactly the span of the deferred CREATE INDEX (2.0). The index
+# build holds SQLite's write lock for minutes on a big archive; every other
+# writer waits busy_timeout (10s) then fails "database is locked". On
+# 2026-09-01 that cost ~5 min of ingest plus push-relay challenge 500s in
+# production. Ingest consults this flag and queues (ingest._WRITE_BEHIND)
+# instead of blocking; the lifespan drains the queue once the build ends.
+_CHART_INDEX_BUILDING = False
+# Every chart-covering index this probe has ever owned carries this
+# prefix. The CURRENT one is versioned by its column list (see
+# chart_index_name) so a rebuild can CREATE the new index beside the old
+# one and only then DROP the old — charts stay covered during the build,
+# and a kill between the two statements leaves the old index in place.
+CHART_INDEX_PREFIX = "idx_obs_chart"
 
 
 def chart_index_rebuild_needed() -> bool:
     return _CHART_INDEX_REBUILD_NEEDED
 
 
+def chart_index_rebuild_in_progress() -> bool:
+    return _CHART_INDEX_BUILDING
+
+
+def chart_index_name() -> str:
+    """`idx_obs_chart_v<hash>`: the hash is of the column list, so a column
+    added to _CHART_INDEX_COLS yields a new name — the build-then-swap
+    rebuild can create it while the previous version still serves."""
+    digest = hashlib.sha1(",".join(_CHART_INDEX_COLS).encode()).hexdigest()
+    return f"{CHART_INDEX_PREFIX}_v{digest[:8]}"
+
+
+def is_lock_error(exc: BaseException) -> bool:
+    """A SQLite "database is locked" / "database is busy" OperationalError:
+    the writer waited out busy_timeout behind a long job. Retrying it in a
+    tight loop only re-queues behind the same lock — callers back off (or
+    answer 503 + Retry-After) instead."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+async def _chart_indexes(db) -> list[tuple[str, str]]:
+    """(name, create_sql) for every idx_obs_chart* index on observations.
+    Name-prefixed, not name-equal: pre-2.0 databases carry the bare
+    `idx_obs_chart`, 2.0 ones the versioned name, and a run killed between
+    CREATE and DROP carries both."""
+    cur = await db.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='observations' AND name LIKE ?",
+        (CHART_INDEX_PREFIX + "%",))
+    return [(r[0], r[1] or "") for r in await cur.fetchall()]
+
+
+def _covers_chart(create_sql: str) -> bool:
+    return set(_CHART_INDEX_COLS) <= _index_columns(create_sql)
+
+
+async def _create_chart_index(db, name: str) -> None:
+    """The one CREATE. Separate so tests can observe the window in which it
+    runs (old index still present, the in-progress flag set)."""
+    # Name comes from chart_index_name() (prefix + hex) — never user input.
+    await db.execute(f"CREATE INDEX IF NOT EXISTS {name} ON observations ("
+                     + ", ".join(_CHART_INDEX_COLS) + ")")
+
+
+async def _drop_stale_chart_indexes(db, keep: str) -> list[str]:
+    """DROP every idx_obs_chart* index except `keep`. Called only once a
+    covering index exists, so charts are never uncovered by this step."""
+    dropped = []
+    for name, _sql in await _chart_indexes(db):
+        if name == keep:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+            # sqlite_master names are ours, but the DROP interpolates —
+            # refuse anything that isn't a plain identifier (never an
+            # assert; those vanish under python -O).
+            raise ValueError(f"refusing to drop oddly named index {name!r}")
+        await db.execute(f"DROP INDEX IF EXISTS {name}")
+        dropped.append(name)
+    return dropped
+
+
 async def rebuild_chart_index() -> None:
-    """The deferred big-archive rebuild: drop + recreate idx_obs_chart with
-    the current column set. Interrupted runs are safe — the next boot's
-    probe sees the missing/stale index and defers again."""
-    global _CHART_INDEX_REBUILD_NEEDED
+    """The deferred big-archive rebuild, build-then-swap (2.0): CREATE the
+    versioned index first, DROP the previous idx_obs_chart* names only
+    once it exists. Interrupted runs are safe in both halves — killed
+    mid-CREATE, the old index still serves and the next boot's probe defers
+    again; killed after CREATE, the next boot's probe sees the covering
+    index and merely sweeps the leftover.
+
+    _CHART_INDEX_BUILDING brackets the CREATE alone: that is the statement
+    that holds the write lock for minutes. The DROP is seconds and rides
+    busy_timeout like any other write."""
+    global _CHART_INDEX_REBUILD_NEEDED, _CHART_INDEX_BUILDING
+    name = chart_index_name()
+    _CHART_INDEX_BUILDING = True
+    try:
+        async with connect() as db:
+            await _create_chart_index(db, name)
+            await db.commit()
+    finally:
+        _CHART_INDEX_BUILDING = False
     async with connect() as db:
-        await db.execute("DROP INDEX IF EXISTS idx_obs_chart")
-        await db.execute("CREATE INDEX idx_obs_chart ON observations ("
-                         + ", ".join(_CHART_INDEX_COLS) + ")")
+        dropped = await _drop_stale_chart_indexes(db, keep=name)
         await db.commit()
+    if dropped:
+        log.info("chart index swapped to %s; dropped %s", name, dropped)
     _CHART_INDEX_REBUILD_NEEDED = False
 
 
@@ -661,6 +789,30 @@ _EXTRA_1_9_COLS: dict[str, str] = {
 QUERYABLE_FIELDS = set(_FIELD_MAP.values())
 
 
+# Migration completion keys (2.0). A schema step that is "ALTER, then a
+# separate backfill" has two commits, and only the first is idempotent by
+# inspection (the column exists). The key is written after the ALTERs and
+# cleared inside the backfill's transaction, so a boot that finds it set
+# runs the backfill even though the columns are already there. The 1.9
+# colfill's COLFILL_PENDING_KEY is the same idea, chunked.
+LIGHTNING_BACKFILL_KEY = "lightning_backfill_pending"
+STORM_CAPTURE_BACKFILL_KEY = "storm_capture_backfill_pending"
+
+
+async def _table_exists(db, name: str) -> bool:
+    row = await (await db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,))).fetchone()
+    return row is not None
+
+
+async def _kv_in(db, key: str) -> str | None:
+    """get_kv on an already-open connection (init_db runs inside one)."""
+    row = await (await db.execute(
+        "SELECT v FROM server_kv WHERE k = ?", (key,))).fetchone()
+    return row[0] if row else None
+
+
 async def init_db() -> None:
     _ensure_dir()
     async with aiosqlite.connect(settings.database_path) as db:
@@ -678,14 +830,13 @@ async def init_db() -> None:
         # ALTER is the only path that reaches an existing database — the
         # alert_prefs lesson.) Fresh databases skip this: the table doesn't
         # exist yet and SCHEMA below creates it with the columns in place.
-        lightning_backfilled = False
         added_extra = False
+        added_lightning = False
         cur = await db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='observations'")
         if await cur.fetchone():
             cur = await db.execute("PRAGMA table_info(observations)")
             existing = {r[1] for r in await cur.fetchall()}
-            added_lightning = False
             for col, decl in (
                 ("lightningcount", "INTEGER"),
                 ("lightning_last_1hr", "INTEGER"),
@@ -718,41 +869,90 @@ async def init_db() -> None:
                     await db.execute(
                         f"ALTER TABLE observations ADD COLUMN {col} {decl}")
                     added_extra = True
-            if added_lightning:
-                # One-time backfill from data_json: the poller captured
-                # lightning into the blob before these columns existed
-                # (deliberately — the counters are interval-scoped, so a
-                # storm that passes unrecorded is gone forever). Without
-                # this, every strike stored before the upgrade would be
-                # invisible to records/charts even though we hold the data.
-                # json_extract of a missing key is NULL and CAST(NULL) is
-                # NULL, so rows without a given key stay NULL — absent is
-                # not zero. The LIKE bounds the rewrite to rows that carry
-                # lightning at all (one full-table read, once, at boot).
-                # typeof-gated: SQLite CAST('junk' AS INTEGER) is 0, so an
-                # unguarded cast would backfill a non-numeric stored value
-                # as a REAL zero-strike reading — a station that never
-                # measured lightning would grow a "0" lightning record
-                # (CodeRabbit, 2026-08-20; the read path's
-                # _normalize_lightning degrades the same junk to None).
-                bf = await db.execute(
-                    """
-                    UPDATE observations SET
-                      lightningcount        = CASE WHEN typeof(json_extract(data_json, '$.lightningcount')) IN ('integer','real')
-                                                   THEN CAST(json_extract(data_json, '$.lightningcount') AS INTEGER) END,
-                      lightning_last_1hr    = CASE WHEN typeof(json_extract(data_json, '$.lightning_last_1hr')) IN ('integer','real')
-                                                   THEN CAST(json_extract(data_json, '$.lightning_last_1hr') AS INTEGER) END,
-                      lightning_distance_mi = CASE WHEN typeof(json_extract(data_json, '$.lightning_distance_mi')) IN ('integer','real')
-                                                   THEN json_extract(data_json, '$.lightning_distance_mi') END
-                    WHERE data_json LIKE '%"lightning%'
-                    """)
-                lightning_backfilled = (bf.rowcount or 0) > 0
         await db.executescript(SCHEMA)
         # Insights rollup tables (see app/insights.py). Created even when
         # the INSIGHTS flag is off — empty tables cost nothing and let the
         # flag flip on without a schema step.
         from .insights import SCHEMA as INSIGHTS_SCHEMA
+        had_comfort = await _table_exists(db, "comfort_rollups")
         await db.executescript(INSIGHTS_SCHEMA)
+        if not had_comfort:
+            # 2.0: comfort_rollups is folded at insert time from here on,
+            # but an archive that predates it has years of readings the
+            # ledger never saw. Mark the rollups dirty and the boot heal
+            # (main.py, after the chart-index task) rebuilds every rollup
+            # table from history, the same path feels_* took in 1.9. A
+            # fresh database has nothing to fold and stays clean.
+            has_obs = await (await db.execute(
+                "SELECT 1 FROM observations LIMIT 1")).fetchone()
+            if has_obs:
+                await db.execute(
+                    "INSERT INTO server_kv (k, v) VALUES ('rollups_dirty', ?) "
+                    "ON CONFLICT(k) DO NOTHING", (str(time.time_ns()),))
+        if added_lightning:
+            # Completion key (2.0, the colfill pattern): the ALTERs above
+            # autocommitted, so a kill during the backfill UPDATE below
+            # used to leave the columns present and nothing to say the
+            # fill never happened — the next boot saw "columns exist"
+            # and skipped it forever. The key is committed BEFORE the
+            # UPDATE starts and cleared in the UPDATE's own transaction.
+            # Written AFTER executescript: a pre-1.5 database gets
+            # server_kv from SCHEMA on this same boot.
+            await db.execute(
+                "INSERT INTO server_kv (k, v) VALUES (?, '1') "
+                "ON CONFLICT(k) DO NOTHING", (LIGHTNING_BACKFILL_KEY,))
+            await db.commit()
+        if await _kv_in(db, LIGHTNING_BACKFILL_KEY) is not None:
+            # One-time backfill from data_json: the poller captured
+            # lightning into the blob before these columns existed
+            # (deliberately — the counters are interval-scoped, so a
+            # storm that passes unrecorded is gone forever). Without
+            # this, every strike stored before the upgrade would be
+            # invisible to records/charts even though we hold the data.
+            # json_extract of a missing key is NULL and CAST(NULL) is
+            # NULL, so rows without a given key stay NULL — absent is
+            # not zero. The LIKE bounds the rewrite to rows that carry
+            # lightning at all (one full-table read, once, at boot).
+            # typeof-gated: SQLite CAST('junk' AS INTEGER) is 0, so an
+            # unguarded cast would backfill a non-numeric stored value
+            # as a REAL zero-strike reading — a station that never
+            # measured lightning would grow a "0" lightning record
+            # (CodeRabbit, 2026-08-20; the read path's
+            # _normalize_lightning degrades the same junk to None).
+            # Runs whenever the key is set — including a boot where the
+            # columns already exist because a previous attempt died
+            # mid-UPDATE (that UPDATE rolled back; the key did not).
+            bf = await db.execute(
+                """
+                UPDATE observations SET
+                  lightningcount        = CASE WHEN typeof(json_extract(data_json, '$.lightningcount')) IN ('integer','real')
+                                               THEN CAST(json_extract(data_json, '$.lightningcount') AS INTEGER) END,
+                  lightning_last_1hr    = CASE WHEN typeof(json_extract(data_json, '$.lightning_last_1hr')) IN ('integer','real')
+                                               THEN CAST(json_extract(data_json, '$.lightning_last_1hr') AS INTEGER) END,
+                  lightning_distance_mi = CASE WHEN typeof(json_extract(data_json, '$.lightning_distance_mi')) IN ('integer','real')
+                                               THEN json_extract(data_json, '$.lightning_distance_mi') END
+                WHERE data_json LIKE '%"lightning%'
+                """)
+            if (bf.rowcount or 0) > 0:
+                # The backfill rewrote observations, but daily_rollups'
+                # lightning_max column stays NULL until a rebuild folds
+                # history in — and records() serves long periods from
+                # rollups, so an upgraded INSIGHTS install would show
+                # "Most Lightning" under Today and under no other period
+                # (CODE_REVIEW_R5 R5-14). The flag makes records() fall
+                # back to raw until a full rebuild clears it; lifespan
+                # kicks that rebuild off in the background. Nonce value
+                # (not a constant) — rebuild()'s conditional clear depends
+                # on it; see maintenance._mark_rollups_dirty.
+                await db.execute(
+                    "INSERT INTO server_kv (k, v) VALUES "
+                    "('rollups_dirty', lower(hex(randomblob(8)))) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v")
+            # Same transaction as the UPDATE (and the dirty flag): the key
+            # clears only if the fill committed.
+            await db.execute("DELETE FROM server_kv WHERE k = ?",
+                             (LIGHTNING_BACKFILL_KEY,))
+            await db.commit()
         if added_extra:
             # Written AFTER executescript (server_kv exists now). JSON
             # trimming refuses to run while this is pending — the backfill
@@ -761,22 +961,6 @@ async def init_db() -> None:
                 "INSERT INTO server_kv (k, v) VALUES "
                 "('colfill_1_9_pending', '1'), ('colfill_1_9_cursor', '0') "
                 "ON CONFLICT(k) DO NOTHING")
-        if lightning_backfilled:
-            # The backfill rewrote observations, but daily_rollups' new
-            # lightning_max column stays NULL until a rebuild folds history
-            # in — and records() serves long periods from rollups, so an
-            # upgraded INSIGHTS install would show "Most Lightning" under
-            # Today and under no other period (CODE_REVIEW_R5 R5-14). The
-            # flag makes records() fall back to raw until a full rebuild
-            # clears it; lifespan kicks that rebuild off in the background.
-            # Written AFTER executescript: a pre-1.5 database gets server_kv
-            # from SCHEMA on this same boot.
-            # Nonce value (not a constant) — rebuild()'s conditional clear
-            # depends on it; see maintenance._mark_rollups_dirty.
-            await db.execute(
-                "INSERT INTO server_kv (k, v) VALUES "
-                "('rollups_dirty', lower(hex(randomblob(8)))) "
-                "ON CONFLICT(k) DO UPDATE SET v = excluded.v")
         # Migrate older DBs: add any alert_prefs columns the schema gained
         # after the table was first created (SQLite CREATE IF NOT EXISTS
         # won't add columns to an existing table).
@@ -804,9 +988,19 @@ async def init_db() -> None:
             # 1.8 quiet hours + daily digest.
             ("quiet_start_min", "INTEGER"), ("quiet_end_min", "INTEGER"),
             ("digest_hour", "INTEGER"),
+            # 2.0 minute past the hour for the morning report.
+            ("digest_minute", "INTEGER"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
+        # 2.0: the operator rename column, after devices shipped in 1.0.
+        # Same lesson as alert_prefs above: CREATE IF NOT EXISTS never adds
+        # a column to an existing table, and a guard here must not be an
+        # `assert` (gone under python -O).
+        cur = await db.execute("PRAGMA table_info(devices)")
+        existing = {r[1] for r in await cur.fetchall()}
+        if "display_name" not in existing:
+            await db.execute("ALTER TABLE devices ADD COLUMN display_name TEXT")
         # 1.8: update-token discriminator, after the table shipped in 1.7.
         cur = await db.execute("PRAGMA table_info(live_activity_tokens)")
         existing = {r[1] for r in await cur.fetchall()}
@@ -887,33 +1081,74 @@ async def init_db() -> None:
             await db.execute(
                 "ALTER TABLE guest_tokens ADD COLUMN "
                 "can_write INTEGER NOT NULL DEFAULT 0")
-        # idx_obs_chart is owned entirely by this probe (it is NOT in the
+        # Same migration for storm_history: the 2.0 storm-close capture
+        # columns came after the table shipped in 1.9. Five plain ALTERs on
+        # a table that holds at most 50 rows per station — SQLite's ADD
+        # COLUMN rewrites no data and takes no table lock worth the name,
+        # so this is safe at boot on an archive of any size (unlike the
+        # 1.9 observations backfill two hundred lines up, which had to be
+        # chunked for exactly that reason).
+        cur = await db.execute("PRAGMA table_info(storm_history)")
+        existing = {r[1] for r in await cur.fetchall()}
+        added_storm_capture = False
+        for col, decl in (("pre_tempf", "REAL"), ("post_tempf", "REAL"),
+                          ("temp_drop_f", "REAL"),
+                          ("pressure_change_inhg", "REAL"),
+                          ("dew_change_f", "REAL")):
+            if col not in existing:
+                await db.execute(
+                    f"ALTER TABLE storm_history ADD COLUMN {col} {decl}")
+                added_storm_capture = True
+        if added_storm_capture:
+            # Completion key, same shape as the lightning one above: the
+            # ALTERs autocommitted, the backfill is a separate pass that
+            # a kill would otherwise skip forever on the next boot.
+            await db.execute(
+                "INSERT INTO server_kv (k, v) VALUES (?, '1') "
+                "ON CONFLICT(k) DO NOTHING", (STORM_CAPTURE_BACKFILL_KEY,))
+            await db.commit()
+        if await _kv_in(db, STORM_CAPTURE_BACKFILL_KEY) is not None:
+            await _backfill_storm_capture(db)
+            await db.execute("DELETE FROM server_kv WHERE k = ?",
+                             (STORM_CAPTURE_BACKFILL_KEY,))
+            await db.commit()
+        # idx_obs_chart* is owned entirely by this probe (it is NOT in the
         # SCHEMA script — see the comment there). Rebuild when the stored
         # definition is stale, AND when the index is missing outright: a
-        # kill between the deferred rebuild's DROP and CREATE leaves no
-        # index at all, and the old `row and row[0]` guard skipped that
+        # pre-2.0 kill between the deferred rebuild's DROP and CREATE left
+        # no index at all, and the old `row and row[0]` guard skipped that
         # case while SCHEMA rebuilt it inline — the v1.8.0 crash-loop
         # reborn (R11 V3). Fresh databases take the inline branch (zero
         # rows), so they still get the index right here.
-        cur = await db.execute(
-            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_obs_chart'")
-        row = await cur.fetchone()
         # Rebuild whenever ANY expected column is missing, rather than testing one
         # hard-coded name — the previous form would silently skip the rebuild for
         # the next column added to the bucketed SELECT, re-introducing the
         # full-row fetch it exists to avoid. Compare PARSED column names, not
         # substrings: "tempf" is a substring of "tempinf" (and "humidity" of
         # "humidityin"), so a stale index missing tempf passed the probe.
-        index_missing = not (row and row[0])
-        index_stale = (not index_missing
-                       and not set(_CHART_INDEX_COLS) <= _index_columns(row[0]))
-        if index_missing or index_stale:
+        # 2.0: the probe looks at every idx_obs_chart* index (the bare
+        # pre-2.0 name and the versioned names alike) and is satisfied by
+        # ANY that covers the column set — a rename is never a reason to
+        # rebuild. Leftovers from a run killed after its CREATE (or the
+        # bare name beside a finished versioned build) are swept here.
+        chart_indexes = await _chart_indexes(db)
+        covering = [name for name, sql in chart_indexes if _covers_chart(sql)]
+        if covering:
+            keep = (chart_index_name() if chart_index_name() in covering
+                    else covering[0])
+            dropped = await _drop_stale_chart_indexes(db, keep=keep)
+            if dropped:
+                log.info("swept stale chart index(es) %s; %s covers the "
+                         "chart columns", dropped, keep)
+        else:
             n = (await (await db.execute(
                 "SELECT COUNT(*) FROM observations")).fetchone())[0]
             if n <= _CHART_INDEX_INLINE_MAX_ROWS:
-                await db.execute("DROP INDEX IF EXISTS idx_obs_chart")
-                await db.execute("CREATE INDEX idx_obs_chart ON observations ("
-                                 + ", ".join(_CHART_INDEX_COLS) + ")")
+                # Same build-then-swap order as rebuild_chart_index, so a
+                # kill mid-boot leaves whatever covered before still there.
+                name = chart_index_name()
+                await _create_chart_index(db, name)
+                await _drop_stale_chart_indexes(db, keep=name)
             else:
                 # DEFER on big archives (v1.8.1): the inline rebuild on a
                 # 1.15M-row box outlived Fly's health-check window, the
@@ -1294,11 +1529,74 @@ async def refresh_ingest_assignment_cache() -> None:
 
 
 async def get_device_name(mac: str) -> str | None:
-    """The station's display name, for labeling its auto-minted token."""
+    """The station's effective display name, for labeling its auto-minted
+    token. Honors an operator rename, like every other reader."""
     async with connect() as db:
         row = await (await db.execute(
-            "SELECT name FROM devices WHERE mac = ?", (mac,))).fetchone()
-    return row["name"] if row and row["name"] else None
+            "SELECT name, display_name FROM devices WHERE mac = ?",
+            (mac,))).fetchone()
+    return effective_device_name(row) if row else None
+
+
+# ───────────────────────── operator rename (2.0) ─────────────────────────
+
+DISPLAY_NAME_MAX = 64
+
+
+def clean_display_name(raw: Any) -> str | None:
+    """Normalize an operator-typed station name. None or a blank string
+    means "clear the override, use the station's own name". Raises
+    ValueError for anything that must not land: a non-string, a control
+    character (the name rides email subjects and push titles), or more
+    than DISPLAY_NAME_MAX characters after trimming. Shared by the API
+    route and the config restore so one rule governs both doors."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("name must be a string")
+    name = raw.strip()
+    if not name:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise ValueError("name must not contain control characters")
+    if len(name) > DISPLAY_NAME_MAX:
+        raise ValueError(f"name must be at most {DISPLAY_NAME_MAX} characters")
+    return name
+
+
+def effective_device_name(row: Any) -> str | None:
+    """THE name every surface shows: the operator's rename when one is
+    set, else whatever the source posted. Takes a devices row (sqlite Row
+    or dict) carrying `name` and, when the column exists, `display_name`."""
+    try:
+        override = row["display_name"]
+    except (KeyError, IndexError):
+        override = None
+    if isinstance(override, str) and override.strip():
+        return override
+    name = row["name"]
+    return name if name else None
+
+
+async def set_device_display_name(mac: str, name: str | None) -> bool:
+    """Set (or with None, clear) the operator rename. Returns False when
+    the MAC is unknown: the override lives on the device row, so there is
+    nothing to attach it to until the station has posted once."""
+    async with connect() as db:
+        cur = await db.execute(
+            "UPDATE devices SET display_name = ? WHERE mac = ?", (name, mac))
+        await db.commit()
+        return (cur.rowcount or 0) > 0
+
+
+async def device_display_names() -> dict[str, str]:
+    """Every operator rename, keyed by MAC — the config backup's slice."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, display_name FROM devices "
+            "WHERE display_name IS NOT NULL AND display_name != '' "
+            "ORDER BY rowid")).fetchall()
+    return {r["mac"]: r["display_name"] for r in rows}
 
 
 async def count_ingest_assignments() -> int:
@@ -1656,7 +1954,9 @@ def is_air_monitor(mac: str) -> bool:
     (share uploads, heat-day, nowcast, forecast location, NWS polling,
     weather smart alerts) must skip them or the monitor fights the real
     station for the job (Volney, 2026-08-26)."""
-    return str(mac or "").upper().replace(":", "").startswith("5D5D07")
+    compact = str(mac or "").upper().replace(":", "")
+    # 07 AirGradient, 08 Govee (2.0). Keep in step with Device.isAirMonitor.
+    return compact.startswith("5D5D07") or compact.startswith("5D5D08")
 
 
 def is_air_monitor_device(device: dict[str, Any]) -> bool:
@@ -1685,7 +1985,8 @@ async def list_devices() -> list[dict[str, Any]]:
         # stays first. The iOS app's Settings → Devices lets the user override
         # with a drag-to-reorder.
         rows = await (await db.execute(
-            "SELECT mac, name, location, info_json, last_seen_ms FROM devices ORDER BY rowid"
+            "SELECT mac, name, display_name, location, info_json, last_seen_ms "
+            "FROM devices ORDER BY rowid"
         )).fetchall()
     overrides = await device_locations()
     out: list[dict[str, Any]] = []
@@ -1700,7 +2001,16 @@ async def list_devices() -> list[dict[str, Any]]:
                 "coords": {"lat": loc["lat"], "lon": loc["lon"]}}}
         out.append({
             "mac": r["mac"],
-            "name": r["name"],
+            # `name` is the EFFECTIVE name (operator rename first) because
+            # this list is the one place device rows leave the database:
+            # alerts, the digest, storm summaries, stories, the public page,
+            # /metrics and every app version read it. `display_name` is the
+            # override alone (NULL when none) and `source_name` what the
+            # station posts, so the app can offer "use the station's own
+            # name" and say what that would be.
+            "name": effective_device_name(r),
+            "display_name": r["display_name"] or None,
+            "source_name": r["name"],
             "location": r["location"],
             "lastSeen": r["last_seen_ms"],
             "lastData": info.get("lastData"),
@@ -1831,7 +2141,8 @@ _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipie
                     "storm_summary", "storm_quiet_minutes", "storm_min_total_in",
                     "rain_start", "storm_channels",
                     "heat_day", "heat_day_threshold_f",
-                    "quiet_start_min", "quiet_end_min", "digest_hour")
+                    "quiet_start_min", "quiet_end_min", "digest_hour",
+                    "digest_minute")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -3011,6 +3322,14 @@ async def history(
           -- as Int? (synthesized Codable) — a REAL-typed 731.0 in the JSON
           -- would fail the whole row's decode, not just this field.
           CAST(MAX(lightning_last_1hr) AS INTEGER) AS lightning_last_1hr,
+          -- MIN, and it is the ONLY field in this SELECT that takes the
+          -- minimum as its headline value. Distance is the one quantity
+          -- here where the interesting number is the SMALLEST one in the
+          -- bucket: a single strike two miles out is the whole story of
+          -- an hour that otherwise averaged twenty. AVG would dilute it
+          -- into calm, and MAX would report the farthest strike, which is
+          -- the exact opposite of what a reader is asking this chart.
+          MIN(lightning_distance_mi) AS lightning_distance_mi,
           -- Air quality (1.8): AVG for the level lines; CO2/PM peaks matter
           -- for "how bad did it get", so carry the bucket MAX for the two
           -- health-relevant series alongside.
@@ -3194,7 +3513,7 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
     cur_year = _tolerant_float(row["yearlyrainin"])
     cur_month = _tolerant_float(row["monthlyrainin"])
 
-    now_local = datetime.now(tz=tz)
+    now_local = _now_local(tz)
     top_of_hour    = now_local.replace(minute=0, second=0, microsecond=0)
     start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     # US-meteorology convention: weeks start Sunday. Python's weekday():
@@ -3258,6 +3577,27 @@ async def _rollup_from_monthly(mac: str, name: str, boundary_ms: int,
     return round(max(0.0, cur_month + max(0.0, prev_final - prior)), 3)
 
 
+def _now_local(tz):
+    """The station-local wall clock, read through one named call.
+
+    A seam on purpose, shared by both rain tiers. Every period boundary in
+    this module — and the tier-3 (mac, local day) cache key — hangs off this
+    single instant, so the rollovers those boundaries exist to handle are
+    only reachable by a test that can move the clock; pinning it is also the
+    only way a test's synthetic observations can be guaranteed to land in
+    one local day/week/month whatever the moment the suite runs at. Both
+    known flakes here were that shape: a suite running at 00:09 UTC put a
+    `now - 30min` reading on yesterday and read back a two-day weekly sum,
+    and a week anchored on the 1st of a month straddled the month boundary.
+
+    Same reason `climate.local_today` exists for the story engine, but kept
+    separate and tz-parameterised: `rain_rollups` is called with an explicit
+    zone and must honour THAT zone, not `settings.timezone`.
+    """
+    from datetime import datetime
+    return datetime.now(tz=tz)
+
+
 async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
     """Week/month/year rain for a source whose ONLY counter is the per-day
     one (Tempest: `precip_accum_local_day`; no monthly, no yearly).
@@ -3290,9 +3630,9 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
     cadence reaches that row count in about a year. The cached values are
     week/month/year sums only, so 60s of staleness is invisible; hourly/
     daily stay None (the station's own numbers are the truth for those)."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
-    now_local = datetime.now(tz=tz)
+    now_local = _now_local(tz)
     start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
 
     cache_key = (mac, start_of_today.date().isoformat())
@@ -3839,20 +4179,207 @@ async def colfill_pending() -> bool:
 
 # ── storm history (1.9 shareables) ──────────────────────────────────────
 
+# ── storm-close capture (2.0) ───────────────────────────────────────────
+#
+# THE WINDOWS, AND WHY THEY CAN NEVER BE REVISED
+#
+# History thinning ages raw observations down to one row per bucket, so the
+# minute-by-minute readings on either side of a storm survive only for the
+# detail window. Everything below is therefore measured ONCE, at the moment
+# the episode closes, and stored. A storm captured under these definitions
+# keeps them forever; changing them later would silently mix two meanings
+# in one column, and there is no data left to re-measure the old rows with.
+# Hence: decide, write it down, live with it.
+#
+# ONE HOUR, EACH SIDE, SYMMETRIC.
+#
+# · BEFORE = the HOTTEST reading in the hour ending at the storm's start.
+#   Not the single reading at the start: outflow leads the rain by tens of
+#   minutes (the summary's own gust window already reaches 30 minutes back
+#   for that reason), so by the time the first bucket tips, the crash has
+#   often begun and the last "before" reading is already down several
+#   degrees. The hour's peak is the heat the storm actually broke. An hour
+#   and not more, so it stays "just before this storm" rather than the
+#   afternoon high.
+#
+# · AFTER = the COOLEST reading in the hour beginning the instant after the
+#   last rain. The mirror of the same argument: the low arrives minutes to
+#   tens of minutes behind the rain, and the reading at the close is not
+#   yet it.
+#
+# · A LIVE capture sees only the part of the after-hour that has already
+#   elapsed — the tracker fires the summary once the quiet window is up
+#   (30 minutes by default), so it reads 30 minutes of "after", not 60.
+#   That is a coverage limit, not a different definition: the number is
+#   still the coolest it got after the rain stopped, measured as far as the
+#   clock had gone. Waiting a full hour to capture would mean holding the
+#   notification back an extra half hour, which is not a trade this feature
+#   gets to make.
+#
+# · PRESSURE and DEW POINT take the MEAN of each window rather than an
+#   extreme. Both move slowly and both carry sensor noise that an extreme
+#   would happily promote into the headline; the temperature drop is the
+#   claim, and these two are its supporting evidence.
+#
+# Signs: the temperature drop is pre − post (positive = it got cooler), and
+# the pressure/dew changes are after − before (positive = it rose), so each
+# reads the way its sentence does.
+_STORM_EDGE_MS = 60 * 60_000
+
+
+async def _storm_edge(db, mac: str, lo_ms: int,
+                      hi_ms: int) -> dict[str, float | None]:
+    """One edge window's measurements over [lo_ms, hi_ms], inclusive.
+
+    Every aggregate is typeof()-filtered for the reason storm_window_stats
+    documents: SQLite keeps TEXT in a REAL column and orders it above every
+    number, so one garbled reading would become the window's MAX. All-None
+    when the station reported nothing in the window — which is the honest
+    answer for a gap, a sensor it does not carry, or history already
+    thinned away.
+
+    Columns are read POSITIONALLY. The backfill runs inside `init_db`,
+    whose connection is opened before any row_factory is set, so a
+    name-keyed read would pass every test that goes through `connect()`
+    and fail on the one boot path that matters.
+    """
+    keys = ("t_max", "t_min", "dew", "pressure")
+    empty: dict[str, float | None] = {"t_max": None, "t_min": None,
+                                      "dew": None, "pressure": None}
+    if hi_ms < lo_ms:
+        return empty
+    row = await (await db.execute(
+        "SELECT MAX(CASE WHEN typeof(tempf) IN ('integer','real') "
+        "            THEN tempf END) AS t_max, "
+        "       MIN(CASE WHEN typeof(tempf) IN ('integer','real') "
+        "            THEN tempf END) AS t_min, "
+        "       AVG(CASE WHEN typeof(dew_point) IN ('integer','real') "
+        "            THEN dew_point END) AS dew, "
+        "       AVG(CASE WHEN typeof(baromrelin) IN ('integer','real') "
+        "            THEN baromrelin END) AS pressure "
+        "FROM observations WHERE mac = ? AND dateutc_ms BETWEEN ? AND ?",
+        (mac, lo_ms, hi_ms))).fetchone()
+    if row is None:
+        return empty
+    return {k: _as_float(row[i]) for i, k in enumerate(keys)}
+
+
+def _delta(after: float | None, before: float | None,
+           places: int) -> float | None:
+    """after − before, or None when either side was never measured. The
+    guard is the point: a missing edge must not become a zero change."""
+    if after is None or before is None:
+        return None
+    return round(after - before, places)
+
+
+async def _storm_close_capture(db, mac: str, started_ms: int, ended_ms: int,
+                               now_ms: int) -> dict[str, float | None]:
+    """The five before/after measurements, read from raw observations.
+
+    `now_ms` bounds the after-window to what has actually been recorded —
+    see the window notes above. Takes an open connection so the live close
+    path and the one-time backfill share one definition.
+    """
+    before = await _storm_edge(db, mac, started_ms - _STORM_EDGE_MS,
+                               started_ms)
+    # Strictly AFTER the last rain: the reading stamped `ended_ms` is the
+    # storm's own last wet reading, and folding it into "after" would let
+    # the episode supply its own post-storm low.
+    after = await _storm_edge(db, mac, ended_ms + 1,
+                              min(ended_ms + _STORM_EDGE_MS, now_ms))
+    pre, post = before["t_max"], after["t_min"]
+    return {
+        "pre_tempf": None if pre is None else round(pre, 1),
+        "post_tempf": None if post is None else round(post, 1),
+        # Stored rather than left to be derived from the pair: the DROP is
+        # the story's claim, and keeping it beside the readings pins the
+        # definition (pre − post, under these windows) to the row that was
+        # measured under it.
+        "temp_drop_f": _delta(pre, post, 1),
+        "pressure_change_inhg": _delta(after["pressure"],
+                                       before["pressure"], 3),
+        "dew_change_f": _delta(after["dew"], before["dew"], 1),
+    }
+
+
+async def storm_close_capture(mac: str, started_ms: int, ended_ms: int,
+                              now_ms: int) -> dict[str, float | None]:
+    """Public entry for the alert monitor: capture at the moment of close."""
+    async with connect() as db:
+        return await _storm_close_capture(db, mac, started_ms, ended_ms,
+                                          now_ms)
+
+
+async def _backfill_storm_capture(db) -> int:
+    """One-time pass, on the single boot that adds the capture columns.
+
+    NOT an estimate and never a fabrication: it re-runs the very same
+    windowed reads the live path runs, against the raw observations, and
+    writes only what those reads actually find. A storm whose hours have
+    already been thinned (or that was recorded on a station with no
+    barometer) returns all-None and keeps its NULLs — which is the correct,
+    permanent answer for it.
+
+    Bounded by construction: storm_history is pruned to the newest 50 rows
+    per station, so this is a few hundred rows at the outside, each costing
+    two primary-key range scans of about an hour of observations.
+    """
+    rows = await (await db.execute(
+        "SELECT id, mac, started_ms, ended_ms FROM storm_history")).fetchall()
+    filled = 0
+    for row_id, mac, started_ms, ended_ms in rows:
+        # The full hour on each side: for a storm that closed in the past,
+        # the after-window has long since elapsed, so there is no clock to
+        # bound it with — the data is there or it is not.
+        cap = await _storm_close_capture(db, mac, started_ms, ended_ms,
+                                         ended_ms + _STORM_EDGE_MS)
+        if all(v is None for v in cap.values()):
+            continue
+        await db.execute(
+            "UPDATE storm_history SET pre_tempf = ?, post_tempf = ?, "
+            "temp_drop_f = ?, pressure_change_inhg = ?, dew_change_f = ? "
+            "WHERE id = ?",
+            (cap["pre_tempf"], cap["post_tempf"], cap["temp_drop_f"],
+             cap["pressure_change_inhg"], cap["dew_change_f"], row_id))
+        filled += 1
+    if filled:
+        log.info("storm-close capture backfilled for %d stored storm(s) "
+                 "whose raw observations survived", filled)
+    return filled
+
+
+# The capture columns, in one place: record_storm writes them, list_storms
+# serves them, and a column added to the story without being added here is
+# a NULL nobody can explain.
+_STORM_CAPTURE_COLS = ("pre_tempf", "post_tempf", "temp_drop_f",
+                       "pressure_change_inhg", "dew_change_f")
+
+
 async def record_storm(mac: str, s: dict) -> None:
     """Persist one CLOSED, reported storm episode — the structured stats
     the Storm Report share card renders. Written at summary delivery
     (the same moment the notification fires), pruned to the newest 50
     per station: a share card wants recent storms, not an archive (the
-    raw history and rollups remain the archive)."""
+    raw history and rollups remain the archive).
+
+    The 2.0 capture fields ride the same dict and are plain `.get()`s: a
+    caller that did not capture them (or a station whose sensors did not
+    report) stores NULL, which is the only honest value for a measurement
+    nobody took.
+    """
     async with connect() as db:
         await db.execute(
             "INSERT INTO storm_history (mac, started_ms, ended_ms, "
-            "total_in, peak_rate_in_hr, max_gust_mph, min_tempf, max_tempf) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "total_in, peak_rate_in_hr, max_gust_mph, min_tempf, max_tempf, "
+            + ", ".join(_STORM_CAPTURE_COLS) + ") "
+            # Eight fixed columns plus one per capture column: generated so
+            # a sixth capture column cannot leave the VALUES list short.
+            "VALUES (" + ", ".join("?" * (8 + len(_STORM_CAPTURE_COLS))) + ")",
             (mac, s["started_ms"], s["ended_ms"], s["total_in"],
              s.get("peak_rate_in_hr"), s.get("max_gust_mph"),
-             s.get("min_tempf"), s.get("max_tempf")))
+             s.get("min_tempf"), s.get("max_tempf"),
+             *(s.get(c) for c in _STORM_CAPTURE_COLS)))
         await db.execute(
             "DELETE FROM storm_history WHERE mac = ? AND id NOT IN "
             "(SELECT id FROM storm_history WHERE mac = ? "
@@ -3864,7 +4391,8 @@ async def list_storms(mac: str, limit: int = 10) -> list[dict[str, Any]]:
     async with connect() as db:
         rows = await (await db.execute(
             "SELECT started_ms, ended_ms, total_in, peak_rate_in_hr, "
-            "max_gust_mph, min_tempf, max_tempf FROM storm_history "
+            "max_gust_mph, min_tempf, max_tempf, "
+            + ", ".join(_STORM_CAPTURE_COLS) + " FROM storm_history "
             "WHERE mac = ? ORDER BY ended_ms DESC LIMIT ?",
             (mac, limit))).fetchall()
     return [dict(r) for r in rows]

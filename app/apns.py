@@ -366,8 +366,16 @@ async def send_widget_refresh() -> dict:
                                     "widgets", "refresh",
                                     url, relay_token, la_payload=payload,
                                     push_type="widgets")
-    for tok in res.get("dead", []):
-        await db.remove_live_activity_token(tok)
+    # Same isolation as the Live Activity sends above (R16 f3, R17 #5): a
+    # failed prune must not propagate into widget_push.check, which would
+    # skip its _last_push_ms stamp and re-send reload pushes every tick for
+    # the length of the outage — the WidgetKit budget this module exists
+    # to protect.
+    try:
+        for tok in res.get("dead", []):
+            await db.remove_live_activity_token(tok)
+    except Exception:
+        log.exception("dead widget token prune failed (send stands)")
     return res
 
 

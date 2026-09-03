@@ -40,6 +40,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+from pathlib import Path
 import time
 from typing import Any
 
@@ -184,10 +186,60 @@ async def image_exists(image_repo: str, tag: str) -> bool:
         return False
 
 
+PRE_UPGRADE_SNAPSHOT_SUFFIX = ".pre-upgrade"
+
+
+async def snapshot_before_upgrade(tag: str) -> Path | None:
+    """VACUUM INTO `<db>.pre-upgrade-<tag>.db` beside the database before a
+    one-tap upgrade, when the volume has room for it (R17: the manifest
+    vouched every 1.x into 2.0 and apply_update took no snapshot; a
+    migration that goes wrong on a stranded operator's box had no way
+    back). Only the newest pre-upgrade snapshot is kept. Returns the
+    path, or None when there was no room or the copy failed, in which
+    case the upgrade still proceeds: a missing safety net is logged, an
+    upgrade refused for lack of one would strand the box on the old
+    release with no one watching."""
+    from .config import settings
+    db_path = Path(settings.database_path)
+    if not db_path.exists():
+        return None
+    dest = db_path.with_name(f"{db_path.name}{PRE_UPGRADE_SNAPSHOT_SUFFIX}-{tag}.db")
+    try:
+        need = int(db_path.stat().st_size * 1.02) + 32 * 1024 * 1024
+        free = shutil.disk_usage(db_path.parent).free
+        if free < need:
+            log.warning("auto-update: no room for a pre-upgrade snapshot "
+                        "(%d MB free, %d MB needed) — upgrading without one",
+                        free // 2**20, need // 2**20)
+            return None
+        dest.unlink(missing_ok=True)
+        import aiosqlite
+        conn = await aiosqlite.connect(str(db_path))
+        try:
+            await conn.execute("VACUUM INTO ?", (str(dest),))
+        finally:
+            await conn.close()
+        # Only now, with the new net in place, let the previous one go: a
+        # snapshot that could not be written must not cost the one that was.
+        for old in db_path.parent.glob(f"{db_path.name}{PRE_UPGRADE_SNAPSHOT_SUFFIX}-*.db"):
+            if old != dest:
+                old.unlink(missing_ok=True)
+        log.warning("auto-update: pre-upgrade snapshot written to %s (%d MB)",
+                    dest.name, dest.stat().st_size // 2**20)
+        return dest
+    except Exception as e:  # noqa: BLE001 — a failed net must not block the upgrade
+        log.warning("auto-update: pre-upgrade snapshot failed (%s) — "
+                    "upgrading without one", e)
+        dest.unlink(missing_ok=True)
+        return None
+
+
 async def apply_update(tag: str) -> bool:
     """Point this machine at the release image via the Machines API. Fly
     restarts the machine as part of the update, so a True return may never
-    be observed — the intent is logged first for exactly that reason."""
+    be observed — the intent is logged first for exactly that reason. A
+    pre-upgrade snapshot of the database goes beside it first."""
+    await snapshot_before_upgrade(tag)
     app_name = os.environ.get("FLY_APP_NAME", "").strip()
     machine_id = os.environ.get("FLY_MACHINE_ID", "").strip()
     token = _fly_token()

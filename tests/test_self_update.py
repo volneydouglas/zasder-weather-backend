@@ -26,6 +26,13 @@ def wired(temp_env: str, monkeypatch):
 
 
 HOUR = 3_600_000
+# A "newer patch of the SAME major", whatever the current version is: the
+# literals were 1.999.x and went stale the day version.py said 2.0.0.
+from app.version import __version__ as _CURRENT  # noqa: E402
+_MAJOR = _CURRENT.split(".")[0]
+NEWER = f"{_MAJOR}.999.0"
+NEWER1 = f"{_MAJOR}.999.1"
+NEXT_MAJOR = f"{int(_MAJOR) + 1}.0.0"
 
 
 def test_eligibility_rules(wired):
@@ -67,24 +74,24 @@ def test_first_seen_clock_persists_and_resets_per_tag(wired, monkeypatch):
     monkeypatch.setattr(su, "image_exists", _async_true)
     monkeypatch.setattr(su, "apply_update", _async_capture(applied))
 
-    _tick(su, "1.999.0")
+    _tick(su, NEWER)
     seen = json.loads(asyncio.run(db.get_kv("auto_update_first_seen")))
-    assert seen["tag"] == "1.999.0"
+    assert seen["tag"] == NEWER
     assert applied == [], "must not apply on first sighting"
 
     # Simulate a restart two days later: rewind the stored clock instead of
     # waiting — the point is that the value comes from the DB, not memory.
     seen["ms"] -= 49 * HOUR
     asyncio.run(db.set_kv("auto_update_first_seen", json.dumps(seen)))
-    _tick(su, "1.999.0")
-    assert applied == ["1.999.0"], "mature release must apply"
+    _tick(su, NEWER)
+    assert applied == [NEWER], "mature release must apply"
 
     # A newer tag restarts the clock: nothing applies on ITS first sighting.
     applied.clear()
-    _tick(su, "1.999.1")
+    _tick(su, NEWER1)
     assert applied == []
     seen2 = json.loads(asyncio.run(db.get_kv("auto_update_first_seen")))
-    assert seen2["tag"] == "1.999.1"
+    assert seen2["tag"] == NEWER1
 
 
 def test_missing_image_holds_and_attempt_cooldown(wired, monkeypatch):
@@ -96,21 +103,21 @@ def test_missing_image_holds_and_attempt_cooldown(wired, monkeypatch):
     monkeypatch.setattr(su, "apply_update", _async_capture(applied))
 
     asyncio.run(db.set_kv("auto_update_first_seen", json.dumps(
-        {"tag": "1.999.0", "ms": 0})))
+        {"tag": NEWER, "ms": 0})))
     monkeypatch.setattr(su, "image_exists", _async_false)
-    _tick(su, "1.999.0")
+    _tick(su, NEWER)
     assert applied == [], "applied onto an unverifiable image"
     assert asyncio.run(db.get_kv("auto_update_last_attempt")) is None, \
         "a held update must not consume the attempt budget"
 
     monkeypatch.setattr(su, "image_exists", _async_true)
-    _tick(su, "1.999.0")
-    assert applied == ["1.999.0"]
+    _tick(su, NEWER)
+    assert applied == [NEWER]
     attempt = json.loads(asyncio.run(db.get_kv("auto_update_last_attempt")))
-    assert attempt["tag"] == "1.999.0"
+    assert attempt["tag"] == NEWER
 
-    _tick(su, "1.999.0")
-    assert applied == ["1.999.0"], "retried within the cooldown"
+    _tick(su, NEWER)
+    assert applied == [NEWER], "retried within the cooldown"
 
 
 async def _async_true(*a, **k):
@@ -144,7 +151,7 @@ def test_update_apply_endpoint_guards(client, monkeypatch):
     # fetch is a network round-trip, and a token-less instance shouldn't
     # pay it for a foregone 409 — so a major bump WITHOUT a token reads
     # "deploy token", not "major".
-    main.app.state.update_info = {"latest": "1.999.0", "update_available": True}
+    main.app.state.update_info = {"latest": NEWER, "update_available": True}
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "deploy token" in r.json()["detail"]
 
@@ -158,7 +165,7 @@ def test_update_apply_endpoint_guards(client, monkeypatch):
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "major" in r.json()["detail"]
 
-    main.app.state.update_info = {"latest": "1.999.0", "update_available": True}
+    main.app.state.update_info = {"latest": NEWER, "update_available": True}
     monkeypatch.setattr(self_update, "image_exists", _async_false)
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "no published image" in r.json()["detail"]
@@ -167,7 +174,7 @@ def test_update_apply_endpoint_guards(client, monkeypatch):
     monkeypatch.setattr(self_update, "image_exists", _async_true)
     monkeypatch.setattr(self_update, "apply_update", _async_capture(applied))
     r = client.post("/api/update/apply", headers=H)
-    assert r.status_code == 200 and applied == ["1.999.0"]
+    assert r.status_code == 200 and applied == [NEWER]
 
 
 def _mock_httpx(monkeypatch, handler):
@@ -408,7 +415,7 @@ def test_update_apply_major_gate_honors_the_vouch(client, monkeypatch):
     from app import main, self_update
     H = {"Authorization": "Bearer test-api-token"}
     monkeypatch.setenv("FLY_API_TOKEN", "x" * 20)
-    main.app.state.update_info = {"latest": "2.0.0", "update_available": True}
+    main.app.state.update_info = {"latest": NEXT_MAJOR, "update_available": True}
 
     async def no_vouch(latest, current):
         return False
@@ -417,7 +424,7 @@ def test_update_apply_major_gate_honors_the_vouch(client, monkeypatch):
     assert r.status_code == 409 and "major" in r.json()["detail"]
 
     async def vouched(latest, current):
-        assert latest == "2.0.0"
+        assert latest == NEXT_MAJOR
         return True
 
     async def no_image(repo, tag):
@@ -436,3 +443,27 @@ def test_auto_update_still_never_crosses_majors(wired):
     ok, _why = su.eligible("2.0.0", "1.9.2", now - 99 * 3_600_000, now,
                            48 * 3_600_000)
     assert ok is False
+
+
+
+def test_a_pre_upgrade_snapshot_is_written_beside_the_database(wired, monkeypatch):
+    """R17 / 2.0: the one-tap path used to take no snapshot. One is written
+    with VACUUM INTO before the machine is pointed at the new image, only
+    the newest is kept, and no room means no snapshot rather than no
+    upgrade."""
+    from pathlib import Path
+    from app import self_update as su
+    from app.config import settings
+    db_path = Path(settings.database_path)
+    stale = db_path.with_name(f"{db_path.name}.pre-upgrade-1.8.0.db")
+    stale.write_bytes(b"old")
+    dest = asyncio.run(su.snapshot_before_upgrade("2.0.0"))
+    assert dest is not None and dest.exists() and dest.stat().st_size > 0
+    assert dest.name == f"{db_path.name}.pre-upgrade-2.0.0.db"
+    assert not stale.exists(), "only the newest snapshot is kept"
+    # No room: logged, skipped, and the upgrade is not blocked.
+    class Usage:
+        free = 0
+    monkeypatch.setattr(su.shutil, "disk_usage", lambda p: Usage)
+    assert asyncio.run(su.snapshot_before_upgrade("2.0.1")) is None
+    assert dest.exists()

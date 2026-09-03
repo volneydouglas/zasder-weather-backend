@@ -30,9 +30,16 @@ def tokens_match(presented: str, allowed: str | Iterable[str] | None) -> bool:
         return False
     if isinstance(allowed, str):
         allowed = (allowed,)
+    # Compare BYTES, not str: compare_digest on str raises TypeError for
+    # anything non-ASCII, and Starlette decodes header bytes as latin-1,
+    # so `Authorization: Bearer \xe9\xe9` arrived as "éé" and 500'd every
+    # gate instead of 401'ing (2026-09-01). surrogatepass so no str can
+    # fail to encode; a mismatch is simply False.
+    presented_b = presented.encode("utf-8", "surrogatepass")
     ok = False
     for t in allowed:
-        if t and _secrets.compare_digest(presented, t):
+        if t and _secrets.compare_digest(
+                presented_b, t.encode("utf-8", "surrogatepass")):
             ok = True
     return ok
 
@@ -174,6 +181,26 @@ class Settings(BaseSettings):
     # station's own name when unset.
     tempest_name: str | None = None
 
+    # Ecowitt cloud (2.0): application key + API key from the ecowitt.net
+    # Private Center. Both required together; every weather station on the
+    # account is polled unless ECOWITT_MACS (comma list) narrows it. The
+    # local gateway upload (/ingest/ecowitt) stays the LAN path; this one
+    # is for HTTPS-only hosts. App-stored credentials win (kv-over-env).
+    ecowitt_app_key: str | None = None
+    ecowitt_api_key: str | None = None
+    ecowitt_macs: str | None = None
+    ecowitt_name: str | None = None
+    ecowitt_poll_interval_seconds: int = 60
+
+    # Govee (2.0): one Platform API key from the Govee Home app polls every
+    # Wi-Fi air monitor on the account (the H5140 CO₂ monitor and its
+    # siblings talk only to Govee's cloud). GOVEE_DEVICES (comma list of
+    # device ids) narrows it. App-stored credentials win (kv-over-env).
+    govee_api_key: str | None = None
+    govee_devices: str | None = None
+    govee_name: str | None = None
+    govee_poll_interval_seconds: int = 60
+
     # INERT since v1.3.2 — the offset calibration was removed after it
     # corrupted rain history in production (ingest.py stores counters
     # raw; period rain derives from deltas, so no calibration is
@@ -248,6 +275,17 @@ class Settings(BaseSettings):
     # rollups keep every day's true extremes. Needs INSIGHTS=1.
     history_detail_days: int = 0
     history_keep_interval_minutes: int = 5
+    # The quiet-hour window thinning runs in (2.0), station-local
+    # (TIMEZONE): it starts at HH:MM and works for at most this many
+    # minutes a night in small bounded batches, then resumes the next
+    # night from where it stopped — a big archive takes several nights,
+    # readings keep flowing the whole time. 0 minutes = thinning paused.
+    # Never runs at boot; a restart waits for the next window start.
+    history_thin_window_start: str = "02:00"
+    history_thin_window_minutes: int = Field(default=120, ge=0, le=1440)
+    # Rows per thinning transaction (the starting/ceiling batch; the pass
+    # halves it when a transaction runs long, floor 200).
+    history_thin_batch_rows: int = Field(default=2000, ge=200, le=20000)
     # data_json trimming (1.9): 0 = off. Blanks the per-row JSON payload
     # (most of each row's bytes) past this window while KEEPING every row
     # — every charted/recorded field has a typed column. App-stored
@@ -546,6 +584,21 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_thin_window(self):
+        raw = self.history_thin_window_start.strip()
+        parts = raw.split(":")
+        ok = (len(parts) == 2 and all(p.isdigit() for p in parts)
+              and 0 <= int(parts[0]) <= 23 and 0 <= int(parts[1]) <= 59)
+        if not ok:
+            raise ValueError(
+                f"HISTORY_THIN_WINDOW_START {self.history_thin_window_start!r} "
+                "must be HH:MM (24-hour, station-local), e.g. '02:00'.")
+        # Store what was validated: a padded " 02:00" in .env otherwise
+        # reaches every consumer with its whitespace still on.
+        self.history_thin_window_start = raw
+        return self
+
+    @model_validator(mode="after")
     def _validate_timezone(self):
         # A typo'd TIMEZONE used to start cleanly and only surface at runtime
         # (500s on /records when the rollup path hit ZoneInfo). Fail at boot.
@@ -566,6 +619,10 @@ class Settings(BaseSettings):
     @property
     def tempest_configured(self) -> bool:
         return bool(self.tempest_token and self.tempest_station_id)
+
+    @property
+    def ecowitt_cloud_configured(self) -> bool:
+        return bool(self.ecowitt_app_key and self.ecowitt_api_key)
 
     @property
     def alert_recipients(self) -> list[str]:

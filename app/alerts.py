@@ -495,6 +495,10 @@ class EffectiveAlertConfig:
     quiet_start_min: int | None = None
     quiet_end_min: int | None = None
     digest_hour: int | None = None
+    # 2.0: minute past the hour (0..59; absent = :00). "An email that is
+    # sent at 7:29 will likely be seen before one at 7am" (Volney): the
+    # on-the-hour report lands in the same minute as everyone else's.
+    digest_minute: int | None = None
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -557,7 +561,8 @@ async def effective_config() -> EffectiveAlertConfig:
         heat_day=heat_on, heat_day_threshold_f=heat_thr,
         quiet_start_min=_int_or_none(p.get("quiet_start_min")),
         quiet_end_min=_int_or_none(p.get("quiet_end_min")),
-        digest_hour=_int_or_none(p.get("digest_hour")))
+        digest_hour=_int_or_none(p.get("digest_hour")),
+        digest_minute=_int_or_none(p.get("digest_minute")))
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -799,6 +804,15 @@ class AlertMonitor:
             await forecast_snapshots.check(devices, now_ms)
         except Exception:
             log.exception("forecast snapshot failed")
+        # The Zambretti daily ledger (2.0): one slide-rule call per station
+        # per local day, filed at the first tick after 09:00 local. Same
+        # rule as the snapshots above — its own delivery surface, bounded
+        # so it can never take the tick down.
+        from . import zambretti_ledger
+        try:
+            await zambretti_ledger.check(devices, now_ms)
+        except Exception:
+            log.exception("zambretti ledger failed")
         from . import share_targets
         try:
             await share_targets.check(devices, now_ms)
@@ -1082,6 +1096,31 @@ class AlertMonitor:
                         # 1.9 Storm Report card: keep the structured stats
                         # this summary was built from. Best-effort — a
                         # failed history write must never unsend a summary.
+                        #
+                        # 2.0 storm-close capture: the before/after
+                        # readings ride the same write, and THIS is the
+                        # only moment they can be taken. History thinning
+                        # ages the minute-by-minute rows either side of the
+                        # storm down to one per bucket, so the pair that
+                        # makes "108°F before, 84°F after" a story is gone
+                        # within days of the storm. Measured now or never
+                        # measured — see db._storm_close_capture for the
+                        # windows and why they are permanent.
+                        #
+                        # The capture is enrichment and the row is the
+                        # record: they fail separately. The storm state
+                        # was cleared above, so nothing retries this tick
+                        # — a capture that raises must not take the
+                        # total, peak rate and gust down with it
+                        # (CodeRabbit, PR #35).
+                        capture: dict = {}
+                        try:
+                            capture = await db.storm_close_capture(
+                                mac, summary.started_ms, summary.ended_ms,
+                                now_ms)
+                        except Exception:
+                            log.exception("storm close capture failed; "
+                                          "recording the storm without it")
                         try:
                             await db.record_storm(mac, {
                                 "started_ms": summary.started_ms,
@@ -1090,7 +1129,8 @@ class AlertMonitor:
                                 "peak_rate_in_hr": summary.peak_rate_in_hr,
                                 "max_gust_mph": summary.max_gust_mph,
                                 "min_tempf": summary.min_tempf,
-                                "max_tempf": summary.max_tempf})
+                                "max_tempf": summary.max_tempf,
+                                **capture})
                         except Exception:
                             log.exception("storm history write failed")
                         log.info("storm summary sent for %s: %.2fin over %.1fh",
@@ -1150,7 +1190,11 @@ class AlertMonitor:
             # UTC (insights._tz), and "yesterday" must agree with them.
             tz = ZoneInfo("UTC")
         local = datetime.fromtimestamp(now_ms / 1000, tz)
-        if local.hour < int(cfg.digest_hour):
+        # Hour AND minute (2.0): the report goes on the first tick at or
+        # after the chosen clock time. getattr: test fixtures and 1.9 rows
+        # predate the minute and mean :00.
+        minute = int(getattr(cfg, "digest_minute", 0) or 0)
+        if local.hour * 60 + local.minute < int(cfg.digest_hour) * 60 + minute:
             return
         raw = await db.get_kv("alerts.digest.last_ms")
         try:

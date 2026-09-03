@@ -363,10 +363,11 @@ def test_nws_legacy_sweep_covers_deleted_devices(client, monkeypatch):
     assert global_raw is not None, "the global key must survive the sweep"
 
 
-def test_public_dashboard_excludes_monitors_even_when_kv_names_them(client):
-    """R8 S5 + the unconditional filter: a kv list naming ONLY monitor
-    macs must fall back to a weather station, and 'all' must not render
-    monitor blocks."""
+def test_public_dashboard_renders_air_card_when_kv_names_a_monitor(client):
+    """2.0 flips R8 S5: the page has an air card now, so a monitor the kv
+    names renders (as its own tiles, never as a weather block), 'all'
+    carries every device, and only the PRIMARY fallback still prefers a
+    weather station."""
     _ingest(client, "AA:BB:CC:00:00:90", "Realstation", tempf=90.0)
     client.post("/ingest/custom",
         headers={"Authorization": "Bearer test-ingest-token",
@@ -377,13 +378,20 @@ def test_public_dashboard_excludes_monitors_even_when_kv_names_them(client):
     client.put("/api/public-dashboard", headers=H,
                json={"enabled": True, "macs": "5D5D07000042"})
     page = client.get("/embed").text
-    assert "Airbox" not in page, "monitor block must not render"
-    assert "Realstation" in page, "fallback must pick the weather station"
+    assert "Airbox" in page and 'class="station station-air"' in page
+    assert "Realstation" not in page, "an explicit monitor-only list is honored"
+    assert 'class="cc-temp">' not in page, "no weather hero for a monitor"
     client.put("/api/public-dashboard", headers=H,
                json={"enabled": True, "macs": "all"})
-    # bust the cache via the config PUT; fetch again
     page = client.get("/embed").text
-    assert "Airbox" not in page and "Realstation" in page
+    assert "Airbox" in page and "Realstation" in page
+    assert page.count('class="station station-air"') == 1
+    # Primary (unset): the first WEATHER station, even though the monitor
+    # is a device too.
+    client.put("/api/public-dashboard", headers=H,
+               json={"enabled": True, "macs": ""})
+    page = client.get("/embed").text
+    assert "Realstation" in page and "Airbox" not in page
 
 
 def test_webhook_task_reaper_consumes_exceptions(client):
@@ -416,9 +424,10 @@ def test_chart_index_rebuild_defers_on_big_archives(client, monkeypatch):
     from app import db
 
     async def run():
-        # Sabotage: drop a column from the index so the probe sees stale.
+        # Sabotage: drop a column from the index so the probe sees stale
+        # (under the pre-2.0 bare name, as an upgrading database carries).
         async with db.connect() as conn:
-            await conn.execute("DROP INDEX idx_obs_chart")
+            await conn.execute(f"DROP INDEX {db.chart_index_name()}")
             await conn.execute(
                 "CREATE INDEX idx_obs_chart ON observations (mac, dateutc_ms)")
             await conn.commit()
@@ -434,8 +443,8 @@ def test_chart_index_rebuild_defers_on_big_archives(client, monkeypatch):
         await db.rebuild_chart_index()
         async with db.connect() as conn:
             row = await (await conn.execute(
-                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
-            )).fetchone()
+                "SELECT sql FROM sqlite_master WHERE name=?",
+                (db.chart_index_name(),))).fetchone()
         rebuilt = set(db._CHART_INDEX_COLS) <= db._index_columns(row[0])
         return deferred, still_stale, rebuilt, db.chart_index_rebuild_needed()
     deferred, still_stale, rebuilt, flag_after = asyncio.run(run())
@@ -455,40 +464,38 @@ def test_chart_index_missing_entirely_is_rebuild_worthy(client, monkeypatch):
     import asyncio
     from app import db
 
+    name = db.chart_index_name()
+
+    async def current():
+        async with db.connect() as conn:
+            return await (await conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name=?", (name,)
+            )).fetchone()
+
     async def run():
         # Simulate the interrupted deferred rebuild: index gone entirely.
         async with db.connect() as conn:
-            await conn.execute("DROP INDEX idx_obs_chart")
+            await conn.execute(f"DROP INDEX {name}")
             await conn.commit()
         # Small archive: init_db recreates it inline, full column set.
         db._CHART_INDEX_REBUILD_NEEDED = False
         await db.init_db()
-        async with db.connect() as conn:
-            row = await (await conn.execute(
-                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
-            )).fetchone()
+        row = await current()
         inline_ok = (row is not None
                      and set(db._CHART_INDEX_COLS) <= db._index_columns(row[0]))
         inline_flag = db.chart_index_rebuild_needed()
 
         # Big archive: missing index defers; boot must NOT build it inline.
         async with db.connect() as conn:
-            await conn.execute("DROP INDEX idx_obs_chart")
+            await conn.execute(f"DROP INDEX {name}")
             await conn.commit()
         monkeypatch.setattr(db, "_CHART_INDEX_INLINE_MAX_ROWS", -1)
         db._CHART_INDEX_REBUILD_NEEDED = False
         await db.init_db()
         deferred = db.chart_index_rebuild_needed()
-        async with db.connect() as conn:
-            row = await (await conn.execute(
-                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
-            )).fetchone()
-        still_missing = row is None
+        still_missing = await current() is None
         await db.rebuild_chart_index()
-        async with db.connect() as conn:
-            row = await (await conn.execute(
-                "SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
-            )).fetchone()
+        row = await current()
         rebuilt = (row is not None
                    and set(db._CHART_INDEX_COLS) <= db._index_columns(row[0]))
         return inline_ok, inline_flag, deferred, still_missing, rebuilt

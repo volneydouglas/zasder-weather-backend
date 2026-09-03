@@ -31,7 +31,10 @@ from . import db
 
 log = logging.getLogger("zasder.config_backup")
 
-FORMAT_VERSION = 1
+# 2: every non-secret alert preference (storm, rain start, heat day, quiet
+# hours, digest hour AND minute), per-device storm_summary, and rule
+# severity. A version-1 file restores as before; a 2.0 server reads both.
+FORMAT_VERSION = 2
 
 WARNING = ("This file contains your alert recipients and server settings. "
            "It does NOT contain your API tokens or SMTP password. Keep it "
@@ -40,11 +43,22 @@ WARNING = ("This file contains your alert recipients and server settings. "
 
 # SMTP password is never read back out; listing the keys we DO carry makes it
 # obvious what a restore will and won't put back.
+# Every non-secret column set_alert_prefs stores (db.py keeps the same
+# list; R18 finding 5 found this one had stopped at email_scope while the
+# API grew storm, Live Activity, quiet-hours and digest preferences, so a
+# restore silently reset all of them). Adding a preference means adding
+# it HERE and in _coerce_alert_pref, and test_config_backup checks the
+# two lists agree with the database's.
 _ALERT_PREF_KEYS = (
     "enabled", "default_threshold_min", "repeat_hours", "recipients",
     "smtp_host", "smtp_port", "smtp_username", "smtp_from",
     "smtp_tls", "smtp_ssl", "email_scope",
+    "storm_summary", "storm_quiet_minutes", "storm_min_total_in",
+    "rain_start", "storm_channels",
+    "heat_day", "heat_day_threshold_f",
+    "quiet_start_min", "quiet_end_min", "digest_hour", "digest_minute",
 )
+RULE_SEVERITIES = ("minor", "standard", "major", "urgent")
 
 
 async def export_config() -> dict[str, Any]:
@@ -57,10 +71,15 @@ async def export_config() -> dict[str, Any]:
         "device_alert_prefs": await db.get_device_alert_prefs(),
         "alert_rules": [
             {k: r.get(k) for k in ("target_mac", "field", "comparator",
-                                   "threshold", "enabled")}
+                                   "threshold", "enabled", "severity")}
             for r in await db.list_alert_rules()
         ],
         "device_locations": await db.device_locations(),
+        # 2.0 operator renames (mac -> name). Optional on restore: a 1.9
+        # file simply has no key, and an unknown MAC is skipped, since the
+        # override lives on the device row the station creates on its
+        # first post.
+        "device_names": await db.device_display_names(),
         # Recorded so a restore can say what it couldn't put back.
         "smtp_password_included": False,
     }
@@ -80,16 +99,35 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
     _INVALID to skip it."""
     if v is None:
         return None
-    if key in ("enabled", "smtp_tls", "smtp_ssl"):
+    if key in ("enabled", "smtp_tls", "smtp_ssl", "storm_summary",
+               "rain_start", "heat_day"):
         if isinstance(v, bool) or v in (0, 1):
             return 1 if v else 0
         return _INVALID
-    if key in ("default_threshold_min", "repeat_hours"):
+    if key in ("default_threshold_min", "repeat_hours",
+               "storm_quiet_minutes", "storm_min_total_in"):
         try:
             f = float(v)
         except (TypeError, ValueError):
             return _INVALID
         return f if math.isfinite(f) and f >= 0 else _INVALID
+    if key == "heat_day_threshold_f":
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return _INVALID
+        return f if math.isfinite(f) else _INVALID
+    if key in ("quiet_start_min", "quiet_end_min", "digest_hour",
+               "digest_minute"):
+        # The same bounds PUT /api/alerts enforces.
+        hi = {"quiet_start_min": 1439, "quiet_end_min": 1439,
+              "digest_hour": 23, "digest_minute": 59}[key]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return _INVALID
+        n = int(v)
+        return n if n == v and 0 <= n <= hi else _INVALID
+    if key == "storm_channels":
+        return v if v in ("push", "email", "both") else _INVALID
     if key == "smtp_port":
         try:
             p = int(v)
@@ -131,6 +169,7 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
 
     summary: dict[str, Any] = {"alert_prefs": 0, "device_alert_prefs": 0,
                                "alert_rules": 0, "device_locations": 0,
+                               "device_names": 0,
                                "smtp_password_restored": False}
 
     prefs = payload.get("alert_prefs")
@@ -157,6 +196,11 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
                 continue
             await db.upsert_device_alert_pref(
                 mac, bool(p.get("monitor", True)), p.get("threshold_min"))
+            # Per-device storm summaries were exported and never restored,
+            # so a muted station came back loud (R18 finding 5). None or
+            # absent means "never set", which is the default (on).
+            if p.get("storm_summary") is not None:
+                await db.set_device_storm_summary(mac, bool(p["storm_summary"]))
             summary["device_alert_prefs"] += 1
 
     rules = payload.get("alert_rules")
@@ -165,7 +209,7 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
         # validating meant a file whose rules were all malformed wiped every
         # existing rule and put nothing back — the worst possible outcome for
         # a restore.
-        staged: list[tuple[Any, str, str, float, bool]] = []
+        staged: list[tuple[Any, str, str, float, bool, str]] = []
         for r in rules:
             if not isinstance(r, dict):
                 continue
@@ -186,8 +230,11 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
                 continue          # skip a malformed rule, keep the rest
             if not math.isfinite(threshold):
                 continue
+            severity = r.get("severity") or "minor"
+            if severity not in RULE_SEVERITIES:
+                severity = "minor"        # a hand-edited file never invents a tier
             staged.append((target_mac, field, comparator, threshold,
-                           bool(r.get("enabled", True))))
+                           bool(r.get("enabled", True)), severity))
         # An explicitly empty list is a legitimate "clear my rules"; a list
         # that had entries but none survived validation is not.
         if staged or not rules:
@@ -196,9 +243,10 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
                 # on top of existing ones would duplicate every rule.
                 for existing in await db.list_alert_rules():
                     await db.delete_alert_rule(int(existing["id"]))
-            for target, field, comparator, threshold, enabled in staged:
+            for target, field, comparator, threshold, enabled, severity in staged:
                 created = await db.create_alert_rule(target, field,
-                                                     comparator, threshold)
+                                                     comparator, threshold,
+                                                     severity=severity)
                 if created and not enabled:
                     await db.set_alert_rule_enabled(int(created["id"]), False)
                 summary["alert_rules"] += 1
@@ -218,6 +266,20 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
             except (TypeError, ValueError):
                 continue
             summary["device_locations"] += 1
+
+    names = payload.get("device_names")
+    if isinstance(names, dict):
+        for mac, name in names.items():
+            # One rule for both doors: the same validator the PUT route
+            # uses, so a hand-edited file can't land what the API refuses.
+            try:
+                clean = db.clean_display_name(name)
+            except ValueError:
+                continue
+            if clean is None or not isinstance(mac, str):
+                continue
+            if await db.set_device_display_name(mac, clean):
+                summary["device_names"] += 1
 
     if sum(v for v in summary.values() if isinstance(v, int)) == 0:
         raise RestoreError("nothing in that file could be restored — "

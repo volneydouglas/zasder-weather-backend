@@ -21,6 +21,7 @@ station's own monthly normals. Degree days use the standard 65 °F base.
 from __future__ import annotations
 
 import logging
+import asyncio
 import math
 from datetime import date, datetime, timezone
 from typing import Any
@@ -72,6 +73,55 @@ def cold_tiers_for(p10_low: float | None) -> tuple[float, ...]:
 # ledgers (a trace day counts the same in Seattle as in Chandler).
 RAIN_DAY_MIN_IN = 0.01
 
+# ── year-to-year comparability ──────────────────────────────────────────
+# THE canonical rule for "may this year be compared against that one?",
+# used by the story engine's ledger baseline and published per year in the
+# payload so a client never has to invent a threshold of its own.
+#
+# The failure it exists to prevent is the same one in two costumes. A year
+# the station spent mostly offline has fewer hot days because it has fewer
+# days, so letting it into a baseline manufactures records. A year the
+# station joined in June has no rain before June, so reading its missing
+# total as 0.00 in claims a drought it never measured. Absent is not zero,
+# and the only honest answer for a year that isn't covered is to say so.
+COMPARISON_MIN_DAYS = 30
+COMPARISON_COVERAGE = 0.80
+
+
+def comparable_to_date(days: int, reference_days: int) -> bool:
+    """Did this year cover enough of the same calendar window to be quoted
+    beside a reference year that covered `reference_days` of it?
+
+    Both counts are DAYS WITH DATA up to the shared anchor. The floor is
+    absolute as well as relative: 80% of a three-week reference is still
+    three weeks, and three weeks is not a year.
+    """
+    if days <= 0 or reference_days <= 0:
+        return False
+    return days >= max(COMPARISON_MIN_DAYS, COMPARISON_COVERAGE * reference_days)
+
+
+def window_days_to_anchor(year: int, anchor_md: str) -> int:
+    """Calendar days in `year` from Jan 1 through the anchor month-day —
+    the DENOMINATOR coverage is measured against.
+
+    Counted by walking the anchor backwards to a date that exists rather
+    than by arithmetic, because the one anchor that needs care is Feb 29:
+    in a non-leap year the string window "everything ≤ 02-29" holds exactly
+    the 59 days through Feb 28, and a client that computed 60 would mark a
+    fully-covered year partial every fourth year.
+    """
+    try:
+        month, day = int(anchor_md[:2]), int(anchor_md[3:5])
+    except (ValueError, IndexError):
+        return 0
+    while day > 0:
+        try:
+            return (date(year, month, day) - date(year, 1, 1)).days + 1
+        except ValueError:
+            day -= 1
+    return 0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS daily_rollups (
     mac        TEXT NOT NULL,
@@ -101,7 +151,32 @@ CREATE TABLE IF NOT EXISTS hour_rollups (
     feels_n   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (mac, month, hour)
 );
+
+-- Comfort ledger (2.0): year x month x hour-of-day COUNTS of feels-like
+-- readings inside, above and below the comfort band. Keyed by YEAR, which
+-- hour_rollups is not, so a producer can rank this year's months against
+-- the record's. Only the SHARES (comfortable_n / n) are read: a share of
+-- bucket-sampled raw is unbiased, so the table rebuilds from thinned
+-- history like hour_rollups does; the raw counts are never quoted as hours.
+CREATE TABLE IF NOT EXISTS comfort_rollups (
+    mac   TEXT NOT NULL,
+    year  INTEGER NOT NULL,
+    month INTEGER NOT NULL,             -- 1..12 (local)
+    hour  INTEGER NOT NULL,             -- 0..23 (local)
+    n             INTEGER NOT NULL DEFAULT 0,
+    comfortable_n INTEGER NOT NULL DEFAULT 0,
+    hot_n         INTEGER NOT NULL DEFAULT 0,
+    cold_n        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (mac, year, month, hour)
+);
 """
+
+# The comfort band, on FEELS-LIKE, in storage units (°F). Between these a
+# reading counts as comfortable outdoors: 60°F is where most people want a
+# layer, 80°F is where shade starts to matter. The band is decided at fold
+# time, so moving it means a rollup rebuild (set `rollups_dirty`).
+COMFORT_LOW_F = 60.0
+COMFORT_HIGH_F = 80.0
 
 _UPSERT_DAILY = """
 INSERT INTO daily_rollups (mac, day,
@@ -162,6 +237,31 @@ def _hour_params(mac: str, month: int, hour: int,
             f if f is not None else 0.0, 1 if f is not None else 0)
 
 
+_UPSERT_COMFORT = """
+INSERT INTO comfort_rollups (mac, year, month, hour, n, comfortable_n, hot_n, cold_n)
+VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+ON CONFLICT(mac, year, month, hour) DO UPDATE SET
+    n             = n + 1,
+    comfortable_n = comfortable_n + excluded.comfortable_n,
+    hot_n         = hot_n + excluded.hot_n,
+    cold_n        = cold_n + excluded.cold_n
+"""
+
+
+def _comfort_params(mac: str, year: int, month: int, hour: int,
+                    p: dict[str, Any]) -> tuple | None:
+    """UPSERT_COMFORT params, or None when the row has no feels-like. One
+    reading lands in exactly one of the three buckets."""
+    f = p["feels_like"]
+    if f is None:
+        return None
+    if f < COMFORT_LOW_F:
+        return (mac, year, month, hour, 0, 0, 1)
+    if f > COMFORT_HIGH_F:
+        return (mac, year, month, hour, 0, 1, 0)
+    return (mac, year, month, hour, 1, 0, 0)
+
+
 def _tz() -> ZoneInfo:
     try:
         return ZoneInfo(settings.timezone)
@@ -190,6 +290,7 @@ def rollup_params(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any] | None:
     return {
         "mac": row.get("_mac"),          # filled by caller
         "day": local.strftime("%Y-%m-%d"),
+        "_year": local.year,
         "_month": local.month,
         "_hour": local.hour,
         "tempf": tempf,
@@ -222,10 +323,12 @@ async def update_rollups(db, mac: str, rows: list[dict[str, Any]]) -> None:
         if p is None:
             continue
         p["mac"] = mac
-        month, hour = p.pop("_month"), p.pop("_hour")
+        year, month, hour = p.pop("_year"), p.pop("_month"), p.pop("_hour")
         await db.execute(_UPSERT_DAILY, p)
         if (hp := _hour_params(mac, month, hour, p)) is not None:
             await db.execute(_UPSERT_HOUR, hp)
+        if (cp := _comfort_params(mac, year, month, hour, p)) is not None:
+            await db.execute(_UPSERT_COMFORT, cp)
 
 
 # Serializes rebuild() runs: two concurrent rebuilds interleaving DELETE +
@@ -324,6 +427,7 @@ async def _rebuild_locked(mac: str | None) -> dict[str, int]:
                         await db.execute(
                             "DELETE FROM daily_rollups WHERE mac = ?", (mac,))
                     await db.execute("DELETE FROM hour_rollups WHERE mac = ?", (mac,))
+                    await db.execute("DELETE FROM comfort_rollups WHERE mac = ?", (mac,))
                 else:
                     if wm_day:
                         await db.execute(
@@ -332,6 +436,10 @@ async def _rebuild_locked(mac: str | None) -> dict[str, int]:
                     else:
                         await db.execute("DELETE FROM daily_rollups")
                     await db.execute("DELETE FROM hour_rollups")
+                    # A half-folded comfort ledger would rank months from
+                    # part of the record with nothing marking it so
+                    # (CodeRabbit, PR #35).
+                    await db.execute("DELETE FROM comfort_rollups")
                 await db.commit()
             log.warning("insights rebuild failed mid-scan — partial rollups "
                         "cleared (mac=%s); re-run the rebuild", mac or "*")
@@ -352,6 +460,23 @@ async def _thin_watermark_day(dbmod) -> str | None:
     from datetime import datetime, timezone as _tzu
     return (datetime.fromtimestamp(wm_ms / 1000, tz=_tzu.utc)
             .astimezone(_tz()).strftime("%Y-%m-%d"))
+
+
+# One rebuild batch, and the pause after it. The batch bounds how long the
+# write lock is held at a stretch; the PAUSE is what lets anyone else
+# have it. Without the pause the loop re-took the lock the instant it
+# committed, and on Volney's box (2026-09-02, the comfort ledger's first
+# fold over 1,239 days) ingest, push registration and the alert tick all
+# answered "database is locked" for the whole rebuild: readings a relay
+# did not retry were simply gone. Two things bound that now. The batch
+# is 1,000 rows, because each row is three upserts through aiosqlite's
+# thread hop and a 5,000-row batch held the lock for ~8 s on Fly's shared
+# CPU, close to the 10 s busy_timeout every other writer waits; a 1,000-row
+# batch is under 2 s. And the loop sleeps between batches, the same yield
+# the 1.9 column backfill uses ("ingest goes first"). A 360k-row rebuild
+# takes a few minutes longer and costs nobody a reading.
+REBUILD_BATCH_ROWS = 1000
+REBUILD_BATCH_PAUSE_S = 0.5
 
 
 async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
@@ -375,6 +500,7 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
                 await db.execute("DELETE FROM daily_rollups WHERE mac = ?",
                                  (mac,))
             await db.execute("DELETE FROM hour_rollups WHERE mac = ?", (mac,))
+            await db.execute("DELETE FROM comfort_rollups WHERE mac = ?", (mac,))
         else:
             if wm_day:
                 await db.execute("DELETE FROM daily_rollups WHERE day >= ?",
@@ -382,6 +508,9 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
             else:
                 await db.execute("DELETE FROM daily_rollups")
             await db.execute("DELETE FROM hour_rollups")
+            # Shares survive bucket sampling like the hour averages do, so
+            # the comfort ledger rebuilds full-history too.
+            await db.execute("DELETE FROM comfort_rollups")
         if mac:
             macs = [mac]
         else:
@@ -400,8 +529,8 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
                 "solarradiation, dailyrainin, yearlyrainin, "
                 "lightning_last_1hr "
                 "FROM observations WHERE mac = ? AND dateutc_ms > ? "
-                "ORDER BY dateutc_ms LIMIT 5000",
-                (one_mac, last))
+                "ORDER BY dateutc_ms LIMIT ?",
+                (one_mac, last, REBUILD_BATCH_ROWS))
             batch = await cur.fetchall()
             if not batch:
                 break
@@ -417,7 +546,8 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
                 if p is None:
                     continue
                 p["mac"] = b[0]
-                month, hour = p.pop("_month"), p.pop("_hour")
+                year, month, hour = (p.pop("_year"), p.pop("_month"),
+                                     p.pop("_hour"))
                 # Preserved (thinned) days: their daily rows survived the
                 # delete above and must not be re-folded — the upsert MERGES
                 # (sums add), so folding thinned raw into a full-detail row
@@ -426,6 +556,8 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
                     await db.execute(_UPSERT_DAILY, p)
                 if (hp := _hour_params(b[0], month, hour, p)) is not None:
                     await db.execute(_UPSERT_HOUR, hp)
+                if (cp := _comfort_params(b[0], year, month, hour, p)) is not None:
+                    await db.execute(_UPSERT_COMFORT, cp)
                 processed += 1
             last = batch[-1][1]
             # Commit PER BATCH: one giant transaction held the write lock
@@ -435,6 +567,8 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
             # a crashed rebuild resumes cleanly since it starts with a
             # DELETE and rebuild is idempotent.
             await db.commit()
+            # Yield the writer: see REBUILD_BATCH_PAUSE_S.
+            await asyncio.sleep(REBUILD_BATCH_PAUSE_S)
         await db.commit()
     log.info("insights rebuild: %d rows folded (mac=%s)", processed, mac or "*")
     return {"rows": processed}
@@ -483,8 +617,13 @@ async def daily_series(mac: str, days: int) -> dict[str, Any]:
     return {"mac": mac, "series": series}
 
 
-async def assemble(mac: str) -> dict[str, Any]:
-    """The /api/insights payload — reads rollups only."""
+async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
+    """The /api/insights payload — reads rollups only.
+
+    `today` overrides the to-date anchor below. Callers that already fixed a
+    "today" for themselves (the story engine does, so a story's period and
+    its ledger window can't disagree across a midnight boundary) pass theirs;
+    everyone else gets the station clock."""
     from . import db as dbmod
     async with dbmod.connect() as db:
         cur = await db.execute(
@@ -514,6 +653,15 @@ async def assemble(mac: str) -> dict[str, Any]:
             return max(0.0, d[7] - d[6])
         return 0.0
 
+    # To-date anchor (2.0, story engine): the month-day that splits each
+    # year into "the part comparable with the running year" and the rest.
+    # Without it every partial-vs-complete year comparison is unfair by
+    # construction — eight months of this year against twelve of last is
+    # how a station "sets a record" by having a shorter year. Station clock,
+    # like every daily_rollups.day; a UTC host is a day ahead of Phoenix for
+    # part of every evening.
+    anchor_md = (today or datetime.now(_tz()).date()).strftime("%m-%d")
+
     years: dict[str, dict[str, Any]] = {}
     # Rain gap: days iterate in date order, so the last assignment in the
     # loop below IS the most recent rain day.
@@ -522,9 +670,26 @@ async def assemble(mac: str) -> dict[str, Any]:
     for d in days:
         y = d[0][:4]
         yr = years.setdefault(y, {
-            "year": int(y), "days": 0,
+            "year": int(y), "days": 0, "days_to_date": 0,
+            # Coverage (2.0): the year's own span, so a consumer can say
+            # "2025 from Jun 3" instead of quoting a total for months the
+            # station was not there for. Days arrive in date order, so the
+            # first row seen IS the year's first day.
+            "first_day": d[0], "last_day": d[0],
             "tiers": {str(int(t)): 0 for t in LEDGER_TIERS},
+            "tiers_to_date": {str(int(t)): 0 for t in LEDGER_TIERS},
             "cold": {str(int(t)): 0 for t in cold_tiers},
+            # The cold ladder's to-date mirror, for the same reason the heat
+            # ladder has one: a running year compared against finished ones
+            # is a headline the calendar wrote. It matters MORE on this side
+            # — cold lands at both ends of a calendar year, so a year running
+            # through August has had one winter while every year beside it
+            # has had two halves of two.
+            "cold_to_date": {str(int(t)): 0 for t in cold_tiers},
+            # Nights at or below freezing. Counted here rather than derived
+            # from `cold` because the cold ladder is climate-adaptive and a
+            # cold-climate station's tiers skip 32°F entirely.
+            "freezes": 0, "freezes_to_date": 0,
             "last_spring_freeze": None, "first_fall_freeze": None,
             "days_p90": 0, "longest_p90_streak": 0, "_streak": 0,
             "hottest": None, "coldest": None,
@@ -534,11 +699,20 @@ async def assemble(mac: str) -> dict[str, Any]:
             "cdd": 0.0, "hdd": 0.0,
         })
         yr["days"] += 1
+        yr["last_day"] = d[0]
+        # Feb 29 sorts before Mar 01 as a string, which is the behaviour we
+        # want: a leap day is inside the window for every year it compares
+        # against, and counted only in the years that have one.
+        to_date = d[0][5:] <= anchor_md
+        if to_date:
+            yr["days_to_date"] += 1
         hi, lo = d[2], d[1]
         if hi is not None:
             for t in LEDGER_TIERS:
                 if hi >= t:
                     yr["tiers"][str(int(t))] += 1
+                    if to_date:
+                        yr["tiers_to_date"][str(int(t))] += 1
             if p90 is not None and hi >= p90:
                 yr["days_p90"] += 1
                 yr["_streak"] += 1
@@ -553,6 +727,8 @@ async def assemble(mac: str) -> dict[str, Any]:
             for t in cold_tiers:
                 if lo <= t:
                     yr["cold"][str(int(t))] += 1
+                    if to_date:
+                        yr["cold_to_date"][str(int(t))] += 1
             # Cold streak — the P90 heat streak's mirror (same reviewer
             # round): consecutive nights at or below this station's own
             # 10th-percentile low, so it adapts to climate by construction.
@@ -564,6 +740,9 @@ async def assemble(mac: str) -> dict[str, Any]:
             else:
                 yr["_cstreak"] = 0
             if lo <= FREEZE_F:
+                yr["freezes"] += 1
+                if to_date:
+                    yr["freezes_to_date"] += 1
                 # Days arrive in date order, so "last one seen in Jan–Jun"
                 # and "first one seen in Jul–Dec" need no extra sorting.
                 if d[0][5:7] <= "06":
@@ -594,6 +773,34 @@ async def assemble(mac: str) -> dict[str, Any]:
         yr["rain_total"] = round(yr["rain_total"], 3)
         yr["cdd"] = round(yr["cdd"], 1)
         yr["hdd"] = round(yr["hdd"], 1)
+
+    # ── comparability (2.0) ─────────────────────────────────────────────
+    # Every year-to-date comparison a client draws — the rain race's "2025
+    # by this day", a rank among years, an anomaly against a prior season —
+    # is only honest when the years being compared covered the same window.
+    # The rule is published rather than left to the client because the
+    # client cannot see the coverage: a year with no rain point before
+    # today's day-of-year looks identical whether the station measured a dry
+    # spring or was still in its box, and defaulting that to 0.00 in is the
+    # zero bug this project keeps re-shipping.
+    #
+    # The signal is POSITIVE-ONLY and deliberately so: `comparable_to_date`
+    # is true only when the server has checked and is sure. An older server
+    # sends nothing at all, which must read as "not established" — never as
+    # "fully covered". A consumer suppresses the baseline claim unless it
+    # sees an explicit true.
+    ordered = [years[y] for y in sorted(years)]
+    reference = ordered[-1] if ordered else None
+    reference_days = int(reference["days_to_date"]) if reference else 0
+    for yr in ordered:
+        window = window_days_to_anchor(int(yr["year"]), anchor_md)
+        yr["window_days_to_date"] = window
+        # None, not 0.0: a year with no window has no coverage FRACTION,
+        # and a zero there would read as "covered none of it".
+        yr["coverage_to_date"] = (round(yr["days_to_date"] / window, 4)
+                                  if window > 0 else None)
+        yr["comparable_to_date"] = comparable_to_date(
+            int(yr["days_to_date"]), reference_days)
 
     # Monthly normals + per-month-year anomalies (warming stripes).
     monthly: dict[str, list[float]] = {}
@@ -642,12 +849,25 @@ async def assemble(mac: str) -> dict[str, Any]:
         "p90_high": p90, "p99_high": p99,
         "p10_low": p10_low,
         "ledger_tiers": [int(t) for t in LEDGER_TIERS],
+        # The month-day every year's `*_to_date` counts stop at (2.0).
+        "ledger_anchor": anchor_md,
+        # The comparability rule, spelled out so a client can explain its
+        # own rendering ("2025 from Jun 3 — not comparable") instead of
+        # guessing at a threshold. `reference_year` is the year every
+        # `comparable_to_date` flag was measured against.
+        "comparison": {
+            "anchor": anchor_md,
+            "reference_year": int(reference["year"]) if reference else None,
+            "reference_days_to_date": reference_days,
+            "min_days": COMPARISON_MIN_DAYS,
+            "min_coverage": COMPARISON_COVERAGE,
+        },
         "cold_tiers": [int(t) for t in cold_tiers],
         # Rain gap (client renders the dry-streak card only when present).
         "last_rain_day": last_rain_day,
         "last_rain_amount": last_rain_amount,
         "dry_streak_days": dry_streak_days,
-        "years": [years[y] for y in sorted(years)],
+        "years": ordered,
         "monthly_normals": normals,
         "monthly_anomalies": anomalies,
         "diurnal_tempf": grid,

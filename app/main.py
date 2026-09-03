@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -57,6 +58,167 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("api")
 
 
+def attach_file_log(db_path: str) -> str | None:
+    """Keep the process log on the data volume, rotated (5 x 10 MB), so a
+    boot's lines survive Fly's short `fly logs` window (Volney, 2026-09-02:
+    the boot log that would have explained a stuck writer had already
+    rolled off). LOG_FILE overrides the path; LOG_FILE="" disables."""
+    import os
+    from logging.handlers import RotatingFileHandler
+    path = os.environ.get("LOG_FILE")
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(db_path)),
+                            "logs", "zasder.log")
+    if not path:
+        return None
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        if not getattr(h, "_zasder_file_log", False):
+            continue
+        if getattr(h, "baseFilename", None) == path:
+            return path
+        # A previous boot in this process (the test suite boots the app
+        # per test with a fresh temp database) pointed at another file.
+        root.removeHandler(h)
+        h.close()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        h = RotatingFileHandler(path, maxBytes=10 * 2**20, backupCount=5)
+    except OSError as e:
+        log.warning("file log disabled (%s): %s", path, e)
+        return None
+    h.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    h._zasder_file_log = True          # type: ignore[attr-defined]
+    root.addHandler(h)
+    return path
+
+
+_WRITE_LOCK_PROBE_S = 30.0
+_WRITE_LOCK_STRIKES = 3
+_WRITE_LOCK_DUMP_EVERY_S = 600.0
+
+
+def _probe_write_lock() -> bool:
+    """True when the writer is free. A one-second BEGIN IMMEDIATE on a
+    fresh connection, rolled back at once — never holds anything itself."""
+    import sqlite3
+    conn = sqlite3.connect(settings.database_path, timeout=1.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.rollback()
+        return True
+    except sqlite3.OperationalError as e:
+        if db.is_lock_error(e):
+            return False
+        raise
+    finally:
+        conn.close()
+
+
+def dump_all_threads(reason: str) -> None:
+    """Every thread's stack, to stderr AND to threads.log beside the
+    database: Fly's log window is a hundred lines and rolled the first
+    dump straight off (2026-09-02 05:39)."""
+    import faulthandler
+    import os
+    import sys
+    log.error("write lock held for %s — dumping every thread's stack",
+              reason)
+    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(
+            settings.database_path)), "logs", "threads.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write("\n=== %s write lock held for %s ===\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), reason))
+            f.flush()
+            faulthandler.dump_traceback(file=f, all_threads=True)
+    except OSError as e:
+        log.warning("threads.log not written: %s", e)
+
+
+async def _write_lock_watchdog(probe=None, dump=None,
+                               sleep=asyncio.sleep) -> None:
+    probe = probe or (lambda: asyncio.to_thread(_probe_write_lock))
+    dump = dump or dump_all_threads
+    strikes = 0
+    last_dump = -_WRITE_LOCK_DUMP_EVERY_S
+    while True:
+        await sleep(_WRITE_LOCK_PROBE_S)
+        try:
+            free = await probe()
+        except Exception:
+            log.exception("write-lock probe failed")
+            continue
+        if free:
+            if strikes >= _WRITE_LOCK_STRIKES:
+                log.warning("write lock free again after %d probes", strikes)
+            strikes = 0
+            continue
+        strikes += 1
+        now = time.monotonic()
+        if (strikes >= _WRITE_LOCK_STRIKES
+                and now - last_dump >= _WRITE_LOCK_DUMP_EVERY_S):
+            last_dump = now
+            dump("%d probes (~%ds)" % (strikes,
+                                       int(strikes * _WRITE_LOCK_PROBE_S)))
+
+
+# Between chart-index rebuild attempts. Module-level so a test can shrink
+# it; production waits a minute, then two.
+_CHART_INDEX_RETRY_DELAY_S = 60.0
+_CHART_INDEX_ATTEMPTS = 3
+
+
+async def _chart_index_job() -> None:
+    """The deferred big-archive chart-index rebuild, with the ingest
+    write-behind drained after EVERY attempt (the queue fills only while
+    a CREATE is running, and the readings must land before the next
+    attempt parks more behind them).
+
+    A few in-process retries (R11): a transient failure — disk-pressure
+    hiccup, an unrelated exception — used to leave the rebuild flag set
+    with nothing re-attempting until the next boot, so charts ran
+    uncovered for the process's whole life. NOT retried: a lock timeout.
+    That means another long writer (the rollup healer, a WU import) held
+    the database for the full busy_timeout, and re-queueing behind it
+    only stretches the ingest outage; the next boot's probe defers again
+    with the old index still serving (build-then-swap, 2.0)."""
+    from . import ingest as _ingest
+    for attempt in range(_CHART_INDEX_ATTEMPTS):
+        try:
+            if attempt:
+                await asyncio.sleep(_CHART_INDEX_RETRY_DELAY_S * attempt)
+            t0 = time.time()
+            log.info("chart index rebuild starting in background "
+                     "(large archive, attempt %d)", attempt + 1)
+            await db.rebuild_chart_index()
+            log.info("chart index rebuilt in %.0fs", time.time() - t0)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if db.is_lock_error(e):
+                log.warning("background chart index rebuild lost the lock "
+                            "race (%s); not retrying — the previous index "
+                            "still serves and the next boot defers again", e)
+                return
+            log.exception("background chart index rebuild failed "
+                          "(attempt %d/%d)", attempt + 1,
+                          _CHART_INDEX_ATTEMPTS)
+        finally:
+            try:
+                await _ingest.drain_write_behind()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("ingest write-behind drain failed; %d "
+                              "reading(s) still parked",
+                              _ingest.write_behind_depth())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail fast if the stripped public build was deployed onto a host that is
@@ -66,37 +228,29 @@ async def lifespan(app: FastAPI):
     build_guard.assert_build_variant()
     await db.init_db()
     app.state.started_at = time.time()
+    attach_file_log(settings.database_path)
+    # Orphaned snapshot sweep (2.0, 2026-09-01): a `.dbbackup-*.db` was
+    # deleted only after a SUCCESSFUL download, so every timed-out or
+    # abandoned backup left a database-sized file on the volume — Volney's
+    # box held three (5.3 GB) beside a 2.07 GB database and the next
+    # backup refused with 507. At boot nothing can be in flight, so any
+    # age goes; an hourly pass below catches the rest.
+    try:
+        swept = await asyncio.to_thread(_sweep_orphan_snapshots, at_boot=True)
+        if swept["deleted"]:
+            log.info("boot sweep removed %d orphaned database snapshot(s), "
+                     "%d MB freed", len(swept["deleted"]),
+                     swept["bytes_freed"] // 2**20)
+    except Exception:
+        log.exception("orphaned snapshot sweep at boot failed")
     # Big-archive chart-index rebuild runs AFTER startup (v1.8.1): inline
     # at boot it outlived Fly's health-check window on a 1.15M-row box and
     # the 1.8.0 upgrade crash-looped. Strong ref on app.state; charts are
     # slower-but-correct until it completes, and an interrupted run just
     # defers again next boot.
+    app.state.chart_index_task = None
     if db.chart_index_rebuild_needed():
-        async def _rebuild_chart_index() -> None:
-            # A few in-process retries (R11): a transient failure — briefly
-            # locked database, disk-pressure hiccup — used to leave the
-            # rebuild flag set with nothing re-attempting until the next
-            # boot, so charts ran uncovered for the process's whole life.
-            # Spaced retries also narrow the window where a kill leaves the
-            # index missing entirely (the init_db probe now catches that
-            # case at next boot regardless).
-            for attempt in range(3):
-                try:
-                    if attempt:
-                        await asyncio.sleep(60 * attempt)
-                    t0 = time.time()
-                    log.info("chart index rebuild starting in background "
-                             "(large archive, attempt %d)", attempt + 1)
-                    await db.rebuild_chart_index()
-                    log.info("chart index rebuilt in %.0fs", time.time() - t0)
-                    return
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.exception("background chart index rebuild failed "
-                                  "(attempt %d/3)", attempt + 1)
-        app.state.chart_index_task = asyncio.create_task(
-            _rebuild_chart_index())
+        app.state.chart_index_task = asyncio.create_task(_chart_index_job())
     # Declare every source up front, configured or not. "Not set up" and "set
     # up but broken" are the two answers a self-hoster needs to tell apart,
     # and they look identical from outside.
@@ -157,6 +311,15 @@ async def lifespan(app: FastAPI):
         from . import insights as _insights
 
         async def _heal_rollups() -> None:
+            # AFTER the chart-index rebuild when one is pending (2.0): the
+            # two used to start together and contend for the write lock —
+            # the healer's BEGIN IMMEDIATE transactions waiting out
+            # busy_timeout behind a minutes-long CREATE INDEX, or the
+            # CREATE losing the race to them and failing. Unchanged when
+            # no rebuild is pending (the task is None).
+            idx = getattr(app.state, "chart_index_task", None)
+            if idx is not None:
+                await idx
             try:
                 stats = await _insights.rebuild()   # clears the flag itself
                 log.info("background rollup rebuild done: %s", stats)
@@ -188,34 +351,38 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(1)     # yield; ingest goes first
         app.state.colfill_task = asyncio.create_task(_colfill())
 
-    # History retention (1.9, opt-in): a daily pass runs BOTH aging jobs —
-    # row thinning past the detail window and data_json trimming past the
-    # (usually shorter) payload window. Always started: the knobs are
-    # app-managed at runtime (env is only the fallback), so the effective
-    # values are re-read every cycle rather than frozen at boot. Off-thread
-    # (sqlite3 sync, chunked commits); guarded inside (rollups, colfill).
-    async def _retention_daily() -> None:
-        from . import maintenance
-        await asyncio.sleep(120)
-        while True:
-            try:
-                eff = await maintenance.effective_retention()
-                if eff["detail_days"] > 0:
-                    summary = await asyncio.to_thread(
-                        maintenance.thin_history, True, None,
-                        eff["detail_days"])
-                    if summary.get("rows_deleted") or summary.get("rows_slimmed"):
-                        log.info("history thinning: %s", summary)
-                if eff["json_days"] > 0:
-                    summary = await asyncio.to_thread(
-                        maintenance.trim_json, True, None, eff["json_days"])
-                    if summary.get("rows_slimmed"):
-                        log.info("json trimming: %s", summary)
-            except Exception:
-                log.exception("history retention pass failed — nothing "
-                              "ages out until a pass succeeds")
-            await asyncio.sleep(24 * 3600)
+    # History retention (1.9, opt-in; quiet-hour window 2.0): the nightly
+    # pass runs BOTH aging jobs inside the operator's window — see
+    # _retention_daily. Always started: the knobs are app-managed at
+    # runtime (env is only the fallback), so they are re-read at every
+    # window rather than frozen at boot.
     app.state.history_thin_task = asyncio.create_task(_retention_daily())
+
+    # Hourly orphaned-snapshot sweep (2.0): a backup job whose client went
+    # away mid-poll, or a ready snapshot nobody fetched inside the fresh
+    # window, would otherwise sit until the next boot. Keeps the live
+    # job's file; see _sweep_orphan_snapshots.
+    async def _snapshot_sweep_hourly() -> None:
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                swept = await asyncio.to_thread(_sweep_orphan_snapshots)
+                if swept["deleted"]:
+                    log.info("hourly sweep removed %d orphaned database "
+                             "snapshot(s), %d MB freed",
+                             len(swept["deleted"]),
+                             swept["bytes_freed"] // 2**20)
+            except Exception:
+                log.exception("orphaned snapshot sweep failed")
+    app.state.snapshot_sweep_task = asyncio.create_task(_snapshot_sweep_hourly())
+
+    # Write-lock watchdog (2026-09-02): a connection held the writer for
+    # four minutes without appending a WAL frame and every write 503'd;
+    # nothing in the log said WHO. SQLite cannot name the holder, but the
+    # process can: when BEGIN IMMEDIATE fails three probes in a row, dump
+    # every thread's stack (aiosqlite runs each connection on its own
+    # thread, so the stuck statement is in there) — once per ten minutes.
+    app.state.write_lock_task = asyncio.create_task(_write_lock_watchdog())
 
     # Daily "is there a newer release?" check → status-page banner + /api/version.
     update_checker = UpdateChecker(app)
@@ -257,14 +424,16 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        heal = getattr(app.state, "rollup_heal_task", None)
-        if heal is not None:
-            # Cancellation mid-scan clears the partial tables (the
-            # _rebuild_locked safeguard) and LEAVES the dirty flag set, so
-            # the next boot retries — never a silently truncated ledger.
-            heal.cancel()
+        # rollup_heal_task: cancellation mid-scan clears the partial tables
+        # (the _rebuild_locked safeguard) and LEAVES the dirty flag set, so
+        # the next boot retries — never a silently truncated ledger. It is
+        # cancelled AND awaited below with the rest (R18 finding 12: it
+        # used to be cancelled here and dropped, so its aiosqlite teardown
+        # could land after the loop closed).
         await integration_manager.stop_all()
         await alert_monitor.stop()
+        from . import wu_import
+        await wu_import.stop()
         await update_checker.stop()
         await self_updater.stop()
         if mqtt_pub is not None: await mqtt_pub.stop()
@@ -273,13 +442,79 @@ async def lifespan(app: FastAPI):
         # which can land after the event loop closes — every test boot then
         # logs "Event loop is closed" from the task's teardown (CI noise,
         # and the same would greet every real shutdown).
-        reapers = [t for t in (getattr(app.state, "history_thin_task", None),
-                               getattr(app.state, "colfill_task", None))
-                   if t is not None]
+        # chart_index_task (2.0): a cancelled CREATE INDEX rolls back and
+        # the old index still serves (build-then-swap); readings parked
+        # in the ingest write-behind are gone with the process, which
+        # the drain's log line at shutdown makes visible.
+        # _STORAGE_TASK (2.0): the storage measurement job — a read-only
+        # scan under a progress handler; cancelling it mid-walk loses
+        # nothing but the report, and the next GET starts it over.
+        # Every app-owned task, in one list (R18 finding 12): the public
+        # dashboard refresh, a database snapshot in progress (its partial
+        # file is the sweep's to remove), the records warmers and the
+        # per-station recounts were never reaped and could still own an
+        # aiosqlite operation when the loop went away.
+        reapers = [t for t in (getattr(app.state, "rollup_heal_task", None),
+                               getattr(app.state, "history_thin_task", None),
+                               getattr(app.state, "snapshot_sweep_task", None),
+                               getattr(app.state, "write_lock_task", None),
+                               getattr(app.state, "colfill_task", None),
+                               getattr(app.state, "chart_index_task", None),
+                               _STORAGE_TASK,
+                               _PUBLIC_DASH_REFRESH_TASK,
+                               _DB_BACKUP_TASK,
+                               *list(_WARM_TASKS),
+                               *list(_OBS_COUNT_TASKS.values()))
+                   # Alive, and OURS: a handle left over from another loop
+                   # (a test's, or a previous lifespan's) cannot be awaited
+                   # here and would raise at the gather.
+                   if t is not None and not t.done()
+                   and t.get_loop() is asyncio.get_running_loop()]
         for t in reapers:
             t.cancel()
         if reapers:
             await asyncio.gather(*reapers, return_exceptions=True)
+
+
+# How often the retention scheduler re-reads its knobs while waiting for
+# the window: the start time is app-managed, so a sleep is never longer
+# than this before the next start is recomputed.
+_RETENTION_RECHECK_S = 3600.0
+
+
+async def _retention_daily() -> None:
+    """History retention: row thinning past the detail window and
+    data_json trimming past the (usually shorter) payload window, run
+    inside the station-local quiet-hour window and NEVER at boot — the
+    scheduler waits for the next window start, strictly after now, so a
+    restart inside tonight's window waits for tomorrow's (2026-09-02:
+    every boot resumed the heavy pass two minutes in while ingest 503'd).
+    Both jobs share the window's minute budget (thinning first, the JSON
+    trim with what remains) and resume from their watermarks the next
+    night. Off-thread (sqlite3 sync, short bounded transactions); guarded
+    inside (rollups, colfill, chart-index rebuild, lock backoff)."""
+    from . import maintenance
+    while True:
+        try:
+            eff = await maintenance.effective_retention()
+            delay = maintenance.seconds_until_thin_window(
+                eff["thin_window_start"])
+        except Exception:
+            log.exception("history retention: could not schedule the "
+                          "window — retrying in an hour")
+            delay = _RETENTION_RECHECK_S
+        if delay > _RETENTION_RECHECK_S:
+            await asyncio.sleep(_RETENTION_RECHECK_S)
+            continue
+        await asyncio.sleep(delay)
+        try:
+            eff = await maintenance.effective_retention()
+            if (eff["detail_days"] > 0 or eff["json_days"] > 0) \
+                    and eff["thin_window_minutes"] > 0:
+                await asyncio.to_thread(maintenance.run_thin_night, eff)
+        except Exception:
+            log.exception("history retention pass failed — nothing "
+                          "ages out until a pass succeeds")
 
 
 # /docs, /redoc, /openapi.json are exposed by default in FastAPI and
@@ -308,6 +543,43 @@ async def _validation_error_no_echo(request: Request,
               for e in exc.errors()]
     return JSONResponse(status_code=422,
                         content={"detail": jsonable_encoder(errors)})
+
+
+# Throttled "database busy" logging, one line per path per minute — the
+# same shape as _log_auth_failure below. Process-global; mutated only on
+# the event loop thread.
+_DB_BUSY_LOG_TS: dict[str, float] = {}
+_DB_BUSY_LOG_INTERVAL_S = 60.0
+_DB_BUSY_LOG_MAX_PATHS = 256
+
+
+def _log_db_busy(path: str) -> None:
+    now = time.monotonic()
+    last = _DB_BUSY_LOG_TS.get(path)
+    if last is not None and now - last < _DB_BUSY_LOG_INTERVAL_S:
+        return
+    if len(_DB_BUSY_LOG_TS) >= _DB_BUSY_LOG_MAX_PATHS:
+        _DB_BUSY_LOG_TS.clear()
+    _DB_BUSY_LOG_TS[path] = now
+    log.warning("database busy on %s — answered 503 Retry-After (throttled: "
+                "1 line/min/path)", path)
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def _sqlite_busy_to_503(request: Request,
+                              exc: sqlite3.OperationalError):
+    """A writer that waited out busy_timeout behind a long job (the
+    chart-index build, a rollup rebuild) used to surface as a 500 — which
+    a LilyGO counts toward its wipe heuristic and a relay client treats as
+    "the server is broken". It is neither: 503 + Retry-After says "come
+    back in a moment", and every client here already retries. Any OTHER
+    OperationalError is a real fault and still 500s exactly as before."""
+    if not db.is_lock_error(exc):
+        raise exc
+    _log_db_busy(request.url.path)
+    return JSONResponse(status_code=503,
+                        content={"detail": "database busy, retry"},
+                        headers={"Retry-After": "5"})
 
 
 app.include_router(capture_router)
@@ -819,7 +1091,12 @@ async def status_page() -> HTMLResponse:
 # blocks. Reset by the test fixture like its dashboard sibling.
 _OBS_COUNT_CACHE: dict[str, tuple[float, int]] = {}
 _OBS_COUNT_TTL_S = 600
-_OBS_COUNT_TASKS: set = set()
+# One in-flight recount per station (R18 finding 7): the set this replaced
+# only kept tasks alive, so every anonymous hit past the TTL spawned its
+# own COUNT(*) — 25 simultaneous refreshes made 25 six-second scans of the
+# same station. Keyed by mac; a station whose recount is still running
+# gets the stale value and no new task. Reaped at shutdown with the rest.
+_OBS_COUNT_TASKS: dict[str, asyncio.Task] = {}
 
 
 async def _cached_observation_count(mac: str) -> int:
@@ -828,15 +1105,19 @@ async def _cached_observation_count(mac: str) -> int:
     if hit is not None and now - hit[0] < _OBS_COUNT_TTL_S:
         return hit[1]
     if hit is not None:
-        async def _recount() -> None:
-            try:
-                _OBS_COUNT_CACHE[mac] = (time.time(),
-                                         await db.observation_count(mac))
-            except Exception:
-                log.exception("count refresh failed for %s", mac)
-        task = asyncio.create_task(_recount())
-        _OBS_COUNT_TASKS.add(task)
-        task.add_done_callback(_OBS_COUNT_TASKS.discard)
+        running = _OBS_COUNT_TASKS.get(mac)
+        if running is None or running.done():
+            async def _recount() -> None:
+                try:
+                    _OBS_COUNT_CACHE[mac] = (time.time(),
+                                             await db.observation_count(mac))
+                except Exception:
+                    log.exception("count refresh failed for %s", mac)
+            task = asyncio.create_task(_recount())
+            _OBS_COUNT_TASKS[mac] = task
+            task.add_done_callback(
+                lambda t, m=mac: _OBS_COUNT_TASKS.pop(m, None)
+                if _OBS_COUNT_TASKS.get(m) is t else None)
         return hit[1]
     n = await db.observation_count(mac)
     _OBS_COUNT_CACHE[mac] = (time.time(), n)
@@ -981,15 +1262,15 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
     fields = pd.resolve_fields(settings.public_dashboard_fields)
     sel = (eff["macs"] or "").strip()
     by_mac = {d["mac"]: d for d in devices}
-    # Air monitors stay off the PUBLIC page entirely — the page renders
-    # weather-station blocks and has no air-quality treatment yet, so a
-    # monitor block is junk however it got selected. Volney's kv carried
-    # the monitor macs EXPLICITLY (the app's sharing screen wrote the full
-    # device list), which is why an honor-explicit-listings filter still
-    # rendered them (2026-08-26). Revisit when the page grows an AQI block.
+    # Air monitors render as their own card (2.0, pd.render_air_station):
+    # they are selectable like any device, by explicit mac or "all". Only
+    # the PRIMARY fallback still prefers a weather station, so a fleet
+    # whose first device is a CO2 sensor opens with the weather.
+    # (Before the air card existed the page filtered monitors out
+    # unconditionally, 2026-08-26.)
     weather = [d for d in devices if not db.is_air_monitor_device(d)]
     if sel.lower() == "all":
-        macs = [d["mac"] for d in weather] or [(weather or devices)[0]["mac"]]
+        macs = [d["mac"] for d in devices]
     elif sel:
         # Match on the separator-stripped uppercase form so the operator can
         # write the MAC colonized or compact, lower or upper case. Walk the
@@ -998,11 +1279,8 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
         # (Volney, 2026-08-21). dict.fromkeys dedups while preserving order.
         def _compact(m: str) -> str:
             return m.upper().replace("-", "").replace(":", "")
-        by_compact = {_compact(d["mac"]): d["mac"] for d in weather}
+        by_compact = {_compact(d["mac"]): d["mac"] for d in devices}
         want = dict.fromkeys(_compact(m) for m in sel.split(",") if m.strip())
-        # Fallback prefers a weather station too: a kv list naming ONLY
-        # monitor macs empties the filter, and devices[0] could re-select
-        # the very block this hunk removes (R8 S5).
         macs = ([by_compact[w] for w in want if w in by_compact]
                 or [(weather or devices)[0]["mac"]])
     else:
@@ -1017,6 +1295,26 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
             continue
         obs = await db.latest_observation(mac)
         rows = await db.history(mac, start_ms, now_ms, limit=5000)
+        if db.is_air_monitor_device(d):
+            # The air card wants one series (PM2.5; db.history carries it
+            # in both the raw and the bucketed SELECT) and none of the
+            # weather machinery: no wind rose, no records scan kicked off
+            # for a monitor, no rain periods, no summary board.
+            pm_pts, co2_pts = [], []
+            for r in rows:
+                t = r.get("dateutc")
+                if t is None:
+                    continue
+                v = pd._num(r.get("pm25"))
+                if v is not None:
+                    pm_pts.append((int(t), v))
+                c = pd._num(r.get("co2"))
+                if c is not None:
+                    co2_pts.append((int(t), c))
+            stations.append({"name": d.get("name") or mac, "obs": obs,
+                             "series": {"pm25": pm_pts, "co2": co2_pts},
+                             "air": True})
+            continue
         # Always carry feelsLike too (overlaid on the temp chart), regardless
         # of the selected fields.
         series: dict[str, list] = {}
@@ -1262,6 +1560,51 @@ _DB_BACKUP_JOB: dict[str, Any] = {"state": "idle"}
 _DB_BACKUP_TASK: asyncio.Task | None = None
 _DB_BACKUP_FRESH_MS = 10 * 60_000     # a ready snapshot is reusable this long
 
+# /api/storage (2.0, 2026-09-01): the measurement is a background job with
+# a cached result, same one-at-a-time process-global shape as the backup
+# job above and reset per test the same way. See api_storage for why a
+# request-time scan cannot be bounded on a 2 GB database.
+_STORAGE_JOB: dict[str, Any] = {"state": "idle"}
+_STORAGE_TASK: asyncio.Task | None = None
+_STORAGE_FRESH_MS = 6 * 3_600_000     # a cached report is served this long
+
+
+def _db_backup_job_expired(job: dict[str, Any], now_ms: int) -> bool:
+    """A ready snapshot nobody downloaded inside the fresh window. The
+    status endpoint reports it as 'expired' and the sweep may delete it."""
+    return (job.get("state") == "ready"
+            and now_ms - int(job.get("finished_ms") or 0) >= _DB_BACKUP_FRESH_MS)
+
+
+def _db_backup_keep_path(now_ms: int) -> Path | None:
+    """The one snapshot file the sweep must leave alone: a running job's
+    (while its task is alive — a VACUUM of a multi-GB database outlives the
+    fresh window) or a ready-and-fresh one. Expired, errored, and dead-task
+    jobs keep nothing."""
+    job = _DB_BACKUP_JOB
+    path = job.get("path")
+    if not path:
+        return None
+    if job.get("state") == "running":
+        task = _DB_BACKUP_TASK
+        return Path(path) if task is not None and not task.done() else None
+    if job.get("state") == "ready" and not _db_backup_job_expired(job, now_ms):
+        return Path(path)
+    return None
+
+
+def _sweep_orphan_snapshots(*, at_boot: bool = False) -> dict[str, Any]:
+    """Delete leftover `.dbbackup-*` files (sync — call via to_thread).
+    At boot nothing can be in flight in this process, so any age goes.
+    Otherwise only files past the fresh window: the inline GET path
+    VACUUMs into an UNTRACKED file, and its mtime stays fresh while the
+    write runs."""
+    from . import maintenance
+    now_ms = int(time.time() * 1000)
+    return maintenance.sweep_stale_snapshots(
+        now_ms, None if at_boot else _db_backup_keep_path(now_ms),
+        max_age_ms=None if at_boot else _DB_BACKUP_FRESH_MS)
+
 
 def _db_backup_dest() -> Path:
     """Pick a directory with room for a full copy of the database.
@@ -1348,9 +1691,16 @@ async def api_backup_database_start() -> dict[str, Any]:
             and Path(job.get("path", "")).exists()
             and now_ms - int(job.get("finished_ms") or 0) < _DB_BACKUP_FRESH_MS):
         return {"state": "ready", "size": job.get("size")}
-    # Sweep a stale/error leftover before starting fresh.
+    # Sweep a stale/error leftover before starting fresh — this job's own
+    # file, then every orphan past the fresh window in both candidate
+    # directories, BEFORE the free-space check counts what is left.
     if job.get("path"):
         Path(job["path"]).unlink(missing_ok=True)
+    _DB_BACKUP_JOB = {"state": "idle"}
+    # Inline, not to_thread: an await here would open a window between
+    # the idempotency checks above and the claim below for a second POST
+    # to stack a VACUUM. Two directory globs and a few unlinks.
+    _sweep_orphan_snapshots()
     dest = _db_backup_dest()
     _DB_BACKUP_JOB = {"state": "running", "path": str(dest), "started_ms": now_ms}
     _DB_BACKUP_TASK = asyncio.create_task(_run_db_backup(_DB_BACKUP_JOB, dest))
@@ -1361,7 +1711,11 @@ async def api_backup_database_start() -> dict[str, Any]:
 async def api_backup_database_status() -> dict[str, Any]:
     job = _DB_BACKUP_JOB
     out: dict[str, Any] = {"state": job.get("state", "idle")}
-    if job.get("state") == "ready":
+    if _db_backup_job_expired(job, int(time.time() * 1000)):
+        # Past the fresh window: the next POST starts over and the sweep
+        # may already have removed the file. Never advertised as ready.
+        out["state"] = "expired"
+    elif job.get("state") == "ready":
         out["size"] = job.get("size")
     if job.get("state") == "error":
         out["error"] = job.get("error")
@@ -1381,6 +1735,15 @@ async def api_backup_database() -> FileResponse:
     global _DB_BACKUP_JOB
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     job = _DB_BACKUP_JOB
+    if _db_backup_job_expired(job, int(time.time() * 1000)):
+        # The status route already calls this snapshot expired and the
+        # next POST refuses to reuse it; a direct GET used to hand it out
+        # anyway (R18 finding 8). Gone, and say so.
+        Path(job.get("path", "")).unlink(missing_ok=True)
+        _DB_BACKUP_JOB = {"state": "idle"}
+        raise HTTPException(status_code=410,
+                            detail="that snapshot expired; start a new one "
+                                   "with POST /api/backup/database")
     if job.get("state") == "ready" and Path(job.get("path", "")).exists():
         dest = Path(job["path"])
         _DB_BACKUP_JOB = {"state": "idle"}
@@ -1670,6 +2033,12 @@ class RetentionIn(BaseModel):
     tighter than 90 days, JSON trimming than 7."""
     detail_days: int | None = Field(default=None, ge=-1, le=3650)
     json_days: int | None = Field(default=None, ge=-1, le=3650)
+    # 2.0 quiet-hour window. Start is "HH:MM" station-local ("" forgets
+    # the app override); minutes is the nightly budget (0 = paused,
+    # -1 = forget); batch rows floor at 200 (-1 = forget).
+    thin_window_start: str | None = Field(default=None, max_length=5)
+    thin_window_minutes: int | None = Field(default=None, ge=-1, le=1440)
+    thin_batch_rows: int | None = Field(default=None, ge=-1, le=20000)
 
 
 @app.get("/api/history-retention",
@@ -1682,6 +2051,9 @@ async def get_history_retention() -> JSONResponse:
                             ("history_json_before_ms", "json_watermark_ms")):
         raw = await db.get_kv(kv_key)
         eff[out_key] = int(raw) if raw and str(raw).isdigit() else None
+    # 2.0: the nightly pass's progress document (None before the first
+    # night) — `nights_remaining` is the number the app shows.
+    eff["thin_progress"] = await maintenance.thin_progress()
     return JSONResponse(eff)
 
 
@@ -1695,6 +2067,20 @@ async def put_history_retention(body: RetentionIn) -> JSONResponse:
             raise HTTPException(
                 status_code=400,
                 detail=f"{name} must be 0 (off) or at least {floor}")
+    if body.thin_batch_rows is not None and \
+            0 <= body.thin_batch_rows < maintenance._THIN_BATCH_FLOOR:
+        raise HTTPException(
+            status_code=400,
+            detail=f"thin_batch_rows must be at least "
+                   f"{maintenance._THIN_BATCH_FLOOR}")
+    if body.thin_window_start:
+        try:
+            maintenance.parse_thin_window_start(body.thin_window_start)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="thin_window_start must be HH:MM (24-hour, "
+                       "station-local)")
     raw = await db.get_kv(maintenance._RETENTION_KV_KEY)
     stored: dict[str, Any] = {}
     if raw:
@@ -1704,7 +2090,8 @@ async def put_history_retention(body: RetentionIn) -> JSONResponse:
                 stored = parsed
         except ValueError:
             pass
-    for name in ("detail_days", "json_days"):
+    for name in ("detail_days", "json_days", "thin_window_minutes",
+                 "thin_batch_rows"):
         v = getattr(body, name)
         if v is None:
             continue
@@ -1712,6 +2099,11 @@ async def put_history_retention(body: RetentionIn) -> JSONResponse:
             stored.pop(name, None)
         else:
             stored[name] = v
+    if body.thin_window_start is not None:
+        if body.thin_window_start == "":
+            stored.pop("thin_window_start", None)
+        else:
+            stored["thin_window_start"] = body.thin_window_start.strip()
     # Cross-check the RESULT, not just each field (R11): thinning blanks
     # data_json on every row it keeps, so an effective json_days above
     # detail_days claims to keep JSON longer than thinning actually
@@ -1734,17 +2126,117 @@ async def put_history_retention(body: RetentionIn) -> JSONResponse:
     return JSONResponse(eff)
 
 
+async def _run_storage_job(job: dict[str, Any], detail_days: int) -> None:
+    """Full measurement on a worker thread, then into the kv cache. The
+    job dict carries the outcome — like _run_db_backup, this task's
+    exception must never vanish into a fire-and-forget void."""
+    from . import maintenance
+    try:
+        report = await asyncio.to_thread(
+            maintenance.storage_breakdown, None, detail_days)
+    except Exception as e:
+        job.update(state="error", error=str(e))
+        return
+    # The scan is minutes of work on a big archive; do not let a ten-second
+    # lock wait on the one-row cache write throw it away (2026-09-02: nine
+    # minutes measured, then "database is locked" on the put). Retry the
+    # write with backoff, and keep the report in the job either way so the
+    # next GET can serve it from memory even if the cache never lands.
+    report["measured_ms"] = int(time.time() * 1000)
+    job["report"] = report
+    for attempt, delay in enumerate((0, 3, 6, 12, 24, 48)):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            await asyncio.to_thread(maintenance.storage_cache_put, report,
+                                    None, report["measured_ms"])
+            break
+        except Exception as e:
+            if attempt == 5 or not db.is_lock_error(e):
+                log.warning("storage report not cached (%s); serving from "
+                            "memory until the next scan", e)
+                break
+    job.update(state="ready", finished_ms=report["measured_ms"])
+
+
 @app.get("/api/storage", dependencies=[Depends(require_write_token)])
-async def api_storage() -> JSONResponse:
+async def api_storage(refresh: bool = False) -> JSONResponse:
     """Where the disk actually goes (1.9): file sizes, per-table bytes
     (when this sqlite exposes dbstat) and row counts, the observations
     data_json split, and the thinning state. Companion to /api/version's
-    free-space number — that says HOW full, this says WITH WHAT. Read-only
-    but a real scan on a big database (seconds) — off the event loop."""
+    free-space number — that says HOW full, this says WITH WHAT.
+
+    A background job with a cached result (2.0, 2026-09-01). The scan is
+    a full read of the observations b-tree on a big database — minutes on
+    Volney's 2.07 GB box, past Fly's 60 s proxy, and sqlite's progress
+    handler can't interrupt dbstat's aggregate walk (one xNext call per
+    b-tree, in C) — so no request can wait for it. Instead:
+
+    - a cached report younger than _STORAGE_FRESH_MS answers at once with
+      `state: "ready"` and its `measured_ms`;
+    - otherwise (or with ?refresh=1) the job starts, or is already
+      running, and the answer is `state: "measuring"` — carrying the
+      stale report if there is one, and always the file sizes, so the
+      app's decoder has its required `db_bytes`;
+    - a failed job answers `state: "error"` once, then goes idle so the
+      next GET retries.
+    Every 1.9 key keeps its shape; `state` and `measured_ms` are new."""
+    global _STORAGE_JOB, _STORAGE_TASK
     from . import maintenance
+    now_ms = int(time.time() * 1000)
+    job = _STORAGE_JOB
+    # Trust "running" only while the task is alive (the backup job's
+    # lesson): a task cancelled at shutdown must not read as measuring
+    # forever.
+    if job.get("state") == "running":
+        task = _STORAGE_TASK
+        if task is None or task.done():
+            job["state"] = "error"
+            job.setdefault("error", "previous measurement was interrupted")
+    if job.get("state") == "error":
+        _STORAGE_JOB = {"state": "idle"}
+        _STORAGE_TASK = None
+        return JSONResponse({**maintenance.storage_skeleton(),
+                             "state": "error", "error": job.get("error")})
+
+    cached = await asyncio.to_thread(maintenance.storage_cache_get)
+    # A finished job whose cache write failed still has its report.
+    if (cached is None and job.get("state") == "ready"
+            and isinstance(job.get("report"), dict)):
+        cached = job["report"]
+
+    def _measuring(job: dict[str, Any]) -> JSONResponse:
+        # The old report (its old measured_ms) when there is one, and the
+        # skeleton always, so every key the app decodes is present.
+        return JSONResponse({**maintenance.storage_skeleton(),
+                             **(cached or {}), "state": "measuring",
+                             "started_ms": job.get("started_ms")})
+
+    # A live job outranks a fresh cache: after ?refresh=1 the poller (no
+    # flag) must keep seeing "measuring" until the NEW report lands, or it
+    # can't tell the refresh from a no-op.
+    job = _STORAGE_JOB
+    task = _STORAGE_TASK
+    if (job.get("state") == "running"
+            and task is not None and not task.done()):
+        return _measuring(job)
+    if (cached is not None and not refresh
+            and now_ms - cached["measured_ms"] < _STORAGE_FRESH_MS):
+        return JSONResponse({**cached, "state": "ready"})
+
+    # Stale, absent, or refresh: start the job. The await here opens a
+    # window for a concurrent GET to have started it first, so the claim
+    # re-checks synchronously — two GETs racing through cannot both start
+    # a job.
     eff = await maintenance.effective_retention()
-    return JSONResponse(await asyncio.to_thread(
-        maintenance.storage_breakdown, None, eff["detail_days"]))
+    job = _STORAGE_JOB
+    task = _STORAGE_TASK
+    if not (job.get("state") == "running"
+            and task is not None and not task.done()):
+        job = _STORAGE_JOB = {"state": "running", "started_ms": now_ms}
+        _STORAGE_TASK = asyncio.create_task(
+            _run_storage_job(job, eff["detail_days"]))
+    return _measuring(job)
 
 
 @app.post("/api/update/check", dependencies=[Depends(require_write_token)])
@@ -1771,7 +2263,8 @@ async def api_update_check() -> JSONResponse:
 
 
 # ── Cloud-source integrations (Settings → Integrations) ──────────────────
-# Configure the AmbientWeather / WeatherLink / Tempest pollers from the app
+# Configure the AmbientWeather / WeatherLink / Tempest / AirGradient /
+# Ecowitt-cloud pollers from the app
 # (server_kv, kv-over-env — the WU-key precedent) without a redeploy. ALL
 # write-gated, and the GET is too: which providers an operator uses is
 # operator business, and the response enumerates credential presence.
@@ -1971,6 +2464,8 @@ class AlertPrefsIn(BaseModel):
     quiet_start_min: int | None = Field(default=None, ge=-1, le=1439)
     quiet_end_min: int | None = Field(default=None, ge=-1, le=1439)
     digest_hour: int | None = Field(default=None, ge=-1, le=23)
+    # 2.0: minute past the hour; -1 clears back to :00.
+    digest_minute: int | None = Field(default=None, ge=-1, le=59)
 
 
 class DeviceAlertIn(BaseModel):
@@ -2044,6 +2539,7 @@ async def _alerts_state() -> dict[str, Any]:
         "quiet_start_min": cfg.quiet_start_min,
         "quiet_end_min": cfg.quiet_end_min,
         "digest_hour": cfg.digest_hour,
+        "digest_minute": cfg.digest_minute,
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -2131,7 +2627,8 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             status_code=400,
             detail="quiet_start_min and quiet_end_min must be set together "
                    "(use -1 for both to clear)")
-    for f in ("quiet_start_min", "quiet_end_min", "digest_hour"):
+    for f in ("quiet_start_min", "quiet_end_min", "digest_hour",
+              "digest_minute"):
         v = getattr(body, f)
         if v is not None:
             fields[f] = None if v < 0 else v
@@ -2225,6 +2722,37 @@ async def put_device_location(mac: str, body: DeviceLocationIn) -> JSONResponse:
                                  int(time.time() * 1000))
     return JSONResponse({"ok": True, "mac": norm, "lat": body.lat,
                          "lon": body.lon, "label": body.label})
+
+
+class DeviceNameIn(BaseModel):
+    # None or "" clears the override back to the name the station posts.
+    # Bounded here as well as in db.clean_display_name so a 10 MB body is
+    # refused by validation before the handler ever trims it.
+    name: str | None = Field(default=None, max_length=1024)
+
+
+@app.put("/api/devices/{mac}/name", dependencies=[Depends(require_shared_write)])
+async def put_device_name(mac: str, body: DeviceNameIn) -> JSONResponse:
+    """Rename a station (2.0). The source keeps posting its own name (an
+    Ecowitt gateway only knows its model); this stores the operator's
+    override, which every surface then shows through
+    db.effective_device_name. Send "" or null to go back to the station's
+    own name. Write-share tier, like the location editor: a guest with a
+    write link may tidy the station list. 404 until the station has posted
+    once — the override lives on the device row."""
+    from .ingest import _format_mac
+    norm = _format_mac(mac)
+    try:
+        clean = db.clean_display_name(body.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not await db.set_device_display_name(norm, clean):
+        raise HTTPException(status_code=404, detail="device not found")
+    dev = next((d for d in await db.list_devices() if d["mac"] == norm), {})
+    return JSONResponse({"ok": True, "mac": norm,
+                         "name": dev.get("name") or norm,
+                         "display_name": dev.get("display_name"),
+                         "source_name": dev.get("source_name")})
 
 
 class WUStationIn(BaseModel):
@@ -2457,6 +2985,54 @@ async def get_storms(mac: str,
     from .ingest import _format_mac
     return JSONResponse({"storms": await db.list_storms(_format_mac(mac),
                                                         limit)})
+
+
+@app.get("/api/devices/{mac}/stories", dependencies=[Depends(require_token)])
+async def get_stories(
+    mac: str,
+    limit: int = Query(4, ge=1, le=12),
+    family: str | None = Query(None),
+    min_score: float = Query(0.0, ge=0.0, le=1.0),
+    temp_unit: str | None = Query(None),
+    wind_unit: str | None = Query(None),
+    rain_unit: str | None = Query(None),
+    pressure_unit: str | None = Query(None),
+) -> JSONResponse:
+    """Ranked stories about this station (2.0) — the Worth Sharing section
+    and the share cards behind it. The server decides what is interesting;
+    the app renders the template each story names.
+
+    Rollups only, like the rest of the Insights family, so it costs the
+    same as one /api/insights call no matter how many producers run. A
+    producer with nothing honest to say declines and is named in
+    `declined` — an empty `stories` list is a valid answer, not an error.
+
+    THE UNIT PARAMETERS ARE NOT COSMETIC. Every string a card shows is
+    written here, and those strings bake the unit into the words ("108 DAYS
+    ≥100°F"). A client cannot convert them afterwards: converting the
+    numbers alone would put "44°C" next to "≥100°F" in one picture. So the
+    caller sends what its user is set to and the whole story comes back in
+    that scale. Values are the app's own enum spellings — temp_unit
+    fahrenheit|celsius, wind_unit mph|kph|ms|knots|beaufort, rain_unit
+    inches|mm, pressure_unit inHg|hPa — and omitting them keeps the
+    API-native rendering unchanged."""
+    from . import stories
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    if family is not None and family not in stories.FAMILIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown family {family!r} — one of {list(stories.FAMILIES)}")
+    try:
+        units = stories.parse_units(temp_unit, wind_unit, rain_unit,
+                                    pressure_unit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    from .ingest import _format_mac
+    return JSONResponse(await stories.top_stories(
+        _format_mac(mac), limit=limit,
+        families=[family] if family else None, min_score=min_score,
+        units=units))
 
 
 @app.get("/api/devices/{mac}/reports/noaa",

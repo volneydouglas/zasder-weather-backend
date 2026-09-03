@@ -116,3 +116,34 @@ async def check(devices: list[dict[str, Any]], now_ms: int) -> None:
         await db.insert_forecast_snapshots("open-meteo", now_ms, rows,
                                            keep_days=_KEEP_DAYS)
         log.debug("snapshotted %d forecast days", len(rows))
+
+
+async def day_ahead_calls(provider: str, since: _dt.date, *,
+                          lead_days: int = 1) -> dict[str, dict[str, Any]]:
+    """The newest `lead_days` call per valid date, from `since` onward,
+    keyed by valid date (local YYYY-MM-DD).
+
+    The story engine's read of this archive: `forecast_snapshots` keeps every
+    issue run, and scoring a forecast means scoring the LAST word the model
+    had before the day began, so per valid date the greatest `issued_ms`
+    wins. Rows without a high are skipped at the SQL — a provider that
+    carries no temperatures (the Zambretti ledger) has nothing to score
+    here, and a row that lost its high in transit is not a forecast of 0°F.
+
+    One range read on (provider, valid_date); the per-date reduction runs
+    in Python over at most a couple of months of rows.
+    """
+    from . import db as dbmod
+    async with dbmod.connect() as conn:
+        rows = await (await conn.execute(
+            "SELECT valid_date, issued_ms, tmax_f, tmin_f, pop, precip_in "
+            "FROM forecast_snapshots "
+            "WHERE provider = ? AND lead_days = ? AND tmax_f IS NOT NULL "
+            "AND valid_date >= ? ORDER BY valid_date, issued_ms",
+            (provider, lead_days, since.isoformat()))).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        # Ordered by issued_ms within a date, so the last one seen is the
+        # freshest issue.
+        out[r["valid_date"]] = dict(r)
+    return out

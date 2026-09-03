@@ -370,3 +370,69 @@ def test_readonly_token_gets_a_permission_message_not_invalid_token(client):
     assert r.status_code == 403
     bad = {"Authorization": "Bearer " + "f" * 64}
     assert client.get("/api/config/backup", headers=bad).status_code == 401
+
+
+def test_every_alert_preference_round_trips_through_backup(client):
+    """R18 finding 5: the export allowlist had stopped at email_scope while
+    the API grew storm, Live Activity, quiet-hours and digest preferences,
+    per-device storm summaries were exported and never restored, and rules
+    lost their severity. Every non-default value survives a reset."""
+    from app import config_backup, db
+    import asyncio
+    changed = {"storm_summary": False, "storm_quiet_minutes": 45,
+               "storm_min_total_in": 0.2, "rain_start": False,
+               "storm_channels": "both", "heat_day": False,
+               "heat_day_threshold_f": 104.0, "quiet_start_min": 1300,
+               "quiet_end_min": 400, "digest_hour": 7, "digest_minute": 29}
+    assert client.put("/api/alerts", headers=H, json=changed).status_code == 200
+    asyncio.run(db.set_device_storm_summary("AA:BB:CC:00:00:11", False))
+    r = client.post("/api/alerts/rules", headers=H,
+                    json={"field": "windgustmph", "comparator": "above",
+                          "threshold": 40, "severity": "urgent"})
+    assert r.status_code in (200, 201), r.text
+
+    backup = client.get("/api/config/backup", headers=H).json()
+    assert backup["version"] == 2
+    for k, v in changed.items():
+        assert backup["alert_prefs"][k] == v, k
+    assert backup["device_alert_prefs"]["AA:BB:CC:00:00:11"]["storm_summary"] is False
+    assert backup["alert_rules"][0]["severity"] == "urgent"
+    # The allowlist and the database's stored column list agree.
+    assert set(config_backup._ALERT_PREF_KEYS) >= set(changed)
+
+    # Reset everything, then restore.
+    reset = {"storm_summary": True, "storm_quiet_minutes": 30,
+             "storm_min_total_in": 0.05, "rain_start": True,
+             "storm_channels": "push", "heat_day": True,
+             "heat_day_threshold_f": 100.0, "quiet_start_min": -1,
+             "quiet_end_min": -1, "digest_hour": -1, "digest_minute": -1}
+    assert client.put("/api/alerts", headers=H, json=reset).status_code == 200
+    asyncio.run(db.set_device_storm_summary("AA:BB:CC:00:00:11", True))
+    assert client.post("/api/config/restore", headers=H, json=backup).status_code == 200
+
+    got = client.get("/api/alerts", headers=H).json()
+    for k, v in changed.items():
+        assert got[k] == v, (k, got[k])
+    prefs = asyncio.run(db.get_device_alert_prefs())
+    assert prefs["AA:BB:CC:00:00:11"]["storm_summary"] is False
+    rules = client.get("/api/alerts/rules", headers=H).json()
+    assert [r["severity"] for r in rules] == ["urgent"]
+
+    # A hand-edited file: out-of-range minutes and an invented tier are
+    # skipped, never stored.
+    bad = dict(backup)
+    bad["alert_prefs"] = {"digest_minute": 75, "storm_channels": "carrier pigeon"}
+    bad["alert_rules"] = [dict(backup["alert_rules"][0], severity="apocalyptic")]
+    assert client.post("/api/config/restore", headers=H, json=bad).status_code == 200
+    got = client.get("/api/alerts", headers=H).json()
+    assert got["digest_minute"] == 29 and got["storm_channels"] == "both"
+    assert [r["severity"] for r in client.get("/api/alerts/rules", headers=H).json()] == ["minor"]
+
+
+def test_a_version_one_backup_still_restores(client):
+    old = {"version": 1, "alert_prefs": {"email_scope": "device_down"},
+           "alert_rules": [{"target_mac": None, "field": "tempf",
+                            "comparator": "above", "threshold": 100, "enabled": True}]}
+    assert client.post("/api/config/restore", headers=H, json=old).status_code == 200
+    assert client.get("/api/alerts", headers=H).json()["email_scope"] == "device_down"
+    assert [r["severity"] for r in client.get("/api/alerts/rules", headers=H).json()] == ["minor"]

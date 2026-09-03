@@ -38,12 +38,28 @@ PROVIDERS: dict[str, list[tuple[str, bool, type]]] = {
     # AirGradient (1.8): one account token covers every monitor; each
     # location becomes its own device, so there is nothing else to configure.
     "airgradient": [("token", True, str)],
+    # Ecowitt cloud (2.0): the two keys from the ecowitt.net Private Center.
+    # `macs` (comma list) restricts the account's device list; blank polls
+    # every station on it. `name` labels the device only when exactly one
+    # station is polled.
+    "ecowitt-cloud": [("application_key", True, str), ("api_key", True, str),
+                      ("macs", False, str), ("name", False, str)],
+    # Govee (2.0): one Platform API key from the Govee Home app covers every
+    # Wi-Fi device on the account; `devices` (comma list of Govee device
+    # ids) narrows it; `name` labels the device only when exactly one
+    # monitor is polled.
+    "govee": [("api_key", True, str), ("devices", False, str),
+              ("name", False, str)],
 }
 
 # Which source_status slug each provider reports under (the names the
 # status page has always used).
 _STATUS_SLUG = {"awn": "ambientweather", "weatherlink": "davis-cloud",
-                "tempest": "tempest", "airgradient": "airgradient"}
+                "tempest": "tempest", "airgradient": "airgradient",
+                "ecowitt-cloud": "ecowitt-cloud", "govee": "govee"}
+
+# Fields a provider can run without.
+_OPTIONAL_FIELDS = frozenset({"name", "macs", "devices"})
 
 
 def _kv_key(provider: str, field: str) -> str:
@@ -62,13 +78,22 @@ def _env_values(provider: str) -> dict[str, Any]:
         return {"token": settings.tempest_token,
                 "station_id": settings.tempest_station_id,
                 "name": settings.tempest_name}
+    if provider == "ecowitt-cloud":
+        return {"application_key": settings.ecowitt_app_key,
+                "api_key": settings.ecowitt_api_key,
+                "macs": settings.ecowitt_macs,
+                "name": settings.ecowitt_name}
+    if provider == "govee":
+        return {"api_key": settings.govee_api_key,
+                "devices": settings.govee_devices,
+                "name": settings.govee_name}
     return {"token": settings.airgradient_token}
 
 
 def _required(provider: str) -> list[str]:
     """Fields that must all be present for the provider to be configured
-    (optional fields — the Tempest display name — excluded)."""
-    return [f for f, _, _ in PROVIDERS[provider] if f != "name"]
+    (optional fields — a display name, an Ecowitt MAC filter — excluded)."""
+    return [f for f, _, _ in PROVIDERS[provider] if f not in _OPTIONAL_FIELDS]
 
 
 async def effective(provider: str) -> dict[str, Any]:
@@ -160,6 +185,30 @@ def _check_station_id(configured: Any, stations: list[dict[str, Any]],
             f"(available: {have})")
 
 
+def _check_macs(configured: Any, devices: list[dict[str, Any]]) -> str | None:
+    """The Ecowitt twin of _check_station_id: every configured MAC must be a
+    weather station the keys can see, and an unrestricted account must have
+    at least one. The message NAMES what the account really has."""
+    from .ecowitt_cloud_poller import parse_macs
+    have: list[str] = []
+    for d in devices:
+        if d.get("type") not in (None, 1, "1"):
+            continue                          # cameras: no readings
+        have.extend(parse_macs(str(d.get("mac") or "")))
+    wanted = parse_macs(str(configured or ""))
+    if not wanted:
+        if not have:
+            return ("keys work but no weather station is visible on this "
+                    "ecowitt.net account")
+        return None
+    missing = [m for m in wanted if m not in have]
+    if not missing:
+        return None
+    avail = ", ".join(have) if have else "none visible to these keys"
+    return (f"{', '.join(missing)} not on this account "
+            f"(available: {avail})")
+
+
 async def probe(provider: str) -> str | None:
     """One cheap authenticated upstream call with the effective credentials.
     Returns None when they work, else a short human-readable reason. Wrong
@@ -196,6 +245,30 @@ async def probe(provider: str) -> str | None:
             # token can actually see.
             return _check_station_id(eff.get("station_id"), stations,
                                      "station_id")
+        elif provider == "ecowitt-cloud":
+            from .ecowitt_cloud_client import EcowittCloudClient
+            client = EcowittCloudClient(eff["application_key"], eff["api_key"])
+            devices = await client.list_devices()
+            return _check_macs(eff.get("macs"), devices)
+        elif provider == "govee":
+            from .govee_cloud_client import GoveeCloudClient
+            from .govee_cloud_poller import (is_air_monitor_listing,
+                                             parse_device_ids)
+            client = GoveeCloudClient(eff["api_key"])
+            listed = await client.list_devices()
+            monitors = {str(d.get("device", "")).upper()
+                        for d in listed if is_air_monitor_listing(d)}
+            wanted = parse_device_ids(eff.get("devices"))
+            if wanted:
+                missing = [w for w in wanted if w not in monitors]
+                if missing:
+                    return (f"key works but these device ids are not air "
+                            f"monitors on the account: {', '.join(missing)}"
+                            + (f" (it has: {', '.join(sorted(monitors))})"
+                               if monitors else ""))
+            elif not monitors:
+                return ("key works but no air monitors are visible — only "
+                        "Wi-Fi Govee devices appear on the API")
         else:
             from .airgradient_client import AirGradientClient
             client = AirGradientClient(eff["token"])
@@ -293,6 +366,19 @@ class IntegrationManager:
             poller = TempestPoller(client, eff["station_id"],
                                    settings.tempest_poll_interval_seconds,
                                    eff.get("name"))
+        elif provider == "ecowitt-cloud":
+            from .ecowitt_cloud_client import EcowittCloudClient
+            from .ecowitt_cloud_poller import EcowittCloudPoller
+            client = EcowittCloudClient(eff["application_key"], eff["api_key"])
+            poller = EcowittCloudPoller(client,
+                                        settings.ecowitt_poll_interval_seconds,
+                                        eff.get("macs"), eff.get("name"))
+        elif provider == "govee":
+            from .govee_cloud_client import GoveeCloudClient
+            from .govee_cloud_poller import GoveeCloudPoller
+            client = GoveeCloudClient(eff["api_key"])
+            poller = GoveeCloudPoller(client, settings.govee_poll_interval_seconds,
+                                      eff.get("devices"), eff.get("name"))
         else:
             from .airgradient_client import AirGradientClient
             from .airgradient_poller import AirGradientPoller

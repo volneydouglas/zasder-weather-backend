@@ -41,6 +41,7 @@ as separate device rows in the iOS app.
 | **F. WeatherFlow Tempest cloud** | A Tempest station (no extra hardware) | 60s cadence | Free personal access token from tempestwx.com. Also configurable from the app: Settings → Integrations. |
 | **G. Ecowitt gateway LAN** | Any Ecowitt gateway/console (GW1000–GW3000, HP2551-class) | 16s+ | The gateway POSTs its "Customized" upload straight to the backend — no vendor cloud, no extra hardware. HTTP-only firmware: direct against local Docker; a cloud backend needs a small LAN forwarder. |
 | **H. WeeWX bridge** | A station already running under WeeWX (70+ families) | your archive interval | One extension forwards every archive record; WeeWX keeps doing everything it does today. |
+| **I. Ecowitt cloud** | Any Ecowitt gateway already uploading to ecowitt.net | 60s cadence | Two free keys from your ecowitt.net profile. For an HTTPS-only backend (Fly) with no LAN forwarder; on a LAN backend prefer Path G. Also configurable from the app: Settings → Integrations. |
 
 Board to buy for C/D: **LilyGO T3 LoRa32 V1.6.1** from the
 [official LilyGO store](https://lilygo.cc/products/lora3) — variant
@@ -64,7 +65,7 @@ The iOS app ([app page](https://zasder.com/weather)) is distributed separately a
 ### Easiest: straight from the iPhone or Mac app — no computer setup at all
 
 The app has a **Guided Setup** that does everything on this page for you
-(app 1.9+ on iOS, 1.8+ on the Mac):
+(app 1.9+ on iOS, 1.7+ on the Mac):
 
 1. Install [Zasder Weather](https://zasder.com/weather) from the App Store.
 2. In the app, choose **Set up a new server**.
@@ -346,6 +347,81 @@ dual-rain stations (say a WS90's haptic sensor plus a WH40 tipping
 gauge) the tipping gauge wins wherever both report — haptic rain
 phantom-tips when the mast gets bumped.
 
+## Path I — Ecowitt cloud poller
+
+The same gateway, through the vendor cloud instead of your LAN. Every
+Ecowitt gateway already uploads to ecowitt.net; this path polls that
+account from wherever the backend runs, so it works against an
+HTTPS-only host (a Fly deploy) with no forwarder on your network.
+**On a LAN backend, Path G is still the better door**: 16 s cadence, no
+vendor cloud in the loop. Pick one path per gateway. A gateway on both
+appears twice, because the local path keys the device by a synthetic
+`EC:EC:…` address (the gateway never sends its MAC) and this one by the
+real MAC from the cloud.
+
+Keys: sign in at [ecowitt.net](https://www.ecowitt.net), open your
+profile (the site calls it the Private Center) and generate an
+**Application Key** and an **API Key**. Then add to `.env` (or as Fly
+secrets):
+
+```sh
+ECOWITT_APP_KEY=<application key>
+ECOWITT_API_KEY=<API key>
+```
+
+Restart. The backend lists every weather station on the account and
+polls each one every 60 s (`ECOWITT_POLL_INTERVAL_SECONDS` to change;
+the station itself only uploads once a minute). Readings arrive in
+US-native units on request (°F, mph, inHg, inches, W/m²) and are stored
+unconverted; per-sensor batteries, the extra T/H, soil, leaf and leak
+channels, and the lightning sensor's nearest strike all come through
+exactly as on Path G, including the tipping-gauge-over-haptic rain rule
+on dual-rain stations. On first start the poller also backfills the
+last 24 hours at 5-minute resolution from the cloud's history.
+
+Optional: `ECOWITT_MACS=88:F1:55:05:D1:63,…` polls only those stations
+on an account with several; `ECOWITT_NAME` overrides the display name
+when exactly one station is polled.
+
+No terminal? The app can configure this instead: **Settings →
+Integrations → Ecowitt Cloud** — app-stored values win over these env
+values, and the save runs a live check of the keys.
+
+## Path J — Govee CO₂ monitor (cloud)
+
+Have a [GoveeLife Smart CO₂ Monitor](https://us.govee.com/) (H5140) or
+one of its air-quality siblings? It only talks to Govee's cloud, so the
+backend polls Govee's Platform API for it: CO₂ (the H5140 carries a
+Sensirion SCD4x, the same NDIR family as an AirGradient), temperature
+and humidity, and PM2.5 on the models that have it. Only Wi-Fi Govee
+devices are visible to the API; a Bluetooth-only unit will not be
+listed.
+
+Key: in the Govee Home app open **Profile → About Us → Apply for API
+Key**; it arrives by email. Then add to `.env` (or as a Fly secret):
+
+```sh
+GOVEE_API_KEY=<key>
+```
+
+Restart. The backend lists the account's air monitors and polls each
+one every 60 s (`GOVEE_POLL_INTERVAL_SECONDS` to change; Govee allows
+30 state reads a minute per device and 10,000 requests a day per
+account, and the cloud value lags the display by a minute or two).
+Each monitor becomes its own device on a synthetic `5D:5D:08:…`
+address and gets the air card (CO₂ hero when there is no particle
+sensor), never the weather-station machinery. Temperature from the
+H5140 arrives in °F unlabelled and is stored as such; a device whose
+listing declares Celsius is converted.
+
+Optional: `GOVEE_DEVICES=12:BC:AC:27:6E:02:6C:7C,…` polls only those
+device ids on an account with several; `GOVEE_NAME` overrides the
+display name when exactly one monitor is polled.
+
+No terminal? **Settings → Integrations → Govee** in the app; app-stored
+values win over these env values, and the save runs a live check of
+the key.
+
 ## Path H — already running WeeWX? Bridge it over
 
 If WeeWX already runs your station — any of its 70+ supported station
@@ -533,6 +609,18 @@ that one page are exposed.
 The page auto-refreshes every 2 minutes. Leave `PUBLIC_DASHBOARD` unset (or `0`)
 to keep the screenshots.
 
+**Air-quality monitors** (an AirGradient, or any device that reports PM/CO2
+with no wind, rain or pressure) can be on the page too, by MAC or through
+`all`: each renders its own air card rather than a weather block. The card
+is a PM2.5 hero with its US EPA (2024) band, fixed tiles for PM10, CO2 (1000
+ppm reads elevated, 2000 high), the Sensirion TVOC and NOx indexes (100 is
+typical), temperature and humidity only when the monitor reports them, and
+a 24-hour PM2.5 chart. `PUBLIC_DASHBOARD_FIELDS` applies to weather
+stations only; the primary-station fallback still prefers a weather station,
+and the "Right now" strip and side-by-side charts stay weather-only. In the
+app, Settings, Public web page, Choose lists monitors with an "Air quality"
+caption.
+
 ### Embed it on your own website (1.6.1+)
 
 With the dashboard on, `GET /embed` serves the dashboard **alone** — no
@@ -584,6 +672,22 @@ The iOS app manages the same settings at `GET/PUT /api/history-retention`
 (app-stored values win over env), and `GET /api/storage` shows where the
 database's bytes actually live. See `.env.example` for the knobs and
 floors.
+
+**When it runs.** Thinning runs in small steps during the quiet hours you
+choose: it starts at `HISTORY_THIN_WINDOW_START` (station-local, default
+02:00) and works for at most `HISTORY_THIN_WINDOW_MINUTES` a night
+(default 120), a couple of thousand rows per transaction with a pause
+between them, then stops and picks up the next night exactly where it
+left off. The JSON trim (`HISTORY_JSON_DETAIL_DAYS`) runs in the same
+window with the same small steps, after thinning, sharing the night's
+minutes. A big archive takes several nights the first time; readings
+keep flowing the whole time, because no single step holds the database
+for more than a moment. It never runs at boot: a restart waits for the
+next window. `GET /api/history-retention` reports the progress
+(`thin_progress.nights_remaining`), and the server logs one line per
+night ("thinning: 41,200 rows in 118 min, watermark at 2024-03-11, ~6
+nights to go"). Set the minutes to 0 to pause thinning without changing
+the retention itself.
 
 ## Smart alerts (optional)
 
@@ -737,6 +841,7 @@ calls these. Public-readable status page at `/`.
 | GET | `/api/version` | Running version, latest release, and whether an update is available (no auth) |
 | GET | `/api/devices` | All devices + latest reading |
 | DELETE | `/api/devices/{mac}` | Remove a retired device + all its observations + alert state (token-gated) |
+| PUT | `/api/devices/{mac}/name` | Rename a station: `{"name": "Back yard"}` (1-64 characters) overrides the name the source posts everywhere it appears (app, widgets, alerts, digest, public page); `""` or `null` goes back to the station's own name. `/api/devices` reports the effective `name`, the override as `display_name`, and the posted name as `source_name` |
 | GET | `/api/devices/{mac}/current` | Composite latest-non-null per field |
 | GET | `/api/devices/{mac}/history?hours=24` | Time series, auto-bucketed for 3d/7d/30d. Optional `end_ms=` sets the window END (epoch ms) to page back through older/imported history |
 | GET | `/api/devices/{mac}/summary?field=tempf&hours=24` | Min/max/avg/median + when |
@@ -745,10 +850,11 @@ calls these. Public-readable status page at `/`.
 | GET | `/api/devices/{mac}/daily-series` | One row per local day (min/max/mean temp, rain, peak gust) for year-span charts |
 | GET | `/api/devices/{mac}/reports/noaa?year=[&month=]` | Classic NOAA-style fixed-width climate report, plain text |
 | GET | `/api/devices/{mac}/storms` | Recent closed storm episodes — the structured stats behind each storm summary |
-| GET/PUT | `/api/history-retention` | History-aging settings (thin/JSON windows) — app-stored values win over the `HISTORY_*` env vars |
+| GET/PUT | `/api/history-retention` | History-aging settings (thin/JSON windows, the nightly quiet-hour window) + thinning progress — app-stored values win over the `HISTORY_*` env vars |
 | GET | `/api/write-audit` | Attribution log for write-share links: who changed what, when (owner-only) |
 | GET | `/api/sources` | Health of each ingest source (last success, last error) — tells a dead API key from dead hardware |
 | GET | `/api/insights?mac=` | Server-side statistics rollups (on by default since 1.9; `INSIGHTS=0` disables) |
+| GET | `/api/devices/{mac}/stories` | Story cards: server-written, shareable weather stories ranked by interest (`limit` 1-12, `min_score` 0-1, `family`, and the reader's `temp_unit`/`wind_unit`/`rain_unit`/`pressure_unit`); 404 when Insights is off |
 | POST | `/api/insights/rebuild` | Force a rollup rebuild (optional `?mac=`) — normally unneeded, a backfill self-schedules on boot |
 | POST | `/api/import/wu` | Start a Weather Underground history import into a device (`dry_run` supported); progress at GET `/api/import/wu/status` |
 | GET/PUT | `/api/config/wu-key` | Server-stored WU API key (write-only — GET reports only configured/source; falls back to the `WU_API_KEY` env var) |

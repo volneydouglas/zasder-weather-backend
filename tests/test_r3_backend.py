@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 H = {"Authorization": "Bearer test-api-token"}
 IH = {"Authorization": "Bearer test-ingest-token"}
@@ -213,7 +213,20 @@ def test_concurrent_rebuilds_serialize_and_stay_correct(client, monkeypatch):
     from app import insights
     from app.config import settings
     monkeypatch.setattr(settings, "insights", True)
-    base_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # A fixed instant, not the wall clock: insights buckets readings into
+    # LOCAL days, and the five rows below span `base_ms` back four minutes,
+    # so a suite starting in the first four minutes of a day split them
+    # across two days and `day_count` came back 2. Noon owns its whole day.
+    # Noon in the STATION zone (the one insights buckets by), not UTC: a
+    # UTC-noon anchor is local midnight for a +12 station and would split
+    # all over again. The most recent noon that has passed rather than a
+    # hardcoded day, so the test can never age out of a recency window.
+    _tz = insights._tz()
+    noon = datetime.now(_tz).replace(hour=12, minute=0, second=0,
+                                     microsecond=0)
+    if noon > datetime.now(_tz):
+        noon -= timedelta(days=1)
+    base_ms = int(noon.timestamp() * 1000)
     from app import db as dbmod
 
     async def scenario():

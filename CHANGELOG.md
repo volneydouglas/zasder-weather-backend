@@ -8,6 +8,138 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.0.0] — 2026-09-03
+
+### Added
+- **Story cards.** `GET /api/devices/{mac}/stories` returns finished,
+  shareable weather stories written server-side in the reader's own
+  units: heat and cold ledgers, wildest day, dry spell, humid month,
+  water year, daylight, tonight's sky, growing season, storms that broke
+  the heat, biggest swing, degree days, fire weather, the barometer's
+  call, the shape of a year, the humidity tax, and new this build, **the
+  forecast versus the backyard**: how far the day-ahead high and low ran
+  from what your station measured last month, and how the rain calls
+  graded. Producers decline rather than pad, so a young station gets
+  fewer cards, not emptier ones. 404 when Insights is off.
+- **A daily Zambretti ledger.** Once a day at 09:00 station time the
+  barometer's call is written down as it was made, never revised, so a
+  future scorecard can grade the 1920 slide rule against what happened.
+  Thinning erases the pressure it was read from; the ledger keeps the
+  call.
+- **Rename any station.** `PUT /api/devices/{mac}/name` stores an
+  operator name that wins over whatever the source posts (an Ecowitt
+  gateway only knows its model, so it arrived as "Ecowitt (GW3000B)").
+  One name everywhere: the device list, alerts, storm summaries, the
+  morning report, story cards, the public page and `/metrics`. Blank
+  goes back to the station's own name; the config backup carries the
+  renames. In the app, the pencil on Settings, Stations.
+- Indoor dew point (`dewPointin`) derived at ingest for consoles that
+  report indoor temperature and humidity but no indoor dew of their own.
+- **Ecowitt cloud poller (Path I).** An Ecowitt gateway can now feed an
+  HTTPS-only backend through ecowitt.net instead of a LAN forwarder:
+  `ECOWITT_APP_KEY` + `ECOWITT_API_KEY` (or Settings → Integrations →
+  Ecowitt Cloud in the app) polls every weather station on the account
+  once a minute, backfills the last day on first start, and carries the
+  same batteries, sensor channels and tipping-gauge-over-haptic rain
+  rule as the local `/ingest/ecowitt` path. Devices are keyed by their
+  real MAC; the local path stays the recommended door on a LAN.
+- **Govee CO₂ monitor (Path J).** A GoveeLife H5140 (or air-quality
+  sibling) feeds the backend through Govee's Platform API: `GOVEE_API_KEY`
+  (or Settings → Integrations → Govee in the app) polls every Wi-Fi air
+  monitor on the account once a minute. CO₂, temperature and humidity,
+  and PM2.5 where the model has it, land in the same columns an
+  AirGradient fills; each monitor is its own `5D:5D:08:…` device with the
+  air card. A monitor with no particle sensor gets a CO₂ hero and a
+  24-hour CO₂ chart instead of "No PM data", in the app and on the
+  public page.
+- **The Comfortable Months.** A story card that ranks the calendar by how
+  much of a waking day (7 am to 10 pm) the feels-like temperature sat
+  between 60 and 80 °F, this year beside the record, from a new
+  year-keyed comfort ledger (`comfort_rollups`) folded at ingest. An
+  existing archive fills it with one background rebuild at first boot.
+- **The morning report at a minute you choose.** `digest_minute` beside
+  `digest_hour` on `PUT /api/alerts` (0 to 59; the app's Send around is a
+  clock picker now), so the report can go at 7:29 instead of on the hour.
+- **Server backups carry every alert preference.** Backup format 2:
+  storm settings, rain start and heat day, quiet hours, digest hour and
+  minute, per-device storm summaries and rule severity all round-trip;
+  a format-1 file still restores.
+- **`trim-head`.** `python -m app.maintenance trim-head --mac M
+  --before-ms T --apply` drops a station's first readings from before it
+  was outside (the sensor that spent its first hour on a desk), backs
+  them up in full beside the database, and refolds that station's
+  rollups.
+- **Air monitors on the public page.** An AirGradient (or any air-only
+  device) named in `PUBLIC_DASHBOARD_MACS`, or included by `all`, now
+  renders its own air card: PM2.5 with its US EPA 2024 band (Good through
+  Hazardous), PM10, CO2 with 1000 and 2000 ppm called out, TVOC and NOx
+  indexes, temperature and humidity when the monitor reports them, and a
+  24-hour PM2.5 chart. No weather hero, wind, rain, pressure or records for
+  a monitor, and `PUBLIC_DASHBOARD_FIELDS` keeps applying to weather
+  stations only. `/embed` carries the same card. The apps' Public web page
+  picker lists monitors with an "Air quality" caption; until now they were
+  hidden from it and dropped by the page.
+
+### Fixed
+- **History thinning no longer stalls ingest.** The first real pass over
+  a multi-year archive held the database's single writer for minutes per
+  step, and every station post in that window answered 503. Thinning is
+  now a nightly batch job: it runs only inside a quiet-hour window you
+  choose (`HISTORY_THIN_WINDOW_START`, default 02:00 station-local, for
+  at most `HISTORY_THIN_WINDOW_MINUTES`, default 120), deletes a couple
+  of thousand rows per short transaction with a pause between them,
+  shrinks the batch on its own when a step runs long, backs off when the
+  database is busy, and resumes the next night exactly where it stopped.
+  The JSON trim (`HISTORY_JSON_DETAIL_DAYS`) runs in the same window
+  with the same bounded steps, sharing the night's minutes. A big
+  archive takes several nights the first time; readings keep flowing
+  throughout. It never runs at boot. `GET /api/history-retention`
+  gains the window knobs (also settable from the app) and a
+  `thin_progress` document with `nights_remaining`; the server logs one
+  summary line per night.
+- **Ingest no longer fails while a large archive rebuilds its chart
+  index.** The deferred rebuild held the database's single writer for
+  minutes on big archives, and every write in that window (station
+  posts, push-relay challenges) answered 500 "database is locked". The
+  index is now built under a new name and swapped in afterwards, so
+  charts stay covered during the build, and station posts that arrive
+  while it runs are held in memory and written in order once it
+  finishes (`{"queued": true}` in the response). A lock that still
+  wins answers 503 with `Retry-After: 5` instead of 500, so relays and
+  boards can back off.
+- **A rollup rebuild no longer starves every other writer.** The
+  boot-time rebuild committed per batch and re-took the lock at once, so
+  for its whole run ingest, push registration and the alert tick
+  answered "database is locked". It now folds 1,000 rows at a time and
+  yields half a second between batches; a big archive takes minutes
+  longer and drops nothing.
+- A reading parked behind the chart-index rebuild and answered 200 was
+  dropped if its replay failed for any reason other than the lock; it
+  is re-parked and retried, three times, before being dropped with the
+  reason.
+- Anonymous status-page hits past the count cache's expiry each spawned
+  their own full COUNT(*); one recount per station now, reaped at
+  shutdown with every other app-owned task.
+- An expired database snapshot could still be downloaded by a direct
+  GET; it now answers 410 and is removed.
+- Ecowitt Cloud: a stale outdoor-temperature timestamp no longer freezes
+  the whole reading (the newest core group stamps it and a group more
+  than 15 minutes behind is left out), and the 24-hour bootstrap window
+  is sent in the device's own zone rather than UTC.
+- A bearer or ingest token containing non-ASCII bytes answered 500
+  instead of 401.
+- A migration killed mid-backfill (the lightning columns, the storm
+  capture) could leave its columns present and the backfill skipped
+  forever; both now record a pending key and resume on the next boot.
+- The widget-refresh push no longer lets a failed dead-token prune
+  re-send reload pushes every tick for the length of a database hiccup.
+- Indoor dew point now has the same plausibility band as the outdoor
+  one, whether the console sent it or the server derived it.
+
+### Docs
+- The public README's API table and the module layout in AGENTS.md now
+  list the stories endpoint and the story and almanac modules.
+
 ## [1.9.1] — 2026-08-30
 
 ### Fixed

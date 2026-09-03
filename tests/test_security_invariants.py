@@ -324,6 +324,7 @@ def test_private_routes_reject_guest_and_reviewer_tokens(guest_client, path):
 SHARED_WRITE_BY_DESIGN = {
     ("PUT", "/api/devices/{mac}/alert"),
     ("PUT", "/api/devices/{mac}/location"),
+    ("PUT", "/api/devices/{mac}/name"),
     ("PUT", "/api/devices/{mac}/wu-station"),
     ("POST", "/api/alerts/test"),
     ("POST", "/api/alerts/rules"),

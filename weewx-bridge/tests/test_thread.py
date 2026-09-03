@@ -182,3 +182,9 @@ def test_cleartext_allowlist_covers_every_private_family():
     for host in ("172.32.0.1", "8.8.8.8", "example.com", "2001:4860::1",
                  None, ""):
         assert not zasder._cleartext_host_allowed(host), host
+    # R17 #4: CGNAT (Tailscale's 100.64.0.0/10) is NOT private to Python's
+    # ipaddress on any supported version — the README once claimed 3.13+
+    # accepted it, which sent users chasing a fix that does not exist. Pin
+    # the refusal so the doc and the code cannot drift apart again.
+    for host in ("100.64.0.1", "100.100.100.100", "100.127.255.254"):
+        assert not zasder._cleartext_host_allowed(host), host

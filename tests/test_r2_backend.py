@@ -366,14 +366,14 @@ def test_stale_chart_index_missing_tempf_is_rebuilt(client):
     # exactly the case the old substring probe waved through.
     stale_cols = [c for c in db._CHART_INDEX_COLS if c not in ("tempf", "humidity")]
     con = sqlite3.connect(settings.database_path)
-    con.execute("DROP INDEX idx_obs_chart")
+    con.execute(f"DROP INDEX {db.chart_index_name()}")
     con.execute("CREATE INDEX idx_obs_chart ON observations ("
                 + ", ".join(stale_cols) + ")")
     con.commit(); con.close()
     asyncio.run(db.init_db())
     con = sqlite3.connect(settings.database_path)
-    sql = con.execute("SELECT sql FROM sqlite_master WHERE name='idx_obs_chart'"
-                      ).fetchone()[0]
+    sql = con.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                      (db.chart_index_name(),)).fetchone()[0]
     con.close()
     assert set(db._CHART_INDEX_COLS) <= db._index_columns(sql), \
         "init_db must rebuild an index that lost a covered column"

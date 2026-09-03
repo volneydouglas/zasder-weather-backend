@@ -70,7 +70,10 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
                 # Settings validation.)
                 # 1.8: AirGradient joined config — same live-poller trap
                 # as TEMPEST_TOKEN, and the token also rides the polled URL.
-                "TEMPEST_TOKEN", "AIRGRADIENT_TOKEN", "GUEST_API_TOKENS"):
+                # 2.0: the Ecowitt cloud poller — both keys ride the polled
+                # URL, same trap.
+                "TEMPEST_TOKEN", "AIRGRADIENT_TOKEN", "GUEST_API_TOKENS",
+                "ECOWITT_APP_KEY", "ECOWITT_API_KEY", "GOVEE_API_KEY"):
         monkeypatch.setenv(var, "")
     # Module-level caches must not leak across tests (the public dashboard HTML
     # and the per-MAC records cache are process-global by design). Reset only a
@@ -86,10 +89,14 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._PUBLIC_DASH_REFRESHING = False   # a test's leaked flag would
         _m._PUBLIC_DASH_REFRESH_TASK = None  # silently disable SWR forever
         _m._OBS_COUNT_CACHE.clear()
+        _m._OBS_COUNT_TASKS.clear()
         _m._RECORDS_CACHE.clear()
         _m._RECORDS_LOCKS.clear()
         _m._DB_BACKUP_JOB = {"state": "idle"}
         _m._DB_BACKUP_TASK = None
+        _m._STORAGE_JOB = {"state": "idle"}      # 2.0 /api/storage job
+        _m._STORAGE_TASK = None
+        _m._DB_BUSY_LOG_TS.clear()       # 2.0 503 handler's log throttle
     # 1.8 modules keep small process-global throttles; same isolation rule.
     _wp = sys.modules.get("app.widget_push")
     if _wp is not None:
@@ -139,12 +146,24 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # database, and a stale token→label entry must not attribute it.
         _d._WRITE_AUDIT_PENDING.clear()
         _d._GUEST_LABEL_CACHE.clear()
+        # 2.0 chart-index rebuild state: a test that patches the build
+        # in-progress flag (ingest write-behind) must not leave it set,
+        # or every later ingest test queues instead of storing.
+        _d._CHART_INDEX_BUILDING = False
+        _d._CHART_INDEX_REBUILD_NEEDED = False
+    _i = sys.modules.get("app.ingest")
+    if _i is not None:
+        _i._WRITE_BEHIND.clear()
+        _i._WRITE_BEHIND_SIZE.clear()
+        _i._WRITE_BEHIND_FAILURES.clear()
+        _i._WRITE_BEHIND_BYTES = 0
+        _i._WRITE_BEHIND_DROP_LOG_TS = 0.0
     yield db_path
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @pytest.fixture
-def client(temp_env: str):
+def client(temp_env: str, monkeypatch: pytest.MonkeyPatch):
     """FastAPI TestClient with a freshly-imported app + isolated DB."""
     # Force re-import so settings + app pick up the env we just set.
     # app.apns and app.relay hold `from .config import settings` at import
@@ -166,5 +185,24 @@ def client(temp_env: str):
         if mod in importlib.sys.modules: importlib.reload(importlib.sys.modules[mod])
     from fastapi.testclient import TestClient
     from app.main import app
+    _check_story_wire_contract(monkeypatch)
     with TestClient(app) as c:
         yield c
+
+
+def _check_story_wire_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every story payload the suite produces — through the endpoint or a
+    direct `stories.top_stories` call — is checked against the wire
+    contract in tests/story_contract.py. Wrapped HERE, after `app.main`
+    has imported `app.stories`, so the first story test of a session is
+    covered too (an autouse fixture would run before the import). A test
+    that patches `stories.top_stories` itself replaces the wrapper for
+    that test, which is the right precedence."""
+    import app.stories as stories
+    from tests.story_contract import check_response
+    real = stories.top_stories
+
+    async def checked(*args, **kwargs):
+        return check_response(await real(*args, **kwargs))
+
+    monkeypatch.setattr(stories, "top_stories", checked)

@@ -701,3 +701,98 @@ def test_partial_delivery_stamps_and_forfeits_the_failed_half(
     assert stamped == now.date().isoformat()
     assert len(la_calls) == 1 and len(push_calls) == 1, \
         "one delivery landing must close the day — no retry"
+
+
+def test_the_report_waits_for_the_minute_not_just_the_hour(client, monkeypatch):
+    """2.0: digest_minute. "An email that is sent at 7:29 will likely be seen
+    before one at 7am" (Volney): on the hour the report lands in the same
+    minute as everyone else's. 7:30 configured -> nothing at 7:29, the
+    report on the first tick at or after 7:30. A 1.9 row without the
+    minute still means :00."""
+    import datetime as _dt
+    from types import SimpleNamespace
+    from zoneinfo import ZoneInfo
+    import app.alerts as al
+    from app import apns, db
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(al, "_send_sync",
+                        lambda subject, body, to, cfg, html=None: None)
+    la_sends = []
+
+    async def fake_la(payload, title, body, activity="rain"):
+        la_sends.append(activity)
+        return {"sent": 1, "dead": [], "failed": 0}
+
+    async def fake_push(title, body, interruption_level=None):
+        return {"sent": 1}
+
+    async def configured():
+        return True
+    monkeypatch.setattr(apns, "send_live_activity_start", fake_la)
+    monkeypatch.setattr(apns, "send_to_all", fake_push)
+    monkeypatch.setattr(apns, "push_configured", configured)
+
+    def cfg(minute):
+        ns = SimpleNamespace(enabled=False, recipients=[], digest_hour=7,
+                             smtp_host=None, smtp_port=465, smtp_username=None,
+                             smtp_password=None, smtp_from=None, smtp_tls=False,
+                             smtp_ssl=True, email_scope="all")
+        if minute is not None:
+            ns.digest_minute = minute
+        return ns
+    try:
+        tz = ZoneInfo(_settings.timezone)
+    except Exception:
+        tz = _dt.timezone.utc
+    base = _dt.datetime.now(tz).replace(hour=7, minute=0, second=0, microsecond=0)
+
+    def at(h, m):
+        return int(base.replace(hour=h, minute=m).timestamp() * 1000)
+
+    yday = base - _dt.timedelta(days=1)
+
+    async def run():
+        from app import insights
+        mac = "AA:BB:CC:DD:EE:97"
+        await db.upsert_device(mac, {"lastData": {"dateutc": at(7, 0), "tempf": 90.0}})
+        # A day with something to report: a quiet day sends nothing at all,
+        # which would make the 7:29 assertion pass for the wrong reason.
+        await db.insert_observations(mac, [
+            {"dateutc": int(yday.replace(hour=15).timestamp() * 1000),
+             "tempf": 104.0, "windgustmph": 34.0, "dailyrainin": 0.12},
+            {"dateutc": int(yday.replace(hour=5).timestamp() * 1000),
+             "tempf": 79.0, "windgustmph": 4.0, "dailyrainin": 0.0},
+        ])
+        await insights.rebuild(mac)
+        devices = await db.list_devices()
+        mon = al.AlertMonitor()
+        await mon._maybe_send_digest(cfg(30), devices, at(7, 29))
+        assert la_sends == [], "7:29 is before 7:30"
+        await mon._maybe_send_digest(cfg(30), devices, at(7, 30))
+        assert la_sends == ["morning"]
+        # A 1.9 config row carries no minute at all: :00, as before.
+        await db.set_kv("alerts.digest.phone_day", None)
+        await db.set_kv("alerts.digest.last_ms", None)
+        await mon._maybe_send_digest(cfg(None), devices, at(7, 0))
+        assert la_sends == ["morning", "morning"]
+
+    asyncio.run(run())
+
+
+def test_digest_minute_round_trips_through_the_api(client):
+    r = client.put("/api/alerts", json={"digest_hour": 7, "digest_minute": 30},
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200, r.text
+    got = client.get("/api/alerts",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert (got["digest_hour"], got["digest_minute"]) == (7, 30)
+    r = client.put("/api/alerts", json={"digest_minute": -1},
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    got = client.get("/api/alerts",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert (got["digest_hour"], got["digest_minute"]) == (7, None)
+    r = client.put("/api/alerts", json={"digest_minute": 60},
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 422

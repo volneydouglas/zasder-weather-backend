@@ -443,3 +443,41 @@ def test_tombstone_expires_even_while_the_level_keeps_posting(client, monkeypatc
     assert _post(client, _ts(16), rain={"daily_in": 2.00}).status_code == 200
     dailies = [r.get("dailyrainin") for r in _rows(client)]
     assert dailies[-1] == 2.00, dailies
+
+
+def test_indoor_dew_point_is_banded_sent_and_derived():
+    """R17 #6: dewPointin had no plausibility band in either direction. A
+    console-sent sentinel is dropped like any other out-of-band field, and
+    a value DERIVED from in-band-but-extreme inputs (tempinf may be 150)
+    is not stored when it lands outside the band."""
+    from app import ingest
+    flat = {"dewPointin": 999.0, "tempinf": 72.0, "humidityin": 50.0}
+    dropped = ingest._apply_plausibility_bands(flat)
+    assert dropped == ["dewPointin=999"] and flat["dewPointin"] is None
+    # Re-derive path: the guard in the derivation block.
+    from app import derived
+    assert derived.dew_point_f(150.0, 100.0) > 100.0   # would breach the band
+    lo, hi = ingest._PLAUSIBLE_BANDS["dewPointin"]
+    assert (lo, hi) == (-90.0, 100.0)
+
+
+def test_a_derived_indoor_dew_point_outside_the_band_is_not_stored(client):
+    """The guard itself, through ingest: tempinf 150 / humidityin 100 are
+    both in band, their Magnus dew point is not, and nothing is stored —
+    where a plain 72 / 56 derives and stores (CodeRabbit, PR #35: the
+    unit test above read the constant, so removing the guard passed it)."""
+    def current():
+        return client.get(f"/api/devices/{MAC}/current", headers=H).json()
+
+    body = {"device": {"id": "AABBCCDD0B20"}, "timestamp_utc": _ts(2),
+            "source": "t", "outdoor": {"tempf": 90.0},
+            "indoor": {"tempf": 150.0, "humidity": 100}}
+    assert client.post("/ingest/custom", headers=IH,
+                       json=body).status_code == 200
+    assert current().get("dewPointin") is None, "out-of-band derivation stored"
+    body = {"device": {"id": "AABBCCDD0B20"}, "timestamp_utc": _ts(1),
+            "source": "t", "outdoor": {"tempf": 90.0},
+            "indoor": {"tempf": 72.0, "humidity": 56}}
+    assert client.post("/ingest/custom", headers=IH,
+                       json=body).status_code == 200
+    assert abs(current()["dewPointin"] - 55.4) < 0.2

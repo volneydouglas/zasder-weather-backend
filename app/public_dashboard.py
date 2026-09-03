@@ -580,6 +580,175 @@ def render_rain_periods(o: dict[str, Any]) -> str:
             f'<div class="cc-chips">{cells}</div></div>')
 
 
+# ── Air-quality monitors (2.0) ───────────────────────────────────────────
+# An AirGradient (or any device the backend classifies as an air monitor,
+# db.is_air_monitor_device) gets its OWN card: a PM2.5 hero with a
+# plain-language band, fixed tiles for the rest of its sensors, and a 24h
+# PM2.5 chart. No weather hero, no wind/rain/pressure tiles, no records
+# footer, and PUBLIC_DASHBOARD_FIELDS does not apply — "just their tiles"
+# (Volney, 2026-09-01). Until now the page skipped monitors entirely, and
+# the app's picker hid them so their macs could not land in the selection.
+
+# US EPA PM2.5 breakpoints, 24-hour, as revised 2024-02-07 (the NAAQS
+# update that lowered the Good/Moderate line from 12.0 to 9.0 µg/m³):
+#
+#   AQI category                     PM2.5 µg/m³ (24h)
+#   Good                               0.0 -   9.0
+#   Moderate                           9.1 -  35.4
+#   Unhealthy for Sensitive Groups    35.5 -  55.4
+#   Unhealthy                         55.5 - 125.4
+#   Very Unhealthy                   125.5 - 225.4
+#   Hazardous                        225.5 +
+#
+# EPA truncates the concentration to one decimal before looking it up,
+# so 9.04 is Good and 9.10 is Moderate. Colors are existing page hues
+# (STATION_COLORS / FIELD_META / the feels-like overlay red), painted
+# only on a swatch dot: the band's TEXT stays in --ink-70 so the label
+# reads on both themes whatever hue the band carries (yellow on white
+# would not).
+PM25_BANDS: list[tuple[float, str, str]] = [
+    (9.0,   "Good",                           "#3ddc97"),
+    (35.4,  "Moderate",                       "#ffd24c"),
+    (55.4,  "Unhealthy for sensitive groups", "#ff9e33"),
+    (125.4, "Unhealthy",                      "#ff5a5f"),
+    (225.4, "Very unhealthy",                 "#b39dff"),
+    (math.inf, "Hazardous",                   "#ff5a8f"),
+]
+
+
+def pm25_band(v: float | None) -> tuple[str, str] | None:
+    """(label, color) for a PM2.5 reading, None when there is no reading.
+    Truncated to one decimal first, the way EPA reads its own table."""
+    if v is None:
+        return None
+    c = max(0.0, math.floor(v * 10.0 + 1e-9) / 10.0)
+    for upper, label, color in PM25_BANDS:
+        if c <= upper:
+            return label, color
+    return PM25_BANDS[-1][1], PM25_BANDS[-1][2]
+
+
+# CO2 thresholds (ppm): indoor-air guidance treats 1000 as the point where
+# a room reads "stuffy" and 2000 as where complaints start.
+CO2_ELEVATED_PPM = 1000.0
+CO2_HIGH_PPM = 2000.0
+
+
+def co2_state(v: float | None) -> str | None:
+    if v is None:
+        return None
+    if v >= CO2_HIGH_PPM:
+        return "high"
+    if v >= CO2_ELEVATED_PPM:
+        return "elevated"
+    return None
+
+
+# PM2.5 chart hue. Text-bearing tiles use hues the page already paints
+# chip values in (FIELD_META), so the air card keeps the contrast the
+# weather chips keep.
+PM25_COLOR = "#b39dff"
+AIR_TILE_COLORS = {"pm10": "#5aa0ff", "co2": "#39c9d6",
+                   "tvoc_index": "#b39dff", "nox_index": "#ff9e33"}
+
+
+def _air_tile(label: str, value: str, sub: str, color: str) -> str:
+    sub_html = f'<span class="cc-k">{_esc(sub)}</span>' if sub else ""
+    return (f'<div class="cc-chip"><span class="cc-k">{_esc(label)}</span>'
+            f'<span class="cc-v" style="color:{color}">{_esc(value)}</span>'
+            f'{sub_html}</div>')
+
+
+def render_air_station(name: str, obs: dict[str, Any] | None,
+                       series: dict[str, list[tuple[int, float]]],
+                       app_url: str = "", location: str | None = None) -> str:
+    """The air card. Fixed tiles (PM10, CO2, TVOC index, NOx index) render
+    whether or not the latest reading carries them, so a sensor still
+    warming up shows "no reading" rather than a hole; temperature and
+    humidity tiles appear ONLY when the monitor reports them (an outdoor
+    AirGradient does, absent is not zero)."""
+    o = obs or {}
+    pm = _num(o.get("pm25"))
+    band = pm25_band(pm)
+    if pm is not None and band is not None:
+        hero_html = (f'<div class="cc-temp aq-hero">{pm:.1f}'
+                     f'<span class="aq-unit">µg/m³ PM2.5</span></div>'
+                     f'<div class="aq-band"><i style="background:{band[1]}"></i>'
+                     f'{_esc(band[0])}</div>')
+    elif (co2_hero := _num(o.get("co2"))) is not None:
+        # A CO₂ monitor (Govee H5140) has no particle sensor: its hero is
+        # the CO₂ reading with the same 1000/2000 ppm states the tile uses.
+        st = co2_state(co2_hero)
+        colour = {"high": AIR_TILE_COLORS["co2"], "elevated": "#f6a13a"}.get(st or "", "#4ed98c")
+        hero_html = (f'<div class="cc-temp aq-hero">{round(co2_hero)}'
+                     f'<span class="aq-unit">ppm CO2</span></div>'
+                     f'<div class="aq-band"><i style="background:{colour}"></i>'
+                     f'{_esc((st or "fresh air").capitalize())}</div>')
+    else:
+        hero_html = '<div class="cc-feels aq-nodata">PM2.5 not reported yet</div>'
+
+    tiles = []
+    pm10 = _num(o.get("pm10"))
+    tiles.append(_air_tile(
+        "PM10", f"{pm10:.1f} µg/m³" if pm10 is not None else "no reading",
+        "", AIR_TILE_COLORS["pm10"]))
+    co2 = _num(o.get("co2"))
+    state = co2_state(co2)
+    tiles.append(_air_tile(
+        "CO2" + (f" · {state}" if state else ""),
+        f"{round(co2)} ppm" if co2 is not None else "no reading",
+        f"{CO2_ELEVATED_PPM:.0f} elevated · {CO2_HIGH_PPM:.0f} high",
+        AIR_TILE_COLORS["co2"]))
+    # Sensirion VOC/NOx index: 1 to 500, 100 = the sensor's learned typical
+    # air, higher = more than usual.
+    for key, label in (("tvoc_index", "TVOC index"), ("nox_index", "NOx index")):
+        v = _num(o.get(key))
+        tiles.append(_air_tile(
+            label, f"{round(v)}" if v is not None else "no reading",
+            "1 to 500 · 100 typical", AIR_TILE_COLORS[key]))
+    for key in ("tempf", "humidity"):
+        v = _num(o.get(key))
+        if v is None:
+            continue
+        meta = FIELD_META[key]
+        tiles.append(_air_tile(meta["label"], _fmt(v, meta["unit"]), "",
+                               meta["color"]))
+
+    if series.get("pm25") or not series.get("co2"):
+        chart = (f'<div class="chart"><div class="chart-title">PM2.5 '
+                 f'<span class="chart-unit">· last 24h · µg/m³</span></div>'
+                 f'{svg_chart(series.get("pm25", []), PM25_COLOR, unit="µg/m³")}'
+                 f'</div>')
+    else:
+        chart = (f'<div class="chart"><div class="chart-title">CO2 '
+                 f'<span class="chart-unit">· last 24h · ppm</span></div>'
+                 f'{svg_chart(series.get("co2", []), AIR_TILE_COLORS["co2"], unit="ppm")}'
+                 f'</div>')
+
+    loc_html = (f'<span class="cc-loc"> · {_esc(location)}</span>'
+                if location else "")
+    side_html = ""
+    if app_url:
+        side_html = (f'<div class="cc-side">'
+                     f'<a class="cc-app" href="{_esc(app_url)}" '
+                     f'target="_blank" rel="noopener">Get the iOS app ↗</a>'
+                     f'</div>')
+    return (
+        f'<section class="station station-air">'
+        f'  <div class="cc">'
+        f'    <div class="cc-main">'
+        f'      <div class="cc-name">{_esc(name)}'
+        f'<span class="cc-loc"> · Air quality</span>{loc_html}</div>'
+        f'      {hero_html}'
+        f'      <div class="cc-chips">{"".join(tiles)}</div>'
+        f'    </div>'
+        f'    {side_html}'
+        f'  </div>'
+        f'  <div class="charts">{chart}</div>'
+        f'</section>'
+    )
+
+
 def render_station(name: str, obs: dict[str, Any] | None,
                    series: dict[str, list[tuple[int, float]]],
                    fields: list[str],
@@ -587,14 +756,21 @@ def render_station(name: str, obs: dict[str, Any] | None,
                    records: dict[str, Any] | None = None,
                    tz_name: str = "UTC",
                    summary: dict[str, Any] | None = None,
-                   app_url: str = "", location: str | None = None) -> str:
+                   app_url: str = "", location: str | None = None,
+                   air: bool = False) -> str:
     """One station block: current-conditions header + a chart per field.
 
     The temperature chart overlays the feels-like line (from
     series["feelsLike"]); a wind rose tile is appended after the wind chart
     when direction+speed samples are available; an all-time records strip is
     appended below the charts when records are supplied.
+
+    `air=True` (the caller classified the device as an air monitor) draws
+    the air card instead: `fields`, wind, records and summary are ignored.
     """
+    if air:
+        return render_air_station(name, obs, series, app_url=app_url,
+                                  location=location)
     o = obs or {}
     temp = _num(o.get("tempf"))
     feels = _num(o.get("feelsLike"))
@@ -741,8 +917,14 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
     station on one axis per field), then the per-station blocks."""
     if not stations:
         return '<div class="chart-empty">No station data yet.</div>'
-    return (render_now_strip(stations, location, tz_name)
-            + render_compare(stations) + "".join(
+    # The composite strip and the side-by-side charts are weather-station
+    # affairs: a monitor's humidity chip would otherwise win "freshest"
+    # and its temperature would join the compare block as a fifth line.
+    # Air stations (`"air": True` from the caller) keep their place in the
+    # page order and render as their own card.
+    weather = [s for s in stations if not s.get("air")]
+    return (render_now_strip(weather, location, tz_name)
+            + render_compare(weather) + "".join(
         render_station(s["name"], s.get("obs"), s.get("series", {}), fields,
                        wind_samples=s.get("wind_samples"),
                        records=s.get("records"), tz_name=tz_name,
@@ -750,7 +932,8 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                        # First station only: one link and one place label per
                        # page, however many stations it shows.
                        app_url=app_url if i == 0 else "",
-                       location=location if i == 0 else None)
+                       location=location if i == 0 else None,
+                       air=bool(s.get("air")))
         for i, s in enumerate(stations)
     ))
 
@@ -865,6 +1048,13 @@ DASHBOARD_CSS = """
         color:var(--ink-40); }
     .rec-v { font-size:19px; font-weight:600; margin-top:3px; }
     .rec-d { font-size:10px; color:var(--ink-40); margin-top:2px; }
+    .aq-hero { font-size:44px; }
+    .aq-unit { font-size:13px; font-weight:500; color:var(--ink-55); margin-left:8px; }
+    .aq-band { display:inline-flex; align-items:center; gap:6px; margin-top:6px;
+        font-size:13px; font-weight:600; color:var(--ink-70); }
+    .aq-band i { width:10px; height:10px; border-radius:50%; display:inline-block;
+        border:1px solid var(--card-edge); }
+    .aq-nodata { margin-top:8px; }
 """
 
 

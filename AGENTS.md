@@ -23,7 +23,8 @@ If you are an agent, before doing anything else:
   `/ingest/custom`. AWN poller (built into backend), WeatherLink poller
   (built into backend), or a LilyGO board on the LAN.
 - **MAC** — synthetic 6-byte identifier `5D:5D:TT:HH:HH:HH` where TT is
-  a sensor-type tag (01=Atlas, 02=Fineoffset outdoor, 05=Davis) and
+  a sensor-type tag (01=Atlas, 02=Fineoffset outdoor, 05=Davis,
+  06=Tempest, 07=AirGradient, 08=Govee) and
   HHHHHH is the low 3 bytes of the sensor's RF ID. Same physical
   sensor always lands on the same MAC across multiple receivers.
 - **Composite latest** — `/api/devices/{mac}/current` returns the
@@ -43,6 +44,8 @@ app/                         FastAPI source (the Python package)
   discovery.py               /ingest/discovery + /api/discoveries
   capture.py                 Optional raw-POST capture for debugging
   insights.py                Statistics rollups + /api/insights (default on since 1.9)
+  stories.py                 Story cards: the producers behind /api/devices/{mac}/stories
+  almanac.py                 Sun, moon and season math the sky stories read
   wu_import.py               Weather Underground history import (/api/import/wu)
   wu_upload.py               Live WU forwarding — re-posts ingested readings
                              to wunderground.com per device (app-managed via
@@ -51,6 +54,10 @@ app/                         FastAPI source (the Python package)
   config_backup.py           /api/config/backup + /api/config/restore
   source_status.py           Per-ingest-source health for /api/sources
   ecowitt.py                 /ingest/ecowitt — Ecowitt "Customized" upload (Path G)
+  ecowitt_cloud_*.py         Ecowitt cloud poller, api.ecowitt.net v3 (Path I);
+                             reuses ecowitt.py's rain/battery/channel rules
+  tempest_*.py               WeatherFlow Tempest cloud poller (Path F)
+  integrations.py            App-managed cloud credentials (/api/integrations)
   alerts.py                  Alert monitor — device-down, thresholds, smart
                              alerts, storm summaries, morning report digest
   storm.py                   Storm episode tracking + summary messages
@@ -130,6 +137,14 @@ Q: What hardware does the user have?
 │     works directly against local Docker; a Fly backend needs a small
 │     TLS-terminating forwarder on the LAN (README has a Caddyfile).
 │     No extra hardware, no vendor cloud.
+│   → Backend is HTTPS-only (Fly) and no forwarder is wanted: Path I,
+│     the Ecowitt cloud poller. ECOWITT_APP_KEY + ECOWITT_API_KEY from
+│     the ecowitt.net profile, or configure from the app (Settings →
+│     Integrations → Ecowitt Cloud). One path per gateway, never both.
+│
+├─ Govee CO₂ / air-quality monitor (H5140 family)
+│   → Path J: GOVEE_API_KEY from the Govee Home app, or Settings →
+│     Integrations → Govee. Cloud-only; the device has no local API.
 │
 ├─ Station already running under WeeWX (any of its 70+ families)
 │   → Use Path H: `weectl extension install` the weewx-bridge/
@@ -137,7 +152,7 @@ Q: What hardware does the user have?
 │     [StdRESTful][[Zasder]], restart WeeWX. See weewx-bridge/README.md.
 │
 └─ Multiple sensors / mix
-    → Any combination of A+B+C+D+E+F+G+H works. They all post into the
+    → Any combination of A+B+C+D+E+F+G+H+I works. They all post into the
       same backend and show up as separate device rows in the iOS app.
 
 Q: Where do they want the backend?

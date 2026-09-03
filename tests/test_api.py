@@ -65,6 +65,37 @@ def test_ingest_header_no_auth_rejected(client):
     r = client.post("/ingest/custom", json=_good_obs())
     assert r.status_code == 401
 
+def test_indoor_dew_point_derived_and_never_overwritten(client):
+    """Indoor dew point (2.0): a console reporting indoor temp+humidity but
+    no indoor dew gets one derived at ingest (Magnus, the outdoor family) —
+    "72° / 56%" needs the translation before it says anything about
+    comfort. A console that SENDS its own dewPointin keeps it untouched:
+    the derivation fills silence, never argues with an instrument."""
+    obs = _good_obs()
+    obs["indoor"] = {"tempf": 72.0, "humidity": 56}
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json=obs)
+    assert r.status_code == 200
+    cur = client.get("/api/devices/AA:BB:CC:DD:EE:FF/current",
+                     headers={"Authorization": "Bearer test-api-token"})
+    got = cur.json()["dewPointin"]
+    # Magnus by hand: 72.0F / 56% -> 13.0C -> 55.4F.
+    assert got == pytest.approx(55.4, abs=0.2)
+
+    # A sender-provided value survives verbatim.
+    obs2 = _good_obs()
+    obs2["timestamp_utc"] = "2026-05-14T06:05:00Z"
+    obs2["indoor"] = {"tempf": 72.0, "humidity": 56, "dew_point_f": 51.0}
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json=obs2)
+    assert r.status_code == 200
+    cur = client.get("/api/devices/AA:BB:CC:DD:EE:FF/current",
+                     headers={"Authorization": "Bearer test-api-token"})
+    assert cur.json()["dewPointin"] == 51.0
+
+
 def test_ingest_path_form_removed(client):
     """The legacy /ingest/custom/{token} URL form was removed 2026-05-21
     (tokens in URLs leak into proxy logs). The route should 404 now,
@@ -2835,7 +2866,7 @@ def test_current_fills_periods_for_a_daily_only_rain_source(client):
         assert dry.get(k) is None, f"{k} fabricated for a rainless station"
 
 
-def test_daily_rollup_cache_serves_within_ttl_and_day_key(client):
+def test_daily_rollup_cache_serves_within_ttl_and_day_key(client, monkeypatch):
     """R5-33: the tier-3 derivation scans a station's whole year of rows —
     measured at 0.5–3.0s on a 1.15M-row archive (Doren's box, 2026-08-23)
     — and /current used to run it per REQUEST. Now cached ~60s per
@@ -2845,10 +2876,35 @@ def test_daily_rollup_cache_serves_within_ttl_and_day_key(client):
     import datetime as dt
     from app import db as dbm
     H = {"Authorization": "Bearer test-api-token"}
-    now = dt.datetime.now(dt.timezone.utc)
+    # Pin the station clock instead of reading the host's. The derivation
+    # buckets readings into LOCAL days, so a test that dates its ingests
+    # from the wall clock is only self-consistent away from midnight: run at
+    # 00:09 UTC, the `now - 30min` reading landed on YESTERDAY and the week
+    # came back 0.23 (yesterday's 0.10 + today's 0.13) instead of 0.13 —
+    # a guaranteed red CI build for the first half hour of every day.
+    # Anchored at local noon, both ingests provably share one local day and
+    # every boundary below is that day's, at any hour the suite runs.
+    # Noon in the STATION zone, not UTC: the buckets are local days, so a
+    # UTC-noon anchor would split again under a +12 station (local 00:00,
+    # with the earlier reading on the previous day).
+    # The most recent noon that has PASSED, not a hardcoded date: ingest
+    # clamps timestamps >15 min in the future and rejects anything ~400+
+    # days old, so a fixed calendar day would quietly become a time bomb.
+    # Only the time-of-day has to be fixed; which day it is never matters,
+    # because the readings and the boundaries share it by construction.
+    from zoneinfo import ZoneInfo
+    from app.config import settings as _s
+    _tz = ZoneInfo(_s.timezone)
+    NOON = dt.datetime.now(_tz).replace(hour=12, minute=0, second=0,
+                                        microsecond=0)
+    if NOON > dt.datetime.now(_tz):          # before midday: yesterday's noon
+        NOON -= dt.timedelta(days=1)
+    monkeypatch.setattr(dbm, "_now_local", lambda tz: NOON.astimezone(tz))
+    now = NOON
 
     def blow(daily: float, mins_ago: int) -> None:
-        ts = (now - dt.timedelta(minutes=mins_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = ((now - dt.timedelta(minutes=mins_ago))
+              .astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
         r = client.post("/ingest/custom",
                         headers={"Authorization": "Bearer test-ingest-token"},
                         json={"device": {"id": "AABBCCDD0779"},
@@ -2873,10 +2929,81 @@ def test_daily_rollup_cache_serves_within_ttl_and_day_key(client):
     # no year-window scan per request.
     assert cur["weeklyrainin"] == 0.10
 
-    # TTL elapses (same effect as the day-key changing at midnight).
+    # TTL elapses: the derivation runs again and picks up the new reading.
+    # (The other way back in is the day key changing — exercised for real,
+    # by moving the clock, in the midnight-rollover test below.)
     dbm._DAILY_ROLLUP_CACHE.clear()
     cur = client.get("/api/devices/AA:BB:CC:DD:07:79/current", headers=H).json()
     assert cur["weeklyrainin"] == 0.13
+
+
+def test_daily_rollup_cache_recomputes_across_the_midnight_rollover(
+        client, monkeypatch):
+    """The cache key carries the local day so that a rollover recomputes
+    INSIDE the 60s TTL — otherwise a station could serve last week's total
+    for the first minute of a new week. Provable only against a pinned
+    clock, which is why `db._now_local` is a seam: here the clock steps
+    from Saturday 23:59 to Sunday 00:01, the week restarts (weeks start
+    Sunday), and Saturday's rain must drop out of the weekly total while
+    August's monthly total keeps it. Nothing is cleared by hand and no
+    time passes, so only the day key can force the recompute."""
+    import datetime as dt
+    from app import db as dbm
+    H = {"Authorization": "Bearer test-api-token"}
+    # All instants are built in the STATION zone — the rollover under test
+    # is a local midnight, not a UTC one — and on the most recent Saturday
+    # that has already passed, never a hardcoded date: ingest rejects
+    # timestamps ~400+ days old, so a fixed day would pass today and start
+    # failing on its own a year from now.
+    from zoneinfo import ZoneInfo
+    from app.config import settings as _s
+    TZ = ZoneInfo(_s.timezone)
+    _now = dt.datetime.now(TZ)
+    saturday = (_now.date()
+                - dt.timedelta(days=(_now.weekday() - 5) % 7))
+    if dt.datetime.combine(saturday, dt.time(23, 59), tzinfo=TZ) > _now:
+        saturday -= dt.timedelta(days=7)     # today IS Saturday, pre-23:59
+    # ...and never the last day of its month: the Sunday under test must
+    # be the SAME month, or the monthly total legitimately resets and the
+    # month-still-carries-it assertion below fails for the week after any
+    # month that ends on a Saturday (CodeRabbit, PR #35 — the same
+    # month-edge class as the other anchors). A week back keeps the
+    # weekday and stays well inside the ingest age limit.
+    while (saturday + dt.timedelta(days=1)).month != saturday.month:
+        saturday -= dt.timedelta(days=7)
+    sunday = saturday + dt.timedelta(days=1)
+    # Built from the DATE, not by adding minutes to an instant: in a zone
+    # that shifts the clock at midnight, 23:59 + 2min is not 00:01.
+    clock = {"now": dt.datetime.combine(saturday, dt.time(23, 59), tzinfo=TZ)}
+    monkeypatch.setattr(dbm, "_now_local",
+                        lambda tz: clock["now"].astimezone(tz))
+
+    rain_at = (dt.datetime.combine(saturday, dt.time(23, 30), tzinfo=TZ)
+               .astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    r = client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token"},
+                    json={"device": {"id": "AABBCCDD0780"},
+                          "timestamp_utc": rain_at,
+                          "source": "tempest",
+                          "outdoor": {"tempf": 70.0},
+                          "rain": {"daily_in": 0.10}})
+    assert r.status_code == 200
+
+    cur = client.get("/api/devices/AA:BB:CC:DD:07:80/current", headers=H).json()
+    assert cur["weeklyrainin"] == 0.10
+    assert cur["monthlyrainin"] == 0.10
+    saturday_keys = set(dbm._DAILY_ROLLUP_CACHE)
+    assert saturday_keys, "derivation result must be cached"
+
+    clock["now"] = dt.datetime.combine(sunday, dt.time(0, 1), tzinfo=TZ)
+    cur = client.get("/api/devices/AA:BB:CC:DD:07:80/current", headers=H).json()
+    # A new week: Saturday's rain is last week's now...
+    assert cur["weeklyrainin"] == 0.0
+    # ...but the same August, so this is a real recompute and not an
+    # everything-reset — the month still carries it.
+    assert cur["monthlyrainin"] == 0.10
+    # The new day's key replaced the old one rather than accumulating.
+    assert set(dbm._DAILY_ROLLUP_CACHE).isdisjoint(saturday_keys)
 
 
 def test_public_dashboard_carries_the_summary_boards(client, monkeypatch):
@@ -3083,6 +3210,85 @@ def test_inline_scripts_are_csp_hash_allowed(client, monkeypatch):
     # script the 1.9 re-broadcast fix lives in.
     embed = client.get("/embed").text
     assert "zasder-embed-height" in embed
+
+
+def test_public_dashboard_air_card_on_every_public_page(client, monkeypatch):
+    """2.0: an air monitor named in the selection renders its air card on
+    `/`, `/status` and `/embed`, with its temperature/humidity tiles only
+    because this one reports them; PUBLIC_DASHBOARD_FIELDS keeps applying
+    to the weather station only; the inline scripts stay CSP-hash-allowed
+    (the card adds none); the station name is escaped; and limited-read
+    (guest) tokens gain nothing, the page is anonymous and the config API
+    stays owner-only."""
+    import base64 as _b64
+    import datetime as _dt
+    import hashlib as _hl
+    import re as _re
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    monkeypatch.setattr(settings, "public_dashboard_fields", "tempf,baromrelin")
+    H = {"Authorization": "Bearer test-api-token"}
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ing = {"Authorization": "Bearer test-ingest-token"}
+    for mins in (120, 60, 5):
+        ts = (now - _dt.timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client.post("/ingest/custom", headers=ing,
+                    json={"device": {"id": "AABBCCDD0E05", "name": "Yard"},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": 90.0 + mins / 60, "humidity": 30},
+                          "wind": {"speed_mph": 3},
+                          "pressure": {"relative_inhg": 29.9}, "source": "test"})
+        client.post("/ingest/custom", headers=ing,
+                    json={"device": {"id": "5D5D07000077",
+                                     "name": 'Home <b>Chandler</b>'},
+                          "timestamp_utc": ts,
+                          "outdoor": {"tempf": 101.2, "humidity": 18},
+                          "air": {"pm25": 40.0 + mins / 10, "pm10": 50.0,
+                                  "co2": 2100, "tvoc_index": 90, "nox_index": 1},
+                          "source": "test"})
+    r = client.put("/api/public-dashboard", headers=H,
+                   json={"enabled": True, "macs": "AABBCCDD0E05,5D5D07000077"})
+    assert r.status_code == 200
+
+    for path in ("/", "/status", "/embed"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        page = r.text
+        assert page.count('class="station station-air"') == 1, path
+        assert "Home &lt;b&gt;Chandler&lt;/b&gt;" in page, path
+        assert "<b>Chandler</b>" not in page, path
+        # Latest reading: pm25 40.5 → Unhealthy for sensitive groups.
+        assert "40.5<span" in page and "Unhealthy for sensitive groups" in page
+        assert "CO2 · high" in page and "2100 ppm" in page
+        assert "101°F" in page and "18%" in page        # reported, so shown
+        assert 'class="chart-title">PM2.5' in page
+        # The weather station honors the fields filter; the air card
+        # ignores it (no Pressure tile or chart on the card, and the
+        # station block has no Humidity chart because it was not chosen).
+        air = page[page.index('class="station station-air"'):]
+        air = air[:air.index("</section>")]
+        assert "Pressure" not in air and "Wind" not in air and "Records" not in air
+        station = page[page.index("Yard"):page.index('class="station station-air"')]
+        assert "Pressure" in station and 'class="chart-title">Humidity' not in station
+        # CSP: every inline script on the page is still hash-allowed.
+        csp = r.headers["content-security-policy"]
+        scripts = _re.findall(r"<script>(.*?)</script>", page, _re.S)
+        assert scripts, f"{path}: no inline scripts, hash check vacuous"
+        for body in scripts:
+            token = "'sha256-" + _b64.b64encode(
+                _hl.sha256(body.encode("utf-8")).digest()).decode() + "'"
+            assert token in csp, f"{path}: script not hash-allowed"
+        assert "<script" not in air, "the air card must add no inline script"
+
+    guest = client.post("/api/guest-tokens", headers=H,
+                        json={"label": "air-page"}).json()["token"]
+    G = {"Authorization": f"Bearer {guest}"}
+    assert client.get("/api/public-dashboard", headers=G).status_code == 403
+    assert client.put("/api/public-dashboard", headers=G,
+                      json={"macs": "all"}).status_code == 403
+    # The selection the guest could not change is still what renders.
+    assert 'class="station station-air"' in client.get("/embed").text
 
 
 def test_embed_theme_param_and_tokenized_pages(client, monkeypatch):

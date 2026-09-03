@@ -41,6 +41,10 @@ static uint32_t      pktsPostedOk  = 0;
 static uint32_t      pkts401       = 0;
 static uint32_t      bootMs        = 0;
 static unsigned long lastPacketMs  = 0;
+// Heap guard telemetry — see noteHeapSample / noteHeapGuardTrip below.
+static uint32_t      heapGuardTrips    = 0;
+static uint32_t      heapGuardTripMax  = 0;   // max_alloc at the last trip
+static uint32_t      minMaxAlloc       = 0;   // low-water mark; 0 = no sample yet
 
 // Cycling diagnostic line on the OLED — rotates IP / mDNS / uptime /
 // RSSI / rx-age every 5 s so the most useful operator-debug fields all
@@ -180,6 +184,17 @@ static void handleStatus() {
   body += "  \"ip\": \""         + escapeJson(ip)  + "\",\n";
   body += "  \"mdns\": \""       + mdnsName + ".local\",\n";
   body += "  \"uptime_s\": "     + String(uptimeS) + ",\n";
+  // Heap visibility (see the "ready" line in main.cpp): free bytes and the
+  // largest allocatable block, so a slow leak or fragmentation is readable
+  // from the LAN before the next heap_caps_calloc NULL reboots the board.
+  body += "  \"free_heap\": "    + String((unsigned) ESP.getFreeHeap()) + ",\n";
+  body += "  \"max_alloc\": "    + String((unsigned) ESP.getMaxAllocHeap()) + ",\n";
+  // Worst largest-block seen by loop() since boot, and how often the heap
+  // guard had to hold the receiver drain (main.cpp). A rising trip count
+  // with a falling low-water mark is the pulse-train pile-up in progress.
+  body += "  \"min_max_alloc\": "    + String(minMaxAlloc) + ",\n";
+  body += "  \"heap_guard_trips\": " + String(heapGuardTrips) + ",\n";
+  body += "  \"heap_guard_trip_max_alloc\": " + String(heapGuardTripMax) + ",\n";
   body += "  \"freq_mhz\": "     + String((double) RF_MODULE_FREQUENCY, 2) + ",\n";
   body += "  \"source\": \""     + String(ZASDER_SOURCE_TAG) + "\",\n";
   body += "  \"backend_url\": \""+ escapeJson(backendUrl) + "\",\n";
@@ -597,6 +612,16 @@ void noteIncomingPacket(const char *model, uint32_t id) {
            model, (unsigned) id);
   // Updates line 3 only — line 2 is owned by the cycling diag below.
   ZasderDisplay::update(nullptr, nullptr, nullptr, dispLine, nullptr);
+}
+
+void noteHeapSample(size_t maxAlloc) {
+  if (minMaxAlloc == 0 || maxAlloc < minMaxAlloc) minMaxAlloc = (uint32_t) maxAlloc;
+}
+
+void noteHeapGuardTrip(size_t maxAlloc) {
+  heapGuardTrips++;
+  heapGuardTripMax = (uint32_t) maxAlloc;
+  if (minMaxAlloc == 0 || maxAlloc < minMaxAlloc) minMaxAlloc = (uint32_t) maxAlloc;
 }
 
 void notePostResult(int httpCode) {

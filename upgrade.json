@@ -1,4 +1,4 @@
 {
-  "_comment": "Upgrade vouching, read at raw.githubusercontent.com/<repo>/v<tag>/upgrade.json by servers >= 1.9 before allowing a one-tap MAJOR upgrade. seamless_from: the oldest version this release installs onto with zero manual steps (schema migrates itself, no config changes required). Same-major upgrades never consult this file. If a future release DOES carry manual steps, raise seamless_from (or delete this file from that tag) and the classic follow-the-release-notes 409 protects everyone below it.",
-  "seamless_from": "1.0.0"
+  "_comment": "Upgrade vouching, read at raw.githubusercontent.com/<repo>/v<tag>/upgrade.json by servers >= 1.9 before allowing a one-tap MAJOR upgrade. seamless_from: the oldest version this release installs onto with zero manual steps (schema migrates itself, no config changes required). Same-major upgrades never consult this file. 2.0.0 vouches from 1.9.0: only servers >= 1.9 read this file at all, 2.0 migrates its own schema (comfort ledger, digest minute) with one background rollup rebuild, and the one-tap path now writes a pre-upgrade snapshot beside the database first. If a future release DOES carry manual steps, raise seamless_from (or delete this file from that tag) and the classic follow-the-release-notes 409 protects everyone below it.",
+  "seamless_from": "1.9.0"
 }

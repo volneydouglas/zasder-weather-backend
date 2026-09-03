@@ -59,7 +59,8 @@ async def test_history_returns_chronological(db_module):
 
 
 @pytest.mark.asyncio
-async def test_rain_rollups_falls_back_to_monthly_when_yearly_broken(db_module):
+async def test_rain_rollups_falls_back_to_monthly_when_yearly_broken(
+        db_module, monkeypatch):
     """Regression: a Davis WeatherLink whose yearly counter reset while a stale
     rain offset clamps it to ~0 (yearly < monthly) must still report weekly
     rain — derived from the reliable monthly counter, not the broken yearly."""
@@ -74,7 +75,19 @@ async def test_rain_rollups_falls_back_to_monthly_when_yearly_broken(db_module):
     # "5 days ago" and "1 day ago" both land in the *previous* week and weekly
     # rain is legitimately 0 — this test used to fail every Sunday.
     tz = ZoneInfo("America/Phoenix")
-    now_local = datetime.now(tz)
+    # ...and pin the clock to MID-month, because anchoring the week was only
+    # half the job: run on the 1st or 2nd and the week starts in the previous
+    # month, the weekly-from-monthly derivation takes its month-straddling
+    # branch, and weekly came back 0.0 instead of 0.14. Failed on the first
+    # two days of every month — found by replaying the suite under a forced
+    # clock. Fallback-when-yearly-is-broken is this test's subject; month
+    # straddling is not, and `_now_local` is the seam that keeps it out.
+    # The 15th is always deep inside its own month: the containing week
+    # starts no earlier than the 9th, so even the pre-week baseline row
+    # below stays in the same month, in every year and every zone.
+    now_local = datetime.now(tz).replace(day=15, hour=12, minute=0,
+                                         second=0, microsecond=0)
+    monkeypatch.setattr(db, "_now_local", lambda z: now_local.astimezone(z))
     start_of_today = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     start_of_week = start_of_today - timedelta(days=(now_local.weekday() + 1) % 7)
     ms = lambda d: int(d.timestamp() * 1000)
@@ -184,20 +197,24 @@ async def test_init_db_rebuilds_stale_chart_index(db_module):
     db = db_module
     await db.init_db()
     async with aiosqlite.connect(settings.database_path) as conn:
-        await conn.execute("DROP INDEX idx_obs_chart")
+        await conn.execute(f"DROP INDEX {db.chart_index_name()}")
+        # The pre-2.0 bare name with an old/narrow definition.
         await conn.execute(
             "CREATE INDEX idx_obs_chart ON observations "
-            "(mac, dateutc_ms, tempf, windgustmph)")     # old/narrow definition
+            "(mac, dateutc_ms, tempf, windgustmph)")
         await conn.commit()
     await db.init_db()                                   # migration runs here
     async with aiosqlite.connect(settings.database_path) as conn:
         conn.row_factory = aiosqlite.Row
         row = await (await conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='index' "
-            "AND name='idx_obs_chart'")).fetchone()
+            "AND name=?", (db.chart_index_name(),))).fetchone()
+        stale = await (await conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='idx_obs_chart'")).fetchone()
     assert row is not None and row["sql"]
     for col in db._CHART_INDEX_COLS:
         assert col in row["sql"], f"rebuilt index is missing {col}"
+    assert stale is None, "the stale bare-name index must be swept after the swap"
 
 
 @pytest.mark.asyncio
@@ -274,6 +291,54 @@ async def test_bucketed_history_serves_lightning_peak_as_int(db_module):
     peak = max(got)
     assert peak == 731
     assert isinstance(peak, int) and not isinstance(peak, bool)
+
+
+@pytest.mark.asyncio
+async def test_bucketed_history_serves_closest_strike_not_the_average(db_module):
+    """Distance is the one field in the bucketed SELECT whose headline value
+    is the MINIMUM. A single strike three miles out is the whole story of an
+    hour that otherwise sat at eighteen; AVG dilutes that into calm and MAX
+    reports the farthest strike, which is the opposite of the question the
+    chart is being asked ("how close did it get?")."""
+    db = db_module
+    await db.init_db()
+    hour = 3_600_000
+    # An 8h window buckets at 60s, so these three readings must be spaced in
+    # SECONDS to land in one bucket. Spacing them a minute apart gave each
+    # its own bucket, and the assertions below passed while aggregating
+    # nothing — verified by probe before this test was trusted.
+    bucket_ms = db._auto_bucket_ms(8 * hour)
+    assert bucket_ms > 0, "8h must take the bucketed path, not the raw one"
+    base = 1 * hour                      # a multiple of the 60s bucket width
+    rows = [{"dateutc": base, "tempf": 88.0,
+             "lightning_last_1hr": 4, "lightning_distance_mi": 18.0},
+            {"dateutc": base + 10_000, "tempf": 88.0,
+             "lightning_last_1hr": 9, "lightning_distance_mi": 3.0},
+            {"dateutc": base + 20_000, "tempf": 88.0,
+             "lightning_last_1hr": 6, "lightning_distance_mi": 21.0}]
+    for r in rows:
+        assert r["dateutc"] // bucket_ms == base // bucket_ms, \
+            "test rows must share one bucket or this asserts nothing"
+    await db.insert_observations("AA:22", rows)
+    out = await db.history("AA:22", 0, 8 * hour)
+    got = [r["lightning_distance_mi"] for r in out
+           if r.get("lightning_distance_mi") is not None]
+    assert got == [3.0], f"expected the one closest strike, got {got}"
+    # Both wrong answers are named, so a future edit to AVG or MAX fails
+    # here rather than shipping a chart that reads calm during a storm that
+    # was three miles away. 14.0 is the mean of the three.
+    assert 14.0 not in got, "distance averaged — the closest strike is gone"
+    assert 21.0 not in got, "distance took the farthest strike, not the nearest"
+
+
+@pytest.mark.asyncio
+async def test_bucketed_distance_column_is_index_covered(db_module):
+    """Every column the bucketed SELECT touches must also live in
+    idx_obs_chart. Miss one and the query falls off the covering index and
+    back to fetching each row's ~1 KB data_json blob, which is what turned a
+    7d chart into a ~9 s query the last time it happened."""
+    db = db_module
+    assert "lightning_distance_mi" in db._CHART_INDEX_COLS
 
 
 @pytest.mark.asyncio
@@ -732,3 +797,5 @@ async def test_records_week_boundary_is_local_midnight_across_dst(db_module):
     # The pre-boundary 120.0 belongs to all-time, never the week.
     assert week["fields"]["tempf"]["max"] == 95.0
     assert out["periods"]["all"]["fields"]["tempf"]["max"] == 120.0
+
+

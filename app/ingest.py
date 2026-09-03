@@ -38,6 +38,7 @@ import re
 import secrets as _secrets
 import time
 import weakref
+from collections import deque
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -273,6 +274,10 @@ def _flatten(normalized: dict[str, Any]) -> dict[str, Any] | None:
         "humidity":       out.get("humidity"),
         "tempinf":        ind.get("tempf"),
         "humidityin":     ind.get("humidity"),
+        # Mirrors the outdoor "dewPoint" mapping: a console that measures
+        # its own indoor dew point sends it here; _do_ingest derives one
+        # only when this stays empty.
+        "dewPointin":     ind.get("dew_point_f"),
         "baromrelin":     rel_inhg,
         "baromabsin":     abs_inhg if abs_inhg is not None else rel_inhg,
         "windspeedmph":   wind.get("speed_mph"),
@@ -406,6 +411,7 @@ _PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
     "tempf":          (-90.0, 140.0),
     "feelsLike":      (-110.0, 160.0),
     "dewPoint":       (-90.0, 100.0),
+    "dewPointin":     (-90.0, 100.0),   # R17 #6: console-sent garbage
     "humidity":       (0.0, 100.0),
     "tempinf":        (-40.0, 150.0),
     "humidityin":     (0.0, 100.0),
@@ -803,6 +809,7 @@ def _auto_device_name(normalized: dict[str, Any]) -> str:
         "acurite-atlas": "AcuRite Atlas",
         "acurite-access": "AcuRite Access",
         "ecowitt": "Ecowitt",
+        "ecowitt-cloud": "Ecowitt",
         "tempest": "Tempest",
         # The Mac app posts WITHOUT device.name unless the user typed one
         # (posting its default clobbered server-side names), so first inserts
@@ -963,6 +970,183 @@ def _adds_field(new: dict[str, Any], prev: dict[str, Any]) -> bool:
     return False
 
 
+# ── Write-behind during the chart-index rebuild (2.0) ────────────────────
+#
+# The deferred idx_obs_chart build holds SQLite's write lock for minutes on
+# a big archive. Every ingest POST in that window used to wait busy_timeout
+# (10s) and then 500 "database is locked" — on 2026-09-01 that was ~5 min
+# of lost readings in production, and each 500 counted toward a LilyGO's
+# 401-wipe heuristic. While db.chart_index_rebuild_in_progress() is set,
+# _do_ingest instead parks the WHOLE validated payload here, answers 200
+# with "queued": true, and the lifespan re-runs _do_ingest on every parked
+# payload once the build ends (drain_write_behind).
+#
+# WHY THE WHOLE PAYLOAD AND NOT THE ROW: _do_ingest's tail after the insert
+# is not just the insert — the glitch guards read the last STORED row, the
+# device upsert is itself a write, insert_observations folds the insights
+# rollups in its own transaction, and the WU forward is scheduled after
+# the commit. Queueing at the row level would have to replay each of those
+# separately and keep them coherent; queueing the payload and re-running
+# the function replays them in the order they run today, against the
+# baseline as it stands at drain time (the queue preserves arrival order,
+# so that baseline is the previous queued reading — exactly what a live
+# post would have seen). The one deliberate omission is the per-device
+# token auto-upgrade in the route wrapper: it writes a token row, and a
+# board that asked during the build simply asks again on its next post.
+_WRITE_BEHIND: deque[dict[str, Any]] = deque()
+_WRITE_BEHIND_MAX = 5000
+# Second bound (CodeRabbit, PR #35): the entry cap alone admits
+# 5000 x INGEST_BODY_MAX_BYTES (64 KiB) of parked payloads, ~320 MB, which
+# is more than the smallest Fly machines have. Sizes are the JSON length of
+# the parked object, taken once at park time and kept by object identity —
+# the payload dict lives in the queue for as long as its id is a key, so
+# the id cannot be recycled underneath us — and forgotten when it leaves.
+_WRITE_BEHIND_MAX_BYTES = 32 * 1024 * 1024
+_WRITE_BEHIND_BYTES = 0
+_WRITE_BEHIND_SIZE: dict[int, int] = {}
+_WRITE_BEHIND_DROP_LOG_TS = 0.0
+_WRITE_BEHIND_DROP_LOG_INTERVAL_S = 60.0
+
+
+def write_behind_depth() -> int:
+    return len(_WRITE_BEHIND)
+
+
+def write_behind_bytes() -> int:
+    return _WRITE_BEHIND_BYTES
+
+
+def _write_behind_size(payload_obj: Any) -> int:
+    try:
+        return len(_json.dumps(payload_obj, separators=(",", ":"),
+                               default=str))
+    except Exception:
+        return INGEST_BODY_MAX_BYTES     # unmeasurable: charge the cap
+
+
+def _write_behind_park(payload_obj: dict[str, Any], *, front: bool) -> None:
+    global _WRITE_BEHIND_BYTES
+    size = _write_behind_size(payload_obj)
+    _WRITE_BEHIND_SIZE[id(payload_obj)] = size
+    _WRITE_BEHIND_BYTES += size
+    (_WRITE_BEHIND.appendleft if front else _WRITE_BEHIND.append)(payload_obj)
+
+
+def _write_behind_take(*, front: bool) -> dict[str, Any]:
+    """Pop from either end and settle its byte charge. An entry a test
+    appended straight onto the deque has no recorded size and settles 0."""
+    global _WRITE_BEHIND_BYTES
+    payload = _WRITE_BEHIND.popleft() if front else _WRITE_BEHIND.pop()
+    _WRITE_BEHIND_BYTES -= _WRITE_BEHIND_SIZE.pop(id(payload), 0)
+    return payload
+
+
+def _enqueue_write_behind(payload_obj: dict[str, Any], mac: str) -> None:
+    global _WRITE_BEHIND_DROP_LOG_TS
+    dropped = 0
+    incoming = _write_behind_size(payload_obj)
+    while _WRITE_BEHIND and (
+            len(_WRITE_BEHIND) >= _WRITE_BEHIND_MAX
+            or _WRITE_BEHIND_BYTES + incoming > _WRITE_BEHIND_MAX_BYTES):
+        evicted = _write_behind_take(front=True)
+        # Its replay-failure count goes with it: the id is only a name
+        # while the object is in the deque, and a later object at the same
+        # address would inherit the count (CodeRabbit, PR #35).
+        _WRITE_BEHIND_FAILURES.pop(id(evicted), None)
+        dropped += 1
+    if dropped:
+        now = time.monotonic()
+        if now - _WRITE_BEHIND_DROP_LOG_TS >= _WRITE_BEHIND_DROP_LOG_INTERVAL_S:
+            _WRITE_BEHIND_DROP_LOG_TS = now
+            log.warning("ingest write-behind queue full (%d entries / %d "
+                        "bytes): dropped the oldest %d reading(s) — the "
+                        "chart-index rebuild is outlasting the queue "
+                        "(throttled: 1 line/min)",
+                        _WRITE_BEHIND_MAX, _WRITE_BEHIND_MAX_BYTES, dropped)
+    _write_behind_park(payload_obj, front=False)
+    log.debug("ingest queued behind the chart-index rebuild: %s (depth %d, "
+              "%d bytes)", mac, len(_WRITE_BEHIND), _WRITE_BEHIND_BYTES)
+
+
+# A parked reading was answered 200 (`queued: true`): the sender was told
+# not to retry, so the queue is the only copy. A replay that fails for a
+# reason other than the lock (R18 finding 4: a transient filesystem or
+# SQLite error, an exception in a post-insert side effect) used to drop it
+# on the spot. It is re-parked at the FRONT and the drain pauses for the
+# caller's next attempt, up to this many failures per reading; only then
+# is it dropped, with the reason. A deterministic validation failure
+# (HTTPException) is still dropped at once, as its live POST would have
+# been 4xx'd.
+_WRITE_BEHIND_MAX_REPLAY_FAILURES = 3
+_WRITE_BEHIND_FAILURES: dict[int, int] = {}
+
+
+async def drain_write_behind(batch: int = 200) -> int:
+    """Re-run _do_ingest on every parked payload, oldest first, yielding to
+    the loop between batches. Stops early (payloads stay parked, in order)
+    if another build starts, the database is still locked, or a replay
+    failed unexpectedly — the caller re-drains after the next attempt. A
+    payload that fails validation is logged and dropped, as its live POST
+    would have been 4xx'd."""
+    global _WRITE_BEHIND_BYTES
+    flushed = 0
+    since_yield = 0
+    while _WRITE_BEHIND:
+        if db.chart_index_rebuild_in_progress():
+            break
+        payload = _write_behind_take(front=True)
+        try:
+            res = await _do_ingest(payload)
+        except HTTPException as e:
+            log.warning("queued ingest dropped on drain (%s): %s",
+                        e.status_code, e.detail)
+            _WRITE_BEHIND_FAILURES.pop(id(payload), None)
+            continue
+        except Exception as e:
+            if db.is_lock_error(e):
+                _write_behind_park(payload, front=True)
+                log.warning("write-behind drain paused: database still "
+                            "locked (%d parked)", len(_WRITE_BEHIND))
+                break
+            failures = _WRITE_BEHIND_FAILURES.get(id(payload), 0) + 1
+            if failures >= _WRITE_BEHIND_MAX_REPLAY_FAILURES:
+                _WRITE_BEHIND_FAILURES.pop(id(payload), None)
+                log.exception("queued ingest failed on drain %d times; "
+                              "reading dropped", failures)
+                continue
+            _WRITE_BEHIND_FAILURES[id(payload)] = failures
+            _write_behind_park(payload, front=True)
+            log.exception("queued ingest failed on drain (attempt %d of %d); "
+                          "reading kept, drain paused (%d parked)", failures,
+                          _WRITE_BEHIND_MAX_REPLAY_FAILURES, len(_WRITE_BEHIND))
+            break
+        _WRITE_BEHIND_FAILURES.pop(id(payload), None)
+        if res.get("queued"):
+            # The flag flipped on between our check and _do_ingest's:
+            # it re-parked itself at the BACK (and nothing awaited since,
+            # so it is still the tail). Take that exact entry back and put
+            # it at the FRONT so arrival order survives, then let the
+            # caller retry later. Not deque.remove(): that matches by
+            # EQUALITY and would pull an earlier identical payload — a
+            # device retrying the same body — out of order instead.
+            for i in range(len(_WRITE_BEHIND) - 1, -1, -1):
+                if _WRITE_BEHIND[i] is payload:
+                    del _WRITE_BEHIND[i]
+                    _WRITE_BEHIND_BYTES -= _WRITE_BEHIND_SIZE.pop(id(payload), 0)
+                    break
+            _write_behind_park(payload, front=True)
+            break
+        flushed += 1
+        since_yield += 1
+        if since_yield >= batch:
+            since_yield = 0
+            await asyncio.sleep(0)
+    if flushed:
+        log.info("ingest write-behind drained %d reading(s); %d parked",
+                 flushed, len(_WRITE_BEHIND))
+    return flushed
+
+
 async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     if not isinstance(payload_obj, dict):
         raise HTTPException(status_code=400, detail="payload must be a JSON object")
@@ -981,6 +1165,14 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
     if not flat:
         raise HTTPException(status_code=400, detail="missing or invalid timestamp_utc")
     raw_dateutc = flat.pop("_raw_dateutc", flat.get("dateutc"))
+    if db.chart_index_rebuild_in_progress():
+        # Validated shape, but the database is behind a minutes-long
+        # CREATE INDEX: park the payload and answer 200 (see the
+        # write-behind note above). Nothing below this line runs now —
+        # it all re-runs on drain, in arrival order.
+        _enqueue_write_behind(payload_obj, mac)
+        return {"ok": True, "mac": mac, "inserted": 0,
+                "ts_ms": flat["dateutc"], "throttled": False, "queued": True}
 
     # Elevation-based sea-level correction BEFORE the plausibility bands
     # (CodeRabbit, round 2): a configured absolute-pressure station above
@@ -1018,6 +1210,40 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
                     d.startswith(("tempf=", "humidity=", "windspeedmph="))
                     for d in dropped):
                 flat["feelsLike"] = None
+
+    # Indoor dew point (2.0, field idea): derived exactly the way the
+    # outdoor one is, for consoles that report indoor temp+humidity but no
+    # indoor dew of their own — "72° / 56%" needs a translation before it
+    # says anything about comfort or about whether opening up adds
+    # moisture. AFTER the plausibility bands, so it only derives from
+    # inputs that survived them (the feels-like rule, applied to the
+    # sibling derivation). A console that sends its own dewPointin keeps
+    # it untouched.
+    if (flat.get("dewPointin") is None
+            and flat.get("tempinf") is not None
+            and flat.get("humidityin") is not None):
+        from . import derived as _derived
+        _din = _derived.dew_point_f(flat["tempinf"], flat["humidityin"])
+        # Derived AFTER the bands, so band the result here: in-band inputs
+        # (tempinf is allowed to 150) can still produce a dew point far
+        # above anything a room has ever had (R17 #6).
+        _lo, _hi = _PLAUSIBLE_BANDS["dewPointin"]
+        if _din is not None and _lo <= _din <= _hi:
+            flat["dewPointin"] = round(_din, 1)
+
+    # Outdoor dew point, same rule (2026-09-02, first real Ecowitt device):
+    # a GW3000 + WS90 posts tempf and humidity but no dew point, and the
+    # Dashboard's Dew Point tile, the muggy/comfort words and the
+    # indoor-vs-outdoor notable all sat empty. AWN and Tempest send their
+    # own; a console's value is never overwritten.
+    if (flat.get("dewPoint") is None
+            and flat.get("tempf") is not None
+            and flat.get("humidity") is not None):
+        from . import derived as _derived
+        _dout = _derived.dew_point_f(flat["tempf"], flat["humidity"])
+        _lo, _hi = _PLAUSIBLE_BANDS["dewPoint"]
+        if _dout is not None and _lo <= _dout <= _hi:
+            flat["dewPoint"] = round(_dout, 1)
 
     # Reject SDR rain-decode glitches: a sudden spike in cumulative yearly
     # rain that's physically impossible for the elapsed time. Real rain ramps
@@ -1442,8 +1668,10 @@ async def ingest_custom_header(
     # No credential for a device probation hasn't admitted (CodeRabbit,
     # PR #27): _do_ingest 200s quarantined posts (so boards don't count
     # them toward the 401-wipe heuristic), but a quarantined MAC must not
-    # walk away with a persisted token.
-    if mac and not result.get("quarantined"):
+    # walk away with a persisted token. A QUEUED post (chart-index build
+    # in progress) skips the upgrade too: minting is a write, and the
+    # board re-asks on its next post anyway.
+    if mac and not result.get("quarantined") and not result.get("queued"):
         assigned = await _token_upgrade_step(
             kind, presented, mac, wants_upgrade=bool(x_token_upgrade))
         if assigned:

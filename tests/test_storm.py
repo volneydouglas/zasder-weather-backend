@@ -502,3 +502,330 @@ def test_stat_line_fits_a_lock_screen_banner():
     stat_line = body.split("\n")[2]
     assert stat_line == "Hi -10°F | Lo -40°F | Gust: 199 mph"
     assert len(stat_line) <= 40
+
+
+# ── storm-close capture (2.0) ───────────────────────────────────────────
+#
+# The one set of numbers in this repo that cannot be recomputed later:
+# history thinning ages the minute-by-minute rows either side of a storm
+# down to one per bucket, so the before/after pair is measured at close or
+# never measured at all. These tests pin the windows, the NULL semantics,
+# and the migration that reaches an existing database.
+
+# The 1.9 shape of storm_history, verbatim — the table every upgrading
+# server already has. Recreated here so the migration is exercised against
+# the real predecessor rather than against a table that already has the
+# columns.
+_LEGACY_STORM_DDL = """
+CREATE TABLE storm_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac             TEXT NOT NULL,
+    started_ms      INTEGER NOT NULL,
+    ended_ms        INTEGER NOT NULL,
+    total_in        REAL NOT NULL,
+    peak_rate_in_hr REAL,
+    max_gust_mph    REAL,
+    min_tempf       REAL,
+    max_tempf       REAL
+)
+"""
+
+CAPTURE_COLS = ("pre_tempf", "post_tempf", "temp_drop_f",
+                "pressure_change_inhg", "dew_change_f")
+
+
+def _columns(db, table: str) -> list[str]:
+    async def run():
+        async with db.connect() as conn:
+            cur = await conn.execute(f"PRAGMA table_info({table})")
+            return [r[1] for r in await cur.fetchall()]
+    return asyncio.run(run())
+
+
+def _rewind_to_1_9(db, storms: list[dict]) -> None:
+    """Put the database back into its 1.9 shape with real storms in it."""
+    async def run():
+        async with db.connect() as conn:
+            await conn.execute("DROP TABLE storm_history")
+            await conn.execute(_LEGACY_STORM_DDL)
+            for s in storms:
+                await conn.execute(
+                    "INSERT INTO storm_history (mac, started_ms, ended_ms, "
+                    "total_in, peak_rate_in_hr, max_gust_mph, min_tempf, "
+                    "max_tempf) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (s["mac"], s["started_ms"], s["ended_ms"], s["total_in"],
+                     s.get("peak_rate_in_hr"), s.get("max_gust_mph"),
+                     s.get("min_tempf"), s.get("max_tempf")))
+            await conn.commit()
+    asyncio.run(run())
+
+
+def _storm_rows(db, mac: str) -> list[dict]:
+    return asyncio.run(db.list_storms(mac, limit=50))
+
+
+def _heat_then_storm(db, mac: str, t0: int) -> None:
+    """An hour of desert afternoon, a storm, and the hour that followed.
+
+    108°F before, a cold outflow, 84°F after — the motivating example,
+    laid down as real observations so the capture reads them the way it
+    will read a live storm.
+    """
+    rows = []
+    # The hour before: hot, dry, low pressure, low dew point. The PEAK is
+    # 40 minutes before the rain; the reading at the storm's start is
+    # already falling, which is exactly why the window is an hour wide.
+    for mins, t in ((60, 104.0), (40, 108.0), (20, 106.0), (0, 99.0)):
+        rows.append(_obs(t0 - mins * 60_000, 10.00, tempf=t,
+                         dewPoint=40.0, baromrelin=29.80))
+    # The storm itself: six minutes of rain.
+    for i in range(1, 7):
+        rows.append(_obs(t0 + i * 60_000, 10.00 + 0.15 * i, tempf=92.0 - 3 * i,
+                         dewPoint=60.0, baromrelin=29.88,
+                         windgustmph=36.0, hourlyrainin=0.9))
+    # The hour after the last rain: the low arrives behind the rain, and
+    # the barometer has jumped.
+    for mins, t in ((5, 86.0), (20, 84.0), (40, 85.0)):
+        rows.append(_obs(t0 + (6 + mins) * 60_000, 10.90, tempf=t,
+                         dewPoint=64.0, baromrelin=29.92))
+    asyncio.run(db.insert_observations(mac, rows))
+
+
+def _tick_through(alerts, mac: str, t0: int) -> None:
+    """Drive the monitor across the storm above and out the far side.
+
+    The DRY tick at t0 matters: the tracker back-dates a storm's start to
+    the previous reading it saw, so a monitor that only wakes up once the
+    rain is already falling would place the start a minute late and pull a
+    wet reading into the "before" window.
+    """
+    _run_tick(alerts, mac, _obs(t0, 10.00, tempf=99.0), t0)
+    for i in range(1, 7):
+        _run_tick(alerts, mac,
+                  _obs(t0 + i * 60_000, 10.00 + 0.15 * i,
+                       tempf=92.0 - 3 * i, windgustmph=36.0),
+                  t0 + i * 60_000)
+    _run_tick(alerts, mac, _obs(t0 + 6 * 60_000, 10.90, tempf=85.0),
+              t0 + 46 * 60_000 + 1)
+
+
+def test_the_capture_columns_migrate_onto_an_existing_database(wired):
+    """A server upgrading from 1.9 already HAS storm_history with rows in
+    it. CREATE IF NOT EXISTS never reaches an existing table, so the ALTER
+    list is the only path — the same rule the alert_prefs columns pay for.
+    """
+    _alerts, db, _sent = wired
+    mac = "AA:BB:CC:DD:EE:20"
+    _rewind_to_1_9(db, [{"mac": mac, "started_ms": START,
+                         "ended_ms": START + HOUR, "total_in": 0.42,
+                         "max_gust_mph": 31.0, "min_tempf": 70.0,
+                         "max_tempf": 88.0}])
+    assert not set(CAPTURE_COLS) & set(_columns(db, "storm_history")), \
+        "precondition: the fixture must be back in its 1.9 shape"
+
+    asyncio.run(db.init_db())
+    assert set(CAPTURE_COLS) <= set(_columns(db, "storm_history"))
+
+    # The storm that predates the capture keeps every number it had...
+    row = _storm_rows(db, mac)[0]
+    assert (row["total_in"], row["max_gust_mph"]) == (0.42, 31.0)
+    # ...and NULLs, forever, on everything nobody measured for it.
+    assert all(row[c] is None for c in CAPTURE_COLS)
+
+
+def test_the_migration_is_idempotent(wired):
+    """init_db runs on every boot. The second one must be a no-op, not a
+    duplicate-column error that crash-loops the server."""
+    _alerts, db, _sent = wired
+    mac = "AA:BB:CC:DD:EE:21"
+    _rewind_to_1_9(db, [{"mac": mac, "started_ms": START,
+                         "ended_ms": START + HOUR, "total_in": 1.10}])
+    for _ in range(3):
+        asyncio.run(db.init_db())
+    cols = _columns(db, "storm_history")
+    assert len(cols) == len(set(cols)), "a column must not be added twice"
+    assert set(CAPTURE_COLS) <= set(cols)
+    assert len(_storm_rows(db, mac)) == 1, "the migration must not lose rows"
+
+
+def test_the_backfill_fills_only_storms_whose_observations_survive(wired):
+    """The one-time pass re-runs the real windowed reads. A storm whose
+    hours are still on disk gets its capture; a storm whose hours have been
+    thinned away keeps NULLs. Nothing is estimated in either case."""
+    _alerts, db, _sent = wired
+    kept, gone = "AA:BB:CC:DD:EE:22", "AA:BB:CC:DD:EE:23"
+    t0 = START
+    _heat_then_storm(db, kept, t0)
+    _rewind_to_1_9(db, [
+        {"mac": kept, "started_ms": t0, "ended_ms": t0 + 6 * 60_000,
+         "total_in": 0.90},
+        # Same shape, no observations anywhere near it — the thinned case.
+        {"mac": gone, "started_ms": t0 - 400 * HOUR,
+         "ended_ms": t0 - 399 * HOUR, "total_in": 0.90},
+    ])
+    asyncio.run(db.init_db())
+
+    filled = _storm_rows(db, kept)[0]
+    assert filled["pre_tempf"] == 108.0
+    assert filled["post_tempf"] == 84.0
+    assert filled["temp_drop_f"] == 24.0
+
+    empty = _storm_rows(db, gone)[0]
+    assert all(empty[c] is None for c in CAPTURE_COLS), \
+        "a storm whose raw hours are gone must never be estimated"
+
+
+def test_the_capture_is_taken_when_the_storm_closes(wired):
+    """End to end through the real monitor: the summary fires and the
+    before/after pair lands on the storm row in the same write."""
+    alerts, db, sent = wired
+    mac = "AA:BB:CC:DD:EE:24"
+    t0 = START
+    _heat_then_storm(db, mac, t0)
+    _tick_through(alerts, mac, t0)
+    assert len(sent) == 1, "the summary itself must be unchanged"
+
+    row = _storm_rows(db, mac)[0]
+    assert row["pre_tempf"] == 108.0, "the hour's PEAK, not the reading at t0"
+    assert row["post_tempf"] == 84.0
+    assert row["temp_drop_f"] == 24.0
+    assert row["pressure_change_inhg"] == pytest.approx(0.12, abs=1e-6)
+    assert row["dew_change_f"] == pytest.approx(24.0, abs=1e-6)
+
+
+def test_the_summary_notification_is_untouched_by_the_capture(wired):
+    """Three rounds of wording went into that third line. Capturing five
+    new numbers must not move one character of it."""
+    alerts, db, sent = wired
+    mac = "AA:BB:CC:DD:EE:25"
+    t0 = START
+    _heat_then_storm(db, mac, t0)
+    _tick_through(alerts, mac, t0)
+    _title, body = sent[0]
+    # The summary's Hi/Lo are the extremes INSIDE the rain window, which is
+    # a different question from the before/after pair — and it keeps the
+    # answer it has always given.
+    assert body.split("\n")[2] == "Hi 99°F | Lo 74°F | Gust: 36 mph"
+
+
+def test_the_before_window_stops_at_one_hour(wired):
+    """The window is an hour and the hour is permanent. A reading ninety
+    minutes before the rain is the afternoon, not the storm's "before"."""
+    _alerts, db, _sent = wired
+    mac = "AA:BB:CC:DD:EE:26"
+    t0 = START
+    _heat_then_storm(db, mac, t0)
+    # A hotter reading, safely outside the window.
+    asyncio.run(db.insert_observations(mac, [
+        _obs(t0 - 90 * 60_000, 10.00, tempf=118.0, dew_point=38.0,
+             baromrelin=29.78)]))
+    cap = asyncio.run(db.storm_close_capture(
+        mac, t0, t0 + 6 * 60_000, t0 + 66 * 60_000))
+    assert cap["pre_tempf"] == 108.0
+
+
+def test_the_last_wet_reading_is_not_the_storms_own_after(wired):
+    """`ended_ms` is the storm's final RAINING reading. Folding it into the
+    after-window would let the episode supply its own post-storm low."""
+    _alerts, db, _sent = wired
+    mac = "AA:BB:CC:DD:EE:27"
+    t0 = START
+    asyncio.run(db.insert_observations(mac, [
+        _obs(t0, 10.0, tempf=100.0),
+        _obs(t0 + 60_000, 10.5, tempf=55.0),      # the last WET reading
+        _obs(t0 + 10 * 60_000, 10.5, tempf=80.0),
+    ]))
+    cap = asyncio.run(db.storm_close_capture(
+        mac, t0, t0 + 60_000, t0 + 40 * 60_000))
+    assert cap["post_tempf"] == 80.0, "55°F was during the storm, not after"
+    assert cap["temp_drop_f"] == 20.0
+
+
+def test_a_station_with_no_barometer_captures_no_pressure_change(wired):
+    """Absent is not zero: a change nobody could measure is NULL, and a
+    NULL is what makes the story decline instead of drawing a flat line."""
+    _alerts, db, _sent = wired
+    mac = "AA:BB:CC:DD:EE:28"
+    t0 = START
+    asyncio.run(db.insert_observations(mac, [
+        _obs(t0 - 10 * 60_000, 10.0, tempf=101.0),
+        _obs(t0 + 20 * 60_000, 10.6, tempf=79.0),
+    ]))
+    cap = asyncio.run(db.storm_close_capture(
+        mac, t0, t0 + 60_000, t0 + 40 * 60_000))
+    assert cap["temp_drop_f"] == 22.0
+    assert cap["pressure_change_inhg"] is None
+    assert cap["dew_change_f"] is None
+
+
+def test_a_storm_with_no_surviving_observations_captures_nothing(wired):
+    _alerts, db, _sent = wired
+    cap = asyncio.run(db.storm_close_capture(
+        "AA:BB:CC:DD:EE:29", START, START + HOUR, START + 2 * HOUR))
+    assert all(v is None for v in cap.values())
+
+
+def test_the_capture_serves_through_the_storms_endpoint(client):
+    """The card reads these off /storms, so the columns have to make the
+    trip — and a NULL has to arrive as null, not as a coerced 0."""
+    import asyncio as _a
+
+    from app import db
+
+    mac = "AA:BB:CC:DD:EE:2A"
+    _a.run(db.record_storm(mac, {
+        "started_ms": START, "ended_ms": START + HOUR, "total_in": 0.90,
+        "peak_rate_in_hr": 1.8, "max_gust_mph": 36.0,
+        "min_tempf": 74.0, "max_tempf": 108.0,
+        "pre_tempf": 108.0, "post_tempf": 84.0, "temp_drop_f": 24.0,
+        "pressure_change_inhg": 0.12, "dew_change_f": None}))
+    r = client.get(f"/api/devices/{mac}/storms",
+                   headers={"Authorization": "Bearer test-api-token"})
+    assert r.status_code == 200
+    row = r.json()["storms"][0]
+    assert (row["pre_tempf"], row["post_tempf"]) == (108.0, 84.0)
+    assert row["temp_drop_f"] == 24.0
+    assert row["dew_change_f"] is None
+
+
+def test_a_failed_capture_still_records_the_storm(wired, monkeypatch):
+    """The capture is enrichment; the row is the record. The storm state
+    is cleared before either runs, so a capture that raises had been
+    taking the whole storm_history row down with it — permanently, since
+    nothing retries a closed storm (CodeRabbit, PR #35)."""
+    alerts, db, sent = wired
+    mac = "AA:BB:CC:DD:EE:2B"
+    t0 = START
+
+    async def boom(*_a, **_kw):
+        raise RuntimeError("capture exploded")
+    monkeypatch.setattr(db, "storm_close_capture", boom)
+
+    _heat_then_storm(db, mac, t0)
+    _tick_through(alerts, mac, t0)
+    assert len(sent) == 1, "the summary itself must still go out"
+    rows = _storm_rows(db, mac)
+    assert len(rows) == 1, "the storm row must survive the capture failure"
+    row = rows[0]
+    assert row["total_in"] == pytest.approx(0.90)
+    assert row["max_gust_mph"] == 36.0
+    # Absent is not zero: the pair nobody measured is NULL, not 0.
+    assert row["pre_tempf"] is None and row["temp_drop_f"] is None
+
+
+def test_record_storm_placeholders_follow_the_capture_columns(wired, monkeypatch):
+    """The INSERT's column list is generated from _STORM_CAPTURE_COLS; its
+    VALUES list must be too, or the next capture column added raises an
+    OperationalError at the moment every summary is delivered. Pinned by
+    shrinking the tuple: a hard-coded 13 placeholders against 12 columns
+    fails the insert."""
+    _alerts, db, _sent = wired
+    mac = "AA:BB:CC:DD:EE:2C"
+    monkeypatch.setattr(db, "_STORM_CAPTURE_COLS", db._STORM_CAPTURE_COLS[:-1])
+    asyncio.run(db.record_storm(mac, {
+        "started_ms": START, "ended_ms": START + HOUR, "total_in": 0.40,
+        "max_gust_mph": 20.0, "min_tempf": 70.0, "max_tempf": 90.0,
+        "pre_tempf": 90.0, "post_tempf": 75.0, "temp_drop_f": 15.0}))
+    row = _storm_rows(db, mac)[0]
+    assert row["total_in"] == pytest.approx(0.40)
+    assert row["pre_tempf"] == 90.0 and row["temp_drop_f"] == 15.0

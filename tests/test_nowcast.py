@@ -86,6 +86,17 @@ def _isolated_state(monkeypatch):
 
     monkeypatch.setattr(nowcast.db, "get_kv", fake_get)
     monkeypatch.setattr(nowcast.db, "set_kv", fake_set)
+    # No storm episode unless a test opens one (2.0.1 end-on-storm path);
+    # the real reader would hit whichever DB the last client fixture left.
+    STORM.clear()
+
+    async def fake_storm(mac):
+        return STORM.get(mac)
+
+    monkeypatch.setattr(nowcast.db, "get_storm_state", fake_storm)
+
+
+STORM: dict = {}   # mac -> storm_state row, set by tests
 
 
 def test_check_alerts_once_then_cooldown(monkeypatch):
@@ -201,5 +212,158 @@ def test_check_starts_live_activity_alongside_the_push(monkeypatch):
         await nowcast.check(_Cfg(), [_device()], later, fake_deliver)
         state = await nowcast._get_state()
         assert state.get("alerted_at_ms") == later
+
+    asyncio.run(run())
+
+
+async def _seed_card(start_ms: int, alerted_at_ms: int) -> None:
+    """A rain-start alert went out and its card is live on some phone."""
+    import json
+    await nowcast.db.set_kv(nowcast._KV_STATE, json.dumps(
+        {"alerted_at_ms": alerted_at_ms, "start_ms": start_ms,
+         "total_in": 0.1}))
+
+
+def _capture_end(monkeypatch):
+    import app.apns as apns
+    calls = []
+
+    async def fake_update(activity, payload, title, body):
+        calls.append((activity, payload))
+        return {"sent": 1, "dead": [], "failed": 0}
+
+    monkeypatch.setattr(apns, "send_live_activity_update", fake_update)
+    return calls
+
+
+def test_card_ends_an_hour_after_the_predicted_onset(monkeypatch):
+    """2.0.1: ActivityKit ignores dismissal-date on a start event, so the
+    server sends the end itself once the onset is an hour old. Before that
+    the card stays; after the end it is stamped and never re-ended; and
+    the end runs even on a tick the poll throttle would otherwise skip."""
+    import asyncio
+
+    async def run():
+        now = int(time.time() * 1000)
+        start = now - 30 * 60_000
+        await _seed_card(start, now - 60 * 60_000)
+        calls = _capture_end(monkeypatch)
+
+        async def no_series(lat, lon):
+            return []
+        monkeypatch.setattr(nowcast, "fetch_minutely", no_series)
+
+        await nowcast.check(_Cfg(), [_device()], now, None)
+        assert calls == [], "half an hour past onset the countdown still stands"
+
+        # Throttled tick, an hour past onset: the end must not wait for
+        # the next poll.
+        later = now + 31 * 60_000
+        nowcast._next_poll_ms = later + 5 * 60_000
+        await nowcast.check(_Cfg(), [_device()], later, None)
+        assert len(calls) == 1
+        activity, payload = calls[0]
+        assert activity == "rain"
+        aps = payload["aps"]
+        assert aps["event"] == "end"
+        assert aps["dismissal-date"] == later // 1000
+        assert aps["content-state"] == {"startMs": start, "totalIn": 0.1}
+        assert "alert" not in aps, "a countdown that ran out is not news"
+
+        state = await nowcast._get_state()
+        assert state["ended_ms"] == later
+        assert state["start_ms"] == start, "cooldown bookkeeping survives"
+
+        nowcast._reset_for_tests()
+        await nowcast.check(_Cfg(), [_device()], later + 60_000, None)
+        assert len(calls) == 1, "ended once, never again"
+
+    asyncio.run(run())
+
+
+def test_card_ends_early_when_a_storm_episode_opens(monkeypatch):
+    """The rain arrived (or the user pressed the storm-watch button): the
+    Storm Watch card takes over, so the countdown ends at once. Air
+    monitors never hold storm state and are skipped."""
+    import asyncio
+
+    async def run():
+        now = int(time.time() * 1000)
+        await _seed_card(now + 20 * 60_000, now - 5 * 60_000)
+        calls = _capture_end(monkeypatch)
+
+        async def no_series(lat, lon):
+            return []
+        monkeypatch.setattr(nowcast, "fetch_minutely", no_series)
+
+        await nowcast.check(_Cfg(), [_device()], now, None)
+        assert calls == [], "no storm yet, the countdown stands"
+
+        STORM["AA"] = {"mac": "AA", "started_ms": now, "last_rain_ms": now}
+        nowcast._reset_for_tests()
+        await nowcast.check(_Cfg(), [_device()], now + 60_000, None)
+        assert len(calls) == 1 and calls[0][1]["aps"]["event"] == "end"
+
+    asyncio.run(run())
+
+
+def test_card_end_failure_stamps_once_and_never_raises(monkeypatch):
+    """Best-effort: a dead push channel must not retry every tick for the
+    rest of the day, and must not take the monitor tick down with it."""
+    import asyncio
+    import app.apns as apns
+
+    async def run():
+        now = int(time.time() * 1000)
+        await _seed_card(now - 2 * 3600_000, now - 3 * 3600_000)
+        attempts = []
+
+        async def boom(activity, payload, title, body):
+            attempts.append(activity)
+            raise RuntimeError("apns down")
+        monkeypatch.setattr(apns, "send_live_activity_update", boom)
+
+        async def no_series(lat, lon):
+            return []
+        monkeypatch.setattr(nowcast, "fetch_minutely", no_series)
+
+        await nowcast.check(_Cfg(), [_device()], now, None)
+        nowcast._reset_for_tests()
+        await nowcast.check(_Cfg(), [_device()], now + 60_000, None)
+        assert attempts == ["rain"], "one attempt, then stamped"
+        assert (await nowcast._get_state())["ended_ms"] == now
+
+    asyncio.run(run())
+
+
+def test_a_fresh_alert_stamps_total_and_clears_the_ended_mark(monkeypatch):
+    """A new event overwrites the state wholesale: the next card gets its
+    own end, and the end payload carries the forecast total."""
+    import asyncio
+    import json
+    import app.apns as apns
+
+    async def run():
+        now = int(time.time() * 1000)
+        await nowcast.db.set_kv(nowcast._KV_STATE, json.dumps(
+            {"alerted_at_ms": now - 5 * 3600_000,
+             "start_ms": now - 4 * 3600_000, "ended_ms": now - 3 * 3600_000}))
+        start = now + 30 * 60_000
+
+        async def fake_fetch(lat, lon):
+            return [(start, 2.54)]
+
+        async def fake_deliver(cfg, subject, body, ptitle, pbody,
+                               email_ok=True, **kw):
+            return True
+
+        async def fake_la(payload, title, body):
+            return {"sent": 1, "dead": [], "failed": 0}
+        monkeypatch.setattr(nowcast, "fetch_minutely", fake_fetch)
+        monkeypatch.setattr(apns, "send_live_activity_start", fake_la)
+        await nowcast.check(_Cfg(), [_device()], now, fake_deliver)
+        state = await nowcast._get_state()
+        assert state == {"alerted_at_ms": now, "start_ms": start,
+                         "total_in": 0.1}
 
     asyncio.run(run())

@@ -8,6 +8,19 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.0.1] — 2026-09-04
+
+### Fixed
+- **The rain-start countdown card now ends.** The Live Activity that
+  counts down to a forecast rain onset was started with a single push and
+  left to expire on its own dismissal date, which ActivityKit only honours
+  on end events. A card for rain that never came stayed on the Lock
+  Screen until iOS's eight-hour cap. The server now ends it explicitly an
+  hour after the predicted onset, or as soon as a storm episode opens on
+  any station and the Storm Watch card takes over. Silent either way, one
+  attempt, and a transport failure does not retry every tick. Server-side
+  only: no app update needed.
+
 ## [2.0.0] — 2026-09-03
 
 ### Added

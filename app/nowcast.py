@@ -45,7 +45,15 @@ RAIN_MM_MIN = 0.15              # a 15-min bucket under this is drizzle-noise
 COOLDOWN_S = 3 * 3600           # one alert per event, re-arm after 3h
 DRY_GATE_IN = 0.02              # trailing-hour accumulation that counts as wet
 
-_KV_STATE = "nowcast.state"     # {"alerted_at_ms": int, "start_ms": int}
+_KV_STATE = "nowcast.state"     # {"alerted_at_ms", "start_ms", "total_in",
+                                #  "ended_ms" once the card was ended}
+# The countdown card lives this long past the predicted onset, then the
+# server ENDS it explicitly (2.0.1). The start push also carries a
+# dismissal-date, but ActivityKit honours that field only on `end`
+# events: a start-only card outlived its hour by up to iOS's 8-hour cap
+# (2026-09-03: a 7:35 PM "rain around 8:30" card was still on the Lock
+# Screen at 1:30 AM).
+ACTIVITY_LIFETIME_MS = 60 * 60_000
 
 # Module-scope throttle; per-process on purpose (a restart just polls once
 # more, which is harmless — the kv state is what prevents duplicate alerts).
@@ -124,6 +132,55 @@ def build_message(name: str, start_ms: int, total_mm_2h: float,
     return title, body
 
 
+async def _storm_open(devices: list[dict[str, Any]]) -> bool:
+    """True when any weather station on this server has a storm episode
+    open: the rain the card promised has arrived (or the user pressed the
+    storm-watch button), and the Storm Watch card takes over."""
+    for d in devices:
+        if db.is_air_monitor_device(d):
+            continue
+        mac = d.get("mac")
+        if not mac:
+            continue
+        st = await db.get_storm_state(mac)
+        if st and st.get("started_ms") is not None:
+            return True
+    return False
+
+
+async def end_activity_if_due(devices: list[dict[str, Any]],
+                              now_ms: int) -> bool:
+    """End the rain-start Live Activity once it is due: the predicted onset
+    is ACTIVITY_LIFETIME_MS old, or a storm episode opened. Silent (the
+    rain either came, which the storm watch announces, or it did not, which
+    is not news). One attempt, then stamped, like every other Live Activity
+    push: a transport failure must not retry every tick, and iOS ends the
+    card itself at eight hours regardless. Runs BEFORE the poll throttle so
+    a throttled tick still ends a due card. Returns True when it ended one."""
+    state = await _get_state()
+    start_ms = int(state.get("start_ms") or 0)
+    if not start_ms or state.get("ended_ms"):
+        return False
+    if now_ms < start_ms + ACTIVITY_LIFETIME_MS and not await _storm_open(devices):
+        return False
+    try:
+        from . import apns
+        payload = apns.build_live_activity_update(
+            {"startMs": start_ms,
+             "totalIn": float(state.get("total_in") or 0.0)},
+            now_s=now_ms // 1000, event="end", dismiss_s=now_ms // 1000)
+        res = await apns.send_live_activity_update(
+            "rain", payload, "Rain watch ended", "the countdown is over")
+        if res.get("sent"):
+            log.info("rain-start live activity ended on %d device(s)",
+                     res["sent"])
+    except Exception as e:  # noqa: BLE001 — best-effort by contract
+        log.warning("rain-start live activity end failed: %s", e)
+    state["ended_ms"] = now_ms
+    await db.set_kv(_KV_STATE, json.dumps(state))
+    return True
+
+
 async def _get_state() -> dict[str, Any]:
     raw = await db.get_kv(_KV_STATE)
     if not raw:
@@ -141,6 +198,9 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
     global _next_poll_ms
     if not getattr(cfg, "rain_start", False):
         return
+    # A live countdown card ends on its own schedule, whatever this
+    # tick decides about polling.
+    await end_activity_if_due(devices, now_ms)
     if now_ms < _next_poll_ms:
         return
     # First device with coordinates = the nowcast location (one sky per
@@ -193,14 +253,16 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
     if await deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
                      email_ok=cfg.email_scope == "all"):
         await db.set_kv(_KV_STATE, json.dumps(
-            {"alerted_at_ms": now_ms, "start_ms": start_ms}))
+            {"alerted_at_ms": now_ms, "start_ms": start_ms,
+             "total_in": round(total_mm / 25.4, 2)}))
         log.info("rain-start alert sent: %s (+%.1f min)",
                  name, (start_ms - now_ms) / 60000)
         # Phase 2 (1.7): the same event also starts a Live Activity on any
         # phone that registered a push-to-start token — a lock-screen
-        # countdown to the onset. One start push runs the whole lifecycle:
-        # the countdown is client-rendered from startMs, staleness greys it
-        # out shortly after onset, and the dismissal date clears it. Rides
+        # countdown to the onset. The countdown is client-rendered from
+        # startMs and staleness greys it out shortly after onset; the
+        # dismissal-date below is NOT honoured on a start event, so
+        # end_activity_if_due sends the real end (2.0.1). Rides
         # INSIDE the delivered-branch on purpose — the plain push is the
         # authoritative alert, and best-effort means a Live Activity
         # failure must neither retry-loop nor block the kv stamp.

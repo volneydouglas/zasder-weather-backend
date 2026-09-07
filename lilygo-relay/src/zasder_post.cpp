@@ -299,6 +299,8 @@ void zasder_post(const char *rtl433Json,
     // Solar irradiance: backend schema only takes outdoor.solar_wm2. If
     // the decoder emits W/m² directly (rare; some Ecowitt variants),
     // use it; otherwise derive from lux via the standard 126.7 lux/(W·m⁻²)
+    // (the same divisor sdr-relay/sdr_relay.py uses: the two relays share
+    // a device row, so they must share the number)
     // sunlight approximation. rtl_433 names differ by decoder:
     //   Atlas emits "lux"; Fineoffset-WH65B/WH24 emits "light_lux".
     if (in["solar_radiation"].is<float>()) {

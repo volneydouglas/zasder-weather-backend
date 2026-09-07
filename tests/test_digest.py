@@ -15,7 +15,8 @@ from app import digest as dg  # noqa: E402
 
 
 def _station(**over):
-    base = dict(name="Crestview", tmax_f=104.2, tmin_f=78.9, rain_in=0.12,
+    base = dict(name="Crestview", tmax_f=104.2, tmin_f=78.9,
+                feels_max_f=None, rain_in=0.12,
                 gust_mph=34.0, humidity_lo=12.0, humidity_hi=55.0,
                 uv_max=9.0)
     base.update(over)
@@ -170,7 +171,8 @@ def test_phone_half_sends_live_activity_and_push_once(client, monkeypatch):
         la_sends.append((activity, payload))
         return {"sent": 1, "dead": [], "failed": 0}
 
-    async def fake_push(title, body, interruption_level=None):
+    async def fake_push(title, body, interruption_level=None,
+                            route=None):
         pushes.append((title, body))
         return {"sent": 1}
 
@@ -442,7 +444,8 @@ def test_quiet_day_stamps_both_halves_and_sends_nothing(client, monkeypatch):
         al, "_send_sync",
         lambda *a, **kw: sent.append(a))
 
-    async def fake_push(title, body, interruption_level=None):
+    async def fake_push(title, body, interruption_level=None,
+                            route=None):
         pushes.append(title)
         return {"sent": 1}
     monkeypatch.setattr(apns, "send_to_all", fake_push)
@@ -483,7 +486,8 @@ def test_email_send_failure_retries_next_tick(client, monkeypatch):
     async def configured():
         return True
 
-    async def fake_push(title, body, interruption_level=None):
+    async def fake_push(title, body, interruption_level=None,
+                            route=None):
         return {"sent": 1}
     monkeypatch.setattr(apns, "send_live_activity_start", fake_la)
     monkeypatch.setattr(apns, "send_to_all", fake_push)
@@ -587,7 +591,8 @@ def test_alerts_only_day_still_pushes_without_a_card(client, monkeypatch):
         la_calls.append(activity)
         return {"sent": 1, "dead": [], "failed": 0}
 
-    async def fake_push(title, body, interruption_level=None):
+    async def fake_push(title, body, interruption_level=None,
+                            route=None):
         pushes.append((title, body))
         return {"sent": 1}
 
@@ -669,7 +674,8 @@ def test_partial_delivery_stamps_and_forfeits_the_failed_half(
         la_calls.append(activity)
         return {"sent": 1, "dead": [], "failed": 0}
 
-    async def bad_push(title, body, interruption_level=None):
+    async def bad_push(title, body, interruption_level=None,
+                       route=None):
         push_calls.append(title)
         raise OSError("apns down")
 
@@ -724,7 +730,8 @@ def test_the_report_waits_for_the_minute_not_just_the_hour(client, monkeypatch):
         la_sends.append(activity)
         return {"sent": 1, "dead": [], "failed": 0}
 
-    async def fake_push(title, body, interruption_level=None):
+    async def fake_push(title, body, interruption_level=None,
+                            route=None):
         return {"sent": 1}
 
     async def configured():
@@ -796,3 +803,45 @@ def test_digest_minute_round_trips_through_the_api(client):
     r = client.put("/api/alerts", json={"digest_minute": 60},
                    headers={"Authorization": "Bearer test-api-token"})
     assert r.status_code == 422
+
+
+# ── feels-like (2.1, Doren's 108°F day) ─────────────────────────────────
+
+def test_feels_like_rides_the_report_when_it_ran_hot():
+    """Doren, 2026-09-03: a day that hit 108 feels-like reads as a 93°F day
+    without it. It belongs in every half of the report."""
+    r = dg.Report(date_label="Thursday, September 3",
+                  stations=[_station(tmax_f=93.4, feels_max_f=108.2)])
+    assert "feeling like 108" in dg.headline(r)
+    assert "FELT LIKE" in dg.build_html(r)
+    assert "108" in dg.build_html(r)
+    assert "felt like 108F" in dg.build_text(r)
+    assert "felt 108°" in dg.push_text(r)[1]
+
+
+def test_feels_like_stays_quiet_when_it_matched_the_air():
+    """A number that just repeats the high back at you is noise. The gap
+    has to be worth a reader's attention."""
+    r = dg.Report(date_label="Friday, September 4",
+                  stations=[_station(tmax_f=93.4, feels_max_f=94.1)])
+    assert "feeling like" not in dg.headline(r)
+    assert "FELT LIKE" not in dg.build_html(r)
+    assert "felt like" not in dg.build_text(r)
+
+
+def test_feels_like_absent_sensor_is_never_zero():
+    """No feels-like on the rollup row means the report says nothing about
+    it — not 0°F, and not a crash ([[absent is not zero]])."""
+    r = dg.Report(date_label="Friday, September 4",
+                  stations=[_station(feels_max_f=None)])
+    for text in (dg.headline(r), dg.build_html(r), dg.build_text(r),
+                 dg.push_text(r)[1]):
+        assert "felt" not in text.lower() and "feeling like" not in text
+
+
+def test_feels_like_below_the_air_still_counts():
+    """Wind chill is the same story in the other direction."""
+    r = dg.Report(date_label="Monday, January 6",
+                  stations=[_station(tmax_f=34.0, tmin_f=18.0,
+                                     feels_max_f=22.0)])
+    assert "feeling like 22" in dg.headline(r)

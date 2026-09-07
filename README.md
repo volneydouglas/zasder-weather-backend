@@ -511,13 +511,17 @@ watches every device, baselines each on first sight (so it won't nag about
 ones that were already gone), alerts on the OK→stale transition, and sends
 a recovery note when data resumes.
 
-Set the SMTP transport as secrets — easiest is a Gmail **App Password**:
+Set the SMTP transport as secrets — easiest is a Gmail **App Password**.
+Piped through `fly secrets import`, the way `bin/setup-fly.sh` does it, so
+the password never lands in your shell history or the process list:
 
-```sh
-fly secrets set -a <app> \
+```bash
+read -rsp 'SMTP app password: ' SMTP_PASSWORD; echo
+printf '%s\n' \
   ALERT_EMAIL_TO=you@example.com \
   SMTP_HOST=smtp.gmail.com SMTP_PORT=587 \
-  SMTP_USERNAME=you@gmail.com SMTP_PASSWORD=your-app-password
+  SMTP_USERNAME=you@gmail.com "SMTP_PASSWORD=$SMTP_PASSWORD" \
+  | fly secrets import -a <app>
 ```
 
 Tune how long offline counts as "down" per device (SDRs tight, cloud feeds
@@ -738,6 +742,95 @@ automatically with the right units and device classes — no YAML. State is
 published to `<MQTT_TOPIC_PREFIX>/<node>/state` every ~30 seconds. Tune with
 `MQTT_PORT`, `MQTT_TOPIC_PREFIX`, and `MQTT_DISCOVERY_PREFIX`.
 
+## Ask Claude or ChatGPT about your weather (MCP, optional)
+
+The backend is also a read-only [MCP](https://modelcontextprotocol.io)
+server, so an assistant you already pay for can answer questions about
+your own record: "how did this August compare with the last three",
+"when did the wind peak in Thursday's storm", "write me a month
+summary". Nothing is stored for this: no provider key, no account. Your
+assistant does the thinking; this server only answers questions about
+the database it already holds, and it can only read.
+
+Endpoint: `POST https://<your-app>.fly.dev/mcp`, Streamable HTTP
+transport, JSON-RPC over plain JSON responses, no sessions to manage.
+Two ways in: the same `Authorization: Bearer <API_TOKEN>` as every
+`/api/*` route (a read-only guest token works too, and reads exactly
+what it reads elsewhere), or OAuth, which the server provides itself for
+the connectors that need it.
+
+Tools: `list_stations`, `current_conditions`, `history` (up to 31 days,
+bucketed past six hours), `daily_summary` (per-day extremes, up to a
+year), `records`, `insights`, `stories`, `reports` + `report` (the stored
+morning reports and storm summaries), `storm_history`, `noaa_report`.
+Every value is in the storage units (°F, mph, inHg, inches, W/m², UV
+index) and a sensor a station lacks comes back `null`.
+
+Connecting depends on the client:
+
+- **claude.ai custom connectors**: Settings → Connectors → Add custom
+  connector, paste `https://<your-app>.fly.dev/mcp`, leave the client ID
+  and secret blank. Claude discovers the server's own OAuth endpoints,
+  registers itself, and opens a consent page on your server. The page
+  names the app and the address it will be sent back to, and asks for a
+  **connect code**: in Zasder Weather open Settings → Server & Backups →
+  Connected apps and mint one (it works once and expires in ten
+  minutes). Typing it approves the app and connects it. Nothing is
+  granted until you do; a registration nobody approved can neither be
+  logged into nor redirected to. What Claude keeps is an access token
+  that expires in an hour and renews itself for thirty days.
+  Once an app is approved, its consent page also accepts the server's
+  API token, or a read-only guest link token (which gives the connector
+  guest access: the same coarse coordinates and no location label a
+  guest sees in the app).
+- **ChatGPT connectors** (Developer mode / MCP connectors): the same URL,
+  no client credentials, the same consent page and connect code.
+- **Claude Code**: `claude mcp add --transport http zasder https://<your-app>.fly.dev/mcp --header "Authorization: Bearer <API_TOKEN>"`,
+  or omit the header and let it run the OAuth flow.
+- **Claude Desktop, Cursor and other clients that take a config file**:
+  the URL through the client's remote-server settings (OAuth), or the
+  bearer header via the `mcp-remote` bridge with
+  `--header "Authorization: Bearer <API_TOKEN>"`.
+
+The OAuth pieces, for the curious: RFC 9728 protected-resource metadata
+at `/.well-known/oauth-protected-resource/mcp`, RFC 8414 authorization
+server metadata at `/.well-known/oauth-authorization-server`, RFC 7591
+dynamic registration at `POST /oauth/register`, `GET /oauth/authorize`
+(the consent page), `POST /oauth/token` (PKCE S256, rotating refresh
+tokens; reuse of a rotated refresh token revokes the whole session),
+`POST /oauth/revoke`. All endpoints are rate-limited per address; codes
+and tokens are stored hashed, and an access token is bound to the
+server address it was issued for. Connected apps are listed at
+`GET /api/oauth/clients` (with whether each is approved), approved with
+`POST /api/oauth/clients/{id}/approve`, cut off with
+`DELETE /api/oauth/clients/{id}`, and connect codes are minted at
+`POST /api/oauth/connect-code` (all owner token). Rotating `API_TOKEN`
+does not revoke OAuth sessions; the delete does.
+
+Two settings: `MCP_ENABLED=0` removes the MCP server and every OAuth
+endpoint, discovery documents included (a guest instance whose operator
+wants no anonymous registration surface). `PUBLIC_BASE_URL` (for example
+`https://weather.example.com`) fixes the server's OAuth identity instead
+of deriving it from each request's `Host` header; set it on any
+deployment behind a proxy.
+
+The server checks the `Origin` header (a browser-borne request from
+another site is refused) and caps every query, so one question cannot
+read the whole archive.
+
+## Reports, storm ledger, server name and recommendations (2.1)
+
+Four settings arrived with 2.1. All are app-managed (Settings → Server &
+Backups on the iPhone and Mac); the environment value is the fallback
+and a value saved from the app wins.
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `REPORTS_MAX_ROWS` | 900 (30..5000) | Stored reports: morning, storm and climate rows the server keeps (`GET/PUT /api/reports/retention`) |
+| `STORM_HISTORY_MAX` | 200 (10..1000) | Closed storms kept per station in the storm ledger the Storm Report card reads (`GET/PUT /api/storms/retention`) |
+| `SERVER_NAME` | the public page's location | What this server calls itself in the apps; `GET /api/session` reports it with the token's role (`GET/PUT /api/config/server-name`) |
+| `SERVER_ADVICE` | 1 | The Server Recommendations card. It reads the machine and volume through `FLY_API_TOKEN` (the same app-scoped deploy token automatic updates use) and offers volume and memory changes that cost money, each behind a confirmation in the app. `0` turns it off; without `FLY_API_TOKEN` it reports unavailable |
+
 ## Upgrading
 
 The backend checks GitHub once a day and shows an **"update available"** banner
@@ -819,7 +912,7 @@ tests/                  pytest suite (run `pytest -q`)
 lilygo-relay/           ESP32+SX1276 firmware (PlatformIO project)
 wll-poller/             Davis WeatherLink Live LAN poller (Path E)
 weewx-bridge/           WeeWX extension → /ingest/custom (Path H)
-mcp/                    Read-only MCP server — your stations, readable by an AI assistant
+mcp/                    Legacy stdio MCP bridge (1.8, six tools) — the MCP server itself is POST /mcp, see above
 bin/setup-fly.sh        Path-based Fly.io setup (sources → app, volume, secrets, summary)
 bin/setup-local.sh      Guided local Docker setup (tokens, .env, docker compose up)
 bin/doctor.sh           Health checklist (auth, /healthz, tokens, volume, pollers, data)
@@ -829,10 +922,16 @@ AGENTS.md               LLM-friendly deployment guide
 .env.example            Annotated environment template
 ```
 
-## API
+## API (selected endpoints)
 
-All `/api/*` routes require `Authorization: Bearer <API_TOKEN>`. iOS app
-calls these. Public-readable status page at `/`.
+Every `/api/*` route except `/api/version` requires
+`Authorization: Bearer <API_TOKEN>`. The apps call these. Public-readable status page at `/`. This table names the
+endpoints a self-hoster is most likely to script against; it is not the
+whole surface (the server has about 120 routes). The OAuth endpoints
+under `/oauth/*` and the two `/.well-known/*` documents (2.1) are open by
+design: they are how claude.ai and ChatGPT connectors sign in, and they
+grant nothing until a connect code minted in the app (or, for an app you
+already approved, the API token) is typed on the consent page.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -874,6 +973,19 @@ calls these. Public-readable status page at `/`.
 | POST | `/ingest/ecowitt` | Ecowitt gateway "Customized" upload (form-encoded; imperial or metric consoles both work — metric keys are converted on ingest). Set the gateway's path to `/ingest/ecowitt?token=<INGEST_TOKEN>` — Ecowitt firmware can't send headers |
 | POST | `/ingest/discovery` | Source posts a `(model, id)` RF sighting |
 | GET | `/api/discoveries?since_hours=24` | Long-tail RF device survey |
+| POST | `/mcp` | Read-only MCP server (Streamable HTTP, JSON-RPC): `list_stations`, `current_conditions`, `history`, `daily_summary`, `records`, `insights`, `stories`, `reports`, `report`, `storm_history`, `noaa_report`. Accepts the bearer API token or an OAuth access token; GET and DELETE answer 405 |
+| GET | `/api/reports?kind=&limit=` | Stored reports newest first (morning, storm, climate); `GET /api/reports/{id}` serves one; `GET /api/reports/morning/preview` builds today's without storing it (2.1) |
+| POST | `/api/reports/run` | Build and store a climate report now: `{kind, mac, year[, month]}` with `kind` = `noaa_month` or `noaa_year` (2.1) |
+| GET/PUT | `/api/reports/retention` | How many reports the server keeps (`REPORTS_MAX_ROWS` is the fallback) (2.1) |
+| GET/PUT | `/api/storms/retention` | Closed storms kept per station (`STORM_HISTORY_MAX` is the fallback) (2.1) |
+| GET/PUT | `/api/config/server-name` | What this server calls itself; also carried by `GET /api/session` with the token's role (2.1) |
+| GET | `/api/session` | What this token may do: `can_write`, `forecast_source`, `server_name`, `role` |
+| GET | `/api/server/advice` | Server Recommendations: volume and memory advice with Fly list prices; `POST /api/server/advice/apply` applies one (write token; `SERVER_ADVICE=0` disables) (2.1) |
+| POST | `/api/backup/database` | Start a full-database snapshot; `GET /api/backup/database/status`, then `GET /api/backup/database` downloads it |
+| POST | `/api/backup/database/restore` | Upload a snapshot to restore (write token + a one-shot challenge from `/api/backup/database/restore/challenge`; progress at `/api/backup/database/restore/status`) (2.1) |
+| GET/DELETE | `/api/oauth/clients[/{id}]` | The assistants connected through OAuth, and the kill switch for one; `POST /api/oauth/clients/{id}/approve` approves a pending one, `POST /api/oauth/connect-code` mints a one-use connect code for the consent page (2.1) |
+| GET | `/.well-known/oauth-protected-resource/mcp`, `/.well-known/oauth-authorization-server` | OAuth discovery for `/mcp` (open) (2.1) |
+| POST | `/oauth/register`, `/oauth/token`, `/oauth/revoke`; GET/POST `/oauth/authorize` | The OAuth 2.1 flow claude.ai and ChatGPT connectors use (open, rate-limited; the consent page asks for a connect code minted in the app, or the API token once the app is approved) (2.1) |
 
 ## Tests
 
@@ -888,6 +1000,24 @@ MIT for backend + setup scripts. `lilygo-relay/` ships under GPL-3.0
 because it links against
 [rtl_433_ESP](https://github.com/NorthernMan54/rtl_433_ESP) which is GPL.
 The GPL is contained to that subdirectory; everything else stays MIT.
+
+## Credits
+
+Zasder Weather is built by Volney Douglas at Zasder LLC. Two people
+outside the project shaped a good part of what it does:
+
+- **Doren Michael**, the first person to run this backend for his own
+  station and a frequent contributor since 1.5: months of field
+  testing on a Davis and a Tempest, the alert history and duplicate
+  chip, the current-conditions share card, the tap-a-day request that
+  became Explore, the Weather Underground row in the networks list, the
+  Govee monitor, the per-network cadence and Save and verify, the
+  station-order fix, and a stream of bug reports with screenshots that
+  arrived before the bug did.
+- **TheBig-O**, who runs the backend under local Docker and keeps the
+  self-hosted path honest.
+
+Thank you both.
 
 ## Acknowledgments
 

@@ -1,3 +1,7 @@
 -r requirements.txt
 pytest>=8.0
-pytest-asyncio>=0.24
+# Capped below the next major (2.1 pre-release review, INF-8): this pin
+# drives the mirror's only CI and an uncapped range let a breaking release
+# turn the public suite red on its own. Runtime pins in requirements.txt
+# are the maintainer's call and stay as they are.
+pytest-asyncio>=0.24,<2

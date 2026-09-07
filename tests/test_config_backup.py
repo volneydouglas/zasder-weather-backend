@@ -167,8 +167,13 @@ def test_restore_says_the_smtp_password_is_missing(client):
     assert "SMTP password" in r.json()["note"]
 
 
-def test_a_malformed_rule_does_not_sink_the_restore(client):
-    """One bad entry in a hand-edited file shouldn't discard the good ones."""
+def test_a_malformed_rule_refuses_the_whole_rule_list(client):
+    """A hand-edited file with one bad entry used to apply the good ones
+    and report success. The 2026-09-06 release review (R21-05) settled
+    the opposite: a rule list is applied whole or not at all, the reasons
+    are named, and whatever rules the server had stay in place."""
+    client.post("/api/alerts/rules", headers=H,
+                json={"field": "humidity", "comparator": "below", "threshold": 20.0})
     payload = {
         "version": 1,
         "alert_rules": [
@@ -178,8 +183,13 @@ def test_a_malformed_rule_does_not_sink_the_restore(client):
         ],
     }
     r = client.post("/api/config/restore", headers=H, json=payload)
-    assert r.status_code == 200
-    assert r.json()["restored"]["alert_rules"] == 1
+    assert r.status_code == 400 and "not valid" in r.json()["detail"], r.text
+    rules = client.get("/api/alerts/rules", headers=H).json()
+    assert len(rules) == 1 and rules[0]["field"] == "humidity"
+    # The same file with the bad entries removed restores cleanly.
+    payload["alert_rules"] = payload["alert_rules"][:1]
+    r = client.post("/api/config/restore", headers=H, json=payload)
+    assert r.status_code == 200 and r.json()["restored"]["alert_rules"] == 1
 
 
 def test_device_locations_actually_restore(client):
@@ -247,12 +257,18 @@ def test_dict_target_mac_does_not_500_after_wiping_rules(client):
     assert r.status_code == 400          # nothing usable in the file
     assert len(client.get("/api/alerts/rules", headers=H).json()) == 1, \
         "existing rules were destroyed by an unusable payload"
-    # A mixed file keeps the good entry and skips the bad one.
+    # A mixed file is refused whole (R21-05): the good entry does not
+    # replace the server's rules while a bad one rides beside it.
     mixed = {"version": 1,
              "alert_rules": [{"target_mac": ["nope"], "field": "tempf",
                               "comparator": "above", "threshold": 80.0},
                              {"field": "humidity", "comparator": "below",
                               "threshold": 20.0}]}
+    r = client.post("/api/config/restore", headers=H, json=mixed)
+    assert r.status_code == 400 and "target_mac" in r.json()["detail"], r.text
+    rules = client.get("/api/alerts/rules", headers=H).json()
+    assert len(rules) == 1 and rules[0]["field"] == "tempf"
+    mixed["alert_rules"] = mixed["alert_rules"][1:]
     r = client.post("/api/config/restore", headers=H, json=mixed)
     assert r.status_code == 200, r.text
     assert r.json()["restored"]["alert_rules"] == 1
@@ -260,10 +276,11 @@ def test_dict_target_mac_does_not_500_after_wiping_rules(client):
     assert len(rules) == 1 and rules[0]["field"] == "humidity"
 
 
-def test_nonfinite_threshold_rules_are_skipped(client):
+def test_nonfinite_threshold_rules_are_refused(client):
     """R3-14: float("nan")/float("inf") passed staging, creating rules that
     can never fire AND 500 every later GET of the rule list (JSONResponse
-    serializes with allow_nan=False)."""
+    serializes with allow_nan=False). Since R21-05 they refuse the list
+    with the reason; the finite rule alone restores."""
     payload = {"version": 1,
                "alert_rules": [{"field": "tempf", "comparator": "above",
                                 "threshold": "inf"},
@@ -271,6 +288,9 @@ def test_nonfinite_threshold_rules_are_skipped(client):
                                 "threshold": "nan"},
                                {"field": "tempf", "comparator": "above",
                                 "threshold": 100.0}]}
+    r = client.post("/api/config/restore", headers=H, json=payload)
+    assert r.status_code == 400 and "not a number" in r.json()["detail"], r.text
+    payload["alert_rules"] = payload["alert_rules"][2:]
     r = client.post("/api/config/restore", headers=H, json=payload)
     assert r.status_code == 200, r.text
     assert r.json()["restored"]["alert_rules"] == 1

@@ -30,8 +30,9 @@ _METRICS: list[tuple[str, str, str]] = [
 
 
 def _esc_label(s: Any) -> str:
-    """Escape a Prometheus label value (backslash, quote, newline)."""
-    return (str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " "))
+    """Escape a Prometheus label value (backslash, quote, newline, CR)."""
+    return (str(s).replace("\\", "\\\\").replace('"', '\\"')
+            .replace("\n", " ").replace("\r", " "))
 
 
 def _mask_mac(mac: Any) -> str:

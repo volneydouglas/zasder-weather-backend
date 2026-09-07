@@ -621,7 +621,11 @@ def test_rain_slow_cadence_level_shift_still_confirms(client):
     assert "AA:BB:CC:DD:0A:10" not in ingest._rain_reject, \
         "shift never confirmed — first-seen timestamp was not preserved"
     cur = client.get("/api/devices/AA:BB:CC:DD:0A:10/current", headers=H).json()
-    assert cur["yearlyrainin"] == 17.12
+    # The confirmed counter is served raw under totalrainin (a yearly-only
+    # source is a lifetime counter); the YEAR bucket is its rise since the
+    # first reading on file, 1.00 → 17.12.
+    assert cur["totalrainin"] == 17.12
+    assert cur["yearlyrainin"] == 16.12
 
 
 def test_rain_reject_registry_is_bounded():

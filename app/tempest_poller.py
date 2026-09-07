@@ -18,6 +18,7 @@ Synthetic MAC scheme, matching sdr-relay / davis-relay / weatherlink_poller:
 """
 from __future__ import annotations
 
+from .poller_lifecycle import reap
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -111,6 +112,14 @@ def build_payload(station_id: int, obs: dict[str, Any],
     rel = mb_to_inhg(num(obs, "sea_level_pressure"))
     if rel is not None:
         pressure["relative_inhg"] = rel
+    # 2.1: the station pressure rides as the ABSOLUTE reading (ingest keeps
+    # a real absolute_inhg and only copies relative into it when absent).
+    # Before this the Tempest's baromabsin equalled its baromrelin, which
+    # the first MCP-driven analysis of Volney's yard called out as a
+    # mislabelled sea-level value (2026-09-06).
+    absolute = mb_to_inhg(num(obs, "station_pressure"))
+    if absolute is not None:
+        pressure["absolute_inhg"] = absolute
 
     # Lightning. The Tempest is the only sensor here that detects it, and the
     # data is unrecoverable after the fact — the counters are interval-scoped
@@ -204,6 +213,16 @@ class TempestPoller:
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
+        """Register the task and return; the station lookup runs inside it
+        (app/poller_lifecycle.py)."""
+        self._task = asyncio.create_task(self._run(), name="tempest-poller")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        task, self._task = self._task, None
+        await reap(task, "tempest-poller")
+
+    async def _warm_up(self) -> None:
         # One metadata read so every payload can carry the station's name and
         # coordinates. Best-effort: a failure here must not stop the poller,
         # which still has everything it needs to record observations.
@@ -218,17 +237,16 @@ class TempestPoller:
             else:
                 log.warning("tempest station %s not visible to this token",
                             self._station_id)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.warning("tempest station lookup failed: %s",
                         source_status.redact(str(e)))
-        self._task = asyncio.create_task(self._run(), name="tempest-poller")
-
-    async def stop(self) -> None:
-        self._stop.set()
-        if self._task:
-            await self._task
 
     async def _run(self) -> None:
+        await self._warm_up()
+        if self._stop.is_set():
+            return
         log.info("tempest poller running every %ds for station %s",
                  self._interval_s, self._station_id)
         while not self._stop.is_set():

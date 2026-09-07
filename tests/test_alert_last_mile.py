@@ -145,6 +145,11 @@ def _mock_httpx(monkeypatch, handler):
         return real_client(transport=httpx.MockTransport(handler), **kw)
 
     monkeypatch.setattr(wh.httpx, "AsyncClient", factory)
+    # 2.1: delivery re-resolves the host and pins the connection; answer
+    # with a public address so the MockTransport sees the request.
+    monkeypatch.setattr(
+        wh.socket, "getaddrinfo",
+        lambda host, port, *a, **kw: [(2, 1, 6, "", ("93.184.216.34", 0))])
 
     async def _no_sleep(_s):
         return None

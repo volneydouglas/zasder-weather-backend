@@ -110,7 +110,14 @@ else
   fi
   echo
   # Fly's documented installer. Piped to sh because that is the method they
-  # publish; the URL is theirs, over HTTPS.
+  # publish; the URL is theirs, over HTTPS. The reader double-clicked a
+  # file, so say exactly what is about to run and ask once more before a
+  # remote script executes on their Mac (2.1 pre-release review, INF-9).
+  info "This runs Fly's installer script from https://fly.io/install.sh"
+  info "(the same command their docs give: curl -fsSL https://fly.io/install.sh | sh)."
+  if ! confirm "  Run Fly's installer script now?"; then
+    bad "Can't continue without it."; exit 1
+  fi
   if curl -fsSL https://fly.io/install.sh | sh; then
     export PATH="$FLYCTL_INSTALL/bin:$PATH"
   fi

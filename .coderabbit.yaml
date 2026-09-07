@@ -22,6 +22,11 @@ reviews:
     drafts: false
 
   path_filters:
+    # The reviewer-notes documents never ship in this mirror, but the
+    # exclusion travels with the config so a stray copy could never reach
+    # a third-party reviewer either.
+    - "!docs/APP_REVIEW.md"
+    - "!docs/APP_REVIEW_MAC.md"
     # Binaries / captures: no reviewable content, and they'd eat the diff budget.
     - "!**/*.png"
     - "!**/*.jpg"
@@ -48,9 +53,16 @@ reviews:
         fire-and-forget tasks whose exceptions vanish, unbounded caches;
         (4) secrets reaching logs (credentials are passed as query params to
         some upstream APIs, and exception messages can embed the full URL);
-        (5) auth gaps on new endpoints — note that /, /healthz, /api/version
-        and /metrics are intentionally open while every /api/* route is
-        token-gated, and /ingest/custom is gated by a separate INGEST_TOKEN.
+        (5) auth gaps on new endpoints — note that /, /healthz, /status,
+        /api/version and /metrics are intentionally open, as is, since 2.1,
+        the OAuth surface for the MCP server (the two /.well-known/oauth-*
+        documents, POST /oauth/register, GET+POST /oauth/authorize,
+        POST /oauth/token, POST /oauth/revoke: open per the MCP
+        authorization spec, rate-limited, granting nothing without a connect
+        code minted in the app, or the API token, on the consent page);
+        POST /mcp takes the bearer or an OAuth access token; every other
+        /api/* route is token-gated, and /ingest/custom is gated by a
+        separate INGEST_TOKEN.
     - path: "tests/**"
       instructions: >-
         pytest with asyncio_mode=auto. Flag tests that mutate shared state

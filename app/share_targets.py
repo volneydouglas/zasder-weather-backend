@@ -33,7 +33,6 @@ import json
 import logging
 import math
 import re
-import time
 from typing import Any
 
 import httpx
@@ -63,6 +62,30 @@ _INTERVALS_MS = {
     "weathercloud": 10 * 60_000,
     "cwop": 10 * 60_000,
 }
+# The operator can send more often (Doren, 2026-09-06: WeatherCat posts
+# PWSWeather every 5 s and WeatherCloud every minute), down to each
+# network's own floor: Windy accepts one report per 5 min, WeatherCloud's
+# free plan one per 10 min, CWOP asks for 5 min or slower, PWSWeather
+# has no published floor (1 min is plenty). `interval_min` in the target's
+# config; absent means the defaults above.
+MIN_INTERVAL_MIN = {"pwsweather": 1, "windy": 5, "weathercloud": 10, "cwop": 5}
+MAX_INTERVAL_MIN = 60
+
+
+def interval_min(target: str, cfg: dict | None) -> int:
+    """The effective cadence in minutes: the configured value clamped to
+    the network's floor and the hour ceiling, else the default."""
+    default = _INTERVALS_MS[target] // 60_000
+    raw = (cfg or {}).get("interval_min")
+    try:
+        v = int(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        v = default
+    return max(MIN_INTERVAL_MIN[target], min(MAX_INTERVAL_MIN, v))
+
+
+def interval_ms(target: str, cfg: dict | None) -> int:
+    return interval_min(target, cfg) * 60_000
 
 # Primary + fallback APRS-IS tier-2 rotation. cwop.aprs.net rotates
 # through IPs that include hosts unreachable from cloud networks (live
@@ -149,6 +172,7 @@ async def _stamp(target: str, ok: bool, error: str | None,
     if ok:
         st["last_ok_ms"] = now_ms
         st["last_error"] = None
+        st["last_error_ms"] = None
     else:
         st["last_error"] = (error or "unknown")[:200]
         st["last_error_ms"] = now_ms
@@ -169,7 +193,7 @@ def pwsweather_params(cfg: dict, obs: dict, now_utc: _dt.datetime) -> dict:
                      ("dewPoint", "dewptf"), ("winddir", "winddir"),
                      ("windspeedmph", "windspeedmph"),
                      ("windgustmph", "windgustmph"),
-                     ("baromrelin", "baromin"), ("hourlyrainin", "rainin"),
+                     ("baromrelin", "baromin"), (RAIN_LAST_HOUR, "rainin"),
                      ("dailyrainin", "dailyrainin"),
                      ("solarradiation", "solarradiation"), ("uv", "UV")):
         v = _f(obs.get(src))
@@ -178,18 +202,54 @@ def pwsweather_params(cfg: dict, obs: dict, now_utc: _dt.datetime) -> dict:
     return p
 
 
+WINDY_V2_UPDATE = "https://stations.windy.com/api/v2/observation/update"
+# The read-back used by the live-marked check in test_share_targets.py:
+# GET ?PASSWORD=<station password>&latestLimit=1 returns the station's
+# header and its newest observation (rh, dew_point, ...). Verified by hand
+# 2026-09-06: after one send with `humidity` and `dewptf` the read-back
+# carried rh=[21] and dew_point=[284.15], so those names are accepted.
+WINDY_V2_READ = "https://stations.windy.com/api/v2/observation"
+WINDY_LEGACY_UPDATE = "https://stations.windy.com/pws/update/"
+
+# The key the runner puts on the reading it hands the senders: rain over
+# the trailing hour in inches (db.rain_last_hour_in). `hourlyrainin` in a
+# reading is a RATE in in/hr by the repo's own rule and must never be sent
+# as an accumulation (round-three review BE-F6: a 40 in/hr burst reached
+# networks that feed NOAA as forty inches of rain).
+RAIN_LAST_HOUR = "rain_last_hour_in"
+
+
 def windy_params(obs: dict) -> dict:
-    p: dict[str, Any] = {"station": 0}
-    for src, dst in (("tempf", "tempf"), ("humidity", "rh"),
+    """The WU-protocol names Windy's Stations API v2 documents (January
+    2026: id + PASSWORD per station, `/api/v2/observation/update`, at most
+    one report per 5 min). `humidity`, `dewptf` and `solarradiation` are
+    the documented names (the spec lists `rh` and `dewpoint` °C as the
+    metric aliases, used only when these are missing); the old
+    `rh`/`dewpointf` pair was the legacy API's. Verified live 2026-09-06
+    against Volney's WestChandler: the read-back after one send carried
+    rh and dew_point, so humidity and dewptf are accepted (round-three
+    review BE-F7)."""
+    p: dict[str, Any] = {}
+    for src, dst in (("tempf", "tempf"), ("humidity", "humidity"),
                      ("winddir", "winddir"),
                      ("windspeedmph", "windspeedmph"),
                      ("windgustmph", "windgustmph"),
-                     ("baromrelin", "baromin"), ("hourlyrainin", "rainin"),
-                     ("uv", "uv"), ("dewPoint", "dewpointf")):
+                     ("baromrelin", "baromin"), (RAIN_LAST_HOUR, "rainin"),
+                     ("uv", "uv"), ("dewPoint", "dewptf"),
+                     ("solarradiation", "solarradiation")):
         v = _f(obs.get(src))
         if v is not None:
             p[dst] = v
     return p
+
+
+def windy_is_v2(cfg: dict | None) -> bool:
+    """A station id and a station password mean the 2026 API; an api_key
+    alone is a legacy account key, honoured on the legacy path until Windy
+    switches it off at the end of 2026."""
+    c = cfg or {}
+    return bool(str(c.get("station_id") or "").strip()
+                and str(c.get("password") or "").strip())
 
 
 def weathercloud_params(cfg: dict, obs: dict) -> dict:
@@ -259,7 +319,7 @@ def cwop_packet(station_id: str, lat: float, lon: float, obs: dict,
         body += f"t-{int(round(min(-t, 99))):02d}"
     else:
         body += f"t{int(round(min(t, 999))):03d}"
-    r = _f(obs.get("hourlyrainin"))
+    r = _f(obs.get(RAIN_LAST_HOUR))
     if r is not None:
         body += f"r{int(round(min(r, 9.99) * 100)):03d}"
     p_mid = _f(obs.get("dailyrainin"))
@@ -281,9 +341,41 @@ def cwop_packet(station_id: str, lat: float, lon: float, obs: dict,
 
 # ── senders ─────────────────────────────────────────────────────────────
 
+def _reading_time(obs: dict, now_ms: int) -> _dt.datetime:
+    """The reading's own time, for the protocols that carry one. The
+    monitor's clock was stamped on every upload before (2.1 pre-release
+    review BE-5), so a station that died at 02:00 had that reading
+    published as current every few minutes, indefinitely."""
+    ts = _f(obs.get("dateutc"))
+    return _dt.datetime.fromtimestamp((ts if ts is not None else now_ms) / 1000,
+                                      _dt.timezone.utc)
+
+
+# How old the primary station's newest reading may be before a target is
+# skipped rather than fed: twice the target's own cadence, so one missed
+# tick still publishes and a dead station does not.
+STALE_FACTOR = 2
+
+
+def reading_too_old(obs: dict, now_ms: int, target: str,
+                    cfg: dict | None = None) -> int | None:
+    """Minutes of staleness when the reading is too old to publish to
+    `target`, else None. Measured against the DEFAULT cadence and nothing
+    else: a 1-minute PWSWeather cadence must not call a 3-minute-old
+    reading dead, and an hourly CWOP cadence must not let a two-hour-old
+    reading through (round-three review BE-F9). `cfg` is accepted for the
+    callers' sake and deliberately unused."""
+    ts = _f(obs.get("dateutc"))
+    if ts is None:
+        return None            # legacy rows without a stamp: unchanged
+    age = now_ms - ts
+    if age > STALE_FACTOR * _INTERVALS_MS[target]:
+        return int(age // 60_000)
+    return None
+
+
 async def _send_pwsweather(cfg, obs, now_ms) -> str | None:
-    params = pwsweather_params(
-        cfg, obs, _dt.datetime.fromtimestamp(now_ms / 1000, _dt.timezone.utc))
+    params = pwsweather_params(cfg, obs, _reading_time(obs, now_ms))
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(
             "https://pwsupdate.pwsweather.com/api/v1/submitwx", params=params)
@@ -293,17 +385,44 @@ async def _send_pwsweather(cfg, obs, now_ms) -> str | None:
 
 
 async def _send_windy(cfg, obs, now_ms) -> str | None:
-    key = cfg.get("api_key", "")
     params = windy_params(obs)
-    st = cfg.get("station")
-    if st is not None:
-        params["station"] = st
+    # Both APIs take the observation time as `dateutc`
+    # ("YYYY-MM-DD HH:MM:SS", UTC); without it the receive time is used.
+    params["dateutc"] = _reading_time(obs, now_ms).strftime("%Y-%m-%d %H:%M:%S")
+    if windy_is_v2(cfg):
+        secret = str(cfg.get("password"))
+        params["id"] = str(cfg.get("station_id")).strip()
+        params["PASSWORD"] = secret
+        params["softwaretype"] = "Zasder Weather"
+        url = WINDY_V2_UPDATE
+    else:
+        secret = str(cfg.get("api_key", ""))
+        params["station"] = cfg.get("station") if cfg.get("station") is not None else 0
+        url = WINDY_LEGACY_UPDATE + secret
     async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(
-            f"https://stations.windy.com/pws/update/{key}", params=params)
-    if r.status_code != 200:
-        return f"HTTP {r.status_code}"
-    return None
+        r = await client.get(url, params=params)
+    # 409 is Windy saying "I already have exactly this report": the data is
+    # there, which is what a send is for.
+    if r.status_code in (200, 409):
+        return None
+    return windy_error(r.status_code, r.text, secret)
+
+
+def windy_error(status: int, body: str, key: str = "") -> str:
+    """"HTTP 400" told an operator nothing (Doren, 2026-09-06: a fresh
+    key, a 400, no idea why). Windy answers JSON with a `message`; carry
+    it, bounded, with the key scrubbed should Windy ever echo it."""
+    msg = ""
+    try:
+        parsed = json.loads(body or "")
+        if isinstance(parsed, dict):
+            msg = str(parsed.get("message") or "")
+    except ValueError:
+        msg = ""
+    msg = " ".join(msg.split())[:120]
+    if key and key in msg:
+        msg = msg.replace(key, "***")
+    return f"HTTP {status}" + (f" — {msg}" if msg else "")
 
 
 async def _send_weathercloud(cfg, obs, now_ms) -> str | None:
@@ -322,9 +441,8 @@ async def _send_cwop(cfg, obs, now_ms, coords) -> str | None:
         return "no station id"
     if coords is None:
         return "station has no coordinates"
-    packet = cwop_packet(
-        sid, coords[0], coords[1], obs,
-        _dt.datetime.fromtimestamp(now_ms / 1000, _dt.timezone.utc))
+    packet = cwop_packet(sid, coords[0], coords[1], obs,
+                         _reading_time(obs, now_ms))
     try:
         reader, writer = await _cwop_connect()
     except Exception as e:
@@ -369,16 +487,89 @@ def _coords(device: dict[str, Any]) -> tuple[float, float] | None:
     return float(lat), float(lon)
 
 
+def station_for(cfg: dict | None, devices: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The device a target publishes: the configured `mac`, or when none
+    is configured the first weather station with a reading (the rule
+    before 2.1; Volney, 2026-09-06: people with several stations pick
+    which one goes out, the app defaults it to their top station).
+
+    An explicit choice never substitutes (round-three review BE-F8):
+    a configured station that is absent, deleted or silent returns None
+    and the caller says so, rather than station B's readings going out
+    under station A's network id. An air monitor is never a station."""
+    want = str((cfg or {}).get("mac") or "").upper()
+    if want:
+        for d in devices:
+            if str(d.get("mac") or "").upper() == want:
+                if d.get("lastData") and not db.is_air_monitor_device(d):
+                    return d
+                return None
+        return None
+    return next((d for d in devices
+                 if d.get("lastData") and not db.is_air_monitor_device(d)), None)
+
+
+async def _with_hour_rain(station: dict[str, Any], now_ms: int) -> dict[str, Any]:
+    """The reading the senders get: the station's newest, plus the
+    trailing hour's accumulation under RAIN_LAST_HOUR (BE-F6)."""
+    obs = dict(station.get("lastData") or {})
+    try:
+        obs[RAIN_LAST_HOUR] = await db.rain_last_hour_in(str(station.get("mac") or ""),
+                                                         now_ms)
+    except Exception as e:                            # noqa: BLE001
+        log.warning("rain_last_hour_in failed for %s: %s", station.get("mac"), e)
+        obs[RAIN_LAST_HOUR] = None
+    return obs
+
+
+SENDERS = {"pwsweather": "_send_pwsweather", "windy": "_send_windy",
+           "weathercloud": "_send_weathercloud", "cwop": "_send_cwop"}
+
+
+async def send_once(target: str, devices: list[dict[str, Any]],
+                    now_ms: int) -> dict[str, Any]:
+    """One send right now, cadence ignored, for the app's Save and verify
+    button (Volney, 2026-09-06: "see if it works before exiting"). Returns
+    {ok, error, station} and stamps the status like the tick does, so the
+    row agrees with the sheet. Network floors are the NETWORK's business:
+    a WeatherCloud test inside its ten minutes comes back as its error."""
+    cfg = await get_config(target)
+    station = station_for(cfg, devices)
+    if station is None:
+        return {"ok": False, "error": "the chosen station has no reading yet",
+                "station": None}
+    obs = await _with_hour_rain(station, now_ms)
+    # The same gate the tick applies (round-three review SEC-G6): a
+    # station that died three days ago is not verified by publishing its
+    # last reading as current to four networks.
+    stale = reading_too_old(obs, now_ms, target, cfg)
+    if stale is not None:
+        err = f"newest reading is {stale} min old; not published"
+        await _stamp(target, False, err, now_ms)
+        return {"ok": False, "error": err, "station": station.get("mac")}
+    try:
+        sender = globals()[SENDERS[target]]
+        if target == "cwop":
+            err = await sender(cfg, obs, now_ms, _coords(station))
+        else:
+            err = await sender(cfg, obs, now_ms)
+    except Exception as e:                            # noqa: BLE001
+        err = _safe_err(e)
+    await _stamp(target, err is None, err, now_ms)
+    _last_send_ms[target] = now_ms
+    return {"ok": err is None, "error": err, "station": station.get("mac")}
+
+
 async def check(devices: list[dict[str, Any]], now_ms: int) -> None:
-    """One monitor-tick entry point. Primary station, per-target cadence."""
-    primary = next((d for d in devices
-                    if d.get("lastData")
-                    and not db.is_air_monitor_device(d)), None)
-    if primary is None:
+    """One monitor-tick entry point. Per-target station and cadence."""
+    if not any(d.get("lastData") for d in devices):
         return
-    obs = primary["lastData"]
 
     async def _one(target: str, cfg: dict) -> None:
+        station = station_for(cfg, devices)
+        if station is None:
+            return
+        obs = await _with_hour_rain(station, now_ms)
         try:
             if target == "pwsweather":
                 err = await _send_pwsweather(cfg, obs, now_ms)
@@ -387,7 +578,7 @@ async def check(devices: list[dict[str, Any]], now_ms: int) -> None:
             elif target == "weathercloud":
                 err = await _send_weathercloud(cfg, obs, now_ms)
             else:
-                err = await _send_cwop(cfg, obs, now_ms, _coords(primary))
+                err = await _send_cwop(cfg, obs, now_ms, _coords(station))
         except Exception as e:
             err = _safe_err(e)
         await _stamp(target, err is None, err, now_ms)
@@ -399,12 +590,31 @@ async def check(devices: list[dict[str, Any]], now_ms: int) -> None:
     # detection, the monitor's actual job.
     due: list[tuple[str, dict]] = []
     for target in TARGETS:
-        if now_ms - _last_send_ms.get(target, 0) < _INTERVALS_MS[target]:
+        # Cheapest gate first: nothing can be due inside the network's own
+        # floor, so the config read happens at most once per floor.
+        if now_ms - _last_send_ms.get(target, 0) < MIN_INTERVAL_MIN[target] * 60_000:
             continue
         cfg = await get_config(target)
         if not cfg.get("enabled"):
             continue
+        if now_ms - _last_send_ms.get(target, 0) < interval_ms(target, cfg):
+            continue
         _last_send_ms[target] = now_ms
+        station = station_for(cfg, devices)
+        if station is None:
+            await _stamp(target, False, "the chosen station has no reading yet", now_ms)
+            continue
+        obs = station["lastData"]
+        # A reading older than twice the cadence is a dead station, not
+        # weather: skip the send and say so in the status, rather than
+        # publish it to PWSWeather, Windy, WeatherCloud and CWOP (which
+        # feeds NOAA MADIS) as current (2.1 pre-release review BE-5).
+        stale = reading_too_old(obs, now_ms, target, cfg)
+        if stale is not None:
+            await _stamp(target, False,
+                         f"newest reading is {stale} min old; not published",
+                         now_ms)
+            continue
         due.append((target, cfg))
     if due:
         await asyncio.gather(*(_one(t, c) for t, c in due))

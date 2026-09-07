@@ -282,3 +282,103 @@ def test_a_govee_reading_stores_air_columns_and_classifies_as_a_monitor(client, 
     assert obs["co2"] == 655.0 and obs["tempinf"] == 71.2 and obs["humidityin"] == 44
     assert obs.get("tempf") is None
     assert db.is_air_monitor_device(dev)
+
+
+def test_a_typed_suffix_resolves_to_the_one_full_id():
+    """Doren 2026-09-06: Govee's device page shows the last six pairs of an
+    eight-pair id; the API lists the full one."""
+    from app.govee_cloud_poller import resolve_device_ids
+    listed = ["04:B5:DC:B4:D9:F2:DE:20", "AA:11:22:33:44:55:66:77"]
+    assert resolve_device_ids(["DC:B4:D9:F2:DE:20"], listed) == (["04:B5:DC:B4:D9:F2:DE:20"], [])
+    assert resolve_device_ids(["dcb4d9f2de20"], listed) == (["04:B5:DC:B4:D9:F2:DE:20"], [])
+    assert resolve_device_ids(["04:B5:DC:B4:D9:F2:DE:20"], listed) == (["04:B5:DC:B4:D9:F2:DE:20"], [])
+    # Ambiguous suffix: two devices end the same way; refuse to guess.
+    both = ["04:B5:DC:B4:D9:F2:DE:20", "99:99:DC:B4:D9:F2:DE:20"]
+    assert resolve_device_ids(["DE:20"], both) == ([], ["DE:20"])
+    assert resolve_device_ids(["11:22:33"], listed) == ([], ["11:22:33"])
+
+
+def test_the_probe_stores_the_full_id_a_suffix_resolved_to(client, monkeypatch):
+    import asyncio
+    from app import integrations, db
+
+    class FakeGovee:
+        def __init__(self, key): pass
+        async def list_devices(self):
+            from app.govee_cloud_poller import AIR_TYPE
+            return [{"device": "04:B5:DC:B4:D9:F2:DE:20", "sku": "H5140",
+                     "deviceName": "Living Room", "type": AIR_TYPE,
+                     "capabilities": []}]
+    import app.govee_cloud_client as gc
+    monkeypatch.setattr(gc, "GoveeCloudClient", FakeGovee)
+    monkeypatch.setattr(integrations, "PROBE_BUDGET_S", 5, raising=False)
+
+    async def run():
+        await db.set_kv(integrations._kv_key("govee", "api_key"), "k" * 36)
+        await db.set_kv(integrations._kv_key("govee", "devices"), "DC:B4:D9:F2:DE:20")
+        err = await integrations.probe("govee")
+        stored = await db.get_kv(integrations._kv_key("govee", "devices"))
+        return err, stored
+    err, stored = asyncio.run(run())
+    assert err is None, err
+    assert stored == "04:B5:DC:B4:D9:F2:DE:20"
+
+
+def test_an_id_the_account_does_not_list_is_a_failure_until_it_appears(temp_env, monkeypatch):
+    """CodeRabbit, PR #36: a typed id the account does not list used to be
+    polled as a listing with no sku, which returned 0 rows without raising,
+    so the source read healthy and discovery never ran again. Now it is a
+    recorded failure, re-resolved every tick, and polled once it appears."""
+    db = _fresh_db(temp_env)
+    from app import govee_cloud_poller as gcp, source_status
+    source_status.reset()
+    posted: list[dict] = []
+
+    async def fake_ingest(payload):
+        posted.append(payload)
+        return {"ok": True, "inserted": 1}
+    monkeypatch.setattr(gcp.ingest, "_do_ingest", fake_ingest)
+    fake = FakeClient([], {DEV_ID: state()})
+    poller = gcp.GoveeCloudPoller(fake, 60, DEV_ID, None)
+
+    async def run():
+        await poller._discover()
+        assert poller._devices == {} and poller._unresolved == [DEV_ID]
+        await poller._tick()
+        st = next(r for r in source_status.snapshot() if r["name"] == gcp.SOURCE)
+        assert st["consecutive_failures"] == 1
+        assert "not on this Govee account" in (st["last_error"] or "")
+        assert posted == []
+        # The monitor joins the account: the next discovery (at most one
+        # per REDISCOVER_AFTER_S, round three) resolves and polls it.
+        fake.listings.append(LISTING)
+        poller._last_discover_mono -= gcp.REDISCOVER_AFTER_S + 1
+        await poller._tick()
+        assert poller._unresolved == [] and list(poller._devices) == [DEV_ID]
+        assert len(posted) == 1
+        st = next(r for r in source_status.snapshot() if r["name"] == gcp.SOURCE)
+        # `healthy` also needs the configured flag the real startup sets;
+        # the counters are what this test is about.
+        assert st["consecutive_failures"] == 0 and st["last_success_ms"] is not None
+    asyncio.run(run())
+    del db
+
+
+def test_rediscovery_of_an_unresolved_id_is_rate_limited(temp_env, monkeypatch):
+    """Round-three review BE-F12: a typo re-listed the account on every
+    tick, 1,440 calls a day. At most one listing per REDISCOVER_AFTER_S
+    while an id stays unresolved; a fresh poller still discovers at once."""
+    db = _fresh_db(temp_env)
+    from app import govee_cloud_poller as gcp
+    fake = FakeClient([], {})
+    poller = gcp.GoveeCloudPoller(fake, 60, DEV_ID, None)
+
+    async def run():
+        for _ in range(5):
+            await poller._tick()
+    asyncio.run(run())
+    assert fake.calls.count("list") == 1, fake.calls
+    poller._last_discover_mono -= gcp.REDISCOVER_AFTER_S + 1
+    asyncio.run(poller._tick())
+    assert fake.calls.count("list") == 2
+    del db

@@ -51,6 +51,8 @@ MIN_INTERVAL_S = 30
 # One day is the largest window the history endpoint allows at 5-minute
 # resolution; the bootstrap asks for exactly that.
 BOOTSTRAP_WINDOW = timedelta(hours=24)
+# How many stations bootstrap their day of history at once.
+BOOTSTRAP_CONCURRENCY = 3
 
 
 def _device_zone(meta: dict[str, Any], mac: str = "") -> timezone | Any:
@@ -410,6 +412,10 @@ class EcowittCloudPoller:
         self._last_ts: dict[str, str] = {}
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        # Set once discovery + bootstrap have run (or been skipped): the
+        # poll loop starts after it, and a test can await it instead of
+        # racing the background task.
+        self.warm = asyncio.Event()
 
     def _label(self, mac: str) -> str | None:
         if self._name and len(self._devices) == 1:
@@ -459,59 +465,103 @@ class EcowittCloudPoller:
         restarts the poller) a no-op."""
         end = datetime.now(timezone.utc)
         start = end - BOOTSTRAP_WINDOW
-        for mac, meta in self._devices.items():
-            try:
-                # The history API reads offset-free date strings in the
-                # DEVICE's zone (`date_zone_id`), and the client formats
-                # what it is given, so the instants go over as that zone's
-                # wall clock. Sent as UTC, a Phoenix station's "last 24 h"
-                # ended seven hours in the future and skipped its earliest
-                # seven (R18 finding 3).
-                zone = _device_zone(meta, mac)
-                data = await self._client.history(
-                    mac, start.astimezone(zone), end.astimezone(zone))
-                payloads = history_payloads(mac, data, self._label(mac), meta)
-                rows: list[dict[str, Any]] = []
-                for p in payloads:
-                    flat = ingest._flatten(p)  # type: ignore[attr-defined]
-                    if not flat:
-                        continue
-                    flat.pop("_raw_dateutc", None)
-                    flat.pop("_feels_derived", None)
-                    rows.append(flat)
-                if rows:
-                    # Same info shape _do_ingest hands upsert_device, minus
-                    # lastData: a day-old row must not become the live view
-                    # (upsert_device is monotonic on last_seen for exactly
-                    # this reason; the first live tick fills it in).
-                    last = payloads[-1]
-                    explicit = last["device"].get("name")
-                    auto = ingest._auto_device_name(last)  # type: ignore[attr-defined]
-                    inner: dict[str, Any] = {"name": explicit or auto,
-                                             "location": None,
-                                             "source": SOURCE}
-                    coords = ingest._payload_coords(last)  # type: ignore[attr-defined]
-                    if coords is not None:
-                        inner["coords"] = coords
-                    await db.upsert_device(mac, {"name": explicit,
-                                                 "auto_name": auto,
-                                                 "info": inner})
-                added = await db.insert_observations(mac, rows)
-                log.info("ecowitt bootstrap %s: %d rows in the last day, %d new",
-                         mac, len(rows), added)
-            except Exception as e:
-                log.warning("ecowitt bootstrap %s failed: %s", mac,
-                            source_status.redact(str(e)))
+        # Bounded concurrency (R18 finding 6): an account with several
+        # stations used to fetch their histories one after another, each
+        # with a 15 s timeout, so a flaky vendor cost 15 s PER device.
+        gate = asyncio.Semaphore(BOOTSTRAP_CONCURRENCY)
+
+        async def one(mac: str, meta: dict[str, Any]) -> None:
+            async with gate:
+                await self._bootstrap_one(mac, meta, start, end)
+
+        await asyncio.gather(*(one(m, d) for m, d in self._devices.items()))
+
+    async def _bootstrap_one(self, mac: str, meta: dict[str, Any],
+                             start: datetime, end: datetime) -> None:
+        try:
+            # The history API reads offset-free date strings in the
+            # DEVICE's zone (`date_zone_id`), and the client formats
+            # what it is given, so the instants go over as that zone's
+            # wall clock. Sent as UTC, a Phoenix station's "last 24 h"
+            # ended seven hours in the future and skipped its earliest
+            # seven (R18 finding 3).
+            zone = _device_zone(meta, mac)
+            data = await self._client.history(
+                mac, start.astimezone(zone), end.astimezone(zone))
+            payloads = history_payloads(mac, data, self._label(mac), meta)
+            rows: list[dict[str, Any]] = []
+            for p in payloads:
+                flat = ingest._flatten(p)  # type: ignore[attr-defined]
+                if not flat:
+                    continue
+                flat.pop("_raw_dateutc", None)
+                flat.pop("_feels_derived", None)
+                rows.append(flat)
+            if rows:
+                # Same info shape _do_ingest hands upsert_device, minus
+                # lastData: a day-old row must not become the live view
+                # (upsert_device is monotonic on last_seen for exactly
+                # this reason; the first live tick fills it in).
+                last = payloads[-1]
+                explicit = last["device"].get("name")
+                auto = ingest._auto_device_name(last)  # type: ignore[attr-defined]
+                inner: dict[str, Any] = {"name": explicit or auto,
+                                         "location": None,
+                                         "source": SOURCE}
+                coords = ingest._payload_coords(last)  # type: ignore[attr-defined]
+                if coords is not None:
+                    inner["coords"] = coords
+                await db.upsert_device(mac, {"name": explicit,
+                                             "auto_name": auto,
+                                             "info": inner})
+            added = await db.insert_observations(mac, rows)
+            log.info("ecowitt bootstrap %s: %d rows in the last day, %d new",
+                     mac, len(rows), added)
+        except Exception as e:
+            log.warning("ecowitt bootstrap %s failed: %s", mac,
+                        source_status.redact(str(e)))
 
     async def start(self) -> None:
-        await self._discover()
-        await self.bootstrap()
+        """Register the background task and return at once. Discovery and
+        the one-day bootstrap run INSIDE the task (R18 finding 6): they
+        used to run here, serially, with a 15 s timeout per vendor call,
+        so a slow or dead ecowitt.net held the whole lifespan — every
+        other integration, the first request — and the settings PUT
+        that restarts this poller. An optional source must never be on
+        the boot path. Progress is visible in source_status while the
+        warm-up runs (`extra.state`)."""
+        self.warm.clear()
+        source_status.declare(SOURCE, True, state="starting")
         self._task = asyncio.create_task(self._run(), name="ecowitt-cloud-poller")
 
     async def stop(self) -> None:
+        """Cancel whatever the task is doing (a warm-up stuck in a vendor
+        call, or a tick mid-way through three stations at 15 s each) and
+        wait a bounded time (app/poller_lifecycle.py). A partial bootstrap
+        or tick is harmless: rows are keyed and the next start re-runs it;
+        the credential change that called us must not wait on the old
+        keys' timeout (2.1 pre-release review BE-4)."""
+        from .poller_lifecycle import reap
         self._stop.set()
-        if self._task:
-            await self._task
+        task, self._task = self._task, None
+        await reap(task, "ecowitt-cloud-poller")
+
+    async def _warm_up(self) -> None:
+        """Discovery then bootstrap, with the stop event honoured between
+        them; any failure is logged inside and never stops the loop."""
+        try:
+            await self._discover()
+            if self._stop.is_set():
+                return
+            await self.bootstrap()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                       # belt and braces
+            log.warning("ecowitt warm-up failed: %s",
+                        source_status.redact(str(e)))
+        finally:
+            self.warm.set()
+            source_status.declare(SOURCE, True, state="polling")
 
     async def _poll_one(self, mac: str, meta: dict[str, Any]) -> int:
         """Returns rows STORED (not posted) — the history-write throttle
@@ -551,12 +601,21 @@ class EcowittCloudPoller:
                 failures.append(f"{mac}: {e}")
                 log.warning("Ecowitt poll failed for %s: %s", mac,
                             source_status.redact(str(e)))
-        if failures and rows == 0:
-            source_status.record_failure(SOURCE, "; ".join(failures))
+        if failures:
+            # Rows from the healthy stations still stored above; only the
+            # STATUS reports the partial failure. A clean record_success
+            # here wiped the other station's last_error (the AirGradient
+            # R11 fix, applied here by the 2.1 pre-release review BE-9).
+            note = "; ".join(failures)
+            if rows:
+                note = (f"{len(self._devices) - len(failures)}/"
+                        f"{len(self._devices)} station(s) ok; {note}")
+            source_status.record_failure(SOURCE, note)
         else:
             source_status.record_success(SOURCE, rows=rows)
 
     async def _run(self) -> None:
+        await self._warm_up()
         log.info("ecowitt cloud poller running every %ds for %d device(s)",
                  self._interval_s, len(self._devices))
         while not self._stop.is_set():

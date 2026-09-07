@@ -102,7 +102,7 @@ async def check(devices: list[dict[str, Any]], now_ms: int) -> None:
             continue
         def col(name):
             vals = daily.get(name) or []
-            v = vals[i] if i < len(vals) else None
+            v = vals[i] if i < len(vals) else None  # noqa: B023 (called in this iteration)
             return float(v) if isinstance(v, (int, float)) else None
         rows.append({
             "valid_date": day,

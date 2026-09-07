@@ -16,7 +16,11 @@ def test_healthz_open(client):
     from app.version import __version__
     r = client.get("/healthz")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "version": __version__}
+    body = r.json()
+    assert body["status"] == "ok" and body["version"] == __version__
+    # 2.1: the effective uid (deploy.sh asserts it is not 0 in production)
+    # and a one-statement read of the database.
+    assert isinstance(body["uid"], int) and body["db"] is True
 
 def test_devices_requires_bearer(client):
     assert client.get("/api/devices").status_code == 401
@@ -478,6 +482,32 @@ def test_rain_rollups_skipped_when_buckets_already_present(client):
     # Operator-provided values must NOT be overwritten by computed values
     assert cur["dailyrainin"] == 0.99
     assert cur["hourlyrainin"] == 0.05
+    # ...and a source that posts real buckets has a yearly that resets on
+    # Jan 1: it is served as-is, with no lifetime-total alias.
+    assert cur["yearlyrainin"] == 0.85
+    assert "totalrainin" not in cur
+
+
+def test_lifetime_counter_year_bucket_is_year_to_date(client):
+    """SDR/LilyGO sources post one number: the sensor's lifetime total.
+    /current serves the YEAR bucket as that counter differenced against
+    Jan 1 (2.47 here) and keeps the raw counter under `totalrainin`, the
+    name Ambient uses for a lifetime total. Read-side only — the stored
+    rows keep the raw counter (the 2026-08-11 ingest offset is why)."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from app import db
+    now = datetime.now(tz=timezone.utc).replace(microsecond=0)
+    mac = _post_yearly_only(client, now.isoformat().replace("+00:00", "Z"), 18.47)
+    # Ingest refuses a timestamp this old; last year's reading goes in the
+    # way a year of history got there — straight into the table.
+    last_year_ms = int((now - timedelta(days=400)).timestamp() * 1000)
+    asyncio.run(db.insert_observations(
+        mac, [{"dateutc": last_year_ms, "yearlyrainin": 16.00}]))
+    cur = client.get(f"/api/devices/{mac}/current",
+                     headers={"Authorization": "Bearer test-api-token"}).json()
+    assert cur["yearlyrainin"] == 2.47
+    assert cur["totalrainin"] == 18.47
 
 def test_history_short_window_returns_raw(client):
     """Window ≤ 6h returns raw observations (no bucketing)."""

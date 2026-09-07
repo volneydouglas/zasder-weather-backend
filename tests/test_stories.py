@@ -98,6 +98,9 @@ ALL_PRODUCERS = ["how_hot_is_hot",
                  "air_flight", "degree_days",
                  # Science: needs a same-day observation; these seed rollups.
                  "fire_weather", "barometer_says",
+                 # Science: the barometer scorecard needs a season of
+                 # ledger calls (SCORECARD_MIN_DAYS); no fixture files any.
+                 "barometer_scorecard",
                  # Science: the forecast scorecard needs MIN_FORECAST_DAYS
                  # day-ahead snapshots matched to rollups; no fixture here
                  # stores a forecast.
@@ -673,3 +676,58 @@ def test_producer_copy_uses_no_em_dashes():
     hits = [(line, text) for line, text in _string_literals(stories)
             if "\u2014" in text]
     assert hits == [], hits
+
+
+def test_the_stories_endpoint_can_return_every_card_a_station_earns(client,
+                                                                    monkeypatch):
+    """2.1, Volney: "the story card should show all the possible story
+    cards not just the top ten." The Reports pane's shareables list asks
+    for everything, so the endpoint's ceiling has to clear the whole
+    registry. 12 was hiding four cards on his oldest station: 16
+    candidates produced, 12 returned."""
+    import app.main as main
+    import app.stories as st
+    from app import db
+    from app.config import settings
+    monkeypatch.setattr(settings, "insights", True)
+
+    assert main.STORY_LIMIT_MAX >= len(st._REGISTRY), (
+        "the ceiling must clear the registry, and producers may each emit "
+        "more than one story")
+
+    _seed_recent_year(db)
+
+    async def fake_top(mac, *, limit=4, families=None, min_score=0.0,
+                       units=st.UNITS_NATIVE):
+        made = [
+            st.Story(
+                id=f"s{i}", family="climate", story_type="stat_hero",
+                title=f"Story {i}", emoji=None,
+                hero=st.Stat(key="h", label="High", value=100.0),
+                hero_line="100", context="c", comparison=None,
+                supporting=[], viz=None,
+                period=st.Period(kind="all_time", label="ever",
+                                 start=None, end=None),
+                station={"mac": mac, "name": "Yard"},
+                interestingness=0.5)
+            for i in range(20)
+        ]
+        return {"mac": mac, "generated_ms": 0, "anchor_day": "2026-09-04",
+                "units": {}, "families": ["climate"],
+                "candidates": len(made), "declined": [],
+                "stories": [s.to_dict() for s in made[:limit]]}
+
+    monkeypatch.setattr(st, "top_stories", fake_top)
+
+    r = client.get(f"/api/devices/{MAC}/stories?limit=20&min_score=0",
+                   headers=H)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["stories"]) == 20, "asking for 20 must return 20"
+    assert body["candidates"] == 20
+
+    # The ceiling is still a ceiling.
+    over = client.get(
+        f"/api/devices/{MAC}/stories?limit={main.STORY_LIMIT_MAX + 1}",
+        headers=H)
+    assert over.status_code == 422

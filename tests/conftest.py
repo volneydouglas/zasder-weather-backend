@@ -73,7 +73,20 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
                 # 2.0: the Ecowitt cloud poller — both keys ride the polled
                 # URL, same trap.
                 "TEMPEST_TOKEN", "AIRGRADIENT_TOKEN", "GUEST_API_TOKENS",
-                "ECOWITT_APP_KEY", "ECOWITT_API_KEY", "GOVEE_API_KEY"):
+                "ECOWITT_APP_KEY", "ECOWITT_API_KEY", "GOVEE_API_KEY",
+                # 2.1: the Fly deploy token drives self-update and the
+                # server-advice card (Machines API); FLY_APP_NAME and
+                # FLY_MACHINE_ID are what makes the code believe it is on
+                # Fly (relay edge trust, origin fallback, advice). A shell
+                # that exports them — deploy.sh does — made every "off Fly"
+                # test depend on the shell (round two, I4).
+                "FLY_API_TOKEN", "FLY_APP_NAME", "FLY_MACHINE_ID",
+                # Found by tests/test_env_sweep.py the day it was written:
+                # the WU key powers the TWC forecast fetch and the WU import,
+                # and the two passwords ride transports whose hosts are
+                # blanked above — blank the credential too, so a host set
+                # by a test never pairs with the developer's real password.
+                "WU_API_KEY", "SMTP_PASSWORD", "MQTT_PASSWORD"):
         monkeypatch.setenv(var, "")
     # Module-level caches must not leak across tests (the public dashboard HTML
     # and the per-MAC records cache are process-global by design). Reset only a
@@ -90,6 +103,11 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._PUBLIC_DASH_REFRESH_TASK = None  # silently disable SWR forever
         _m._OBS_COUNT_CACHE.clear()
         _m._OBS_COUNT_TASKS.clear()
+        # The health probe's answer and its single-flight lock (round-three
+        # review SEC-G4), and the verify throttle, must not cross tests.
+        _m._HEALTHZ_CACHE = None
+        _m._HEALTHZ_LOCK = None
+        _m._SHARE_TEST_LAST.clear()
         _m._RECORDS_CACHE.clear()
         _m._RECORDS_LOCKS.clear()
         _m._DB_BACKUP_JOB = {"state": "idle"}
@@ -131,6 +149,29 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _hw = sys.modules.get("app.health_watch")
     if _hw is not None:
         _hw._reset_for_tests()
+    # 2.1 modules with process-global job/cache state (2.1 pre-release
+    # review BE-10): a restore left "swapping" by one test must not make
+    # the next test's restore refuse, and cached advice must not leak.
+    _rs = sys.modules.get("app.restore")
+    if _rs is not None:
+        _rs.JOB.clear()
+        _rs.JOB["state"] = "idle"
+        _rs._TASK = None
+        # Round two (I4): a challenge minted by one test must not satisfy
+        # the next test's upload, and app.relay appends its post-swap hook
+        # at import — the `client` fixture reloads it per test, so without
+        # this clear the list grew by one duplicate hook every test.
+        _rs._CHALLENGE = None
+        _rs.POST_SWAP_HOOKS.clear()
+    # OAuth's rate limiter and last-used stamp cache are process-global
+    # (round two, I4): only test_oauth.py reset them, so an authorize burst
+    # in one file could 429 the first request of the next.
+    _oa = sys.modules.get("app.oauth")
+    if _oa is not None:
+        _oa.reset_state()
+    _ma = sys.modules.get("app.machine_advice")
+    if _ma is not None:
+        _ma.reset_cache()
     # app.db's guest last-used stamps are process-global for the same reason
     # (written by the sync auth dep, flushed on list) — a stale stamp from
     # one test must not flush into another test's database.
@@ -141,6 +182,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # R5-33 rollup cache: a value computed against one test's DB must
         # not answer for the next test's — same isolation rule as above.
         _d._DAILY_ROLLUP_CACHE.clear()
+        _d._YEAR_PRIOR_CACHE.clear()
         # 1.9 write-audit buffer + auth-time label cache (R12): a pending
         # audit row from one test must not flush into another test's
         # database, and a stale token→label entry must not attribute it.
@@ -151,6 +193,12 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # or every later ingest test queues instead of storing.
         _d._CHART_INDEX_BUILDING = False
         _d._CHART_INDEX_REBUILD_NEEDED = False
+        # 2.1 maintenance lease (restore): a test that held or timed a
+        # lease must not leave the gate closed or the counter off.
+        _d._GATE_CLOSED = False
+        _d._GATE_EVENT = None
+        _d._GATE_LOOP = None
+        _d._ACTIVE_CONNECTIONS = 0
     _i = sys.modules.get("app.ingest")
     if _i is not None:
         _i._WRITE_BEHIND.clear()

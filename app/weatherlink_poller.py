@@ -20,6 +20,7 @@ Synthetic MAC scheme matches sdr-relay / davis-relay:
 """
 from __future__ import annotations
 
+from .poller_lifecycle import reap
 import asyncio
 import logging
 from typing import Any
@@ -209,8 +210,18 @@ class WeatherlinkPoller:
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
-        # Discover the station's metadata once at startup so build_payload
-        # can use station_name / city as defaults.
+        """Register the task and return; discovery runs inside it
+        (app/poller_lifecycle.py)."""
+        self._task = asyncio.create_task(self._run(), name="wl-poller")
+
+    async def stop(self) -> None:
+        self._stop.set()
+        task, self._task = self._task, None
+        await reap(task, "wl-poller")
+
+    async def _warm_up(self) -> None:
+        # Discover the station's metadata once so build_payload can use
+        # station_name / city as defaults.
         try:
             stations = await self._client.list_stations()
             self._station_meta = next(
@@ -225,6 +236,8 @@ class WeatherlinkPoller:
                 log.warning("station_id %s not found in account — "
                             "did you put the wrong ID?", self._station_id)
                 self._station_meta = {}
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             # Message only, never log.exception: a traceback renders the raising
             # exception's args, so anything that escapes WeatherLinkError (an
@@ -235,14 +248,9 @@ class WeatherlinkPoller:
                         "polling will still attempt /current/",
                         source_status.redact(str(e)))
             self._station_meta = {}
-        self._task = asyncio.create_task(self._run(), name="wl-poller")
-
-    async def stop(self) -> None:
-        self._stop.set()
-        if self._task:
-            await self._task
 
     async def _run(self) -> None:
+        await self._warm_up()
         while not self._stop.is_set():
             try:
                 current = await self._client.current(self._station_id)

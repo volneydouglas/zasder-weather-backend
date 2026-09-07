@@ -181,8 +181,10 @@ def test_rain_gap_rain_on_last_day_and_no_rain(insights_on):
         (base + dt.timedelta(days=2)).strftime("%Y-%m-%d")
     assert body["years"][0]["longest_dry_streak"] == 2
 
-    # A record with NO rain at all: last_rain_* stay None and the streak
-    # spans the whole record (3 calendar days here).
+    # A record with NO rain measurement at all (the posts carry no rain
+    # block): last_rain_* stay None and there is NO dry streak — a station
+    # without a gauge is not "dry", it is unmeasured (round-two review
+    # BE-N1; it used to span the whole record).
     other = "11:22:33:44:55:66"
     for i in range(3):
         b = {"device": {"id": "112233445566"},
@@ -196,7 +198,8 @@ def test_rain_gap_rain_on_last_day_and_no_rain(insights_on):
     body = client.get("/api/insights?mac=" + other, headers=_H).json()
     assert body["last_rain_day"] is None
     assert body["last_rain_amount"] is None
-    assert body["dry_streak_days"] == 3
+    assert body["dry_streak_days"] is None
+    assert body["years"][0]["longest_dry_streak"] is None
 
 
 def test_rebuild_matches_incremental(insights_on):
@@ -272,7 +275,9 @@ def test_jan1_yearly_fallback_not_counted(insights_on):
     body = client.get("/api/insights?mac=" + MAC, headers=_H).json()
     assert body["day_count"] == 1
     assert len(body["years"]) == 1, "yearly rollups vanished"
-    assert body["years"][0]["rain_total"] == 0.0
+    # The only day is the reset day, which measures nothing: the year has
+    # no rain total rather than a zero one (round-three review BE-F11).
+    assert body["years"][0]["rain_total"] is None
 
 
 def test_daily_series_endpoint(insights_on):
@@ -346,3 +351,58 @@ def test_cold_streak_mirrors_heat_streak(insights_on):
     y = body["years"][0]
     assert y["longest_p10_streak"] == 3
     assert y["nights_p10"] >= 3
+
+
+def test_a_station_with_no_rain_gauge_has_no_dry_streak(insights_on):
+    """Round-two review BE-N1: insights kept a fourth copy of the rain rule
+    with a 0.0 default, so a station with no gauge at all reported an
+    ever-growing dry streak on /api/insights. No measurement is None."""
+    client = insights_on
+    mac = "11:22:33:44:55:77"
+    base = _recent_jan1() - dt.timedelta(days=20)
+    for i in range(3):
+        body = {"device": {"id": "112233445577"},
+                "timestamp_utc": (base + dt.timedelta(days=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "outdoor": {"tempf": 70.0, "humidity": 40},
+                "wind": {}, "rain": {}, "pressure": {"relative_inhg": 29.9},
+                "source": "test"}
+        assert client.post("/ingest/custom", headers=_ING, json=body).status_code == 200
+    body = client.get("/api/insights?mac=" + mac, headers=_H).json()
+    assert body["last_rain_day"] is None
+    assert body["dry_streak_days"] is None
+    assert body["years"][0]["longest_dry_streak"] is None
+    # Round-three review BE-F11: no gauge is no total and no series, not a
+    # flat zero line.
+    assert body["years"][0]["rain_total"] is None
+    assert body["years"][0]["rain_series"] is None
+
+
+def test_a_gauge_added_later_does_not_file_earlier_years_as_dry(insights_on):
+    """Round-three review BE-F11: `any_rain_measured` was record-wide, so a
+    station that gained a gauge in its second year reported the first
+    year as 0.00 in of rain. Rain is judged per year."""
+    client = insights_on
+    mac = "11:22:33:44:55:78"
+    jan1 = _recent_jan1()
+    early = jan1 - dt.timedelta(days=5)          # the previous year's last days
+    for i in range(3):
+        body = {"device": {"id": "112233445578"},
+                "timestamp_utc": (early + dt.timedelta(days=i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "outdoor": {"tempf": 70.0, "humidity": 40},
+                "wind": {}, "rain": {}, "pressure": {"relative_inhg": 29.9}, "source": "test"}
+        assert client.post("/ingest/custom", headers=_ING, json=body).status_code == 200
+    for i, daily in ((0, 0.0), (1, 0.3), (2, 0.3)):
+        body = {"device": {"id": "112233445578"},
+                "timestamp_utc": (jan1 + dt.timedelta(days=10 + i, hours=12))
+                    .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "outdoor": {"tempf": 70.0, "humidity": 40},
+                "wind": {}, "rain": {"daily_in": daily}, "pressure": {"relative_inhg": 29.9},
+                "source": "test"}
+        assert client.post("/ingest/custom", headers=_ING, json=body).status_code == 200
+    body = client.get("/api/insights?mac=" + mac, headers=_H).json()
+    by_year = {y["year"]: y for y in body["years"]}
+    assert len(by_year) == 2
+    first, second = sorted(by_year)
+    assert by_year[first]["rain_total"] is None and by_year[first]["rain_series"] is None
+    assert by_year[second]["rain_total"] == pytest.approx(0.6)
+    assert len(by_year[second]["rain_series"]) == 3

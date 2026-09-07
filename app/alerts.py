@@ -14,7 +14,7 @@ import smtplib
 import ssl
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
@@ -267,6 +267,182 @@ ALERT_SEVERITY: dict[str, str] = {
     "battery_recovered": "info",
     "disk_recovered": "info",
 }
+
+
+async def build_morning_report(devices, now_ms: int, window_start: int,
+                               tz, local):
+    """Gather the morning report: yesterday's rollup row per weather
+    station, the alerts since `window_start`, and a best-effort peek at
+    today. Returns `(report, stations, alert_rows)`, or `(None, [], [])`
+    when there is nothing at all to say.
+
+    Module-level and side-effect-free (beyond the forecast fetch) BECAUSE
+    two callers need the identical object: the 7am job that sends it, and
+    `/api/reports/morning/preview` that renders it on demand. "Run it now"
+    has to produce the same report the mail did, or the Reports pane is
+    lying (2.1).
+    """
+    from . import digest as dg
+    from .climate import _rollup_rows
+    from .day_rain import day_rain_in
+
+    rows = await db.alerts_since(window_start)
+    rows = [r for r in rows if r["kind"] != "digest"]
+    alert_lines = [
+        dg.AlertLine(
+            when=datetime.fromtimestamp(r["ts_ms"] / 1000, tz)
+                .strftime("%a %H:%M"),
+            title=r["title"],
+            severity=r.get("severity") or severity_of(r["kind"]))
+        for r in rows]
+
+    # Yesterday, per WEATHER station, off the daily rollups — the same
+    # rows the year charts and climate reports trust.
+    yday = (local.date() - timedelta(days=1)).isoformat()
+    stations: list = []
+    primary_coords: tuple[float, float] | None = None
+    for d in devices:
+        if db.is_air_monitor_device(d):
+            continue
+        rrows = await _rollup_rows(d["mac"], yday, yday)
+        if primary_coords is None:
+            c = (((d.get("info") or {}).get("coords") or {})
+                 .get("coords") or {})
+            if isinstance(c.get("lat"), (int, float)) \
+                    and isinstance(c.get("lon"), (int, float)):
+                primary_coords = (float(c["lat"]), float(c["lon"]))
+        if not rrows:
+            continue
+        r = rrows[0]
+        stations.append(dg.StationDay(
+            name=d.get("name") or d["mac"],
+            tmax_f=r["tempf_max"], tmin_f=r["tempf_min"],
+            # 2.1 (Doren): the rollup has carried feels_like_max since
+            # 1.9; the report just never read it.
+            feels_max_f=_row_get(r, "feels_like_max"),
+            # The one rain rule (day_rain.py): a yearly-counter station's
+            # day is the counter's rise, and a gauge-less day is None, not
+            # 0.00 — this reader fed the morning report, the digest and
+            # the Live Activity raw (round-two review BE-N1).
+            rain_in=day_rain_in(r), gust_mph=r["windgustmph_max"],
+            humidity_lo=r["humidity_min"], humidity_hi=r["humidity_max"],
+            uv_max=r["uv_max"]))
+
+    # Nothing to say at all (no alerts, no rollups — INSIGHTS off on a
+    # quiet day).
+    if not rows and not stations:
+        return None, [], []
+
+    # Today's outlook — best-effort, ten seconds, the report stands
+    # without it. Same Open-Meteo daily fields the forecast route uses.
+    outlook = None
+    if primary_coords is None and settings.forecast_lat is not None \
+            and settings.forecast_lon is not None:
+        primary_coords = (settings.forecast_lat, settings.forecast_lon)
+    if primary_coords is not None:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={"latitude": primary_coords[0],
+                            "longitude": primary_coords[1],
+                            "daily": "temperature_2m_max,"
+                                     "temperature_2m_min,"
+                                     "precipitation_probability_max",
+                            "temperature_unit": "fahrenheit",
+                            "forecast_days": 1,
+                            "timezone": settings.timezone})
+                daily = resp.json().get("daily") or {}
+
+                def _first(key):
+                    v = daily.get(key) or []
+                    return v[0] if v and isinstance(v[0], (int, float)) \
+                        else None
+                outlook = dg.Outlook(
+                    hi_f=_first("temperature_2m_max"),
+                    lo_f=_first("temperature_2m_min"),
+                    precip_pct=(int(_first("precipitation_probability_max"))
+                                if _first("precipitation_probability_max")
+                                is not None else None))
+        except Exception:
+            outlook = None
+
+    report = dg.Report(
+        date_label=local.strftime("%A, %B %-d"),
+        stations=stations, alerts=alert_lines, outlook=outlook)
+    return report, stations, rows
+
+
+# 2.1 Reports shipped with an empty list on day one: storm summaries
+# only became report rows when a storm closed on 2.1 code, though
+# storm_history had kept every episode since 1.8. This turns that history
+# into rows, once, in the background at boot. Idempotent twice over: each
+# row is keyed by the same dedupe key the live path uses, and inserted
+# ONLY if absent, so a storm the live path already reported keeps its own
+# row; and a kv flag records completion so later boots do nothing.
+_STORM_BACKFILL_KV_KEY = "reports_storm_backfill_done"
+
+
+async def backfill_storm_reports() -> int:
+    """Rows added. Skips work already marked done."""
+    from . import reports as rp
+    if await db.get_kv(_STORM_BACKFILL_KV_KEY):
+        return 0
+    names = {d["mac"]: (d.get("name") or d["mac"])
+             for d in await db.list_devices()}
+    pending: list[dict] = []
+    for row in await db.all_storm_history():
+        try:
+            summary = storm.StormSummary(
+                started_ms=int(row["started_ms"]),
+                ended_ms=int(row["ended_ms"]),
+                total_in=float(row["total_in"]),
+                peak_rate_in_hr=row.get("peak_rate_in_hr"),
+                min_tempf=row.get("min_tempf"),
+                max_tempf=row.get("max_tempf"),
+                max_gust_mph=row.get("max_gust_mph"))
+        except (TypeError, ValueError):
+            continue
+        mac = row["mac"]
+        dname = names.get(mac, mac)
+        title, _body = storm.build_storm_message(dname, summary,
+                                                 settings.timezone)
+        capture = {c: row.get(c) for c in db._STORM_CAPTURE_COLS}
+        payload = rp.storm_payload(dname, summary, capture)
+        pending.append(dict(
+            kind=rp.KIND_STORM, mac=mac, ts_ms=summary.ended_ms,
+            for_date=_local_date_iso(summary.ended_ms), title=title,
+            summary=rp.storm_summary_line(payload), payload=payload,
+            dedupe=rp.storm_key(mac, summary.started_ms)))
+    # One connection for the whole batch (2.1 pre-release review BE-10).
+    added = await db.insert_reports_if_absent(pending)
+    eff = await db.effective_report_retention()
+    await db.prune_reports(eff["max_rows"])
+    await db.set_kv(_STORM_BACKFILL_KV_KEY, str(int(time.time() * 1000)))
+    return added
+
+
+def _local_date_iso(ms: int) -> str:
+    """The local calendar day a timestamp fell on, for the report's
+    `for_date`. Falls back to UTC exactly like the digest does, so a bad
+    TIMEZONE never takes a report write down with it."""
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return datetime.fromtimestamp(ms / 1000, tz).date().isoformat()
+
+
+def _row_get(row, key: str):
+    """A column that older databases may not carry yet. sqlite3.Row raises
+    IndexError on an unknown key rather than returning None, and a server
+    whose daily_rollups predates the feels_* columns must still get its
+    morning report."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return None
 
 
 def severity_of(kind: str) -> str:
@@ -680,7 +856,6 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
     # never heard about the alert at all (CodeRabbit, PR #32 round 2).
     webhook_channel = False
     try:
-        from . import webhooks as _wh
         webhook_channel = bool(await db.list_webhooks(enabled_only=True))
     except Exception:
         pass
@@ -1133,6 +1308,26 @@ class AlertMonitor:
                                 **capture})
                         except Exception:
                             log.exception("storm history write failed")
+                        # 2.1 Reports: the same episode, kept as a report
+                        # the Reports pane lists and a card can share.
+                        # Separate try from the history row on purpose —
+                        # storm_history feeds the story producers and must
+                        # not be lost to a reports failure, or the reverse.
+                        try:
+                            from . import reports as rp
+                            rpayload = rp.storm_payload(dname, summary,
+                                                        capture)
+                            await db.insert_report(
+                                kind=rp.KIND_STORM, mac=mac, ts_ms=now_ms,
+                                for_date=_local_date_iso(
+                                    summary.ended_ms or now_ms),
+                                title=title,
+                                summary=rp.storm_summary_line(rpayload),
+                                payload=rpayload,
+                                dedupe=rp.storm_key(mac,
+                                                    summary.started_ms))
+                        except Exception:
+                            log.exception("storm report write failed")
                         log.info("storm summary sent for %s: %.2fin over %.1fh",
                                  dname, summary.total_in, summary.duration_hours)
                         # 1.8 Storm Watch: final Activity beat, silent —
@@ -1222,46 +1417,9 @@ class AlertMonitor:
         # same trailing day the original report described.
         window_start = (now_ms - 86_400_000) if email_done \
             else (last or (now_ms - 86_400_000))
-        rows = await db.alerts_since(window_start)
-        rows = [r for r in rows if r["kind"] != "digest"]
-        alert_lines = [
-            dg.AlertLine(
-                when=datetime.fromtimestamp(r["ts_ms"] / 1000, tz)
-                    .strftime("%a %H:%M"),
-                title=r["title"],
-                severity=r.get("severity") or severity_of(r["kind"]))
-            for r in rows]
-
-        # Yesterday, per WEATHER station, off the daily rollups — the same
-        # rows the year charts and climate reports trust.
-        from datetime import timedelta as _td
-        from .climate import _rollup_rows
-        yday = (local.date() - _td(days=1)).isoformat()
-        stations: list = []
-        primary_coords: tuple[float, float] | None = None
-        for d in devices:
-            if db.is_air_monitor_device(d):
-                continue
-            rrows = await _rollup_rows(d["mac"], yday, yday)
-            if primary_coords is None:
-                c = (((d.get("info") or {}).get("coords") or {})
-                     .get("coords") or {})
-                if isinstance(c.get("lat"), (int, float)) \
-                        and isinstance(c.get("lon"), (int, float)):
-                    primary_coords = (float(c["lat"]), float(c["lon"]))
-            if not rrows:
-                continue
-            r = rrows[0]
-            stations.append(dg.StationDay(
-                name=d.get("name") or d["mac"],
-                tmax_f=r["tempf_max"], tmin_f=r["tempf_min"],
-                rain_in=r["rain_total"], gust_mph=r["windgustmph_max"],
-                humidity_lo=r["humidity_min"], humidity_hi=r["humidity_max"],
-                uv_max=r["uv_max"]))
-
-        # Nothing to say at all (no alerts, no rollups — INSIGHTS off on a
-        # quiet day): stamp and skip, exactly like the 1.8 behavior.
-        if not rows and not stations:
+        report, stations, rows = await build_morning_report(
+            devices, now_ms, window_start, tz, local)
+        if report is None:
             # Both stamps: with per-half retry gating (R15) an unstamped
             # phone half would re-enter — and re-gather rollups — every
             # tick for the rest of the day.
@@ -1269,53 +1427,35 @@ class AlertMonitor:
             await db.set_kv("alerts.digest.phone_day",
                             local.date().isoformat())
             return
+        yday = (local.date() - timedelta(days=1)).isoformat()
 
-        # Today's outlook — best-effort, ten seconds, the report stands
-        # without it. Same Open-Meteo daily fields the forecast route uses.
-        outlook = None
-        if primary_coords is None and settings.forecast_lat is not None \
-                and settings.forecast_lon is not None:
-            primary_coords = (settings.forecast_lat, settings.forecast_lon)
-        if primary_coords is not None:
-            try:
-                import httpx
-                async with httpx.AsyncClient(timeout=10) as client:
-                    resp = await client.get(
-                        "https://api.open-meteo.com/v1/forecast",
-                        params={"latitude": primary_coords[0],
-                                "longitude": primary_coords[1],
-                                "daily": "temperature_2m_max,"
-                                         "temperature_2m_min,"
-                                         "precipitation_probability_max",
-                                "temperature_unit": "fahrenheit",
-                                "forecast_days": 1,
-                                "timezone": settings.timezone})
-                    daily = resp.json().get("daily") or {}
-
-                    def _first(key):
-                        v = daily.get(key) or []
-                        return v[0] if v and isinstance(v[0], (int, float)) \
-                            else None
-                    outlook = dg.Outlook(
-                        hi_f=_first("temperature_2m_max"),
-                        lo_f=_first("temperature_2m_min"),
-                        precip_pct=(int(_first(
-                            "precipitation_probability_max"))
-                            if _first("precipitation_probability_max")
-                            is not None else None))
-            except Exception:
-                outlook = None
-
-        report = dg.Report(
-            date_label=local.strftime("%A, %B %-d"),
-            stations=stations, alerts=alert_lines, outlook=outlook)
+        # ── the durable record (2.1). Written BEFORE either half goes
+        # out, from the very object they are both rendered from, so the
+        # Reports page can never disagree with the email — and so the
+        # push and the Live Activity have a report id to deep-link to.
+        # Idempotent on the day key: the phone half retries on its own
+        # stamp (R15) and must not leave a second row behind.
+        # Best-effort: a storage failure must not cost the reader their
+        # morning report, it only costs the deep link.
+        report_id = None
+        try:
+            from . import reports as rp
+            payload = rp.morning_payload(report)
+            report_id = await db.insert_report(
+                kind=rp.KIND_MORNING, mac=None, ts_ms=now_ms,
+                for_date=yday, title="Morning report · " + report.date_label,
+                summary=rp.morning_summary(payload), payload=payload,
+                dedupe=rp.morning_key(local.date().isoformat()))
+        except Exception:
+            log.exception("morning report not stored; sending it anyway")
 
         # ── the phone half (1.9, Volney: "a daily digest for your phone
         # first thing in the morning... like what we do with the storm").
         # Its OWN daily stamp, separate from the email's: a failed email
         # retries next tick, and re-sending the Live Activity + push each
         # retry would stack morning cards on the lock screen.
-        await self._send_morning_phone(report, stations, local, now_ms)
+        await self._send_morning_phone(report, stations, local, now_ms,
+                                       report_id)
 
         if email_done:
             return                  # only the phone half needed a retry
@@ -1340,7 +1480,8 @@ class AlertMonitor:
             log.exception("digest send failed; will retry next tick")
 
     async def _send_morning_phone(self, report, stations, local,
-                                  now_ms: int) -> None:
+                                  now_ms: int,
+                                  report_id: int | None = None) -> None:
         """The morning report's lock-screen half: a push-to-start Live
         Activity (yesterday's numbers + today's outlook, self-dismissing
         by mid-morning — a newspaper, not a ticker) plus a compact push
@@ -1362,6 +1503,10 @@ class AlertMonitor:
         if lead is not None:
             try:
                 state = {"dateMs": now_ms,
+                         # 2.1: the card's tap target. None on a server
+                         # that could not store the report, and the card
+                         # then opens the dashboard as it did in 2.0.
+                         "reportId": report_id,
                          "hiF": lead.tmax_f, "loF": lead.tmin_f,
                          "rainIn": lead.rain_in, "gustMph": lead.gust_mph,
                          "todayHiF": report.outlook.hi_f
@@ -1390,7 +1535,9 @@ class AlertMonitor:
                 log.exception("morning live activity failed")
         try:
             if await apns.push_configured():
-                res = await apns.send_to_all(title, body)
+                res = await apns.send_to_all(
+                    title, body,
+                    route=(f"report/{report_id}" if report_id else None))
                 sent_any = sent_any or bool(res.get("sent"))
                 had_targets = had_targets or bool(res.get("total"))
         except Exception:

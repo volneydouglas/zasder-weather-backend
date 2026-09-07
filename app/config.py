@@ -388,6 +388,32 @@ class Settings(BaseSettings):
     # to derive location from stored coordinates, so what appears is exactly
     # what the operator chose to reveal, at whatever coarseness they chose.
     public_dashboard_location: str | None = None
+    # 2.1: what this server calls itself ("Chaucer Drive"). App-managed
+    # through /api/config/server-name; this env value is the fallback, and
+    # the public-dashboard location the fallback's fallback. Read by the
+    # apps from /api/session so a multi-server switcher (2.2) can label a
+    # connection without the owner upgrading.
+    server_name: str | None = None
+    # 2.1: the read-only MCP server at POST /mcp and the OAuth 2.1 endpoints
+    # that let claude.ai / ChatGPT connectors reach it. Off = none of those
+    # routes exist (404), including the discovery documents. Guest and
+    # mirror instances whose operator does not want an anonymous OAuth
+    # registration surface set this to 0 (2.1 review, SEC-2).
+    mcp_enabled: bool = True
+    # 2.1: this server's canonical origin ("https://weather.example.com").
+    # When set it is THE issuer and resource identity in the OAuth metadata
+    # documents and the WWW-Authenticate challenge; unset, they are derived
+    # from each request's Host header, which is only as trustworthy as the
+    # proxy in front (2.1 review, SEC-5). Set it on any deployment behind
+    # a proxy that passes arbitrary Host values through.
+    public_base_url: str | None = None
+    # 2.1 bounds and switches that used to be read with os.environ.get and
+    # so ignored a value in .env on a bare uvicorn run (2.1 pre-release
+    # review, §3.1). Same names, now honoured like every other setting.
+    # The app-managed values (server_kv) still win over these.
+    reports_max_rows: int | None = None       # REPORTS_MAX_ROWS
+    storm_history_max: int | None = None      # STORM_HISTORY_MAX
+    server_advice: bool = True                # SERVER_ADVICE=0 turns the card off
 
     # ── Staleness alerting (email) ───────────────────────────────────────
     # Email an operator when a device that was reporting goes quiet for

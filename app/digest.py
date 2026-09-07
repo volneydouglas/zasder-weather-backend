@@ -25,6 +25,11 @@ class StationDay:
     name: str
     tmax_f: float | None
     tmin_f: float | None
+    # Doren, 2026-09-03, after a 108°F feels-like day: "that variable
+    # should also be included in the summary for the prior day." Shown
+    # only when it actually ran hotter (or colder) than the air, which is
+    # the only time it says anything the high and low did not.
+    feels_max_f: float | None
     rain_in: float | None
     gust_mph: float | None
     humidity_lo: float | None
@@ -55,7 +60,109 @@ class Report:
     outlook: Outlook | None = None
 
 
+# ── the disagreement (2.1) ──────────────────────────────────────────────
+#
+# Volney's ask was a combined, all-station report. The honest first card
+# is not an average: on one day his five stations spread 6.5°F on the
+# high, and siting bias is systematic, so a mean is a number no sensor
+# read. What the stations DISAGREE by is real information about the yard.
+# Median for temperatures and humidity, MAX for gust and rain (the
+# highest gauge is closest to the truth; both under-catch), quoted as
+# `consensus`, but the headline is the spread.
+
+# The fields the spread covers, in the order the card lists them:
+# (label, StationDay attribute, unit, consensus rule). Pressure is not in
+# the morning rollup row the report reads, so it is not here.
+SPREAD_FIELDS: tuple[tuple[str, str, str, str], ...] = (
+    ("High", "tmax_f", "°F", "median"),
+    ("Low", "tmin_f", "°F", "median"),
+    ("Humidity", "humidity_hi", "%", "median"),
+    ("Peak gust", "gust_mph", "mph", "max"),
+    ("Rain", "rain_in", "in", "max"),
+)
+
+_WORDS = {2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+          7: "seven", 8: "eight", 9: "nine"}
+
+
+def _median(vals: list[float]) -> float:
+    xs = sorted(vals)
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def compute_spread(stations: list[StationDay]) -> dict | None:
+    """How far the stations disagreed on yesterday, or None with fewer
+    than two stations reporting a field. Pure; the report payload and the
+    email both read this one answer."""
+    if len(stations) < 2:
+        return None
+    fields: list[dict] = []
+    for label, attr, unit, rule in SPREAD_FIELDS:
+        pairs = []
+        for s in stations:
+            v = getattr(s, attr, None)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                pairs.append((s.name, float(v)))
+        if len(pairs) < 2:
+            continue
+        lo = min(pairs, key=lambda p: p[1])
+        hi = max(pairs, key=lambda p: p[1])
+        vals = [v for _, v in pairs]
+        consensus = max(vals) if rule == "max" else _median(vals)
+        fields.append({
+            "key": attr, "label": label, "unit": unit,
+            "min": lo[1], "min_station": lo[0],
+            "max": hi[1], "max_station": hi[0],
+            "spread": round(hi[1] - lo[1], 2),
+            "consensus": round(consensus, 2), "n": len(pairs),
+        })
+    if not fields:
+        return None
+    lead = fields[0]
+    word = _WORDS.get(lead["n"], str(lead["n"]))
+    headline = (f"Your {word} sensors spread "
+                f"{_spread_value(lead, lead['spread'], delta=True)} "
+                f"on yesterday's {lead['label'].lower()}")
+    return {"station_count": len(stations), "headline": headline,
+            "fields": fields}
+
+
+def _spread_value(f: dict, v: float, delta: bool = False) -> str:
+    """A field value in the report's own (API-native) units. A DELTA of
+    temperature carries the same degree sign; the app converts by scale
+    only, this text is the email's."""
+    key = f["key"]
+    if key == "rain_in":
+        return f"{v:.2f} in"
+    if key == "gust_mph":
+        return f"{v:.0f} mph"
+    if key == "humidity_hi":
+        return f"{v:.0f}%"
+    return f"{v:.1f}°F" if delta else f"{v:.0f}°F"
+
+
+def spread_lines(sp: dict) -> list[str]:
+    """One line per field: 'High: 98°F at Roof to 105°F at Yard, 6.5°F
+    apart'. Shared by the plain-text mail and the HTML block."""
+    return [
+        f"{f['label']}: {_spread_value(f, f['min'])} at {f['min_station']} "
+        f"to {_spread_value(f, f['max'])} at {f['max_station']}, "
+        f"{_spread_value(f, f['spread'], delta=True)} apart"
+        for f in sp["fields"]]
+
+
 # ── the anchor's opening line ───────────────────────────────────────────
+
+# A feels-like worth printing: at least this far from the air
+# temperature. Below it the number just repeats the high back at you.
+FEELS_GAP_F = 3.0
+
+
+def _feels_worth_saying(s: StationDay) -> bool:
+    return (s.feels_max_f is not None and s.tmax_f is not None
+            and abs(s.feels_max_f - s.tmax_f) >= FEELS_GAP_F)
+
 
 def headline(r: Report) -> str:
     """One nightly-news sentence for the lead station's day. Template
@@ -74,6 +181,8 @@ def headline(r: Report) -> str:
             bits.append(f"A freezing day, {deg} at best")
         else:
             bits.append(f"A high of {deg}")
+    if _feels_worth_saying(lead):
+        bits.append(f"feeling like {lead.feels_max_f:.0f}")
     if lead.rain_in is not None and lead.rain_in >= 0.01:
         bits.append(f'{lead.rain_in:.2f}" of rain in the gauge')
     if lead.gust_mph is not None and lead.gust_mph >= 30:
@@ -125,6 +234,9 @@ def _station_block(s: StationDay) -> str:
     hi = _fmt(s.tmax_f, ".0f", "&deg;")
     lo = _fmt(s.tmin_f, ".0f", "&deg;")
     tiles: list[str] = []
+    if _feels_worth_saying(s):
+        tiles.append(_tile("FELT LIKE", f"{s.feels_max_f:.0f}&deg;",
+                           _WARM if s.feels_max_f > s.tmax_f else _ACCENT))
     if s.rain_in is not None:
         tiles.append(_tile("RAIN", f"{s.rain_in:.2f}&quot;",
                            _ACCENT if s.rain_in >= 0.01 else _TEXT))
@@ -201,10 +313,28 @@ def _alerts_block(alerts: list[AlertLine]) -> str:
             + "".join(rows) + '</table>')
 
 
+def _spread_block(sp: dict | None) -> str:
+    if not sp:
+        return ""
+    rows = "".join(
+        f'<div style="font:400 12px -apple-system,Arial,sans-serif;'
+        f'color:{_TEXT};padding:3px 0;">{html.escape(line)}</div>'
+        for line in spread_lines(sp))
+    return (f'<div style="{_TILE}margin-top:12px;">'
+            f'<div style="{_LABEL}">YOUR SENSORS DISAGREE</div>'
+            f'<div style="font:700 14px -apple-system,Arial,sans-serif;'
+            f'color:{_TEXT};padding:4px 0 6px;">'
+            f'{html.escape(sp["headline"])}</div>{rows}'
+            f'<div style="font:400 10px -apple-system,Arial,sans-serif;'
+            f'color:{_DIM};padding-top:6px;">Siting, not error. No average '
+            f'is printed because no sensor read one.</div></div>')
+
+
 def build_html(r: Report) -> str:
     """The whole email body. Single dark column, 480px, every style
     inline, zero external requests."""
     stations = "".join(_station_block(s) for s in r.stations)
+    stations += _spread_block(compute_spread(r.stations))
     outlook = _outlook_block(r.outlook) if r.outlook else ""
     return f"""<!DOCTYPE html>
 <html><body style="margin:0;padding:0;background:{_BG};">
@@ -241,6 +371,8 @@ def build_text(r: Report) -> str:
             line.append(f"high {s.tmax_f:.0f}F")
         if s.tmin_f is not None:
             line.append(f"low {s.tmin_f:.0f}F")
+        if _feels_worth_saying(s):
+            line.append(f"felt like {s.feels_max_f:.0f}F")
         if s.rain_in is not None:
             line.append(f'rain {s.rain_in:.2f}"')
         if s.gust_mph is not None:
@@ -252,6 +384,9 @@ def build_text(r: Report) -> str:
         if s.uv_max is not None and s.uv_max > 0:
             line.append(f"UV {s.uv_max:.0f}")
         out.append("  " + " | ".join(line))
+    if (sp := compute_spread(r.stations)):
+        out += ["", sp["headline"] + "."]
+        out += ["  " + line for line in spread_lines(sp)]
     if r.outlook and (r.outlook.hi_f is not None
                       or r.outlook.lo_f is not None
                       or r.outlook.precip_pct is not None):
@@ -286,6 +421,8 @@ def push_text(r: Report) -> tuple[str, str]:
             bits.append(f"Hi {lead.tmax_f:.0f}°")
         if lead.tmin_f is not None:
             bits.append(f"Lo {lead.tmin_f:.0f}°")
+        if _feels_worth_saying(lead):
+            bits.append(f"felt {lead.feels_max_f:.0f}°")
         if lead.rain_in is not None and lead.rain_in >= 0.01:
             bits.append(f'{lead.rain_in:.2f}" rain')
         if lead.gust_mph is not None:

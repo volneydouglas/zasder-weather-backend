@@ -90,6 +90,29 @@ PUBLIC_BY_DESIGN = {
     # same fragment the open "/" page already shows when that flag is on —
     # no new data crosses the line (1.6.1).
     ("GET", "/embed"),
+    # OAuth 2.1 discovery for the MCP server (2.1, app/oauth.py). The two
+    # metadata documents say only where to log in (RFC 9728 / RFC 8414),
+    # and the consent page names the asking app and takes a token — it
+    # grants nothing; the POST that does is checked in-handler.
+    ("GET", "/.well-known/oauth-protected-resource/mcp"),
+    ("GET", "/.well-known/oauth-protected-resource"),
+    ("GET", "/.well-known/oauth-authorization-server"),
+    ("GET", "/oauth/authorize"),
+}
+
+# Routes that are anonymous AND mutating, on purpose: the OAuth 2.1
+# endpoints a connector must reach before it has any credential
+# (2.1 review, SEC-7). Their control is rate limiting plus what each one
+# can and cannot do: registration stores an inert client (nothing until
+# the owner approves it); the consent POST verifies a connect code or the
+# typed server token; token and revoke authenticate the client_id and the
+# code / refresh token by hash. Listed by method+path so a rate limiter
+# alone can never count as authentication anywhere else.
+ANONYMOUS_BY_DESIGN = {
+    ("POST", "/oauth/register"),
+    ("POST", "/oauth/authorize"),
+    ("POST", "/oauth/token"),
+    ("POST", "/oauth/revoke"),
 }
 
 _AUTH_CALL = re.compile(
@@ -107,6 +130,13 @@ _AUTH_CALL = re.compile(
     # matching any Depends() would let a route with only Depends(get_db)
     # pass as authenticated.
     r"|Depends\(\s*_?\w*(auth|token|key|admin)"
+    # the OAuth 2.1 endpoints for the MCP server (2.1, app/oauth.py):
+    # registration is open by RFC 7591 and controlled by rate limiting like
+    # the nonce endpoint below (_rate_ok, and it grants nothing); the
+    # consent POST verifies the typed server token through _role_for
+    # (tokens_match inside); the token and revoke endpoints authenticate
+    # the client_id via _get_client and the code / refresh token by hash.
+    r"|_role_for\(|_get_client\("
     # a public nonce endpoint whose control is rate limiting, not identity.
     # It issues a random challenge and grants nothing; the attestation it
     # feeds is verified separately when the challenge is redeemed.
@@ -164,13 +194,21 @@ def test_every_undeclared_route_authenticates_in_its_handler():
     for guard, method, path, fname in _routes():
         if guard != "NO-DEP" or (method, path) in PUBLIC_BY_DESIGN:
             continue
+        if (method, path) in ANONYMOUS_BY_DESIGN:
+            continue
         # The hosted-relay server is stripped from the public mirror and is
         # gated by App Attest, not a bearer token. Its own test module covers
         # that flow; asserting it here would require naming symbols this file
         # must not contain.
         if fname == "relay.py":
             continue
-        if not _AUTH_CALL.search(_handler_body(path, method, fname)):
+        body = _handler_body(path, method, fname)
+        # The OAuth helpers (_role_for, _get_client, _rate_ok) establish
+        # authentication only inside app/oauth.py, where each endpoint's
+        # control is documented above; elsewhere they prove nothing.
+        if fname != "oauth.py":
+            body = re.sub(r"_role_for\(|_get_client\(", "", body)
+        if not _AUTH_CALL.search(body):
             unguarded.append(f"{method} {path} ({fname})")
     assert not unguarded, (
         "route(s) with neither an auth dependency nor an in-handler check: "
@@ -183,9 +221,127 @@ def test_every_undeclared_route_authenticates_in_its_handler():
 def test_the_public_route_list_has_not_quietly_grown():
     """PUBLIC_BY_DESIGN is the whole unauthenticated surface. It should change
     only by deliberate edit, never as a side effect."""
-    assert len(PUBLIC_BY_DESIGN) == 6   # +/embed, the opt-in iframe page (1.6.1)
+    assert len(PUBLIC_BY_DESIGN) == 10  # +/embed (1.6.1); +4 OAuth discovery/consent (2.1)
     assert all(m == "GET" for m, _ in PUBLIC_BY_DESIGN), (
         "a mutating route was added to the public-by-design list")
+    assert len(ANONYMOUS_BY_DESIGN) == 4, (
+        "an anonymous mutating route was added; document its control here")
+    assert all(p.startswith("/oauth/") for _, p in ANONYMOUS_BY_DESIGN)
+
+
+def test_the_anonymous_mutating_routes_are_exactly_the_oauth_four():
+    """The complement of the previous test: every mutating route that
+    has no dependency is in ANONYMOUS_BY_DESIGN, and each one lives in
+    oauth.py and calls its limiter. Routes are read from source, so a new
+    anonymous POST anywhere else fails here before it can be relied on."""
+    # Every module (relay.py excepted, as in the sweep above): a new
+    # anonymous POST in main.py must land in `found` and fail the equality,
+    # not be filtered out before the comparison (CodeRabbit, PR #36).
+    # /ingest/* routes check INGEST_TOKEN inside the handler and /mcp
+    # runs its own bearer gate (API, guest or OAuth token); the sweep
+    # above proves those calls are present, so neither is anonymous.
+    found = {(m, p, f) for g, m, p, f in _routes()
+             if g == "NO-DEP" and m in {"POST", "PUT", "PATCH", "DELETE"}
+             and f != "relay.py" and not p.startswith("/ingest/")
+             and p != "/mcp"}
+    assert {(m, p) for m, p, _ in found} == ANONYMOUS_BY_DESIGN, found
+    assert {f for _, _, f in found} == {"oauth.py"}, found
+    for method, path in ANONYMOUS_BY_DESIGN:
+        assert "_rate_ok(" in _handler_body(path, method, "oauth.py"), (method, path)
+
+
+_OWNER = {"Authorization": "Bearer test-api-token"}
+
+
+def test_no_mcp_handler_defaults_its_role():
+    """A privilege parameter fails closed (round-two review, BE-N8): every
+    tool handler, call_tool and handle_message take `role` with no
+    default, so a new call site cannot quietly run as the owner."""
+    import ast
+    tree = ast.parse((APP / "mcp.py").read_text())
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            continue
+        args = node.args
+        # Positional-only and regular positionals share one defaults list,
+        # aligned with the LAST len(defaults) of them; keyword-only
+        # parameters carry their own (None = no default).
+        positional = [a.arg for a in args.posonlyargs + args.args]
+        if "role" in positional:
+            idx = positional.index("role") - (len(positional) - len(args.defaults))
+            if idx >= 0:
+                offenders.append(node.name)
+        for a, d in zip(args.kwonlyargs, args.kw_defaults):
+            if a.arg == "role" and d is not None:
+                offenders.append(node.name)
+    assert not offenders, f"role defaults in mcp.py: {offenders}"
+
+
+def test_mcp_and_oauth_vanish_together_when_disabled(temp_env, monkeypatch):
+    """MCP_ENABLED=0 (SEC-2): no /mcp, no OAuth endpoints, no discovery
+    documents — the routes are not registered, so they 404 like any
+    unknown path rather than answering with a policy error. Probed over
+    HTTP: FastAPI stores included routers behind a private wrapper, and a
+    behavioural check is what the switch promises anyway."""
+    import importlib
+    from fastapi.testclient import TestClient
+
+    def probe():
+        for mod in ["app.config", "app.main"]:
+            if mod in importlib.sys.modules:
+                importlib.reload(importlib.sys.modules[mod])
+        from app.main import app
+        with TestClient(app) as c:
+            return {
+                "mcp": c.post("/mcp", json={"jsonrpc": "2.0", "id": 1,
+                                            "method": "ping"}).status_code,
+                "as": c.get("/.well-known/oauth-authorization-server").status_code,
+                "pr": c.get("/.well-known/oauth-protected-resource/mcp").status_code,
+                "reg": c.post("/oauth/register", json={}).status_code,
+                "auth": c.get("/oauth/authorize").status_code,
+                # The four owner routes live on the app, not the router
+                # (round-two review, SEC-F4): they take the switch as a
+                # dependency instead. A made-up client id: with the switch
+                # on these answer 404 too, so the "on" assertion below
+                # reads them from a real registration.
+                "clients": c.get("/api/oauth/clients", headers=_OWNER).status_code,
+                "code": c.post("/api/oauth/connect-code", headers=_OWNER).status_code,
+                **_approve_and_drop(c),
+            }
+
+    def _approve_and_drop(c):
+        # A real registration when the switch is on (a made-up id would
+        # 404 either way and prove nothing); when off, registration 404s
+        # and the two routes are probed with a placeholder.
+        reg = c.post("/oauth/register", json={"client_name": "probe",
+                                               "redirect_uris": ["https://probe.example/cb"]})
+        cid = reg.json().get("client_id", "nope") if reg.status_code in (200, 201) else "nope"
+        return {
+            "ok": c.post(f"/api/oauth/clients/{cid}/approve", headers=_OWNER).status_code,
+            "drop": c.delete(f"/api/oauth/clients/{cid}", headers=_OWNER).status_code,
+        }
+
+    import os
+    before = os.environ.get("MCP_ENABLED")
+    try:
+        monkeypatch.setenv("MCP_ENABLED", "0")
+        off = probe()
+        assert set(off.values()) == {404}, off
+        monkeypatch.setenv("MCP_ENABLED", "1")
+        on = probe()
+        assert on["mcp"] == 401 and on["as"] == 200 and on["pr"] == 200, on
+        assert on["reg"] == 400 and on["auth"] == 400, on
+        assert on["clients"] == 200 and on["code"] == 200, on
+        assert on["ok"] == 200 and on["drop"] == 200, on
+    finally:
+        # A failed assertion must not leave app.main reloaded with the
+        # server switched off for every test that follows.
+        if before is None:
+            monkeypatch.delenv("MCP_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("MCP_ENABLED", before)
+        probe()
 
 
 def test_mutating_routes_are_never_merely_read_guarded():
@@ -247,7 +403,7 @@ def guest_client(temp_env, monkeypatch):
     import importlib, sys
     monkeypatch.setenv("GUEST_API_TOKENS", "test-guest-token")
     for mod in ["app.config", "app.db", "app.insights", "app.wu_upload",
-                "app.capture", "app.ingest", "app.meter", "app.discovery",
+                "app.capture", "app.ingest", "app.discovery",
                 "app.alerts", "app.apns", "app.relay", "app.integrations",
                 "app.main"]:
         if mod in sys.modules:
@@ -365,7 +521,7 @@ def write_share_client(temp_env):
     """A client plus a freshly minted zww_ token."""
     import importlib, sys
     for mod in ["app.config", "app.db", "app.insights", "app.wu_upload",
-                "app.capture", "app.ingest", "app.meter", "app.discovery",
+                "app.capture", "app.ingest", "app.discovery",
                 "app.alerts", "app.apns", "app.relay", "app.integrations",
                 "app.main"]:
         if mod in sys.modules:
@@ -422,3 +578,54 @@ def test_a_write_share_token_reaches_every_station_ops_route(
         f"{method} {path} answered {r.status_code} to the write-share "
         "token — 401/403 means the tier lost a designed route; 5xx means "
         "the handler is broken, which this sweep must not paper over")
+
+
+def test_no_read_route_hands_a_guest_the_source_blob(client):
+    """§5 row 11, a sweep rather than two named sites: every GET route
+    that takes a station is called with a guest bearer, for a station
+    whose newest reading carries a `_source` with exact coordinates, and
+    none of the answers may contain it. Routes that need more than a mac
+    are called with what a client would send by default; a refusal is
+    fine, a body with `_source` is not."""
+    import asyncio
+    import time as _t
+    from app import db
+    from app.main import app as _app
+    client.post("/ingest/custom", headers={"Authorization": "Bearer test-ingest-token"}, json={
+        "device": {"id": "AABBCCDDEEFF", "name": "Yard"},
+        "timestamp_utc": _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime()),
+        "outdoor": {"tempf": 80.0, "humidity": 30},
+        "coords": {"lat": 33.3004, "lon": -111.9378, "location": "123 Elm St"},
+        "source": "test"})
+    mac = "AA:BB:CC:DD:EE:FF"
+    own = client.get(f"/api/devices/{mac}/current", headers=_OWNER).json()
+    assert "_source" in own, "the fixture must carry a source blob to be worth sweeping"
+    guest_tok = "zwg_" + "ab" * 16
+    asyncio.run(db.add_guest_token(guest_tok, "Sweep", int(_t.time() * 1000)))
+    gh = {"Authorization": f"Bearer {guest_tok}"}
+    swept = 0
+    for route in _app.routes:
+        path = getattr(route, "path", "")
+        if "GET" not in (getattr(route, "methods", None) or ()) or "{mac}" not in path:
+            continue
+        url = path.replace("{mac}", mac)
+        for k in ("{field}", "{year}", "{kind}", "{id}", "{day}"):
+            url = url.replace(k, "tempf" if k == "{field}" else "2026")
+        r = client.get(url, headers=gh, params={"hours": 24, "year": 2026, "field": "tempf"})
+        assert "_source" not in r.text, (path, r.status_code)
+        swept += 1
+    assert swept >= 5, swept
+    # MCP list_stations: the owner sees the poster's payload, a guest never.
+    mcp_h = {"Accept": "application/json, text/event-stream",
+             "MCP-Protocol-Version": "2025-06-18"}
+
+    def rpc(c, method, params, headers):
+        return c.post("/mcp", headers=headers,
+                      json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    r = rpc(client, "tools/call", {"name": "list_stations", "arguments": {}},
+            headers={**mcp_h, **gh})
+    assert "_source" not in r.text and "123 Elm" not in r.text
+    r = rpc(client, "tools/call", {"name": "list_stations", "arguments": {}},
+            headers={**mcp_h, **_OWNER})
+    st = r.json()["result"]["structuredContent"]["stations"][0]
+    assert st["source"] is not None, "the owner's list names the source (BE-F12)"

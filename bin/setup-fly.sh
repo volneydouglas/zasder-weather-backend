@@ -451,10 +451,19 @@ if [ "$mode" = "create" ]; then
   # rollups exist to prevent. (Update mode never touches it — operators
   # who turned it off stay off.)
   secret_args=(API_TOKEN="$api_token" INGEST_TOKEN="$ingest_token" TIMEZONE="$tz" GUEST_API_TOKENS="$guest_token" INSIGHTS=1)
+  # The server's canonical origin for the OAuth / MCP identity (2.1,
+  # SEC-5): the custom hostname when one was given, else the app's own
+  # fly.dev name. Without it the metadata documents would be derived from
+  # whatever Host header arrived.
+  secret_args+=(PUBLIC_BASE_URL="https://${custom_host:-$app_name.fly.dev}")
   source_enabled awn   && secret_args+=(AW_APPLICATION_KEY="$aw_app_key" AW_API_KEY="$aw_api_key")
   source_enabled davis && secret_args+=(WEATHERLINK_API_KEY="$wl_key" WEATHERLINK_API_SECRET="$wl_secret" WEATHERLINK_STATION_ID="$wl_station")
   source_enabled tempest && secret_args+=(TEMPEST_TOKEN="$tp_token" TEMPEST_STATION_ID="$tp_station")
-  fly secrets set --app "$app_name" "${secret_args[@]}"
+  # stdin import, never argv: every value here is a credential and `ps`
+  # shows argv to every user on the machine (2.1 review, SEC-11). Same form
+  # the deploy token below already uses. One NAME=VALUE per line; none of
+  # these values contain a newline.
+  printf '%s\n' "${secret_args[@]}" | fly secrets import --app "$app_name"
 
   # Optional: automatic backend updates. The token is app-scoped (deploy
   # only), and the updater applies a release only after it has been out
@@ -476,7 +485,11 @@ if [ "$mode" = "create" ]; then
     else
       warn "Could not create a deploy token — automatic updates skipped."
       warn "Enable later:  fly tokens create deploy --app $app_name"
-      warn "  then:        fly secrets set FLY_API_TOKEN=<token> AUTO_UPDATE=1 --app $app_name"
+      # Not `fly secrets set FLY_API_TOKEN=<token>`: a value on the command
+      # line lands in shell history and the process list (SEC-11; round
+      # three I3-3 found this one line still saying it).
+      warn "  then:        fly tokens create deploy --app $app_name | sed 's/^/FLY_API_TOKEN=/' | fly secrets import --app $app_name"
+      warn "               fly secrets set AUTO_UPDATE=1 --app $app_name"
     fi
   fi
 
@@ -673,6 +686,9 @@ stage AW_API_KEY             "$aw_api_key"
 stage WEATHERLINK_API_KEY    "$wl_key"
 stage WEATHERLINK_API_SECRET "$wl_secret"
 stage WEATHERLINK_STATION_ID "$wl_station"
+# A hostname added on update becomes the canonical origin too (see the
+# create path); blank keeps whatever PUBLIC_BASE_URL the app has.
+[ -n "$custom_host" ] && upd_args+=(PUBLIC_BASE_URL="https://$custom_host")
 
 if [ "$ROTATE_TOKENS" -eq 1 ]; then
   new_api=$(openssl rand -hex 32)
@@ -694,7 +710,9 @@ fi
 
 if [ "${#upd_args[@]}" -gt 0 ]; then
   bold "Updating secrets"
-  fly secrets set --app "$app_name" "${upd_args[@]}"
+  # stdin, not argv (SEC-11): rotated tokens and vendor keys pass through
+  # here, and `fly secrets set` would put them in the process list.
+  printf '%s\n' "${upd_args[@]}" | fly secrets import --app "$app_name"
 fi
 if [ "${#unset_names[@]}" -gt 0 ]; then
   bold "Clearing secrets: ${unset_names[*]}"

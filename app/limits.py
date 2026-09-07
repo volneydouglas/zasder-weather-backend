@@ -20,11 +20,19 @@ Two layers:
 Cap defaults to 1 MiB — comfortably above every legitimate request
 (observations are ~500 B; ingest endpoints enforce their own 16-64 KiB
 limits on top of this). Tune with MAX_REQUEST_BYTES.
+
+One path is exempt: the database restore upload (2.1) is a whole SQLite
+file, hundreds of MB on a years-deep archive. Its route reads the body
+only AFTER the write-token dependency has passed and streams it to disk
+under its own free-space bound (app/restore.py), so an anonymous request
+still costs no memory: FastAPI answers 401 without touching the stream.
 """
 
 import os
 
 _DEFAULT_MAX = 1 * 1024 * 1024  # 1 MiB
+# Exact paths whose routes bound their own body, after authentication.
+EXEMPT_PATHS = frozenset({"/api/backup/database/restore"})
 
 
 def _max_bytes() -> int:
@@ -43,7 +51,7 @@ class BodySizeLimitMiddleware:
         self.max_bytes = max_bytes if max_bytes is not None else _max_bytes()
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
+        if scope["type"] != "http" or scope.get("path") in EXEMPT_PATHS:
             await self.app(scope, receive, send)
             return
 

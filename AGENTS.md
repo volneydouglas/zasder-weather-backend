@@ -68,7 +68,7 @@ app/                         FastAPI source (the Python package)
   airgradient_*.py           AirGradient air-quality integration (cloud + LAN)
   static/                    Status page HTML
 tests/                       pytest suite — run with `pytest -q`
-Dockerfile                   python:3.12-slim → uvicorn
+Dockerfile                   python:3.12-slim → docker-entrypoint.sh (chown /data, drop to `app`) → uvicorn
 fly.toml                     Fly.io app + volume + secrets configuration
 requirements.txt             Runtime deps (FastAPI, httpx, aiosqlite, pydantic)
 requirements-dev.txt         Test deps (pytest, testclient, anyio)
@@ -81,7 +81,7 @@ wll-poller/                  Path E — Davis WeatherLink Live LAN poller
 weewx-bridge/                Path H — WeeWX extension POSTing archive
                              records to /ingest/custom (weectl install)
 
-mcp/                         Read-only MCP server over the token-gated API
+mcp/                         Legacy stdio MCP bridge (1.8, six tools); the MCP server is POST /mcp (eleven tools, OAuth for connectors)
 
 lilygo-relay/                ESP32 firmware (PlatformIO)
   src/
@@ -182,6 +182,10 @@ Q: Where do they want the backend?
 | `WATER_YEAR_START_MONTH` | Optional | Water-year start for `/api/devices/{mac}/climate`. Default 10 (October); 1 = calendar year. |
 | `AIRGRADIENT_LOCAL_HOSTS` | Optional | Comma-separated AirGradient monitor hosts/IPs for cloud-free LAN polling (local Docker installs). Cloud-token integration is app-managed instead. |
 | `AUTO_UPDATE` + `FLY_API_TOKEN` | Optional | Self-updating Fly instance (app-scoped deploy token, `FlyV1` macaroon or `Bearer` both accepted). Never crosses a major version. |
+| `SERVER_ADVICE` | Optional | Default on. The Server Recommendations card (2.1) reads the Fly machine and volume through `FLY_API_TOKEN` (that token's second job) and offers paid volume/memory changes behind an in-app confirmation. `0` disables. |
+| `REPORTS_MAX_ROWS` | Optional | Stored reports kept (default 900, 30..5000); app value via `PUT /api/reports/retention` wins. |
+| `STORM_HISTORY_MAX` | Optional | Closed storms kept per station (default 200, 10..1000); app value via `PUT /api/storms/retention` wins. |
+| `SERVER_NAME` | Optional | What the server calls itself in the apps; `GET /api/session` carries it with the token's role. App value via `PUT /api/config/server-name` wins; the public page's location is the last fallback. |
 | `PUBLIC_DASHBOARD` (+ `_MACS`, `_FIELDS`) | Optional | `1` replaces the status page screenshots with a live server-rendered dashboard; `/embed` serves it frameable for iframes. |
 | `SMART_ALERTS` | Optional | `1` enables threshold-free weather-intelligent alerts (frost, dangerous heat, pressure drop, temp drops, wind ramps, gust fronts). |
 | `STORM_SUMMARY` (+ `_QUIET_MINUTES`, `_MIN_TOTAL_IN`) | Optional | One report after the rain stops. Default on (0.05 in floor, 30 min quiet); app-saved values win over env. |
@@ -201,6 +205,8 @@ Q: Where do they want the backend?
 | `ALERT_EMAIL_TO` + `SMTP_HOST` | Optional | Both set = device-down email alerts on. SMTP_USERNAME/PASSWORD/PORT/SSL for transport (Gmail App Password works). |
 | `ALERT_STALE_MINUTES` (+ `_BY_MAC`) | Optional | Minutes offline before alerting; per-MAC override map, `0` disables a device. Default 15. |
 | `ALLOWED_HOSTS` | Recommended in prod | Comma-separated allow-list for Host header. Defaults `*`. |
+| `MCP_ENABLED` | Optional | Default on. `0` removes `POST /mcp`, the OAuth endpoints and both `/.well-known/oauth-*` documents (they 404 like any unknown path). |
+| `PUBLIC_BASE_URL` | Recommended in prod | The origin the server is reached at (`https://your-app.fly.dev`). OAuth discovery documents, the resource audience and the consent page derive their URLs from it. Unset on Fly, the app's own `https://<FLY_APP_NAME>.fly.dev` is used; unset elsewhere, the request's Host header is reflected. |
 | `DEBUG` | Never set in prod | `1` re-enables `/docs` (off by default). |
 
 `.env.example` has full annotations. Read it.
@@ -227,12 +233,14 @@ fly status                                           # confirms you're authed
 # Health checklist after deploy
 ./bin/doctor.sh --app <app-name>
 
-# Add WeatherLink (Path B) later
-fly secrets set -a <app-name> \
+# Add WeatherLink (Path B) later. Piped through `fly secrets import`
+# (what setup-fly.sh does) so no key rides the command line or history.
+printf '%s\n' \
   WEATHERLINK_API_KEY=... \
   WEATHERLINK_API_SECRET=... \
-  WEATHERLINK_STATION_ID=...
-# Setting a secret auto-restarts the machine.
+  WEATHERLINK_STATION_ID=... \
+  | fly secrets import -a <app-name>
+# Importing a secret auto-restarts the machine.
 
 # Read a secret value (digests only show in `fly secrets list`)
 fly ssh console -a <app-name> -C 'printenv WEATHERLINK_API_KEY'

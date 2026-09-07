@@ -495,7 +495,7 @@ def test_boot_sweep_runs_in_lifespan(temp_env, monkeypatch):
     # Same reload dance as the `client` fixture, then hook the sweep
     # AFTER the reload (the fixture's reload would drop an earlier patch).
     for mod in ["app.config", "app.maintenance", "app.db", "app.insights",
-                "app.wu_upload", "app.capture", "app.ingest", "app.meter",
+                "app.wu_upload", "app.capture", "app.ingest", 
                 "app.discovery", "app.alerts", "app.apns", "app.relay",
                 "app.integrations", "app.main"]:
         if mod in importlib.sys.modules:

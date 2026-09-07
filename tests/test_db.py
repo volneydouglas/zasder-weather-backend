@@ -128,6 +128,203 @@ async def test_rain_rollups_uses_yearly_for_lifetime_counter(db_module):
 
 
 @pytest.mark.asyncio
+async def test_rain_rollups_year_to_date_for_lifetime_counter(db_module):
+    """A lifetime counter's `yearly_in` is the counter differenced against
+    the start of the local year — 18.47 on the sensor in a year that began
+    at 16.00 is 2.47 of rain, not 18.47 (the WH24 case, 2026-09-06)."""
+    from app import db
+    import time
+    await db.init_db()
+    mac = "5D:5D:02:00:00:7D"
+    DAY = 86_400_000
+    now = int(time.time() * 1000)
+    await db.insert_observations(mac, [
+        {"dateutc": now - 400 * DAY, "yearlyrainin": 16.00},
+        {"dateutc": now,             "yearlyrainin": 18.47},
+    ])
+    r = await db.rain_rollups(mac, "America/Phoenix")
+    assert r["yearly_in"] == 2.47
+
+
+@pytest.mark.asyncio
+async def test_year_prior_is_looked_up_once_and_tier_check_is_bounded(db_module, monkeypatch):
+    """Live profile 2026-09-06: the Jan-1 lookup walked 1.4 s of null
+    rows on every /current, and the tier check scanned the Tempest's
+    whole counter-less history. The prior is cached per (mac, boundary);
+    the tier check looks only at the last week."""
+    from app import db
+    import time as _t
+    await db.init_db()
+    mac = "5D:5D:02:00:00:7D"
+    DAY = 86_400_000
+    now = int(_t.time() * 1000)
+    await db.insert_observations(mac, [
+        {"dateutc": now - 400 * DAY, "yearlyrainin": 16.00},
+        {"dateutc": now,             "yearlyrainin": 18.47},
+    ])
+    calls = []
+    real = db.yearly_rain_at_or_before
+
+    async def counted(m, cutoff):
+        calls.append(cutoff)
+        return await real(m, cutoff)
+    monkeypatch.setattr(db, "yearly_rain_at_or_before", counted)
+    mins = []
+    real_min = db._min_rain_col_after
+
+    async def counted_min(m, col, since):
+        mins.append(since)
+        return await real_min(m, col, since)
+    monkeypatch.setattr(db, "_min_rain_col_after", counted_min)
+    r1 = await db.rain_rollups(mac, "America/Phoenix")
+    n1 = len(calls)
+    r2 = await db.rain_rollups(mac, "America/Phoenix")
+    assert r1["yearly_in"] == r2["yearly_in"] == 2.47
+    # Second pass: no boundary is looked up again (round-three review
+    # BE-F3: every boundary's prior and reset floor are memoised).
+    assert len(calls) == n1, (n1, len(calls))
+    # A gauge that reset (the Davis started at 14.6 and reads 1.59): the
+    # year-since-reset floor is a full scan, so it is memoised too.
+    reset = "5D:5D:05:00:00:01"
+    await db.insert_observations(reset, [
+        {"dateutc": now - 400 * DAY, "yearlyrainin": 14.6},
+        {"dateutc": now - 100 * DAY, "yearlyrainin": 0.2},
+        {"dateutc": now,             "yearlyrainin": 1.59},
+    ])
+    db._YEAR_PRIOR_CACHE.clear(); mins.clear()
+    a = await db.rain_rollups(reset, "America/Phoenix")
+    b = await db.rain_rollups(reset, "America/Phoenix")
+    assert a["yearly_in"] == b["yearly_in"] == 1.39
+    assert mins.count(int(db._now_local(__import__("zoneinfo").ZoneInfo("America/Phoenix"))
+                         .replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                         .timestamp() * 1000)) == 1, mins
+    # The second call scanned NOTHING: the reset floor is memoised for the
+    # hour, day, week and month boundaries too (BE-F3), not only the year.
+    assert len(mins) <= 5, mins
+    # A station whose NEWEST row carries no counter (a daily-only source
+    # that once posted a yearly) is read as counter-less (tier 3).
+    old = "5D:5D:0A:00:00:01"
+    await db.insert_observations(old, [
+        {"dateutc": now - 30 * DAY, "yearlyrainin": 3.0},
+        {"dateutc": now, "dailyrainin": 0.1},
+    ])
+    r3 = await db.rain_rollups(old, "America/Phoenix")
+    assert r3["hourly_in"] is None and r3["daily_in"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_silent_lifetime_counter_keeps_its_year_to_date(db_module):
+    """Round-three review BE-F1: the week-bounded tier check lost a
+    yearly-only station that had been silent nine days, rollups came
+    back empty and /current served the lifetime total as the year again.
+    The newest row decides the tier, however old it is."""
+    from app import db
+    import time as _t
+    await db.init_db()
+    mac = "5D:5D:02:00:00:7D"
+    DAY = 86_400_000
+    now = int(_t.time() * 1000)
+    await db.insert_observations(mac, [
+        {"dateutc": now - 400 * DAY, "yearlyrainin": 16.00},
+        {"dateutc": now - 9 * DAY,   "yearlyrainin": 18.47},
+    ])
+    r = await db.rain_rollups(mac, "America/Phoenix")
+    assert r["yearly_in"] == 2.47
+    assert r["daily_in"] == 0.0 and r["monthly_in"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_second_reset_inside_the_floor_cache_is_not_a_year_of_zero(db_module):
+    """Round-three review BE-F2: the cached reset floor sat above the new
+    counter after a SECOND reset, the guard rejected it and `prior` fell
+    back to January: 0.00 for the rest of the six hours."""
+    from app import db
+    import time as _t
+    await db.init_db()
+    mac = "5D:5D:02:00:00:8A"
+    DAY = 86_400_000
+    now = int(_t.time() * 1000)
+    await db.insert_observations(mac, [
+        {"dateutc": now - 400 * DAY, "yearlyrainin": 16.00},
+        {"dateutc": now - 100 * DAY, "yearlyrainin": 2.00},     # first reset
+        {"dateutc": now - 50 * DAY,  "yearlyrainin": 3.00},
+    ])
+    assert (await db.rain_rollups(mac, "America/Phoenix"))["yearly_in"] == 1.0
+    # A replacement gauge: the counter drops again, below the cached floor.
+    await db.insert_observations(mac, [
+        {"dateutc": now - DAY, "yearlyrainin": 0.10},           # second reset
+        {"dateutc": now,       "yearlyrainin": 0.40},
+    ])
+    r = await db.rain_rollups(mac, "America/Phoenix")
+    assert r["yearly_in"] == pytest.approx(0.30)
+
+
+@pytest.mark.asyncio
+async def test_the_reset_threshold_is_a_boundary_not_a_cliff(db_module):
+    """A drop of just under RAIN_RESET_DROP_IN is a calibration wobble and
+    clamps to zero; just over it is a reset and re-differences."""
+    from app import db
+    import time as _t
+    await db.init_db()
+    DAY = 86_400_000
+    now = int(_t.time() * 1000)
+    wobble, reset = "5D:5D:02:00:00:8B", "5D:5D:02:00:00:8C"
+    drop = db.RAIN_RESET_DROP_IN
+    # The wobble: the counter now sits 0.40 below the boundary value.
+    await db.insert_observations(wobble, [
+        {"dateutc": now - 3 * DAY, "yearlyrainin": 10.00},
+        {"dateutc": now - DAY,     "yearlyrainin": 10.00 - drop - 0.05},
+        {"dateutc": now,           "yearlyrainin": 10.00 - drop + 0.10},
+    ])
+    # The reset: the counter now sits 0.55 below it, having touched 9.40.
+    await db.insert_observations(reset, [
+        {"dateutc": now - 3 * DAY, "yearlyrainin": 10.00},
+        {"dateutc": now - DAY,     "yearlyrainin": 10.00 - drop - 0.10},
+        {"dateutc": now,           "yearlyrainin": 10.00 - drop - 0.05},
+    ])
+    # Against an explicit boundary (the week boundary moves with the day).
+    boundary = now - 2 * DAY
+    assert await db._yearly_rise_since(wobble, 10.00 - drop + 0.10, boundary) == 0.0
+    assert await db._yearly_rise_since(reset, 10.00 - drop - 0.05,
+                                       boundary) == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_rain_last_hour_is_the_counters_rise_not_the_rate(db_module):
+    """Round-three review BE-F6: what the networks call `rainin` is the
+    trailing hour's accumulation. From the yearly counter when there is
+    one, the daily counter otherwise (its midnight reset inside the hour
+    leaves "since midnight"), None when neither has an hour of history."""
+    from app import db
+    import time as _t
+    await db.init_db()
+    now = int(_t.time() * 1000)
+    HOUR = 3_600_000
+    yearly = "5D:5D:02:00:00:9A"
+    await db.insert_observations(yearly, [
+        {"dateutc": now - 2 * HOUR, "yearlyrainin": 5.00, "hourlyrainin": 0.0},
+        {"dateutc": now - 50 * 60_000, "yearlyrainin": 5.05, "hourlyrainin": 3.0},
+        {"dateutc": now, "yearlyrainin": 5.12, "hourlyrainin": 40.0},
+    ])
+    assert await db.rain_last_hour_in(yearly, now) == pytest.approx(0.12)
+    daily = "5D:5D:02:00:00:9B"
+    await db.insert_observations(daily, [
+        {"dateutc": now - 2 * HOUR, "dailyrainin": 0.30},
+        {"dateutc": now, "dailyrainin": 0.42},
+    ])
+    assert await db.rain_last_hour_in(daily, now) == pytest.approx(0.12)
+    midnight = "5D:5D:02:00:00:9C"
+    await db.insert_observations(midnight, [
+        {"dateutc": now - 2 * HOUR, "dailyrainin": 0.90},
+        {"dateutc": now, "dailyrainin": 0.05},                 # reset inside the hour
+    ])
+    assert await db.rain_last_hour_in(midnight, now) == pytest.approx(0.05)
+    fresh = "5D:5D:02:00:00:9D"
+    await db.insert_observations(fresh, [{"dateutc": now, "yearlyrainin": 1.0}])
+    assert await db.rain_last_hour_in(fresh, now) is None
+
+
+@pytest.mark.asyncio
 async def test_upsert_device_out_of_order_does_not_regress(db_module):
     """The devices-row UPDATE arm is monotonic on purpose (backend CR-18): a
     backfilled / out-of-order post (SDR replay, a batch of history) must not

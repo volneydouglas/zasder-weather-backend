@@ -410,3 +410,13 @@ def test_build_payload_maps_battery_volts_to_flag():
 
     p = build_payload(173303, OBS)          # no battery key at all
     assert "battery_outdoor" not in p["device"]
+
+
+def test_station_pressure_rides_as_the_absolute_reading():
+    """2.1: the Tempest hands over both pressures; the station pressure is
+    the absolute one and must not be overwritten by the sea-level copy."""
+    from app.tempest_poller import build_payload
+    body = build_payload(173303, dict(OBS, station_pressure=974.8), "T")
+    p = body["pressure"]
+    assert abs(p["relative_inhg"] - 29.99) < 0.02
+    assert abs(p["absolute_inhg"] - 28.79) < 0.02

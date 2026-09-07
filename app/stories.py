@@ -50,6 +50,8 @@ from __future__ import annotations
 import logging
 import math
 import time
+
+from .day_rain import day_rain_in
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
@@ -1440,34 +1442,10 @@ _DIM_BY_KEY = {d.key: d for d in _DIMS}
 
 def _day_rain_in(row: dict[str, Any]) -> float | None:
     """The day's rainfall, or None when the station never measured it.
-
-    PROVENANCE, and this is the rule a bumped mast is not allowed to beat:
-    `rain_total` is the day's high-water mark of `dailyrainin`, and the
-    tipping-gauge-over-haptic preference is applied where it belongs — at
-    ingest, once, for every consumer (ecowitt._rain picks `dailyrainin`
-    ahead of `drain_piezo`, `yearlyrainin` ahead of `yrain_piezo`). A piezo
-    reading only ever reaches these columns on a station whose tipping gauge
-    is silent, so reading them IS honouring the rule; re-deciding it here
-    would be a second, divergent copy of it.
-
-    Nothing here touches `hourlyrainin`. That field is a RATE, not an
-    accumulation, and reading it as one is a documented way to invent rain.
-
-    None, never 0.0, when neither counter reported: a station with no rain
-    gauge must drop the dimension, and `insights.day_rain`'s 0.0 default is
-    right for a running total and wrong for a ranking.
-    """
-    total = _num(row.get("rain_total"))
-    if total is not None:
-        return max(0.0, total)
-    lo, hi = _num(row.get("yearly_min")), _num(row.get("yearly_max"))
-    # The yearly-counter fallback for sources that carry no daily total.
-    # Not on Jan 1: the counter resets there, so the day's delta is the
-    # whole previous year running backwards.
-    new_year = str(row.get("day", "")).endswith("-01-01")
-    if lo is not None and hi is not None and not new_year:
-        return max(0.0, hi - lo)
-    return None
+    The rule itself lives in app/day_rain.py (2.1) so the climate reports,
+    the Zambretti ledger and this engine cannot answer it three ways; the
+    provenance notes are there too."""
+    return day_rain_in(row)
 
 
 def _monthly_normals(rows: Sequence[dict[str, Any]]) -> tuple[dict[int, float],
@@ -3684,6 +3662,13 @@ async def how_hard_did_the_ac_work(ctx: StoryContext) -> list[Story]:
 
     u = ctx.units
     period = _period_label(year, partial)
+    # A record that begins mid-year is not the year (2026-09-06, the first
+    # MCP analysis: "no heating demand at all" was true of a dataset that
+    # starts May 22, not of Chandler). Name the first scored day when it
+    # falls more than a week into the year.
+    first_scored = min(s[0] for s in this_year)
+    if first_scored > date(year, 1, 8):
+        period = f"{year} since {_short_date(first_scored)}"
     comparison: Comparison | None = None
     standout: float | None = None
     if prior:
@@ -3976,14 +3961,12 @@ async def fire_weather(ctx: StoryContext) -> list[Story]:
 BAROMETER_RAPID_INHG = 0.12
 
 # The card says "change in three hours" and "falling for three hours", so
-# the span it measured has to BE three hours. `zambretti_ledger.compute_call`
-# finds its anchor at or before obs−3h with a three-hour freshness floor
-# (the right rule for a ledger that must file a call most mornings), which
-# after an outage puts the anchor anywhere in [obs−6h, obs−3h]. This is
-# how much older than obs−3h the anchor may be before the label is a lie
-# and the card declines: one missed poll of a five-minute station, or one
-# of a fifteen-minute one, is slack; a second missing hour is not.
-BAROMETER_ANCHOR_SLACK_MS = 30 * 60_000
+# the span it measured has to BE three hours. Since 2.1 the slack lives
+# with the ledger (`zambretti_ledger.ANCHOR_SLACK_MS`) and
+# `compute_call` applies it, so the ledger and this card refuse the same
+# stale anchors; the alias keeps this module's tests and readers honest
+# about which number they mean.
+from .zambretti_ledger import ANCHOR_SLACK_MS as BAROMETER_ANCHOR_SLACK_MS  # noqa: E402
 
 
 async def _todays_forecast(today: date) -> dict[str, Any] | None:
@@ -4169,6 +4152,127 @@ async def barometer_says(ctx: StoryContext) -> list[Story]:
         period=Period(kind="moment", label="right now",
                       start=ctx.today.isoformat(),
                       end=ctx.today.isoformat(), partial=False),
+        station=ctx.station(await ctx.insights()),
+        interestingness=round(min(1.0, max(0.0, score)), 4),
+        score_parts=parts,
+    )]
+
+
+@producer(FAMILY_SCIENCE, "barometer_scorecard")
+async def barometer_scorecard(ctx: StoryContext) -> list[Story]:
+    """1920 vs 2026: the season's slide-rule calls, scored.
+
+    The barometer card sets two forecasts side by side and refuses to
+    score them, because scoring needs a season of calls captured at issue
+    time and matched to what happened. The ledger has been filing that
+    call every morning since 2.0; this card pays the footnote once there
+    is a season to be honest about (SCORECARD_MIN_DAYS scored days).
+
+    One question, asked of both instruments: did it rain today? The slide
+    rule's sentence is filed as a rain call or a dry one
+    (`zambretti_ledger.DRY_CALLS` / `WET_CALLS`); the model's chance of
+    rain is a rain call at or above MODERN_RAIN_POP; the station's own
+    gauge is the judge. Days the gauge never reported are dropped, not
+    counted as dry. The model's rate is over ITS days (a forecast issued
+    before the call existed for them) and the slide rule's rate on those
+    same days is printed beside it, so the comparison is like for like.
+    """
+    from . import zambretti_ledger as zl
+    card = await zl.scorecard(ctx.mac, FORECAST_PROVIDER)
+    if card is None or card.days < zl.SCORECARD_MIN_DAYS:
+        return []
+    z_pct = round(100.0 * card.zambretti_hit_rate)
+    supporting = [
+        Stat("days", "days scored", card.days, UNIT_DAYS),
+        Stat("rain_days", "days it rained", card.rain_days, UNIT_DAYS),
+        Stat("zambretti_hits", "days the slide rule was right",
+             card.zambretti_hits, UNIT_DAYS),
+    ]
+    series = [{"key": "zambretti", "label": "The slide rule, 1920",
+               "hits": card.zambretti_hits, "days": card.days,
+               "share": round(card.zambretti_hit_rate, 4),
+               "note": f"{z_pct}% of {card.days} days"}]
+    context = (f"Every morning at nine the barometer's reading and its "
+               f"three-hour trend went through the Negretti & Zambra slide "
+               f"rule and the sentence was filed, unrevised. Over {card.days} "
+               f"days with a rain outcome from your own gauge, it called "
+               f"rain or no rain correctly on {card.zambretti_hits}, "
+               f"{z_pct}%. It rained on {card.rain_days} of them.")
+    gap = None
+    z_on_m_pct: int | None = None
+    if card.modern_hit_rate is not None and card.modern_days:
+        m_pct = round(100.0 * card.modern_hit_rate)
+        z_on_m = card.zambretti_hits_on_modern_days or 0
+        z_on_m_pct = round(100.0 * z_on_m / card.modern_days)
+        supporting.append(Stat("modern_hits", "days the model was right",
+                               card.modern_hits, UNIT_DAYS))
+        supporting.append(Stat("modern_days", "days the model was scored",
+                               card.modern_days, UNIT_DAYS))
+        series.append({"key": "modern", "label": "This morning\u2019s model",
+                       "hits": card.modern_hits, "days": card.modern_days,
+                       "share": round(card.modern_hit_rate, 4),
+                       "note": f"{m_pct}% of {card.modern_days} days"})
+        gap = card.modern_hit_rate - (z_on_m / card.modern_days)
+        if abs(gap) < 0.02:
+            verdict = "a dead heat"
+        elif gap > 0:
+            verdict = f"the model ahead by {round(100 * gap)} points"
+        else:
+            verdict = f"the slide rule ahead by {round(-100 * gap)} points"
+        context += (f" The numerical model had a forecast on file before "
+                    f"the call on {card.modern_days} of those days and was "
+                    f"right on {m_pct}% of them; the slide rule managed "
+                    f"{z_on_m_pct}% on the same days. That is {verdict}.")
+    else:
+        context += (" No stored forecast was on file before the morning "
+                    "call on any of those days, so the slide rule is scored "
+                    "alone here, unopposed rather than unbeaten.")
+
+    # Two parts: how much of a season this is (a 30-day card is a
+    # curiosity, a 300-day one is a finding), and how decisive the
+    # comparison came out. A card with no model to compare against keeps
+    # the season part only.
+    parts = {"season": round(min(1.0, card.days / 180.0), 4)}
+    if gap is not None:
+        parts["verdict"] = round(min(1.0, abs(gap) / 0.25), 4)
+        score = 0.6 * parts["season"] + 0.4 * parts["verdict"]
+    else:
+        score = 0.6 * parts["season"]
+
+    return [Story(
+        id=f"science.barometer_scorecard.{card.last_day}",
+        family=FAMILY_SCIENCE,
+        story_type="barometer_scorecard",
+        title="1920 vs 2026",
+        emoji="\U0001f3c1",
+        hero=Stat("hit_rate", "the slide rule was right", z_pct, UNIT_PCT),
+        hero_line=f"RIGHT {z_pct}% OF DAYS",
+        context=context,
+        comparison=(Comparison(
+            kind="model_vs_slide_rule",
+            label="this morning\u2019s model on the same days",
+            # The slide rule's rate on the MODEL's days, not on all scored
+            # days: value and baseline must describe one population or the
+            # delta compares two seasons (2.1 pre-release review BE-6).
+            value=float(z_on_m_pct if z_on_m_pct is not None else z_pct),
+            baseline=round(100.0 * card.modern_hit_rate, 1),
+            baseline_label="the model\u2019s hit rate",
+            direction=("above" if gap is not None and gap < -0.02 else
+                       "below" if gap is not None and gap > 0.02 else "level"),
+            delta=round(-100.0 * gap, 1) if gap is not None else None,
+            # Points of hit rate, not a percentage OF the baseline: a
+            # 60-vs-40 result is "20 points", and the baseline can be 0.
+            delta_pct=None)
+            if card.modern_hit_rate is not None else None),
+        supporting=supporting,
+        viz=Viz(kind="scorecard_bars", series=series, unit=UNIT_PCT,
+                axis_label="rain or no rain, called correctly",
+                footnote=(f"Scored on whether it rained that day, judged by "
+                          f"your own gauge, {card.first_day} to "
+                          f"{card.last_day}. Hedged calls count as dry."),
+                highlight="zambretti", highlight_key="zambretti"),
+        period=Period(kind="spell", label="the season so far",
+                      start=card.first_day, end=card.last_day, partial=True),
         station=ctx.station(await ctx.insights()),
         interestingness=round(min(1.0, max(0.0, score)), 4),
         score_parts=parts,

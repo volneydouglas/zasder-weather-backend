@@ -39,8 +39,12 @@ from .capture import router as capture_router
 from .config import settings, tokens_match
 from . import source_status
 from . import config_backup
+from . import restore as _restore
 from . import public_dashboard as _pd
 from .discovery import router as discovery_router
+from .mcp import router as mcp_router
+from . import oauth
+from .oauth import router as oauth_router
 from .ingest import router as ingest_router
 
 logging.basicConfig(
@@ -103,6 +107,8 @@ def _probe_write_lock() -> bool:
     """True when the writer is free. A one-second BEGIN IMMEDIATE on a
     fresh connection, rolled back at once — never holds anything itself."""
     import sqlite3
+    if not db.is_open():
+        return True        # a restore holds the file; that is not a stuck writer
     conn = sqlite3.connect(settings.database_path, timeout=1.0)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -125,6 +131,20 @@ def dump_all_threads(reason: str) -> None:
     import sys
     log.error("write lock held for %s — dumping every thread's stack",
               reason)
+    # 2.1: the statements, not just the stacks. A thread dump names the
+    # function that holds or waits; these lines name the SQL, how long
+    # its transaction has been open, and where a running rollup rebuild
+    # is (phase, station, cursor).
+    lines = [f"open transaction {tx['open_s']}s: {tx['sql']}"
+             for tx in db.open_transactions()]
+    try:
+        from . import insights as _insights
+        if (flight := _insights.in_flight()):
+            lines.append(flight)
+    except Exception:       # never let the diagnostic break the dump
+        pass
+    for line in lines:
+        log.error("%s", line)
     faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(
@@ -133,6 +153,8 @@ def dump_all_threads(reason: str) -> None:
         with open(path, "a") as f:
             f.write("\n=== %s write lock held for %s ===\n"
                     % (time.strftime("%Y-%m-%d %H:%M:%S"), reason))
+            for line in lines:
+                f.write(line + "\n")
             f.flush()
             faulthandler.dump_traceback(file=f, all_threads=True)
     except OSError as e:
@@ -170,6 +192,22 @@ async def _write_lock_watchdog(probe=None, dump=None,
 # it; production waits a minute, then two.
 _CHART_INDEX_RETRY_DELAY_S = 60.0
 _CHART_INDEX_ATTEMPTS = 3
+
+
+async def _heal_rollups_after(app: FastAPI) -> None:
+    """The boot's background rollup rebuild, reusable after a restore:
+    waits for a pending chart-index build first (they contend for the
+    writer), then rebuilds and clears the dirty flag."""
+    from . import insights as _insights
+    idx = getattr(app.state, "chart_index_task", None)
+    if idx is not None and not idx.done():
+        await idx
+    try:
+        stats = await _insights.rebuild()
+        log.info("background rollup rebuild done: %s", stats)
+    except Exception:
+        log.exception("background rollup rebuild failed — records stay on "
+                      "the raw path until one succeeds")
 
 
 async def _chart_index_job() -> None:
@@ -226,9 +264,24 @@ async def lifespan(app: FastAPI):
     # deliberately not marked PRIVATE — this line must survive into the mirror,
     # where it is inert unless REQUIRE_RELAY is set. See app/build_guard.py.
     build_guard.assert_build_variant()
+    # A restore killed between its two renames leaves a marker beside the
+    # database; put the pre-restore copy back BEFORE init_db, which would
+    # otherwise create an empty database under the vanished name (R21-02).
+    try:
+        if (note := await asyncio.to_thread(_restore.recover_at_boot)):
+            log.warning("restore recovery at boot: %s", note)
+    except Exception:
+        log.exception("restore recovery at boot failed; continuing with the file on disk")
     await db.init_db()
     app.state.started_at = time.time()
     attach_file_log(settings.database_path)
+    # The server's identity for OAuth, said once where an operator looks
+    # first (round-three review SEC-G2): which origin, and why that one.
+    try:
+        origin, why = oauth.describe_origin()
+        log.info("oauth origin: %s (%s)", origin or "the request's Host", why)
+    except Exception:
+        log.exception("could not describe the OAuth origin")
     # Orphaned snapshot sweep (2.0, 2026-09-01): a `.dbbackup-*.db` was
     # deleted only after a SUCCESSFUL download, so every timed-out or
     # abandoned backup left a database-sized file on the volume — Volney's
@@ -237,6 +290,9 @@ async def lifespan(app: FastAPI):
     # age goes; an hourly pass below catches the rest.
     try:
         swept = await asyncio.to_thread(_sweep_orphan_snapshots, at_boot=True)
+        # 2.1: a restore upload a killed process left beside the database.
+        if (n := await asyncio.to_thread(_restore.sweep_leftovers)):
+            log.info("boot sweep removed %d abandoned restore upload(s)", n)
         if swept["deleted"]:
             log.info("boot sweep removed %d orphaned database snapshot(s), "
                      "%d MB freed", len(swept["deleted"]),
@@ -271,6 +327,51 @@ async def lifespan(app: FastAPI):
     integration_manager = IntegrationManager()
     await integration_manager.start_all()
     app.state.integration_manager = integration_manager
+
+    async def _reconcile_after_restore() -> None:
+        """Bring the running process in line with a database that was just
+        swapped in (round-four review R21-03): the pollers re-apply from the
+        restored credentials, every process cache that mirrors the database
+        is dropped, the deferred jobs a fresh boot would schedule are
+        scheduled, and the report backfill runs. Only after this does the
+        restore report done."""
+        global _PUBLIC_DASH_CACHE
+        from . import wu_upload as _wu, share_targets as _st, alerts as _al
+        db._YEAR_PRIOR_CACHE.clear()
+        db._DAILY_ROLLUP_CACHE.clear()
+        _RECORDS_CACHE.clear()
+        _OBS_COUNT_CACHE.clear()
+        _PUBLIC_DASH_CACHE = None
+        _SHARE_TEST_LAST.clear()
+        _wu._stats.clear()
+        _st._last_send_ms.clear()
+        source_status.reset()
+        source_status.declare("custom-ingest", True,
+                              note="LilyGO boards, SDR relays and the WeatherLink "
+                                   "Live poller POST here; health is per-device "
+                                   "last-seen, see /api/devices")
+        # Stop, rebuild and start every provider from the restored kv: a
+        # provider the restored file configures starts, one it does not
+        # stops, a changed credential is a new client.
+        await integration_manager.start_all()
+        if settings.insights:
+            import time as _time
+            await db.set_kv("rollups_dirty", str(_time.time_ns()))
+            heal = getattr(app.state, "rollup_heal_task", None)
+            if heal is None or heal.done():
+                app.state.rollup_heal_task = asyncio.create_task(_heal_rollups_after(app))
+        if db.chart_index_rebuild_needed():
+            idx = getattr(app.state, "chart_index_task", None)
+            if idx is None or idx.done():
+                app.state.chart_index_task = asyncio.create_task(_chart_index_job())
+        try:
+            added = await _al.backfill_storm_reports()
+            if added:
+                log.info("post-restore storm report backfill: %d row(s)", added)
+        except Exception:
+            log.exception("post-restore storm report backfill failed")
+
+    _restore.POST_SWAP_HOOKS.append(_reconcile_after_restore)
 
     # Device-staleness email alerts — independent of any poller; watches ALL
     # devices (cloud + SDR) for going quiet. ALWAYS started: it re-reads the
@@ -328,6 +429,22 @@ async def lifespan(app: FastAPI):
                               "stay on the raw path until one succeeds")
         app.state.rollup_heal_task = asyncio.create_task(_heal_rollups())
 
+    # 2.1 Reports: every storm summary storm_history already holds becomes
+    # a report row, once, in the background (the list was empty on day
+    # one otherwise). Delayed so ingest and the health checks go first.
+    async def _backfill_storm_reports() -> None:
+        await asyncio.sleep(20)
+        try:
+            from . import alerts as _al
+            added = await _al.backfill_storm_reports()
+            if added:
+                log.info("reports: %d storm summar%s backfilled from "
+                         "storm_history", added, "y" if added == 1 else "ies")
+        except Exception:
+            log.exception("storm report backfill failed; will retry next boot")
+    app.state.report_backfill_task = asyncio.create_task(
+        _backfill_storm_reports())
+
     # 1.9 column backfill: when the migration added the field-survey
     # columns to an existing database, fill them from data_json in
     # background chunks — a foreground full-table UPDATE at boot is
@@ -375,6 +492,23 @@ async def lifespan(app: FastAPI):
             except Exception:
                 log.exception("orphaned snapshot sweep failed")
     app.state.snapshot_sweep_task = asyncio.create_task(_snapshot_sweep_hourly())
+
+    # OAuth housekeeping (2.1): expired codes and tokens, idle clients. At
+    # boot and hourly.
+    from . import oauth as _oauth
+    try:
+        await _oauth.sweep_expired()
+    except Exception:
+        log.exception("oauth sweep at boot failed")
+
+    async def _oauth_sweep_hourly() -> None:
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                await _oauth.sweep_expired()
+            except Exception:
+                log.exception("oauth sweep failed")
+    app.state.oauth_sweep_task = asyncio.create_task(_oauth_sweep_hourly())
 
     # Write-lock watchdog (2026-09-02): a connection held the writer for
     # four minutes without appending a WAL frame and every write 503'd;
@@ -460,6 +594,8 @@ async def lifespan(app: FastAPI):
                                getattr(app.state, "write_lock_task", None),
                                getattr(app.state, "colfill_task", None),
                                getattr(app.state, "chart_index_task", None),
+                               getattr(app.state, "report_backfill_task", None),
+                               getattr(app.state, "oauth_sweep_task", None),
                                _STORAGE_TASK,
                                _PUBLIC_DASH_REFRESH_TASK,
                                _DB_BACKUP_TASK,
@@ -565,6 +701,15 @@ def _log_db_busy(path: str) -> None:
                 "1 line/min/path)", path)
 
 
+@app.exception_handler(db.DatabaseUnavailable)
+async def _database_unavailable(request: Request, exc: db.DatabaseUnavailable):
+    """The maintenance lease is held (a restore is swapping files): a
+    request that could not get a connection in time is told to retry,
+    never served from the wrong file (R21-01)."""
+    return JSONResponse(status_code=503, content={"detail": str(exc)},
+                        headers={"Retry-After": "5"})
+
+
 @app.exception_handler(sqlite3.OperationalError)
 async def _sqlite_busy_to_503(request: Request,
                               exc: sqlite3.OperationalError):
@@ -584,6 +729,13 @@ async def _sqlite_busy_to_503(request: Request,
 
 app.include_router(capture_router)
 app.include_router(discovery_router)
+if settings.mcp_enabled:
+    # 2.1: read-only MCP at POST /mcp, and the OAuth 2.1 authorization
+    # server + discovery documents that let connectors reach it. One
+    # switch for both (SEC-2): MCP_ENABLED=0 and none of these routes
+    # exist, the well-known documents included.
+    app.include_router(mcp_router)
+    app.include_router(oauth_router)
 app.include_router(ingest_router)
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
@@ -591,9 +743,13 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 # ───────────────────────── security middleware ─────────────────────────
 # Two layers of hardening recommended by an external code review:
 #   1. TrustedHostMiddleware — reject requests whose Host header doesn't
-#      match an allow-list. Defends against Host-header poisoning if we
-#      ever generate absolute URLs from request.url (we don't today; this
-#      is belt-and-suspenders). Allow list is configurable via
+#      match an allow-list. Defends against Host-header poisoning where we
+#      generate absolute URLs from the request: since 2.1 the OAuth
+#      metadata documents and the /mcp WWW-Authenticate challenge do
+#      (app/oauth.py `issuer`). Their first line of defence is
+#      PUBLIC_BASE_URL, which fixes the origin regardless of Host; their
+#      second is a Host sanity check that refuses anything but
+#      host[:port]. This allow-list is the third. Configurable via the
 #      ALLOWED_HOSTS env var (comma-separated). Defaults to "*" (accept
 #      anything) so the public template works out-of-box; set this in
 #      Fly secrets for production deploys (e.g.
@@ -924,8 +1080,83 @@ def _is_limited_read(authorization: str | None) -> bool:
 
 
 @app.get("/healthz")
-async def healthz() -> dict[str, str]:
-    return {"status": "ok", "version": __version__}
+async def healthz() -> JSONResponse:
+    """Liveness for Fly's checks and deploy.sh. Two additions in 2.1:
+    `uid` (the effective uid, so a container whose entrypoint fell back
+    to root is visible from outside -- deploy.sh's VERIFY asserts it) and
+    a one-statement READ of the database with a short timeout, so a
+    server whose SQLite file has gone away or whose connection hangs
+    drops out of rotation instead of answering "ok" forever. It is a
+    read: a held WRITE lock does not fail it (WAL readers never wait on
+    the writer), and it must not, or a long rebuild would look like an
+    outage."""
+    import os as _os
+    db_ok = await _database_healthy()
+    body = {"status": "ok" if db_ok else "degraded", "version": __version__,
+            "uid": _os.geteuid(), "db": db_ok}
+    return JSONResponse(body, status_code=200 if db_ok else 503)
+
+
+# (path, expires_monotonic, ok): the route is unauthenticated, so one
+# probe answers every caller for a few seconds. Keyed by path so a test
+# that swaps the database between calls is not answered from the last one.
+_HEALTHZ_CACHE: tuple[str, float, bool] | None = None
+HEALTHZ_CACHE_S = 5.0
+# Single-flight (round-three review SEC-G4): the route is unauthenticated
+# and the cache was written AFTER the probe, so concurrent anonymous hits
+# during a slow probe each took a thread on the shared executor. Built
+# lazily like _PUBLIC_DASH_LOCK (a Lock binds to the loop that first
+# awaits it) and reset per test in conftest.
+_HEALTHZ_LOCK: asyncio.Lock | None = None
+
+
+def _probe_database(path: str) -> bool:
+    """One READ of the schema table through a read-only URI. `mode=ro`
+    refuses to create a file, so a volume that remounted empty answers
+    "missing" instead of gaining a schemaless weather.db from the
+    liveness check; reading sqlite_master touches the file, so a corrupt
+    one fails here instead of passing a SELECT 1 that never opened it
+    (round-two review, SEC-F2)."""
+    import os as _os
+    import sqlite3 as _sqlite3
+    from urllib.parse import quote as _quote
+    uri = "file:" + _quote(_os.path.abspath(path)) + "?mode=ro"
+    conn = _sqlite3.connect(uri, uri=True, timeout=2.0)
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    finally:
+        conn.close()
+    return True
+
+
+def _healthz_cached(path: str, now: float) -> bool | None:
+    hit = _HEALTHZ_CACHE
+    if hit is not None and hit[0] == path and now < hit[1]:
+        return hit[2]
+    return None
+
+
+async def _database_healthy() -> bool:
+    global _HEALTHZ_CACHE, _HEALTHZ_LOCK
+    path = settings.database_path
+    cached = _healthz_cached(path, time.monotonic())
+    if cached is not None:
+        return cached
+    if _HEALTHZ_LOCK is None:
+        _HEALTHZ_LOCK = asyncio.Lock()
+    async with _HEALTHZ_LOCK:
+        # Whoever held the lock may have answered for everyone.
+        now = time.monotonic()
+        cached = _healthz_cached(path, now)
+        if cached is not None:
+            return cached
+        try:
+            ok = bool(await asyncio.wait_for(
+                asyncio.to_thread(_probe_database, path), timeout=3.0))
+        except Exception:
+            ok = False
+        _HEALTHZ_CACHE = (path, now + HEALTHZ_CACHE_S, ok)
+        return ok
 
 
 @app.get("/metrics")
@@ -959,6 +1190,48 @@ async def api_version() -> JSONResponse:
     # request (one statvfs); null when the path can't be statted.
     from . import disk_watch
     return JSONResponse({**info, "disk": disk_watch.snapshot()})
+
+
+# ── 2.1 server recommendations: more disk / memory, one tap ──────────
+# Reads this machine and its volume through the Machines API the backend
+# already holds a deploy token for (self_update.py) and says whether a
+# bigger volume or more memory would help, with Fly's list price for the
+# difference. `available: false` (with the reason) on a box without the
+# token — a guest instance, local Docker — and the apps hide the card.
+# See app/machine_advice.py.
+
+@app.get("/api/server/advice", dependencies=[Depends(require_write_token)])
+async def api_server_advice(refresh: bool = Query(False)) -> JSONResponse:
+    """Write-tier like `apply` (2.1 review, SEC-6): the answer names the
+    machine size, live RSS, OOM history and the volume id, which is the
+    operator's infrastructure, not weather. A share-link guest or the App
+    Store reviewer token gets 401 and the apps hide the card."""
+    from . import machine_advice
+    return JSONResponse(await machine_advice.advice(refresh=refresh))
+
+
+class ServerAdviceApplyIn(BaseModel):
+    kind: str = Field(pattern=r"^(volume|memory)$")
+    target: int = Field(ge=1, le=100_000)
+
+
+@app.post("/api/server/advice/apply",
+          dependencies=[Depends(require_write_token)])
+async def api_server_advice_apply(body: ServerAdviceApplyIn) -> JSONResponse:
+    """Extend the volume (online) or set the machine's memory (Fly reboots
+    the machine, so the app confirms first and then waits for it to come
+    back). Validated against the machine as it is NOW, never the cached
+    advice: a stale card cannot shrink anything."""
+    from . import machine_advice
+    try:
+        out = await machine_advice.apply(body.kind, body.target)
+    except machine_advice.ApplyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:  # noqa: BLE001 — Fly said no; say what it said
+        log.warning("server advice apply failed: %s", e)
+        raise HTTPException(status_code=502,
+                            detail=f"Fly did not accept the change: {e}")
+    return JSONResponse(out)
 
 
 @app.get("/embed", response_class=HTMLResponse)
@@ -1224,6 +1497,14 @@ def _refresh_public_dashboard_soon(devices: list[dict], now_ms: int) -> None:
 
 
 async def _cached_public_dashboard(devices: list[dict], now_ms: int) -> str:
+    """The cached section, with its "updated Xm ago" recomputed for this
+    serve: the cache may be up to a day old (see the stale ceiling), and
+    the phrase used to be frozen at build time."""
+    from . import public_dashboard as _pd
+    return _pd.restamp_ages(await _cached_public_dashboard_raw(devices, now_ms))
+
+
+async def _cached_public_dashboard_raw(devices: list[dict], now_ms: int) -> str:
     global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK
     hit = _PUBLIC_DASH_CACHE
     if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
@@ -1409,6 +1690,13 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     ui = update_info or {}
     _repo_url = "https://github.com/volneydouglas/zasder-weather-backend"
     version_html = f'<span class="ver">v{__version__}</span>'
+    try:
+        _origin, _why = oauth.describe_origin()
+        if _origin:
+            version_html += (f' <span class="ver">· origin {_html.escape(_origin)}'
+                             f' ({_html.escape(_why)})</span>')
+    except Exception:
+        pass
     update_banner = ""
     if ui.get("update_available") and ui.get("latest"):
         update_banner = (
@@ -1655,6 +1943,7 @@ async def _run_db_backup(job: dict[str, Any], dest: Path) -> None:
     aiosqlite's worker thread so the event loop never blocks."""
     import aiosqlite
     try:
+        await db.wait_open()
         conn = await aiosqlite.connect(settings.database_path)
         try:
             await conn.execute("VACUUM INTO ?", (str(dest),))
@@ -1757,6 +2046,7 @@ async def api_backup_database() -> FileResponse:
             background=BackgroundTask(_cleanup))
     import aiosqlite
     dest = _db_backup_dest()
+    await db.wait_open()
     conn = await aiosqlite.connect(settings.database_path)
     try:
         await conn.execute("VACUUM INTO ?", (str(dest),))
@@ -1769,6 +2059,57 @@ async def api_backup_database() -> FileResponse:
         dest, media_type="application/vnd.sqlite3",
         filename=f"zasder-weather-{stamp}.db",
         background=BackgroundTask(lambda: dest.unlink(missing_ok=True)))
+
+
+# ── Database restore (2.1) — see app/restore.py for the gate and the swap.
+
+def _restore_other_busy() -> str | None:
+    """What main.py knows and restore.py cannot see: the backup job."""
+    job = _DB_BACKUP_JOB
+    if job.get("state") == "running":
+        task = _DB_BACKUP_TASK
+        if task is not None and not task.done():
+            return "a database backup is being prepared; try again when it is done"
+    return None
+
+
+@app.post("/api/backup/database/restore/challenge",
+          dependencies=[Depends(require_write_token)])
+async def api_restore_challenge() -> dict[str, Any]:
+    """Step one of the two-step: a one-shot nonce plus what is about to be
+    replaced, so the app can put a number in its confirmation."""
+    out = _restore.issue_challenge()
+    try:
+        out["current_rows"] = await _restore.current_rows()
+        out["rows_known"] = True
+    except Exception:          # a missing table on a fresh box is not a refusal
+        # Unknown is not zero (R21-07): the app must not say "empty".
+        out["current_rows"] = None
+        out["rows_known"] = False
+    return out
+
+
+@app.post("/api/backup/database/restore",
+          dependencies=[Depends(require_write_token)])
+async def api_restore_database(
+        request: Request,
+        x_restore_challenge: Annotated[str | None, Header()] = None,
+        x_restore_sha256: Annotated[str | None, Header()] = None,
+        content_length: Annotated[int | None, Header()] = None,
+) -> dict[str, Any]:
+    """Step two: the snapshot itself as the raw request body. Answers as
+    soon as the bytes are on disk and their digest checks out; validation
+    and the swap run behind `.../restore/status`."""
+    return await _restore.start_restore(
+        request.stream(), challenge=x_restore_challenge,
+        sha256_hex=x_restore_sha256, content_length=content_length,
+        other_busy=_restore_other_busy)
+
+
+@app.get("/api/backup/database/restore/status",
+         dependencies=[Depends(require_write_token)])
+async def api_restore_status() -> dict[str, Any]:
+    return _restore.status()
 
 
 @app.post("/api/config/restore", dependencies=[Depends(require_write_token)])
@@ -2586,7 +2927,115 @@ async def get_session(
     # they follow the server: a configured WU key means the owner set up
     # TWC, and guests should see the same forecast (Volney, 2026-08-23).
     src = "twc" if await effective_wu_key() else "open-meteo"
-    return JSONResponse({"can_write": can_write, "forecast_source": src})
+    # 2.1: the server names itself and says what THIS token is to it, so
+    # an app holding several connections (2.2) can label each one.
+    name = await effective_server_name()
+    return JSONResponse({"can_write": can_write, "forecast_source": src,
+                         "server_name": name["name"],
+                         "role": "owner" if can_write else "guest"})
+
+
+SERVER_NAME_MAX = 60
+
+
+def _clean_server_name(raw: str | None) -> str | None:
+    """One line, trimmed, bounded; None when empty or unprintable."""
+    if raw is None:
+        return None
+    name = " ".join(str(raw).split())
+    if not name or _has_ctl(name):
+        return None
+    return name[:SERVER_NAME_MAX]
+
+
+async def effective_server_name() -> dict[str, Any]:
+    """{'name': str|None, 'source': 'app'|'env'|'location'|'none'}: the
+    app-set name, else SERVER_NAME in the env, else the public dashboard's
+    location, else nothing."""
+    stored = _clean_server_name(await db.get_kv("server_name"))
+    if stored:
+        return {"name": stored, "source": "app"}
+    env = _clean_server_name(settings.server_name)
+    if env:
+        return {"name": env, "source": "env"}
+    loc = _clean_server_name(settings.public_dashboard_location)
+    if loc:
+        return {"name": loc, "source": "location"}
+    return {"name": None, "source": "none"}
+
+
+class ServerNameIn(BaseModel):
+    """Empty forgets the app value (env, then the public location, take
+    over)."""
+    name: str = Field(max_length=200)
+
+
+@app.get("/api/config/server-name", dependencies=[Depends(require_token)])
+async def get_server_name() -> JSONResponse:
+    return JSONResponse(await effective_server_name())
+
+
+@app.put("/api/config/server-name", dependencies=[Depends(require_write_token)])
+async def put_server_name(body: ServerNameIn) -> JSONResponse:
+    name = _clean_server_name(body.name)
+    if body.name.strip() and name is None:
+        raise HTTPException(status_code=400, detail="name must be printable text")
+    await db.set_kv("server_name", name)
+    return JSONResponse(await effective_server_name())
+
+
+def require_mcp_enabled() -> None:
+    """MCP_ENABLED=0 removes the MCP and OAuth routers at import; these
+    three owner routes are declared on the app itself, so they take the
+    switch as a dependency and 404 like the rest (round-two review,
+    SEC-F4). Read at request time, so a reloaded config is honoured."""
+    if not settings.mcp_enabled:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@app.get("/api/oauth/clients",
+         dependencies=[Depends(require_mcp_enabled), Depends(require_write_token)])
+async def list_oauth_clients() -> JSONResponse:
+    """The apps that connected through OAuth (2.1): claude.ai, ChatGPT,
+    whatever registered. Name, when it last read, how many logins it
+    holds, and which role it got (owner or guest). Never the tokens."""
+    from . import oauth
+    return JSONResponse({"clients": await oauth.list_clients()})
+
+
+@app.delete("/api/oauth/clients/{client_id}",
+            dependencies=[Depends(require_mcp_enabled), Depends(require_write_token)])
+async def revoke_oauth_client(client_id: str) -> JSONResponse:
+    """Cut a connected app off: its registration, its codes, every access
+    and refresh token it holds. The kill switch rotating API_TOKEN is not."""
+    from . import oauth
+    if not await oauth.revoke_client(client_id):
+        raise HTTPException(status_code=404, detail="no such client")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/oauth/clients/{client_id}/approve",
+          dependencies=[Depends(require_mcp_enabled), Depends(require_write_token)])
+async def approve_oauth_client(client_id: str) -> JSONResponse:
+    """The owner's approval of a registered app (2.1 review, SEC-1). Until
+    this, the app's consent page shows no token field and its malformed
+    requests get an error page rather than a redirect. Typing a connect
+    code on the consent page approves in the same step."""
+    from . import oauth
+    if not await oauth.approve_client(client_id):
+        raise HTTPException(status_code=404, detail="no such client")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/oauth/connect-code",
+          dependencies=[Depends(require_mcp_enabled), Depends(require_write_token)])
+async def mint_oauth_connect_code() -> JSONResponse:
+    """A one-shot, ten-minute code the owner types on the consent page in
+    place of the API token (SEC-1). Minting it is the proof: only the
+    write token can. Never logged; the response is the only copy."""
+    from . import oauth
+    return JSONResponse(await oauth.mint_connect_code(),
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/alerts/recent", dependencies=[Depends(require_token)])
@@ -2774,10 +3223,17 @@ class WUStationIn(BaseModel):
 def _wu_station_view(norm: str, row: dict[str, Any] | None) -> dict[str, Any]:
     """API shape for a WU association: the key itself NEVER leaves the
     server — only whether one is set."""
+    from . import wu_upload
+    stats = wu_upload.stats(norm)
     return {"mac": norm,
             "wu_station_id": row["station_id"] if row else None,
             "upload_enabled": bool(row and row["upload_enabled"]),
-            "upload_key_set": bool(row and row["upload_key"])}
+            "upload_key_set": bool(row and row["upload_key"]),
+            # The forwarding page shows "sent 3 minutes ago" like the
+            # networks list does (Doren, 2026-09-06); status only, never
+            # the key.
+            "upload_last_ok_ms": stats.get("last_ok_ms"),
+            "upload_last_error": stats.get("last_error")}
 
 
 @app.get("/api/devices/{mac}/wu-station", dependencies=[Depends(require_token)])
@@ -2933,7 +3389,7 @@ async def get_daily_series(
     raw detail; this is the coarser series above it. Days beyond the
     station's history simply aren't in the result. Opt-in with Insights
     (the rollups ARE the data source)."""
-    from . import climate, insights
+    from . import climate
     if not settings.insights:
         raise HTTPException(status_code=404, detail="insights not enabled")
     from datetime import date as _date, timedelta as _td
@@ -2987,10 +3443,236 @@ async def get_storms(mac: str,
                                                         limit)})
 
 
+# The most stories one request may ask for. Comfortably above the whole
+# registry (21 producers, some of which emit several) so "show me
+# everything" is answerable, and low enough that a payload stays sane.
+STORY_LIMIT_MAX = 50
+
+
+# ── Reports (2.1) ───────────────────────────────────────────────────────
+#
+# The morning report and every storm summary, kept as rows instead of
+# notifications that scroll away. `/api/reports` is the Reports pane's
+# list; `/api/reports/{id}` is the detail page a push or a Live Activity
+# tap deep-links into; `/api/reports/morning/preview` renders today's
+# report on demand, so a fresh install has something to open before its
+# first 7am and a "run it now" button has something to call.
+
+
+@app.get("/api/reports", dependencies=[Depends(require_token)])
+async def get_reports(
+    kind: str | None = Query(None),
+    limit: int = Query(30, ge=1, le=100),
+    before_ms: int | None = Query(None, ge=0),
+    before_id: int | None = Query(None, ge=0),
+    temp_unit: str | None = Query(None),
+    wind_unit: str | None = Query(None),
+    rain_unit: str | None = Query(None),
+    pressure_unit: str | None = Query(None),
+) -> JSONResponse:
+    """Stored reports, newest first. `kind` filters to one family; omit it
+    for the mixed list the Reports pane shows. `before_ms` and `before_id`
+    page: pass the oldest row's `ts_ms` AND `id` (the keyset, so rows
+    written in the same millisecond are never skipped); `before_ms` alone
+    still works for older clients. Payloads are NOT included — read one report
+    for its numbers. The unit query parameters are the ones
+    /api/devices/{mac}/stories takes: with any of them set, each row's
+    `summary` is re-rendered in those units (2.1 pre-release review
+    BE-3); omit them for the stored API-native text."""
+    from . import reports as rp, stories as _st
+    if kind is not None and kind not in rp.KINDS:
+        raise HTTPException(status_code=400,
+                            detail=f"kind must be one of {', '.join(rp.KINDS)}")
+    try:
+        units = _st.parse_units(temp_unit, wind_unit, rain_unit, pressure_unit)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    convert = units != _st.UNITS_NATIVE
+    rows = await db.list_reports(kind=kind, limit=limit, before_ms=before_ms,
+                                 before_id=before_id, with_payload=convert)
+    if convert:
+        for row in rows:
+            payload = row.pop("payload", None) or {}
+            rendered = rp.summary_line(row["kind"], payload, units)
+            if rendered:
+                row["summary"] = rendered
+    return JSONResponse({"reports": rows, "kinds": list(rp.KINDS)})
+
+
+class ReportRetentionIn(BaseModel):
+    """`max_rows` -1 forgets the app override (env, then the default, take
+    over). Anything else is clamped to the documented floor/ceiling."""
+    max_rows: int = Field(ge=-1, le=100_000)
+
+
+@app.get("/api/reports/retention", dependencies=[Depends(require_write_token)])
+async def get_report_retention() -> JSONResponse:
+    """How many reports the server keeps and where that number came from
+    (2.1): app, env, or the default. `count` is what it holds now."""
+    from . import reports as rp
+    eff = await db.effective_report_retention()
+    eff.update(count=await db.count_reports(),
+               floor=rp.MIN_ROWS, ceiling=rp.MAX_ROWS_CEILING,
+               default=rp.MAX_ROWS)
+    return JSONResponse(eff)
+
+
+@app.put("/api/reports/retention", dependencies=[Depends(require_write_token)])
+async def put_report_retention(body: ReportRetentionIn) -> JSONResponse:
+    """Set the bound. Prunes at once so a smaller number shows at once."""
+    from . import reports as rp
+    try:
+        eff = await db.set_report_retention(
+            None if body.max_rows == -1 else body.max_rows)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    eff.update(count=await db.count_reports(),
+               floor=rp.MIN_ROWS, ceiling=rp.MAX_ROWS_CEILING,
+               default=rp.MAX_ROWS)
+    return JSONResponse(eff)
+
+
+class StormRetentionIn(BaseModel):
+    """`max_per_station` -1 forgets the app override (env, then the
+    default, take over). Anything else is clamped to the floor/ceiling."""
+    max_per_station: int = Field(ge=-1, le=100_000)
+
+
+def _storm_retention_body(eff: dict[str, Any], count: int) -> dict[str, Any]:
+    eff.update(count=count, floor=db.STORM_HISTORY_FLOOR,
+               ceiling=db.STORM_HISTORY_CEILING,
+               default=db.STORM_HISTORY_DEFAULT)
+    return eff
+
+
+@app.get("/api/storms/retention", dependencies=[Depends(require_write_token)])
+async def get_storm_retention() -> JSONResponse:
+    """How many closed storms the server keeps per station (2.1) and where
+    that number came from: app, env, or the default. `count` is the
+    whole ledger's row count now."""
+    return JSONResponse(_storm_retention_body(
+        await db.effective_storm_retention(), await db.count_storm_history()))
+
+
+@app.put("/api/storms/retention", dependencies=[Depends(require_write_token)])
+async def put_storm_retention(body: StormRetentionIn) -> JSONResponse:
+    """Set the bound. Prunes every station at once."""
+    try:
+        eff = await db.set_storm_retention(
+            None if body.max_per_station == -1 else body.max_per_station)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(_storm_retention_body(eff, await db.count_storm_history()))
+
+
+class ReportRunIn(BaseModel):
+    """A report to build and store now. `month` is required for the
+    monthly kind and ignored by the yearly one."""
+    kind: str = Field(max_length=32)
+    mac: str = Field(min_length=1, max_length=64)
+    year: int = Field(ge=1970, le=2100)
+    month: int | None = Field(default=None, ge=1, le=12)
+
+
+@app.post("/api/reports/run", dependencies=[Depends(require_write_token)])
+async def run_report(body: ReportRunIn) -> JSONResponse:
+    """Build one of the runnable report kinds for a station and period,
+    store it (one row per station and period: a re-run updates), and
+    return it as the detail page would (2.1). The NOAA-style climate
+    tables come from the same renderer `/reports/noaa` has served since
+    1.9; this is what puts them in the Reports pane."""
+    from . import climate
+    from . import reports as rp
+    if body.kind not in rp.RUNNABLE_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"kind must be one of {', '.join(rp.RUNNABLE_KINDS)}")
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    if body.kind == rp.KIND_NOAA_MONTH and body.month is None:
+        raise HTTPException(status_code=400,
+                            detail="month is required for noaa_month")
+    from .ingest import _format_mac
+    norm = _format_mac(body.mac)
+    dev = next((d for d in await db.list_devices() if d["mac"] == norm), None)
+    if dev is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    name = dev.get("name") or norm
+    month = body.month if body.kind == rp.KIND_NOAA_MONTH else None
+    if month is not None:
+        text = await climate.noaa_month_report(norm, name, body.year, month)
+        numbers = await climate.noaa_month_numbers(norm, body.year, month)
+    else:
+        text = await climate.noaa_year_report(norm, name, body.year)
+        numbers = await climate.noaa_year_numbers(norm, body.year)
+    payload = rp.noaa_payload(body.kind, norm, name, body.year, month,
+                              text, numbers)
+    now_ms = int(time.time() * 1000)
+    for_date = (f"{body.year}-{month:02d}-01" if month
+                else f"{body.year}-01-01")
+    rid = await db.insert_report(
+        kind=body.kind, mac=norm, ts_ms=now_ms, for_date=for_date,
+        title=rp.noaa_title(body.kind, name, body.year, month),
+        summary=rp.noaa_summary_line(payload), payload=payload,
+        dedupe=rp.noaa_key(body.kind, norm, body.year, month))
+    row = await db.get_report(rid) if rid is not None else None
+    if row is None:
+        raise HTTPException(status_code=500,
+                            detail="the report was built but not stored")
+    return JSONResponse({"report": row})
+
+
+@app.get("/api/reports/morning/preview", dependencies=[Depends(require_token)])
+async def get_morning_preview() -> JSONResponse:
+    """Today's morning report, built NOW and not stored or sent. The same
+    builder the 7am job uses, so the preview is the report — this is the
+    "run it now" path, and the only thing a brand-new server can show in
+    the Reports pane before its first morning."""
+    from zoneinfo import ZoneInfo
+
+    from . import alerts as al
+    from . import reports as rp
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    now_ms = int(time.time() * 1000)
+    local = datetime.fromtimestamp(now_ms / 1000, tz)
+    report, _stations, _rows = await al.build_morning_report(
+        await db.list_devices(), now_ms, now_ms - 86_400_000, tz, local)
+    if report is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no rollups yet for yesterday; Insights must be on and "
+                   "the station must have reported")
+    payload = rp.morning_payload(report)
+    return JSONResponse({
+        "report": {"id": None, "kind": rp.KIND_MORNING, "mac": None,
+                   "ts_ms": int(time.time() * 1000), "for_date": None,
+                   "title": "Morning report · " + report.date_label,
+                   "summary": rp.morning_summary(payload),
+                   "payload": payload, "preview": True}})
+
+
+@app.get("/api/reports/{report_id}", dependencies=[Depends(require_token)])
+async def get_report_detail(report_id: int) -> JSONResponse:
+    """One stored report with its payload — the detail page."""
+    row = await db.get_report(report_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such report")
+    return JSONResponse({"report": row})
+
+
 @app.get("/api/devices/{mac}/stories", dependencies=[Depends(require_token)])
 async def get_stories(
     mac: str,
-    limit: int = Query(4, ge=1, le=12),
+    # The ceiling is "every card this station can produce", not a page
+    # size. 21 producers and several emit more than one story, so 12 was
+    # silently hiding cards from a rich archive: Volney's oldest station
+    # had 16 candidates and the Reports pane's "every shareable you can
+    # run" list could only ever show 12 of them (2.1). Still bounded —
+    # each story carries its rendered strings and viz rows.
+    limit: int = Query(4, ge=1, le=STORY_LIMIT_MAX),
     family: str | None = Query(None),
     min_score: float = Query(0.0, ge=0.0, le=1.0),
     temp_unit: str | None = Query(None),
@@ -3279,9 +3961,16 @@ async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONRespons
     return JSONResponse({"ok": True})
 
 
+# Shown back by an ALLOW-list (round-three review, SEC info): a field that
+# is not named here is treated as a secret whatever it is called, so a
+# future `token` or `secret` field cannot leak by default.
+_SHARE_SHOWN = {"station_id", "wid", "station"}
 _SHARE_FIELDS = {
     "pwsweather": ("station_id", "api_key"),
-    "windy": ("api_key", "station"),
+    # Windy's 2026 API wants the station's own id and password; api_key and
+    # station index are the legacy account key, still merged and honoured
+    # until Windy retires that path.
+    "windy": ("station_id", "password", "api_key", "station"),
     "weathercloud": ("wid", "key"),
     "cwop": ("station_id",),
 }
@@ -3304,7 +3993,33 @@ async def sharing_status() -> JSONResponse:
             "last_ok_ms": status.get("last_ok_ms"),
             "last_error": status.get("last_error"),
             "last_error_ms": status.get("last_error_ms"),
+            "interval_min": st.interval_min(t, cfg),
+            "min_interval_min": st.MIN_INTERVAL_MIN[t],
+            "mac": cfg.get("mac"),
+            # The non-secret settings, shown back so the sheet reads as
+            # filled in; secrets stay write-only (Volney, 2026-09-06).
+            "values": {f: str(cfg.get(f)) for f in _SHARE_FIELDS[t]
+                       if f in _SHARE_SHOWN and cfg.get(f) not in (None, "")},
         }
+    # Weather Underground is forwarded per station (its own page), but the
+    # networks list shows it beside the four, and "sent 3 minutes ago"
+    # belongs there too (Doren, 2026-09-06: "is there a notation of a
+    # successful send for WU?"). One summary row: on if any station
+    # forwards, the newest acceptance, the newest error.
+    from . import wu_upload
+    wu = {"enabled": False, "fields": {}, "last_ok_ms": None,
+          "last_error": None, "last_error_ms": None}
+    for assoc in await db.list_wu_stations():
+        if not assoc["upload_enabled"]:
+            continue
+        wu["enabled"] = True
+        stats = wu_upload.stats(assoc["mac"])
+        ok = stats.get("last_ok_ms")
+        if ok is not None and (wu["last_ok_ms"] is None or ok > wu["last_ok_ms"]):
+            wu["last_ok_ms"] = ok
+        if stats.get("last_error") and wu["last_error"] is None:
+            wu["last_error"] = stats["last_error"]
+    out["wu"] = wu
     return JSONResponse(out)
 
 
@@ -3317,6 +4032,12 @@ class SharePut(BaseModel):
     station: int | None = Field(default=None, ge=-1, le=255)
     wid: str | None = Field(default=None, max_length=64)
     key: str | None = Field(default=None, max_length=128)
+    password: str | None = Field(default=None, max_length=128)
+    # Minutes between sends; clamped to the network's floor server-side.
+    # -1 clears the setting (back to the network's default), like `station`.
+    interval_min: int | None = Field(default=None, ge=-1, le=60)
+    # Which station this network publishes; "" = the first weather station.
+    mac: str | None = Field(default=None, max_length=32)
 
 
 @app.put("/api/sharing/{target}", dependencies=[Depends(require_write_token)])
@@ -3339,10 +4060,40 @@ async def sharing_put(target: str, body: SharePut) -> JSONResponse:
                 cfg[f] = v if f == "station" else sv
             else:
                 cfg.pop(f, None)
+    if body.mac is not None:
+        from .ingest import _format_mac
+        if body.mac.strip():
+            norm = _format_mac(body.mac)
+            device = next((d for d in await db.list_devices()
+                           if str(d.get("mac") or "").upper() == norm), None)
+            if device is None:
+                raise HTTPException(status_code=400,
+                                    detail=f"{norm} is not a station this server knows")
+            if db.is_air_monitor_device(device):
+                raise HTTPException(status_code=400,
+                                    detail="an air monitor's readings are not outdoor "
+                                           "weather; pick a weather station")
+            cfg["mac"] = norm
+        else:
+            cfg.pop("mac", None)
+    if body.interval_min is not None:
+        if body.interval_min == -1:
+            cfg.pop("interval_min", None)
+        elif body.interval_min == 0:
+            raise HTTPException(status_code=422, detail="interval_min must be 1..60, or -1 to clear")
+        else:
+            cfg["interval_min"] = max(st.MIN_INTERVAL_MIN[target],
+                                      min(st.MAX_INTERVAL_MIN, int(body.interval_min)))
     if body.enabled is not None:
         if body.enabled:
-            missing = [f for f in _SHARE_FIELDS[target]
-                       if f != "station" and not str(cfg.get(f) or "").strip()]
+            if target == "windy":
+                # Either credential shape enables: id + password (2026
+                # API) or the legacy account key.
+                missing = ([] if st.windy_is_v2(cfg) or str(cfg.get("api_key") or "").strip()
+                           else ["station_id", "password"])
+            else:
+                missing = [f for f in _SHARE_FIELDS[target]
+                           if f != "station" and not str(cfg.get(f) or "").strip()]
             if missing:
                 raise HTTPException(
                     status_code=400,
@@ -3350,6 +4101,36 @@ async def sharing_put(target: str, body: SharePut) -> JSONResponse:
         cfg["enabled"] = body.enabled
     await st.set_config(target, cfg)
     return JSONResponse({"ok": True, "enabled": bool(cfg.get("enabled"))})
+
+
+# Save-and-verify sends per target: one every SHARE_TEST_EVERY_S, so a
+# held-down button cannot hammer a network that feeds NOAA (round-three
+# review SEC-G6). Reset per test in conftest.
+_SHARE_TEST_LAST: dict[str, float] = {}
+SHARE_TEST_EVERY_S = 30.0
+
+
+@app.post("/api/sharing/{target}/test", dependencies=[Depends(require_write_token)])
+async def sharing_test(target: str) -> JSONResponse:
+    """Send one report now and say what the network answered (the Save
+    and verify button). Cadence is ignored for this one send; the
+    staleness gate is not (a dead station's last reading is never
+    "verified" onto a network); the status row is stamped so the list
+    agrees with the sheet."""
+    from . import share_targets as st
+    if target not in st.TARGETS:
+        raise HTTPException(status_code=404, detail="unknown target")
+    cfg = await st.get_config(target)
+    if not cfg.get("enabled"):
+        raise HTTPException(status_code=400, detail="turn the upload on first")
+    now_mono = time.monotonic()
+    if now_mono - _SHARE_TEST_LAST.get(target, -1e9) < SHARE_TEST_EVERY_S:
+        raise HTTPException(status_code=429,
+                            detail=f"one verify per {int(SHARE_TEST_EVERY_S)} s per network")
+    _SHARE_TEST_LAST[target] = now_mono
+    devices = await db.list_devices()
+    result = await st.send_once(target, devices, int(time.time() * 1000))
+    return JSONResponse(result)
 
 
 class WebhookIn(BaseModel):
@@ -3623,6 +4404,14 @@ async def _fill_rain_periods(mac: str, obs: dict[str, Any]) -> None:
          "yearlyrainin")
     ):
         return
+    # A source that posts ONLY a yearly counter — no daily, no monthly — is
+    # an SDR/LilyGO sensor, and that counter is the sensor's LIFETIME total
+    # (a WH24 read 18.47" in a 1.6" year). Decided before the fill below
+    # adds the buckets the source lacks. Every other shape (AWN, Davis,
+    # Ecowitt, Tempest) posts a yearly that resets on Jan 1 or none at all.
+    lifetime_counter = (obs.get("yearlyrainin") is not None
+                        and obs.get("monthlyrainin") is None
+                        and obs.get("dailyrainin") is None)
     try:
         rollups = await db.rain_rollups(mac, settings.timezone)
     except Exception as e:
@@ -3635,10 +4424,31 @@ async def _fill_rain_periods(mac: str, obs: dict[str, Any]) -> None:
                   ("yearlyrainin",  rollups.get("yearly_in"))):
         if obs.get(k) is None and v is not None:
             obs[k] = v
+    # Lifetime counter: the YEAR bucket becomes the counter differenced
+    # against Jan 1 (or the first reading on file), and the raw counter
+    # moves to `totalrainin` — Ambient's own name for a lifetime total —
+    # so nothing is lost and a reader can tell the two apart. Read-side
+    # only: the 2026-08-11 ingest offset rewrote stored history and broke
+    # rollups and records; this touches the served dict and nothing else.
+    if lifetime_counter and rollups.get("yearly_in") is not None:
+        obs["totalrainin"] = obs["yearlyrainin"]
+        obs["yearlyrainin"] = rollups["yearly_in"]
+
+
+def _strip_observation_pii(obs: dict[str, Any]) -> dict[str, Any]:
+    """The reading for a read-only token. `_source` is the poster's own
+    payload kept verbatim, and for a cloud-polled station (Tempest,
+    AirGradient) it carries the station's name and exact coordinates —
+    the fields _strip_device_pii hides on /api/devices. The apps never
+    read it; it exists for the owner's debugging (CodeRabbit, PR #36)."""
+    return {k: v for k, v in obs.items() if k != "_source"}
 
 
 @app.get("/api/devices/{mac}/current", dependencies=[Depends(require_token)])
-async def get_current(mac: str) -> JSONResponse:
+async def get_current(
+    mac: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
     # Read-side MAC normalization: storage keys are the uppercase colonized
     # form. Write endpoints already normalize; without the same here a
     # lowercase/compact MAC from a script 404s while the uppercase works.
@@ -3648,6 +4458,8 @@ async def get_current(mac: str) -> JSONResponse:
     if not obs:
         raise HTTPException(status_code=404, detail="no data for device")
     await _fill_rain_periods(mac, obs)
+    if _is_limited_read(authorization):
+        obs = _strip_observation_pii(obs)
     return JSONResponse(obs)
 
 

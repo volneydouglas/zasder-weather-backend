@@ -194,8 +194,16 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
         for mac, p in dev_prefs.items():
             if not isinstance(p, dict):
                 continue
+            thr = p.get("threshold_min")
+            if thr is not None:
+                try:
+                    thr = float(thr)
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(thr) or thr < 0:
+                    continue
             await db.upsert_device_alert_pref(
-                mac, bool(p.get("monitor", True)), p.get("threshold_min"))
+                mac, bool(p.get("monitor", True)), thr)
             # Per-device storm summaries were exported and never restored,
             # so a muted station came back loud (R18 finding 5). None or
             # absent means "never set", which is the default (on).
@@ -209,9 +217,16 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
         # validating meant a file whose rules were all malformed wiped every
         # existing rule and put nothing back — the worst possible outcome for
         # a restore.
+        # One rule schema for both doors (round-four review R21-05): the
+        # PUT route's field and comparator sets, so a hand-edited file cannot
+        # land a rule the API refuses. An unknown field never matches a
+        # reading and an unknown comparator silently became "equalTo".
+        from .alerts import THRESHOLD_FIELDS, THRESHOLD_COMPARATORS
         staged: list[tuple[Any, str, str, float, bool, str]] = []
+        rejected: list[str] = []
         for r in rules:
             if not isinstance(r, dict):
+                rejected.append(f"{r!r:.60}: not a rule")
                 continue
             # target_mac must be a string or None: a hand-edited dict/list
             # here survived staging and blew up INSIDE create_alert_rule
@@ -222,27 +237,44 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
             # (JSONResponse serializes with allow_nan=False).
             target_mac = r.get("target_mac")
             if target_mac is not None and not isinstance(target_mac, str):
+                rejected.append("target_mac must be a MAC string or null")
                 continue
             try:
                 threshold = float(r["threshold"])
                 field, comparator = str(r["field"]), str(r["comparator"])
             except (KeyError, TypeError, ValueError):
-                continue          # skip a malformed rule, keep the rest
+                rejected.append(f"{r.get('field', '?')!s:.40}: malformed rule")
+                continue
             if not math.isfinite(threshold):
+                rejected.append(f"{field:.40}: threshold is not a number")
+                continue
+            if field not in THRESHOLD_FIELDS:
+                rejected.append(f"{field:.40}: unknown field")
+                continue
+            if comparator not in THRESHOLD_COMPARATORS:
+                rejected.append(f"{field:.40}: unknown comparator {comparator:.20}")
                 continue
             severity = r.get("severity") or "minor"
             if severity not in RULE_SEVERITIES:
                 severity = "minor"        # a hand-edited file never invents a tier
             staged.append((target_mac, field, comparator, threshold,
                            bool(r.get("enabled", True)), severity))
-        # An explicitly empty list is a legitimate "clear my rules"; a list
-        # that had entries but none survived validation is not.
-        if staged or not rules:
-            if replace_rules:
-                # Rules have no stable identity across servers, so restoring
-                # on top of existing ones would duplicate every rule.
-                for existing in await db.list_alert_rules():
-                    await db.delete_alert_rule(int(existing["id"]))
+        # An explicitly empty list is a legitimate "clear my rules". A list
+        # with ANY rejected entry is applied not at all: replacing a working
+        # set with a partial one, and reporting it as restored, was the
+        # worst outcome (R21-05). The rejections ride the summary.
+        if rejected:
+            summary["alert_rules_rejected"] = rejected
+            summary["alert_rules_error"] = (
+                f"{len(rejected)} alert rule(s) in the file are not valid "
+                f"({'; '.join(rejected[:3])}{'; …' if len(rejected) > 3 else ''}); "
+                "the existing rules were left as they were")
+        elif replace_rules:
+            # Rules have no stable identity across servers, so restoring on
+            # top of existing ones would duplicate every rule: one atomic
+            # replacement, all or nothing.
+            summary["alert_rules"] = await db.replace_alert_rules(staged)
+        else:
             for target, field, comparator, threshold, enabled, severity in staged:
                 created = await db.create_alert_rule(target, field,
                                                      comparator, threshold,
@@ -260,7 +292,14 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
             if lat is None or lon is None:
                 continue
             try:
-                await db.set_device_location(mac, float(lat), float(lon),
+                flat, flon = float(lat), float(lon)
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(flat) and math.isfinite(flon)
+                    and -90.0 <= flat <= 90.0 and -180.0 <= flon <= 180.0):
+                continue
+            try:
+                await db.set_device_location(mac, flat, flon,
                                              loc.get("label"),
                                              int(time.time() * 1000))
             except (TypeError, ValueError):
@@ -282,6 +321,8 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
                 summary["device_names"] += 1
 
     if sum(v for v in summary.values() if isinstance(v, int)) == 0:
+        if summary.get("alert_rules_error"):
+            raise RestoreError(str(summary["alert_rules_error"]))
         raise RestoreError("nothing in that file could be restored — "
                            "is it a backend configuration backup?")
     log.info("config restored: %s", summary)

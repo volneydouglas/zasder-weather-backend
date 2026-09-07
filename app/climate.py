@@ -23,9 +23,14 @@ from datetime import date, timedelta
 from typing import Any
 
 from .config import settings
+from .day_rain import day_rain_in, sum_or_none
 
 HDD_CDD_BASE_F = 65.0
 GDD_BASE_F, GDD_CAP_F = 50.0, 86.0
+
+
+def _round2(v: float | None) -> float | None:
+    return None if v is None else round(v, 2)
 
 
 def _f(v: Any) -> float | None:
@@ -82,7 +87,10 @@ def _day_stats(r) -> dict[str, Any]:
     return {
         "day": r["day"], "tmin": tmin, "tmax": tmax,
         "mean": (tmin + tmax) / 2 if dd else None,
-        "rain": _f(r["rain_total"]) or 0.0,
+        # None when the station never measured rain (app/day_rain.py):
+        # a yearly-counter station used to print 0.00 in on every
+        # line and every total (2.1 pre-release review BE-1).
+        "rain": day_rain_in(r),
         "gust": _f(r["windgustmph_max"]),
         "hdd": dd[0] if dd else None,
         "cdd": dd[1] if dd else None,
@@ -111,7 +119,7 @@ async def year_summary(mac: str, year: int) -> dict[str, Any]:
             "min": lo, "max": hi,
             "min_day": next((d["day"] for d in temps if d["tmin"] == lo), None),
             "max_day": next((d["day"] for d in temps if d["tmax"] == hi), None),
-            "rain": round(sum(d["rain"] for d in days), 2) if days else None,
+            "rain": _round2(sum_or_none(d["rain"] for d in days)),
             "hdd": round(sum(d["hdd"] for d in temps), 1) if temps else None,
             "cdd": round(sum(d["cdd"] for d in temps), 1) if temps else None,
             "gdd": round(sum(d["gdd"] for d in temps), 1) if temps else None,
@@ -127,8 +135,7 @@ async def year_summary(mac: str, year: int) -> dict[str, Any]:
         # None, not "0.00 in of rain" — indistinguishable from a real
         # drought. Same rule the per-month rows already follow.
         "totals": {
-            "rain": round(sum(d["rain"] for d in all_days), 2)
-                    if all_days else None,
+            "rain": _round2(sum_or_none(d["rain"] for d in all_days)),
             "hdd": round(sum(d["hdd"] for d in all_temps), 1)
                    if all_temps else None,
             "cdd": round(sum(d["cdd"] for d in all_temps), 1)
@@ -149,7 +156,7 @@ async def year_summary(mac: str, year: int) -> dict[str, Any]:
     wy_rows = await _rollup_rows(mac, start.isoformat(), today.isoformat())
     out["water_year"] = {
         "start": start.isoformat(),
-        "rain": round(sum(_f(r["rain_total"]) or 0 for r in wy_rows), 2),
+        "rain": _round2(sum_or_none(day_rain_in(r) for r in wy_rows)),
     }
     return out
 
@@ -159,6 +166,54 @@ async def month_days(mac: str, year: int, month: int) -> list[dict[str, Any]]:
             - timedelta(days=1))
     rows = await _rollup_rows(mac, f"{year}-{month:02d}-01", last.isoformat())
     return [_day_stats(r) for r in rows]
+
+
+# ── the numbers behind a NOAA report (2.1, for the stored report row) ───
+
+async def noaa_month_numbers(mac: str, year: int, month: int) -> dict[str, Any]:
+    """The month's headline figures, flat: what the Reports list row and
+    the share card say without parsing the table. Absent is None."""
+    days = await month_days(mac, year, month)
+    temps = [d for d in days if d["mean"] is not None]
+    hi = max((d["tmax"] for d in temps), default=None)
+    lo = min((d["tmin"] for d in temps), default=None)
+    return {
+        "days": len(days),
+        "mean_f": round(sum(d["mean"] for d in temps) / len(temps), 1)
+                  if temps else None,
+        "high_f": hi,
+        "high_day": next((d["day"] for d in temps if d["tmax"] == hi), None),
+        "low_f": lo,
+        "low_day": next((d["day"] for d in temps if d["tmin"] == lo), None),
+        "rain_in": _round2(sum_or_none(d["rain"] for d in days)),
+        "hdd": round(sum(d["hdd"] for d in temps), 1) if temps else None,
+        "cdd": round(sum(d["cdd"] for d in temps), 1) if temps else None,
+        "gust_mph": max((d["gust"] for d in days if d["gust"] is not None),
+                        default=None),
+    }
+
+
+async def noaa_year_numbers(mac: str, year: int) -> dict[str, Any]:
+    summary = await year_summary(mac, year)
+    months = summary["months"]
+    with_temps = [m for m in months if m["max"] is not None]
+    hi = max((m["max"] for m in with_temps), default=None)
+    lo = min((m["min"] for m in with_temps), default=None)
+    t = summary["totals"]
+    return {
+        "days": sum(m["days"] for m in months),
+        "mean_f": t.get("mean"),
+        "high_f": hi,
+        "high_day": next((m["max_day"] for m in with_temps
+                          if m["max"] == hi), None),
+        "low_f": lo,
+        "low_day": next((m["min_day"] for m in with_temps
+                         if m["min"] == lo), None),
+        "rain_in": t.get("rain"),
+        "hdd": t.get("hdd"),
+        "cdd": t.get("cdd"),
+        "gust_mph": None,
+    }
 
 
 # ── the NOAA-style text report ──────────────────────────────────────────
@@ -197,7 +252,7 @@ async def noaa_month_report(mac: str, name: str, year: int,
             f"{_fmt(min(d['tmin'] for d in temps), 7)}"
             f"{_fmt(sum(d['hdd'] for d in temps), 7)}"
             f"{_fmt(sum(d['cdd'] for d in temps), 7)}"
-            f"{_fmt(sum(d['rain'] for d in days), 9, 2)}"
+            f"{_fmt(sum_or_none(d['rain'] for d in days), 9, 2)}"
             f"{_fmt(max((d['gust'] for d in days if d['gust'] is not None), default=None), 9)}")
     else:
         lines.append("   (no data for this month)")
@@ -231,6 +286,7 @@ async def noaa_year_report(mac: str, name: str, year: int) -> str:
         f"{_fmt(t['hdd'], 8)}{_fmt(t['cdd'], 8)}{_fmt(t['rain'], 10, 2)}")
     wy = summary["water_year"]
     lines.append("")
-    lines.append(f"   Water year (from {wy['start']}): "
-                 f"{wy['rain']:.2f} in")
+    wy_rain = (f"{wy['rain']:.2f} in" if wy['rain'] is not None
+               else "no rain measured")
+    lines.append(f"   Water year (from {wy['start']}): {wy_rain}")
     return "\n".join(lines) + "\n"

@@ -8,6 +8,509 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.1.0] — 2026-09-07
+
+### Added
+- **On the Mac, Charts fill the window:** a wider, taller plot, four stat
+  tiles across, and longer sparklines. Dashboard and History use the extra
+  width too, and the station name sits at the trailing edge of the header.
+  The iPhone layout is unchanged.
+- **Each weather network publishes the station you choose.** Every
+  network page has a Station picker when you have more than one. It
+  defaults to the station at the top of your list and becomes explicit on
+  the first save, so reordering later does not move the feed.
+- **Send to the weather networks as often as each one allows.** Every
+  network page has a "Send every" picker, down to a minute for PWSWeather,
+  five for Windy and CWOP, ten for WeatherCloud (their own limits), and up
+  to an hour.
+- **The Weather Underground row shows its sends like the others,** and the
+  forwarding page says when the last upload was accepted and what the last
+  failure was.
+- **Windy uploads use its 2026 Stations API.** Windy retired the
+  account-key upload; the Windy page now takes the station's ID and
+  station password from its page under My Stations, and sends the
+  documented parameter names. A duplicate report counts as delivered.
+- **Save and verify on every network page.** One tap saves, sends a
+  report right away, and shows the network's answer in the sheet. The
+  sheet also shows what is already saved: the station ID as text, a
+  secret as "Set".
+- **Windy says why it refused.** A failed send shows Windy's own message
+  beside the status, and the Windy page takes the station number for
+  accounts with more than one station and says the station must be
+  registered on stations.windy.com first.
+- **Reports.** The morning report and every storm summary are now kept as
+  rows you can open again, instead of a notification that scrolls away.
+  A new Reports pane in History lists them newest first, alongside every
+  story card the station has earned. Tapping a morning-report push, or the
+  morning Live Activity on the Lock Screen, opens that morning's report
+  directly: yesterday's numbers per station, today's forecast, and what
+  went off overnight. `GET /api/reports` lists them, `GET /api/reports/{id}`
+  serves one, and `GET /api/reports/morning/preview` builds today's on
+  demand without storing or sending it, so a fresh install has something
+  to read before its first 7am. Reports are written from the same object
+  the email is rendered from, so the page and the mail can never disagree.
+  Storage is bounded and idempotent: a retried send updates its row rather
+  than stacking a second one.
+- **Feels-like in the morning report.** A day that hit 93°F and felt like
+  108 reads as a 93°F day without it. Reported in the email, the plain-text
+  alternative, the push and the stored report, and only when it is far
+  enough from the air temperature to say something the high did not.
+
+- **Seven Big watch complications**, one per reading: Temperature, Feels
+  Like, Dew Point, Humidity, Wind, Rain and UV. Each spends the whole
+  slot on one number, coloured by value on the app's own scales. Dew
+  point is coloured by comfort rather than temperature, because a 70°F
+  dew point is oppressive, not warm. Feels Like runs its shading the
+  other way so it is not mistaken for Temperature on the same face.
+- **Every story card, per station.** The story-cards page now asks for
+  every card a station can produce instead of the top twelve, and has a
+  station picker, since a 2015-archive Davis and a week-old Tempest earn
+  very different lists.
+
+- **Climate reports in the Reports pane.** The NOAA-style monthly and
+  yearly climatological summaries the Explore view has shown since 1.9
+  are now report kinds you run for any station and period, stored one
+  row per period, with the table verbatim and the headline numbers
+  beside it. `POST /api/reports/run` builds one.
+- **Where your sensors disagree.** A morning report covering two or more
+  stations now says how far they spread on the high, low, humidity, gust
+  and rain, naming the stations at each end. Never an average: siting
+  bias is systematic and no sensor read the mean. In the email, the text
+  alternative, the stored report and the app.
+- **Storm ledger retention is a setting.** How many closed storms the
+  server keeps per station for the Storm Report card was a hard 50; it
+  is now app-managed (`/api/storms/retention`), `STORM_HISTORY_MAX` in
+  the env as the fallback, 200 by default, 10 to 1,000.
+- **Reports retention is a setting.** How many reports the server keeps
+  is app-managed (`/api/reports/retention`), `REPORTS_MAX_ROWS` in the
+  env as the fallback, 900 by default, 30 to 5,000.
+- **Restore the weather database from the app.** The snapshot the app
+  saves can go back onto a server from Settings, or at the end of Guided
+  Setup for a fresh box that replaces one you backed up. The server asks
+  for a fresh confirmation, checks the file's integrity and that it is
+  not from a newer release, keeps the previous database beside it as a
+  pre-restore copy, and swaps in one step.
+  `POST /api/backup/database/restore/challenge`,
+  `POST /api/backup/database/restore`,
+  `GET /api/backup/database/restore/status`.
+- **The Mac backs up the database on a schedule.** Pick a folder once
+  (iCloud Drive keeps the copies in iCloud), a day or a week, and how
+  many to keep; the Mac app makes the copy while it runs and catches up
+  at launch.
+- **Server recommendations.** A self-hosted server now reads its own Fly
+  machine and volume and says when more disk or memory would help: the
+  volume past 80% full or under 90 days of room at the rate the archive
+  grows, memory when the process is using three quarters of it or was
+  killed for running out this week. Each recommendation carries Fly's
+  list price for the difference and one tap applies it after a
+  confirmation that names what happens (volumes extend online; a memory
+  change restarts the server). `GET /api/server/advice`,
+  `POST /api/server/advice/apply`. A server without a Fly deploy token,
+  or with `SERVER_ADVICE=0`, reports the feature unavailable and the apps
+  show nothing.
+- **Sign in with Fly.io, in beta.** Guided Setup can open Fly's own login
+  page and take the token from there instead of a paste, using the same
+  browser handshake flyctl uses. It is a small secondary button under the
+  paste field, marked beta and use at your own risk, because the
+  handshake is Fly's private one and could change without notice; pasting
+  a token always works and stays the primary path. The login token is
+  used only to create the server and is never stored.
+- **The server names itself.** `GET /api/session` now carries
+  `server_name` and `role` (owner or guest), and the name is settable from
+  the app (`/api/config/server-name`), with `SERVER_NAME` in the env and
+  the public page's location as fallbacks. A later release lets one app
+  hold several servers, and this is the name it will show for each.
+- **Glance says so.** When the dashboard density is Glance, a line under
+  the stations says "Glance view · Show everything" and one tap switches
+  back, so the thinned layout can never again pass for a broken one.
+- **Reset display settings** in Dashboard & Charts (iPhone and Mac):
+  density back to Instrument, every tile and chart field shown in stock
+  order, per-station layouts cleared, watch gauges to default. Units,
+  appearance, stations, alerts and the server stay.
+- **Open any past day.** Select a day on any History, Explore card and
+  open its hour-by-hour charts, with previous and next day controls.
+- The header names what the page is showing: the station on Charts,
+  the pane on History. With many stations the chips truncate to
+  "Chandler Davi…"; the full name now sits in the header's empty middle.
+- **Settings search on the Mac**, searching the same index as the iPhone.
+- **Connected apps in Settings.** Server & Backups now lists every
+  assistant that registered with your server's MCP endpoint, with Approve
+  for the ones waiting and Remove to revoke everything an app holds.
+  "Connect an assistant" mints the one-use connect code the assistant's
+  sign-in page asks for, shows it with a Copy button and its ten-minute
+  countdown, and says where to paste the server address.
+- The month browser inside the History tab is now the "Explore" chip. It
+  was labelled "History", which read as "History under History" once the
+  header started naming the pane.
+- **Connected apps need your approval.** An assistant that registers
+  itself with your server is inert until you approve it: its consent
+  page takes only a connect code minted in the app (ten minutes, one
+  use), names the app and the address it returns to, and never redirects
+  anywhere for a request it cannot honour. Once approved, the page also
+  accepts the server's API token or a guest link token.
+  `POST /api/oauth/connect-code`, `POST /api/oauth/clients/{id}/approve`.
+- **OAuth sessions are bound and single-use under load.** A refresh token
+  used again after rotation revokes the whole session; two simultaneous
+  exchanges of one code or one refresh token yield one success; an access
+  token is honoured only at the server address it was issued for.
+  `MCP_ENABLED=0` removes the MCP server and every OAuth endpoint,
+  discovery documents included. `PUBLIC_BASE_URL` fixes the server's
+  OAuth identity instead of trusting the request's `Host`.
+- **The Reports list speaks your units.** `GET /api/reports` accepts the
+  same unit parameters as the story cards and renders each summary line
+  in them.
+- **No cloud poller sits on the boot path.** AmbientWeather, Tempest,
+  WeatherLink and Govee join Ecowitt: the server starts and saves
+  settings at once while each poller warms up in the background, and a
+  poller that will not stop is abandoned after five seconds rather than
+  holding the request.
+- **claude.ai and ChatGPT can connect to the MCP server.** The backend is
+  now its own OAuth 2.1 authorization server for `/mcp`: RFC 9728 and
+  RFC 8414 discovery, RFC 7591 registration, a consent page on your own
+  server where you type the API token (or a guest link token for
+  read-only guest access), PKCE, hour-long access tokens and rotating
+  thirty-day refresh tokens, all stored hashed. Paste `https://<host>/mcp`
+  into a custom connector and sign in; nothing else to configure.
+  Connected apps are listed at `GET /api/oauth/clients` and cut off with
+  `DELETE /api/oauth/clients/{id}`. The bearer-token path for Claude Code
+  and config-file clients is unchanged.
+- **Ask Claude or ChatGPT about your own weather.** The backend is now a
+  read-only MCP server at `POST /mcp` (Streamable HTTP, JSON-RPC, no
+  sessions), behind the same bearer token as every `/api/*` route. Eleven
+  tools cover stations, current conditions, history, daily summaries,
+  records, insights, stories, stored reports, storm history and the NOAA
+  report, every value in storage units and a missing sensor as null.
+  Nothing is stored for it: no provider key, no account; the assistant you
+  already pay for does the thinking.
+- **The container no longer runs as root.** A small entrypoint hands the
+  data volume to an unprivileged `app` user at boot and starts the server
+  as that user; nothing about the volume, secrets, upgrades or `fly ssh
+  console` changes.
+- `bin/ci-green.sh` waits for a running CI (up to `CI_GREEN_WAIT_S`,
+  default 20 minutes) instead of refusing and asking you to try again, and
+  tells a `gh` failure apart from "no runs found".
+- **1920 vs 2026, the barometer scorecard.** The Barometer Says card
+  promised a scoreboard once a season of calls existed; the ledger has
+  filed one slide-rule call every morning since 2.0, and this card scores
+  them once thirty days have a rain outcome. One question, asked of both
+  instruments: did it rain today, judged by your own gauge. The numerical
+  model is scored only on days it had a forecast on file before the 09:00
+  call, and the slide rule's rate on those same days sits beside it, so
+  the comparison is like for like. Hedged calls ("Fine, possibly
+  showers") count as dry; a day the gauge never reported is dropped, not
+  counted as dry.
+- The Zambretti ledger's table is created with the rest of the schema at
+  boot rather than on first use; the ledger still recreates it if it is
+  dropped by hand.
+- **The ledger and the card now refuse the same stale trend anchor.** The
+  daily Zambretti call accepted a pressure anchor up to six hours old
+  while the card declined past three and a half; one constant now, both
+  readers.
+
+### Changed
+- `/healthz` reports the process's effective uid and performs one read of
+  the database, answering 503 when the file cannot be opened; deploy.sh
+  refuses a guest tree that still carries any private module, and
+  `ALLOW_RED_CI` no longer skips the uncommitted-changes check.
+- `REPORTS_MAX_ROWS`, `STORM_HISTORY_MAX` and `SERVER_ADVICE` are honoured
+  from `.env` like every other setting; all four 2.1 settings are
+  documented in `.env.example` and the README.
+- The container entrypoint only hands the data directory to the app user
+  when root still owns it, refuses a bare mount root, and gives the app
+  user a writable HOME; the base image is pinned by digest.
+- **Ecowitt Cloud no longer sits on the boot path.** The poller used to
+  look up the account and fetch a day of history for every station before
+  the server finished starting, each call with a fifteen-second timeout,
+  so a slow or dead ecowitt.net held every other integration and the
+  settings save that restarts it. It now starts its background task at
+  once and warms up inside it; the source reports "starting" until the
+  first poll, and saving credentials answers within eight seconds even
+  when the vendor does not.
+- **Webhook delivery checks the address every time.** The private-network
+  guard ran only when a webhook was registered; a host that later
+  re-pointed its DNS at an internal address was delivered to. Every
+  delivery now re-resolves the host, refuses private, loopback,
+  link-local and carrier-grade-NAT answers, and pins the connection to
+  the address it checked while still verifying the certificate against
+  the hostname.
+- The "Open <day>" button under an Explore card opens that day on the
+  reading the card was showing, rain on rain and gust on gust, instead of
+  always landing on temperature.
+- The "Open <day>" button under an Explore card stays put after the
+  selection gesture ends, instead of vanishing under the thumb on its way
+  to it.
+- Storm summary timing sliders save when you let go and say "Saved",
+  instead of a Save link that gave no feedback.
+- Widget captions at 9 pt where the layouts allow; the widget's UV and
+  sun-arc colours are the app's own.
+- **Rollup rebuilds no longer empty the ledger while they run.** A rebuild
+  used to delete every rollup row first and refold from the start, so the
+  Insights cards, long-period records and story cards on every station
+  vanished for the whole run, and a rebuild that died left them empty. It
+  now folds into staging tables and swaps them in with one short
+  transaction at the end; readers see the old ledger or the new one, never
+  neither, and a failed rebuild changes nothing. Readings that arrive
+  while the scan runs are folded exactly once. The pause between batches
+  now scales with the batch, so on a shared CPU that is being stolen the
+  rebuild still holds the writer for at most a third of wall time instead
+  of most of it. Leftover staging tables from a process killed
+  mid-rebuild are swept at boot.
+- **The write-lock watchdog names the SQL.** Its thread dump now lists
+  every open transaction with the last statement it ran and how long it
+  has been open, plus where a running rebuild is (phase, station,
+  cursor), which is what the 2026-09-02 investigation lacked.
+- Pushes may now carry a **route**: where a tap should land inside the app.
+  It is a validated verb and id, never a payload, and the hosted relay
+  builds the notification from it rather than forwarding it, so the relay's
+  payload lock stands. A relay too old to know the field answers 422 and
+  the push is retried without it, so a route can never cost a delivery.
+
+### Fixed
+- **A database restore closes the database for the seconds it takes to
+  swap files.** Every other request waits or is told to retry, so
+  nothing can write into the copy that is about to become the safety
+  net. The uploaded file is checked against the full schema before
+  anything moves; if the restored file cannot be started the previous
+  database is put back automatically; a restore interrupted mid-swap is
+  repaired at the next start instead of leaving an empty database.
+- **After a restore the server picks up the restored settings on its
+  own:** cloud pollers start, stop or switch to the restored credentials,
+  and the rollups and reports rebuild, with no restart or re-save.
+- **A settings backup with an unusable alert rule is refused with the
+  reason** instead of replacing the working rules, and a valid rule list
+  is applied all at once.
+- **Changing the server is one step.** The address and token are saved
+  together, so a half-edited connection can no longer send the previous
+  server's token to the new one or show the previous server's weather
+  under the new name. A server that answers 429 or 5xx to the capability
+  check is asked again with backoff instead of being remembered.
+- **Every station's current reading loads before any history,** and
+  histories load only for stations on the Dashboard, so one slow station
+  cannot hold the others. Weather warnings and the forecast belong to
+  the station's location: a failed fetch for a new location no longer
+  keeps the old location's.
+- **The Reports archive has a "Load older reports" row,** so every stored
+  report is reachable. Climate report creation is owner-only and says so
+  to a guest.
+- **The restore confirmation says when the server could not count its
+  readings,** and that a restore replaces stored settings and access
+  grants too. A restore whose progress the app lost offers a status check
+  instead of a second upload; a failed challenge leaves no copy behind.
+- **The rain networks receive the last hour's rainfall, not the rain
+  rate.** The reading's hourly figure is a rate in inches per hour and was
+  being sent as the hour's total, so a burst of 40 in/hr went out as forty
+  inches. The hour's accumulation is derived from the counters and omitted
+  when it cannot be.
+- **A network publishes only the station you chose.** A chosen station
+  that is silent, removed or an air monitor sends nothing and the row says
+  why, instead of another station going out under its ID. Save and verify
+  refuses a stale reading like the scheduled send does.
+- **A station whose counter went quiet keeps its year-to-date,** a rain
+  gauge that resets twice in a day or at UTC midnight on December 31 is
+  read as a reset both times, and a station with no gauge has no rain
+  total for that year rather than a zero.
+- **The server's OAuth identity is the address you configured,** or a
+  custom domain listed in ALLOWED_HOSTS, or its fly.dev name. It is logged
+  at boot and shown on the status page. Changing it means connecting each
+  assistant again. An assistant that rotates its refresh token thousands
+  of times is cut off, so a replay can always be recognised.
+- **A restore no longer loses its upload to a reader that held the
+  database for an instant;** the checkpoint is retried for five seconds
+  and a refused upload is kept. Reports page correctly when several were
+  written in the same millisecond, the health probe answers concurrent
+  checks with one read, and a cloud poller that ignores a stop request is
+  abandoned after five seconds instead of holding the shutdown.
+- **Every credential the app can copy now asks first and copies the same
+  way,** local to this device and gone in a minute. The setup code on the
+  wizard's done screen, the per-device token and the forecast key had
+  copied to the shared clipboard without asking.
+- **Settings sections that hide themselves on an older server come back
+  when you point the app at a newer one.** They stayed hidden until the
+  app restarted. A network page whose status fails to load says so and
+  offers a retry instead of loading forever, Save waits while a verify is
+  in flight, and a Windy page still on the retired account key says how
+  to move.
+- **The poll status dot's refresh is a real button VoiceOver can reach,**
+  and the Connected apps buttons are full-size targets.
+- **The Mac widget no longer shows a placeholder after every launch,** and
+  the watch complication drops its last reading when the server or token
+  changes. A restore says "Preparing" while it reads the file and can be
+  cancelled during that step.
+- **Settings, four small moves after a review against Apple's, Google's
+  and Microsoft's settings guidance.** Connected apps sits under Sharing
+  with the read link, write link and public page, since it is one more
+  grant of access; Reset display settings is the last row of Dashboard
+  and Charts, after everything it resets; the search result for the
+  alert-rules page now carries the row's own name, Email and device
+  monitoring; and the Mac's Server tab follows the iPhone's order.
+- **The current reading answers fast again on a large database.** Two
+  rain lookups walked the whole table on every poll: the year-to-date
+  bucket's January value on a station whose counter history begins
+  mid-year, and the "does this station have a counter at all" check on
+  one that never had one. The first is remembered for six hours, the
+  second looks only at the last week, and the daily-counter rollup is
+  kept for five minutes instead of one.
+- **The morning report, the emailed digest and the rain Live Activity
+  quote a yearly-counter station's rain,** and a station with no gauge
+  reads as unmeasured rather than 0.00. A station with no rain gauge no
+  longer reports an ever-growing dry streak.
+- **A replaced or reset rain gauge no longer pins every rain total at
+  0.00** until the new counter passes the old one; totals restart from
+  the reset. January 1 is no longer dropped from the rain record of a
+  station that reports only a lifetime counter.
+- **A Govee monitor whose air has not changed is re-posted every two
+  minutes,** so it no longer flaps "stopped reporting" against a
+  five-minute threshold. A device typed as a two-character suffix is
+  refused instead of guessed.
+- **A control character in a station's reported model or location can no
+  longer reach the device name** and break its alert mail. Capture logs
+  redact the Weather Underground protocol's station ID and password, and
+  webhook address resolution runs on its own small thread pool.
+- **A station order that includes an air monitor is honoured on the
+  Dashboard.** Monitors used to be drawn after every station whatever
+  Settings said; a monitor you place above a station now shows there, and
+  one you never ordered keeps its place after the stations.
+- **The health probe reads the database instead of opening it.** A
+  corrupt or missing file now answers 503, and the check can no longer
+  create an empty database on a bare volume.
+- **A stolen refresh token stays detectable.** The record of a rotated
+  token survives a burst of logins and a day offline, so a replay still
+  revokes the whole session.
+- **Turning the MCP server off also removes the connected-apps routes.**
+  A bad Host header on the MCP endpoint gets a proper 401 challenge
+  instead of a 400, and on Fly the server's canonical origin defaults to
+  its own fly.dev hostname when PUBLIC_BASE_URL is unset.
+- **The pending consent page's code field no longer shares a name with
+  the token field,** so a password manager cannot offer a saved API token
+  on the page that says not to type it.
+- **The connect code and the webhook signing secret copy the way the
+  setup code does:** locally, expiring in a minute, after asking.
+- **The poll status dot speaks its state to VoiceOver,** and a failed
+  refresh stays in words on Charts and History.
+- **A stored report with a poisoned number opens** and shows a dash
+  instead of crashing the app.
+- **The header keeps its refresh control at the largest text sizes;**
+  the wordmark shrinks first. Day chevrons and the Connected apps buttons
+  are full-size targets, the connect code countdown stops at expiry, the
+  Reports list refetches when you change units, and the share card's
+  date follows your locale.
+- **A storm summary cools in the reader's units.** The line read
+  "cooled 9°F" beside Celsius everywhere else; a temperature drop is a
+  difference, so it converts by scale alone and says "cooled 5°C".
+- **A past day's rain tile names the day.** Opened from Explore, the rain
+  tile said "Total Rain · Last 24h" with "today" under it while showing a
+  day last month. It now reads "Rain · Sep 3" with no subline. The same
+  day is also bounded by its own midnights rather than 24 hours back from
+  the next one, so a daylight-saving day of 23 or 25 hours is drawn whole.
+- **A read-only token no longer sees the raw source payload.** The
+  latest reading carried the poster's payload verbatim, which for a
+  cloud-polled station includes its name and exact coordinates, the very
+  fields the device list hides from guests. Both the API and the MCP
+  server now drop it for read-only tokens.
+- **A widget never answers a new token from the old token's cache.** Changing the
+  token in the app clears the widget's last-good reading, and the widget's
+  own short-lived cache is keyed by credential as well as host.
+- **A restore refuses to swap while a reader blocks the checkpoint.**
+  SQLite answers a blocked `wal_checkpoint` with a busy flag instead of an
+  error, and the swap went ahead, so the pre-restore copy could be missing
+  the last committed rows. The flag is checked now and the swap aborts
+  with both files untouched. The app also hashes the upload off the main
+  thread, so a large database no longer freezes the screen while it is read.
+- **A lifetime rain counter no longer poses as this year's total.** An
+  SDR or LilyGO sensor posts one rain number, the total since it was
+  powered, and the YEAR bucket showed it as if the year had started at
+  zero (18.47 in on a station whose year had seen 1.7). The year bucket is
+  now that counter differenced against January 1, the way the day, week
+  and month buckets always were, and the raw counter is kept beside it as
+  `totalrainin`, the name Ambient uses for the same thing. Read-side only:
+  stored rows keep the raw counter, so records and rollups are untouched.
+- The Tempest's station pressure is stored as the absolute reading; it
+  used to be a copy of the sea-level value, so both columns agreed and
+  neither was the barometer's own number.
+- The monthly anomaly rows say how many years the station's own monthly
+  normal rests on, and the payload names that normal's source. A record
+  one year deep has anomalies of exactly zero by construction; that is the
+  record, not a finding. The daily anomaly path still uses NOAA normals.
+- The degree-day story names the record's first day when a year did not
+  start with it: "2026 since May 22", so a station switched on in late
+  spring is not read as a place with no heating season.
+- A Govee device id typed the way Govee's own app shows it, the last six
+  pairs of the eight, now resolves to the account's full id when exactly
+  one device matches, and the full id is what gets stored. Doren's first
+  Govee attempt.
+- The Share to weather networks list has a Weather Underground row that
+  opens the existing upload page, so all five networks are on one screen.
+- **Climate reports no longer print 0.00 in of rain for a station that
+  reports only a yearly counter.** One rain rule now serves the reports,
+  the story cards and the barometer ledger; a day the gauge never
+  measured is a dash, not a zero.
+- **A dead station is no longer published as live.** Sharing to
+  PWSWeather, Windy, WeatherCloud and CWOP skips a reading older than
+  twice the target's cadence and says so in the status; PWSWeather, Windy
+  and CWOP now carry the reading's own time.
+- The barometer scorecard compares the slide rule and the model on the
+  same days; a peak rain rate above 15 in/hr is kept (the ceiling is
+  60 in/hr); a partly failing Ecowitt or Govee account reports the
+  failure instead of a clean success; a station name posted with a
+  control character is dropped rather than breaking the metrics page and
+  that station's alert mail; capture logs redact the Ecowitt PASSKEY.
+- `GET /api/server/advice` is owner-only, like apply. `setup-fly.sh` no
+  longer puts secrets on `fly`'s command line.
+- Server recommendations now load; the card's fetch was attached inside
+  the condition that only became true once it had loaded.
+- Guided Setup never stores the token you signed in with on the server.
+  If Fly does not hand out an app-scoped deploy token, the server ships
+  without one and the Update button asks for a token the first time you
+  use it. A pasted token is stored only when Fly explicitly refuses to
+  mint.
+- A notification tap that launches the app cold now opens the report it
+  names.
+- The Reports filter chips no longer vanish when a filter matches one
+  report or none; the empty list says whether a filter, a guest login or
+  a fresh server is the reason.
+- The database restore button disables while a restore runs.
+- Report pages are titled by kind; the History chip row steps aside while
+  a report is open; the day sheet from Explore shows one bar instead of
+  two; chip rows and the day chevrons have 44 pt tap targets and
+  VoiceOver labels; the NOAA table follows Dynamic Type; the pinned day
+  in Explore clears when you switch stations; Run a report offers only
+  months that have begun.
+- Lowering how many reports or storms the server keeps asks first, since
+  it deletes the oldest rows at once.
+- The Mac's automatic database copies work in the signed app: the
+  sandbox entitlement that lets the app keep the folder you picked was
+  missing, so the schedule never ran outside a debug build. Copies iCloud
+  has evicted to placeholders now count toward "keep N" and are removed
+  when their turn comes.
+- Tapping a morning-report Live Activity on the Mac opens that report,
+  instead of the window opening on Dashboard.
+- The morning-report Live Activity can no longer be brought down by an
+  out-of-range gust value from the server.
+- Watch complications share one fetch per refresh instead of ten, and
+  VoiceOver reads each face as its reading and unit rather than a bare
+  number.
+- Settings search finds the server name, report and storm retention,
+  automatic backups and server recommendations, and on the Mac the
+  Sending pane.
+- The public page's "updated Xm ago" is recomputed every time the page is
+  served. The section is cached and served stale for up to a day, and the
+  phrase was frozen at build time, so a page built at dawn could say
+  "updated 1m ago" at breakfast.
+- App Attest challenges are consumed in a single statement, so two
+  simultaneous key requests can no longer both pass with the same
+  challenge.
+- The `X-Ingest-Token` header is redacted from stored request captures.
+- **The Reports list is not empty on day one.** Every storm summary
+  already in storm history becomes a report row once, in the background
+  after upgrade; storms the live path reported keep their rows.
+- A cancelled stale refresh can no longer switch the loading spinner off
+  under the live one, and a dropped connection during the capability
+  probe is retried instead of being remembered as the answer, so a
+  read-only share no longer shows owner doors until relaunch.
+- Stations that have ever reported lightning keep their lightning tile
+  and chart fields through a calm spell; stations without a detector
+  never show them.
+
 ## [2.0.1] — 2026-09-04
 
 ### Fixed

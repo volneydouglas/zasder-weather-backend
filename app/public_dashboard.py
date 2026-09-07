@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html as _html
 import math
+import re
 import time
 from typing import Any
 
@@ -242,6 +243,26 @@ def svg_multi_chart(series_list: list[tuple[str, str, list[tuple[int, float]]]],
             + legend + time_row)
 
 
+_UPDATED_RE = re.compile(
+    r'<span class="cc-updated" data-as-of-ms="(\d+)">[^<]*</span>')
+
+
+def updated_marker(as_of_ms: float) -> str:
+    """The "updated Xm ago" phrase, carrying the timestamp it was computed
+    from so `restamp_ages` can recompute it at serve time."""
+    ms = int(as_of_ms)
+    return (f'<span class="cc-updated" data-as-of-ms="{ms}">'
+            f'updated {_age_text(ms)}</span>')
+
+
+def restamp_ages(html: str) -> str:
+    """Rewrite every updated-marker in a cached page against the clock NOW.
+    One regex over the page per serve; the cache keeps the markers, so the
+    same html restamps correctly every time it is served."""
+    return _UPDATED_RE.sub(
+        lambda m: updated_marker(int(m.group(1))), html)
+
+
 def _age_text(ms: float) -> str:
     s_ = max(0, int(time.time() - ms / 1000))
     if s_ < 60:
@@ -333,7 +354,11 @@ def render_now_strip(stations: list[dict[str, Any]],
     if location:
         meta_bits.append(_esc(location))
     if ages:
-        meta_bits.append("updated " + _age_text(max(ages)))
+        # Marked with the reading's own timestamp so the SERVE path can
+        # restamp the age: this section is cached and served stale for up
+        # to a day, and a page built when the data was a minute old said
+        # "updated 1m ago" for as long as it was served (2026-09-05).
+        meta_bits.append(updated_marker(max(ages)))
     return (
         f'<section class="station now-strip">'
         f'  <div class="cc">'

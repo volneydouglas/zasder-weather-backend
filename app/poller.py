@@ -1,3 +1,4 @@
+from .poller_lifecycle import reap
 import asyncio
 import logging
 import time
@@ -18,13 +19,14 @@ class Poller:
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
-        await self.bootstrap()
+        """Register the task and return; the bootstrap runs inside it
+        (app/poller_lifecycle.py)."""
         self._task = asyncio.create_task(self._run(), name="aw-poller")
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task:
-            await self._task
+        task, self._task = self._task, None
+        await reap(task, "aw-poller")
 
     async def bootstrap(self) -> None:
         """One-time backfill: pull device list + 288 most recent observations each."""
@@ -46,6 +48,9 @@ class Poller:
                 log.exception("bootstrap: device_history(%s) failed: %s", mac, e)
 
     async def _run(self) -> None:
+        await self.bootstrap()
+        if self._stop.is_set():
+            return
         interval = max(15, settings.poll_interval_seconds)
         log.info("poller running every %ds", interval)
         while not self._stop.is_set():

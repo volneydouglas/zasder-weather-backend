@@ -963,8 +963,8 @@ def _slim_mac_window(conn: sqlite3.Connection, mac: str, lo: int, hi: int,
 
         def run(c):
             nonlocal slimmed
-            for i in range(0, len(rowids), _THIN_IN_CHUNK):
-                part = rowids[i:i + _THIN_IN_CHUNK]
+            for i in range(0, len(rowids), _THIN_IN_CHUNK):  # noqa: B023 (run in this iteration)
+                part = rowids[i:i + _THIN_IN_CHUNK]  # noqa: B023
                 cur = c.execute(
                     "UPDATE observations SET data_json = '{}' "
                     "WHERE rowid IN (%s)" % ",".join("?" * len(part)), part)

@@ -130,7 +130,8 @@ def test_last_yearly_rain_tolerates_text_column_value(client, temp_env):
     assert asyncio.run(db.last_yearly_rain(MAC)) is None
     rollups = asyncio.run(db.rain_rollups(MAC))
     assert rollups == {"hourly_in": None, "daily_in": None,
-                       "weekly_in": None, "monthly_in": None}
+                       "weekly_in": None, "monthly_in": None,
+                       "yearly_in": None}
     # THE incident: the next ingest for this MAC must be a 200, not a 500.
     r = _post_obs(client, extra_rain={"yearly_in": 1.1})
     assert r.status_code == 200, r.text
@@ -309,20 +310,24 @@ def test_discovery_sample_scrubs_nonfinite_literals(client, temp_env):
 
 # ───────────── R3-90: a crashed rebuild doesn't leave a truncated ledger ─────────────
 
-def test_failed_rebuild_clears_partial_rollups(client, monkeypatch):
-    """A rebuild commits per batch, so a mid-scan crash left plausible-looking
-    partial rollups with the endpoint's 'run rebuild' hint never firing
-    (it needs day_count == 0). The failure path must clear the tables."""
+def test_failed_rebuild_leaves_the_ledger_complete(client, monkeypatch):
+    """R3-90 was 'a mid-scan crash left plausible-looking PARTIAL rollups',
+    answered then by clearing the tables so the empty-state hint fired.
+    2.1 answers it upstream: the scan folds into staging twins and the
+    live tables are replaced only by the final swap, so a crash leaves the
+    ledger exactly as complete as it was, and the twins are dropped."""
     from app import insights
     assert _post_obs(client).status_code == 200
     asyncio.run(insights.rebuild(MAC))
-    assert asyncio.run(insights.assemble(MAC))["day_count"] >= 1
+    before = asyncio.run(insights.assemble(MAC))["day_count"]
+    assert before >= 1
 
     async def partial_then_crash(dbmod, mac):
-        # Simulate "some batches committed, then the process died".
+        # Simulate "some batches folded into staging, then the process died".
         async with dbmod.connect() as d:
+            await insights._create_staging(d)
             await d.execute(
-                "INSERT OR REPLACE INTO daily_rollups (mac, day, tempf_n) "
+                "INSERT OR REPLACE INTO daily_rollups_staging (mac, day, tempf_n) "
                 "VALUES (?, '2020-01-01', 1)", (mac,))
             await d.commit()
         raise RuntimeError("interrupted mid-scan")
@@ -332,8 +337,16 @@ def test_failed_rebuild_clears_partial_rollups(client, monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(insights.rebuild(MAC))
     insights._REBUILD_LOCK = None
-    assert asyncio.run(insights.assemble(MAC))["day_count"] == 0, \
-        "partial rollups survived a failed rebuild (silently truncated ledger)"
+    assert asyncio.run(insights.assemble(MAC))["day_count"] == before, \
+        "a failed rebuild changed the live ledger"
+
+    async def leftovers():
+        from app import db
+        async with db.connect() as d:
+            cur = await d.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '%_staging'")
+            return [r[0] for r in await cur.fetchall()]
+    assert asyncio.run(leftovers()) == []
 
 
 # ───────────── R3-91: retained MQTT topics retracted on device delete ─────────────

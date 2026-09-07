@@ -28,6 +28,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .config import settings
+from .day_rain import day_rain_in
 
 log = logging.getLogger("zasder.insights")
 
@@ -344,15 +345,16 @@ async def rebuild(mac: str | None = None) -> dict[str, int]:
     """Recompute rollups from raw history — used when enabling INSIGHTS on
     existing data. Batched scan; bounded memory.
 
-    Residual caveat (known, accepted): the scan commits per batch so live
-    ingest keeps working, which means a row ingested (or backfilled by a WU
-    import) WHILE a rebuild runs can be folded twice — once by the live
-    insert's update_rollups and once by the scan — or missed if it lands
-    behind the cursor. Every current assemble() consumer is duplication-
-    insensitive (min/max/idempotent; means divide doubled sums by doubled
-    counts), and the fix is the documented one: re-run the rebuild after an
-    import that overlapped one. The lock below removes the concurrent-
-    rebuild variant of the same corruption."""
+    2.1: the scan folds into staging twins of the rollup tables and one
+    short transaction swaps them in at the end (see the staging section
+    below), so the live ledger keeps serving throughout and a crashed
+    rebuild changes nothing. The swap also folds rows that arrived behind
+    the scan cursor, so live ingest during a rebuild is counted exactly
+    once. Residual caveat (known, accepted): a row that lands BELOW the
+    cursor while the scan runs — a WU import backfilling old days — is
+    not in the new ledger; the documented answer is to re-run the rebuild
+    after an import that overlapped one. The lock below removes the
+    concurrent-rebuild variant of the same corruption."""
     global _REBUILD_LOCK
     import asyncio
     if _REBUILD_LOCK is None:      # no await between test and assignment
@@ -405,46 +407,28 @@ async def _rebuild_locked(mac: str | None) -> dict[str, int]:
     try:
         return await _rebuild_scan(dbmod, mac)
     except BaseException:
-        # A crashed/interrupted rebuild commits per batch, so it would leave
-        # a silently TRUNCATED ledger — plausible-looking rollups covering
-        # only part of history, with the endpoint's "run rebuild" hint never
-        # firing (it needs day_count == 0). Clear the partial tables so the
-        # empty-state hint fires instead. Best-effort: a shutdown may have
-        # torn the loop down already.
+        # 2.1: the scan folds into STAGING tables and the live rollups are
+        # replaced in one short transaction at the very end, so a crashed
+        # or interrupted rebuild leaves the live ledger exactly as it was:
+        # complete, if stale. Before this the scan DELETED the live rows up
+        # front and a failure had to clear the half-folded remainder, which
+        # left Insights empty until a re-run succeeded. All that can be left
+        # behind now is the staging tables; drop them so the next run
+        # starts clean (init_db does the same at boot for a rebuild killed
+        # with the process). Best-effort: a shutdown may have torn the loop
+        # down already.
         try:
-            # Bounded by the thin watermark, same as the scan's own clear
-            # (CodeRabbit, PR #33): for thinned days the rollups are the
-            # ONLY remaining record of those days' extremes — an unbounded
-            # clear here would destroy what the re-run can never rebuild.
-            wm_day = await _thin_watermark_day(dbmod)
             async with dbmod.connect() as db:
-                if mac:
-                    if wm_day:
-                        await db.execute(
-                            "DELETE FROM daily_rollups WHERE mac = ? "
-                            "AND day >= ?", (mac, wm_day))
-                    else:
-                        await db.execute(
-                            "DELETE FROM daily_rollups WHERE mac = ?", (mac,))
-                    await db.execute("DELETE FROM hour_rollups WHERE mac = ?", (mac,))
-                    await db.execute("DELETE FROM comfort_rollups WHERE mac = ?", (mac,))
-                else:
-                    if wm_day:
-                        await db.execute(
-                            "DELETE FROM daily_rollups WHERE day >= ?",
-                            (wm_day,))
-                    else:
-                        await db.execute("DELETE FROM daily_rollups")
-                    await db.execute("DELETE FROM hour_rollups")
-                    # A half-folded comfort ledger would rank months from
-                    # part of the record with nothing marking it so
-                    # (CodeRabbit, PR #35).
-                    await db.execute("DELETE FROM comfort_rollups")
+                await drop_staging(db)
                 await db.commit()
-            log.warning("insights rebuild failed mid-scan — partial rollups "
-                        "cleared (mac=%s); re-run the rebuild", mac or "*")
+            log.warning("insights rebuild failed mid-scan — live rollups "
+                        "untouched, staging dropped (mac=%s); re-run the "
+                        "rebuild", mac or "*")
         except Exception:
-            log.exception("could not clear partial rollups after a failed rebuild")
+            log.exception("could not drop the rollup staging tables after "
+                          "a failed rebuild")
+        finally:
+            _set_progress(None)
         raise
 
 
@@ -462,6 +446,72 @@ async def _thin_watermark_day(dbmod) -> str | None:
             .astimezone(_tz()).strftime("%Y-%m-%d"))
 
 
+# ───────────────────────── staging tables ─────────────────────────
+#
+# 2.1: a rebuild folds into twins of the three rollup tables and swaps
+# them in at the end. Until then the live tables keep serving whatever
+# they held (Insights cards, records, the story engine), and live ingest
+# keeps folding into them as usual — those folds are superseded by the
+# swap, which also catches up on rows that arrived behind the cursor.
+# Before this the rebuild's FIRST statement deleted the live rows, so
+# every Insights card on every station vanished for the whole run and
+# came back one batch at a time.
+
+ROLLUP_TABLES = ("daily_rollups", "hour_rollups", "comfort_rollups")
+STAGING_SUFFIX = "_staging"
+
+
+def staging_table(table: str) -> str:
+    """The staging twin of a rollup table. Whitelist-guarded (a raise, not
+    an assert: those vanish under -O) because the name is interpolated."""
+    if table not in ROLLUP_TABLES:
+        raise ValueError(f"not a rollup table: {table!r}")
+    return table + STAGING_SUFFIX
+
+
+def _upsert_into(sql: str, table: str) -> str:
+    """The same upsert aimed at `table`'s staging twin."""
+    head = f"\nINSERT INTO {table} ("
+    if head not in sql:
+        raise ValueError(f"upsert does not target {table}")
+    return sql.replace(head, f"\nINSERT INTO {staging_table(table)} (", 1)
+
+
+_UPSERT_DAILY_STAGING = _upsert_into(_UPSERT_DAILY, "daily_rollups")
+_UPSERT_HOUR_STAGING = _upsert_into(_UPSERT_HOUR, "hour_rollups")
+_UPSERT_COMFORT_STAGING = _upsert_into(_UPSERT_COMFORT, "comfort_rollups")
+
+
+async def drop_staging(db) -> None:
+    """Remove the staging twins if any exist. Called at the end of every
+    rebuild, after a failed one, and by init_db at boot."""
+    for t in ROLLUP_TABLES:
+        await db.execute(f"DROP TABLE IF EXISTS {staging_table(t)}")
+
+
+async def _create_staging(db) -> None:
+    """Empty twins of the three rollup tables, built from the LIVE tables'
+    own DDL in sqlite_master so every ALTERed-in column (lightning_max,
+    feels_*) and the primary key the upserts' ON CONFLICT clause needs
+    come along. CREATE TABLE ... AS SELECT would drop the key. SQLite
+    stores the DDL with IF NOT EXISTS stripped and the name right after
+    CREATE TABLE, which is what the prefix check relies on."""
+    await drop_staging(db)
+    for t in ROLLUP_TABLES:
+        cur = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (t,))
+        row = await cur.fetchone()
+        ddl = row[0] if row else None
+        head = f"CREATE TABLE {t}"
+        if not ddl or not ddl.startswith(head):
+            raise RuntimeError(f"rollup table {t} is missing or its DDL is "
+                               f"unexpected: {(ddl or '')[:40]!r}")
+        await db.execute(f"CREATE TABLE {staging_table(t)}" + ddl[len(head):])
+
+
+# ───────────────────────── pacing + progress ─────────────────────────
+#
 # One rebuild batch, and the pause after it. The batch bounds how long the
 # write lock is held at a stretch; the PAUSE is what lets anyone else
 # have it. Without the pause the loop re-took the lock the instant it
@@ -473,13 +523,100 @@ async def _thin_watermark_day(dbmod) -> str | None:
 # thread hop and a 5,000-row batch held the lock for ~8 s on Fly's shared
 # CPU, close to the 10 s busy_timeout every other writer waits; a 1,000-row
 # batch is under 2 s. And the loop sleeps between batches, the same yield
-# the 1.9 column backfill uses ("ingest goes first"). A 360k-row rebuild
-# takes a few minutes longer and costs nobody a reading.
+# the 1.9 column backfill uses ("ingest goes first").
+#
+# 2.1: the pause also SCALES with the batch. A fixed half second is a
+# 25% duty cycle when a batch takes 2 s and an 80% one when the shared
+# CPU is being stolen and the same batch takes 8 s, which is exactly when
+# the other writers most need the lock. The pause is now at least
+# REBUILD_IDLE_RATIO times the batch it follows, so the rebuild holds the
+# writer for at most 1/(1+ratio) of wall time however slow the box is.
 REBUILD_BATCH_ROWS = 1000
 REBUILD_BATCH_PAUSE_S = 0.5
+REBUILD_IDLE_RATIO = 2.0
+# The swap transaction also folds rows that arrived behind the cursor
+# while the scan ran. That is minutes of live ingest, tens of rows; the
+# cap keeps a concurrent bulk import (old timestamps mostly, but not
+# only) from turning the one transaction that must be short into a long
+# one. Overflow marks the ledger dirty so records fall back to raw scans
+# and the "run the rebuild" hint fires, which is the documented answer to
+# an import that overlapped a rebuild anyway.
+REBUILD_CATCHUP_MAX = 5000
+
+
+def rebuild_pause_s(batch_elapsed_s: float) -> float:
+    """How long to yield the writer after a batch that took this long."""
+    return max(REBUILD_BATCH_PAUSE_S,
+               float(batch_elapsed_s) * REBUILD_IDLE_RATIO)
+
+
+# Where the running rebuild is, for the write-lock watchdog's dump
+# (main.dump_all_threads). A thread dump names the FUNCTION that holds
+# the lock; this names the phase, the station, the cursor and how long
+# the current batch has been running. None when no rebuild is running.
+_PROGRESS: dict[str, Any] | None = None
+
+
+def _set_progress(p: dict[str, Any] | None) -> None:
+    global _PROGRESS
+    _PROGRESS = p
+
+
+def in_flight() -> str | None:
+    """One line describing the running rebuild, or None."""
+    p = _PROGRESS
+    if not p:
+        return None
+    import time as _time
+    return ("insights rebuild in flight: phase=%s mac=%s rows=%d "
+            "cursor_ms=%s current statement/batch %.1fs"
+            % (p.get("phase"), p.get("mac") or "*", p.get("rows", 0),
+               p.get("cursor_ms"),
+               _time.monotonic() - p.get("batch_started", _time.monotonic())))
+
+
+_SCAN_SELECT = (
+    "SELECT mac, dateutc_ms, tempf, humidity, windspeedmph, "
+    "windgustmph, baromrelin, dew_point, feels_like, uv, "
+    "solarradiation, dailyrainin, yearlyrainin, lightning_last_1hr "
+    "FROM observations WHERE mac = ? AND dateutc_ms > ? "
+    "ORDER BY dateutc_ms LIMIT ?")
+
+
+async def _fold_batch(db, batch, tz, wm_day: str | None) -> int:
+    """Fold scanned observation rows into the STAGING tables. Returns how
+    many rows folded (rows without a timestamp are skipped)."""
+    folded = 0
+    for b in batch:
+        row = {"dateutc": b[1], "tempf": b[2], "humidity": b[3],
+               "windspeedmph": b[4], "windgustmph": b[5],
+               "baromrelin": b[6], "dewPoint": b[7],
+               "feelsLike": b[8], "uv": b[9],
+               "solarradiation": b[10], "dailyrainin": b[11],
+               "yearlyrainin": b[12],
+               "lightning_last_1hr": b[13]}
+        p = rollup_params(row, tz)
+        if p is None:
+            continue
+        p["mac"] = b[0]
+        year, month, hour = (p.pop("_year"), p.pop("_month"),
+                             p.pop("_hour"))
+        # Preserved (thinned) days: their daily rows were COPIED into
+        # staging before the scan and must not be re-folded — the upsert
+        # MERGES (sums add), so folding thinned raw into a full-detail row
+        # would corrupt the averages it exists to protect.
+        if not (wm_day and p["day"] < wm_day):
+            await db.execute(_UPSERT_DAILY_STAGING, p)
+        if (hp := _hour_params(b[0], month, hour, p)) is not None:
+            await db.execute(_UPSERT_HOUR_STAGING, hp)
+        if (cp := _comfort_params(b[0], year, month, hour, p)) is not None:
+            await db.execute(_UPSERT_COMFORT_STAGING, cp)
+        folded += 1
+    return folded
 
 
 async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
+    import time as _time
     tz = _tz()
     processed = 0
     # History thinning (1.9): days behind the thin watermark keep only
@@ -488,29 +625,27 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
     # rebuild must PRESERVE those daily rows, never recompute them from
     # thinned raw. Hour rollups are month x hour-of-day AVERAGES; bucket
     # sampling leaves averages unbiased, so they rebuild from whatever raw
-    # remains, full-history.
+    # remains, full-history. Comfort shares survive sampling the same way.
     wm_day = await _thin_watermark_day(dbmod)
+    scope = " AND mac = ?" if mac else ""
+    scope_args: tuple = (mac,) if mac else ()
+    # Highest timestamp folded per station: the swap's catch-up starts here.
+    high: dict[str, int] = {}
+    progress: dict[str, Any] = {"phase": "staging", "mac": mac, "rows": 0,
+                                "cursor_ms": None,
+                                "batch_started": _time.monotonic()}
+    _set_progress(progress)
+    daily_stg = staging_table("daily_rollups")
+    hour_stg = staging_table("hour_rollups")
+    comfort_stg = staging_table("comfort_rollups")
     async with dbmod.connect() as db:
-        if mac:
-            if wm_day:
-                await db.execute(
-                    "DELETE FROM daily_rollups WHERE mac = ? AND day >= ?",
-                    (mac, wm_day))
-            else:
-                await db.execute("DELETE FROM daily_rollups WHERE mac = ?",
-                                 (mac,))
-            await db.execute("DELETE FROM hour_rollups WHERE mac = ?", (mac,))
-            await db.execute("DELETE FROM comfort_rollups WHERE mac = ?", (mac,))
-        else:
-            if wm_day:
-                await db.execute("DELETE FROM daily_rollups WHERE day >= ?",
-                                 (wm_day,))
-            else:
-                await db.execute("DELETE FROM daily_rollups")
-            await db.execute("DELETE FROM hour_rollups")
-            # Shares survive bucket sampling like the hour averages do, so
-            # the comfort ledger rebuilds full-history too.
-            await db.execute("DELETE FROM comfort_rollups")
+        await _create_staging(db)
+        if wm_day:
+            # The rows a rebuild can never recompute ride along untouched.
+            await db.execute(
+                f"INSERT INTO {daily_stg} SELECT * FROM daily_rollups "
+                f"WHERE day < ?{scope}", (wm_day, *scope_args))
+        await db.commit()
         if mac:
             macs = [mac]
         else:
@@ -520,56 +655,109 @@ async def _rebuild_scan(dbmod, mac: str | None) -> dict[str, int]:
         # one mac the timestamp cursor is unique and can't split a batch on
         # equal values — the all-macs single cursor skipped cross-station
         # rows sharing a timestamp at a batch boundary.
+        progress["phase"] = "fold"
         for one_mac in macs:
-          last = -1
-          while True:
-            cur = await db.execute(
-                "SELECT mac, dateutc_ms, tempf, humidity, windspeedmph, "
-                "windgustmph, baromrelin, dew_point, feels_like, uv, "
-                "solarradiation, dailyrainin, yearlyrainin, "
-                "lightning_last_1hr "
-                "FROM observations WHERE mac = ? AND dateutc_ms > ? "
-                "ORDER BY dateutc_ms LIMIT ?",
-                (one_mac, last, REBUILD_BATCH_ROWS))
-            batch = await cur.fetchall()
-            if not batch:
+            last = -1
+            progress["mac"] = one_mac
+            while True:
+                started = _time.monotonic()
+                progress["batch_started"] = started
+                cur = await db.execute(_SCAN_SELECT,
+                                       (one_mac, last, REBUILD_BATCH_ROWS))
+                batch = await cur.fetchall()
+                if not batch:
+                    break
+                processed += await _fold_batch(db, batch, tz, wm_day)
+                last = batch[-1][1]
+                high[one_mac] = last
+                progress["rows"] = processed
+                progress["cursor_ms"] = last
+                # Commit PER BATCH: one giant transaction held the write
+                # lock for the entire multi-minute rebuild and starved every
+                # other writer (ingest, config PUTs) into "database is
+                # locked" 500s. Staging makes a crashed rebuild harmless:
+                # the live tables were never touched.
+                await db.commit()
+                # Yield the writer: see REBUILD_IDLE_RATIO.
+                await asyncio.sleep(
+                    rebuild_pause_s(_time.monotonic() - started))
+        # ── the swap ──
+        # One short transaction: catch up on rows that arrived behind the
+        # cursor, replace the live rows with the staging rows, done. A
+        # reader sees either the old ledger or the new one, never neither.
+        progress.update(phase="swap", mac=mac, batch_started=_time.monotonic())
+        await db.execute("BEGIN IMMEDIATE")
+        if mac:
+            macs_now = [mac]
+        else:
+            # A station that sent its first reading DURING the scan has
+            # live rollups from ingest and nothing in staging; fold it from
+            # the start so the swap does not erase it.
+            cur = await db.execute("SELECT DISTINCT mac FROM observations")
+            macs_now = [r[0] for r in await cur.fetchall()]
+        overflow = False
+        budget = REBUILD_CATCHUP_MAX
+        for one_mac in macs_now:
+            cur = await db.execute(_SCAN_SELECT,
+                                   (one_mac, high.get(one_mac, -1), budget + 1))
+            late = await cur.fetchall()
+            if len(late) > budget:
+                overflow = True
+                late = late[:budget]
+            budget -= len(late)
+            processed += await _fold_batch(db, late, tz, wm_day)
+            if budget <= 0:
+                # Budget exactly met is not overflow: only rows still
+                # waiting on THIS or a later station make the ledger
+                # incomplete (2.1 pre-release review BE-10).
+                for m in macs_now[macs_now.index(one_mac):]:
+                    cur = await db.execute(
+                        _SCAN_SELECT,
+                        (m, high.get(m, -1) if m != one_mac else late[-1][1]
+                         if late else high.get(m, -1), 1))
+                    if await cur.fetchone():
+                        overflow = True
+                        break
                 break
-            for b in batch:
-                row = {"dateutc": b[1], "tempf": b[2], "humidity": b[3],
-                       "windspeedmph": b[4], "windgustmph": b[5],
-                       "baromrelin": b[6], "dewPoint": b[7],
-                       "feelsLike": b[8], "uv": b[9],
-                       "solarradiation": b[10], "dailyrainin": b[11],
-                       "yearlyrainin": b[12],
-                       "lightning_last_1hr": b[13]}
-                p = rollup_params(row, tz)
-                if p is None:
-                    continue
-                p["mac"] = b[0]
-                year, month, hour = (p.pop("_year"), p.pop("_month"),
-                                     p.pop("_hour"))
-                # Preserved (thinned) days: their daily rows survived the
-                # delete above and must not be re-folded — the upsert MERGES
-                # (sums add), so folding thinned raw into a full-detail row
-                # would corrupt the averages it exists to protect.
-                if not (wm_day and p["day"] < wm_day):
-                    await db.execute(_UPSERT_DAILY, p)
-                if (hp := _hour_params(b[0], month, hour, p)) is not None:
-                    await db.execute(_UPSERT_HOUR, hp)
-                if (cp := _comfort_params(b[0], year, month, hour, p)) is not None:
-                    await db.execute(_UPSERT_COMFORT, cp)
-                processed += 1
-            last = batch[-1][1]
-            # Commit PER BATCH: one giant transaction held the write lock
-            # for the entire multi-minute rebuild and starved every other
-            # writer (ingest, config PUTs) into "database is locked" 500s.
-            # Batch commits keep each lock hold to a few thousand upserts;
-            # a crashed rebuild resumes cleanly since it starts with a
-            # DELETE and rebuild is idempotent.
-            await db.commit()
-            # Yield the writer: see REBUILD_BATCH_PAUSE_S.
-            await asyncio.sleep(REBUILD_BATCH_PAUSE_S)
+        progress["rows"] = processed
+        # daily: bounded by the watermark like every delete in this module.
+        # The preserved rows are ALSO in staging (copied above), so the
+        # insert ignores the ones the bounded delete left in place.
+        if wm_day:
+            await db.execute(
+                f"DELETE FROM daily_rollups WHERE day >= ?{scope}",
+                (wm_day, *scope_args))
+        else:
+            await db.execute(
+                "DELETE FROM daily_rollups" + (" WHERE mac = ?" if mac else ""),
+                scope_args)
+        await db.execute(
+            f"INSERT OR IGNORE INTO daily_rollups SELECT * FROM {daily_stg}")
+        for live, stg in (("hour_rollups", hour_stg),
+                          ("comfort_rollups", comfort_stg)):
+            await db.execute(
+                f"DELETE FROM {live}" + (" WHERE mac = ?" if mac else ""),
+                scope_args)
+            await db.execute(f"INSERT INTO {live} SELECT * FROM {stg}")
+        if overflow:
+            # More arrived behind the cursor than the swap may fold in one
+            # go; the rest is not in the ledger. Mark it so records read
+            # raw and the "run the rebuild" hint fires. INSERT OR REPLACE:
+            # this must outlive rebuild()'s conditional clear, which only
+            # removes the exact nonce it saw before the scan.
+            await db.execute(
+                "INSERT OR REPLACE INTO server_kv (k, v) VALUES "
+                "('rollups_dirty', ?)",
+                (f"rebuild-catchup-overflow-{_time.time_ns()}",))
         await db.commit()
+        await drop_staging(db)
+        await db.commit()
+    _set_progress(None)
+    if overflow:
+        log.warning("insights rebuild: more than %d rows arrived behind "
+                    "the cursor during the scan (mac=%s); ledger marked "
+                    "dirty — re-run the rebuild", REBUILD_CATCHUP_MAX,
+                    mac or "*")
     log.info("insights rebuild: %d rows folded (mac=%s)", processed, mac or "*")
     return {"rows": processed}
 
@@ -645,13 +833,13 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
     # months later. Under ~2 months of days, keep the shipped warm ladder.
     cold_tiers = cold_tiers_for(p10_low if len(lows) >= 60 else None)
 
-    def day_rain(d) -> float:
-        if d[5] is not None:
-            return d[5]
-        # Yearly-counter fallback; Jan 1 resets make the delta a lie there.
-        if d[6] is not None and d[7] is not None and not d[0].endswith("-01-01"):
-            return max(0.0, d[7] - d[6])
-        return 0.0
+    def day_rain(d) -> float | None:
+        # The one rain rule (day_rain.py). None when the station never
+        # measured rain that day: such a day neither wets nor dries a
+        # streak, and a station with no gauge at all has no dry streak
+        # rather than an ever-growing one (round-two review BE-N1).
+        return day_rain_in({"day": d[0], "rain_total": d[5],
+                            "yearly_min": d[6], "yearly_max": d[7]})
 
     # To-date anchor (2.0, story engine): the month-day that splits each
     # year into "the part comparable with the running year" and the rest.
@@ -667,6 +855,12 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
     # loop below IS the most recent rain day.
     last_rain_day: str | None = None
     last_rain_amount: float | None = None
+    # Does this station measure rain? Judged PER YEAR (round-three review
+    # BE-F11): a day with no measurement in a year that has some (a source
+    # that omits the bucket on a dry day) is a dry day; a year with none
+    # (no gauge yet, or a gauge added later) has no total and no series,
+    # not a flat zero.
+    rain_measured_years = {d[0][:4] for d in days if day_rain(d) is not None}
     for d in days:
         y = d[0][:4]
         yr = years.setdefault(y, {
@@ -750,11 +944,18 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
                 elif yr["first_fall_freeze"] is None:
                     yr["first_fall_freeze"] = d[0]
         rain = day_rain(d)
-        yr["rain_total"] += rain
-        yr["rain_series"].append([d[0], round(yr["rain_total"], 3)])
+        measured_year = y in rain_measured_years
+        if rain is not None:
+            yr["rain_total"] += rain
+        elif measured_year:
+            rain = 0.0
+        if measured_year:
+            yr["rain_series"].append([d[0], round(yr["rain_total"], 3)])
         # Rain gap. Streaks count consecutive ROLLUP rows (one per day with
         # data), like the p90 streak — a coverage gap doesn't inflate them.
-        if rain >= RAIN_DAY_MIN_IN:
+        if rain is None:
+            pass
+        elif rain >= RAIN_DAY_MIN_IN:
             last_rain_day, last_rain_amount = d[0], round(rain, 3)
             yr["_dry_streak"] = 0
         else:
@@ -770,7 +971,12 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
         yr.pop("_streak", None)
         yr.pop("_dry_streak", None)
         yr.pop("_cstreak", None)
-        yr["rain_total"] = round(yr["rain_total"], 3)
+        if str(yr["year"]) not in rain_measured_years:
+            yr["longest_dry_streak"] = None
+            yr["rain_total"] = None
+            yr["rain_series"] = None
+        else:
+            yr["rain_total"] = round(yr["rain_total"], 3)
         yr["cdd"] = round(yr["cdd"], 1)
         yr["hdd"] = round(yr["hdd"], 1)
 
@@ -810,10 +1016,21 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
             continue
         monthly.setdefault(d[0][5:7], []).append(d[2])
         per_my.setdefault(d[0][:7], []).append(d[2])
+    # The "normal" here is the STATION'S OWN multi-year mean for the
+    # calendar month, so a month covered by one year alone has, by
+    # construction, an anomaly of exactly zero. That is not a finding; it
+    # is the record being one year deep. `years` says how many years the
+    # normal rests on so a reader can tell the two apart (2026-09-06, the
+    # first MCP analysis flagged every anomaly reading 0.00). NOAA normals
+    # feed the DAILY anomaly path (the heat ledger), not this one.
     normals = {m: round(sum(v) / len(v), 2) for m, v in monthly.items()}
+    years_per_month: dict[str, set[str]] = {}
+    for my in per_my:
+        years_per_month.setdefault(my[5:7], set()).add(my[:4])
     anomalies = [
         {"month": my, "avg_high": round(sum(v) / len(v), 2),
-         "anomaly": round(sum(v) / len(v) - normals[my[5:7]], 2)}
+         "anomaly": round(sum(v) / len(v) - normals[my[5:7]], 2),
+         "years": len(years_per_month.get(my[5:7], ()))}
         for my, v in sorted(per_my.items())
     ]
 
@@ -821,8 +1038,10 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
     # which count rollup rows): "how long has it been dry" must not shrink
     # because the station was offline for a week of it. 0 = it rained on the
     # newest rollup day; a record with no rain at all spans the whole record.
+    # A station that never measured rain has no dry streak: absent is not
+    # zero, and "dry for 400 days" on a gauge-less station is a lie.
     dry_streak_days: int | None = None
-    if days:
+    if days and rain_measured_years:
         last_day_date = date.fromisoformat(days[-1][0])
         if last_rain_day is not None:
             dry_streak_days = (last_day_date
@@ -869,6 +1088,7 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
         "dry_streak_days": dry_streak_days,
         "years": ordered,
         "monthly_normals": normals,
+        "monthly_normals_source": "station record",
         "monthly_anomalies": anomalies,
         "diurnal_tempf": grid,
         "diurnal_feels": feels_grid,

@@ -377,6 +377,7 @@ def test_declines_when_the_station_has_never_reported(engine):
     out = _science()
     assert out["stories"] == [] and out["declined"] == ["air_flight", "degree_days", "fire_weather",
                                             "barometer_says",
+                                            "barometer_scorecard",
                                             "forecast_vs_backyard",
                                             "humidity_tax"]
 
@@ -585,6 +586,7 @@ def test_endpoint_serves_the_science_family(client, monkeypatch):
     # reading three hours back to take a trend from, and this fixture seeds
     # a single observation. Both decline by name.
     assert body["declined"] == ["degree_days", "barometer_says",
+                                "barometer_scorecard",
                                 "forecast_vs_backyard", "humidity_tax"]
     s = next(s for s in body["stories"] if s["story_type"] == "air_flight")
     assert s["family"] == "science"

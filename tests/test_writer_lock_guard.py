@@ -274,7 +274,7 @@ def booted(temp_env, monkeypatch):
     TestClient. Returns (client, main, db, insights)."""
     def _boot(prepare):
         for mod in ["app.config", "app.maintenance", "app.db", "app.insights",
-                    "app.wu_upload", "app.capture", "app.ingest", "app.meter",
+                    "app.wu_upload", "app.capture", "app.ingest", 
                     "app.discovery", "app.alerts", "app.apns", "app.relay",
                     "app.integrations", "app.main"]:
             if mod in sys.modules:

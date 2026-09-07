@@ -3,7 +3,6 @@ from typing import Any
 
 import httpx
 
-from .config import settings
 
 BASE_URL = "https://rt.ambientweather.net/v1"  # rt = REST + realtime endpoints
 _TIMEOUT = httpx.Timeout(20.0)

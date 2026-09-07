@@ -339,14 +339,19 @@ def test_the_producer_never_reads_a_rain_rate_out_of_hourlyrainin():
 
 
 def test_rain_falls_back_to_the_yearly_counter_but_never_across_new_year():
-    """The yearly-counter fallback for sources with no daily total. Jan 1 is
-    excluded: the counter resets there, so the day's delta would be the
-    whole previous year running backwards."""
+    """The yearly-counter fallback for sources with no daily total. A
+    lifetime counter (the only shape that lacks a daily total) does not
+    reset on Jan 1, so that day counts like any other (round-two review
+    BE-N4); what is refused is the RESET signature — a low at zero under a
+    high that is last year's total — and any implausible rise."""
     mid = {"day": "2026-06-04", "rain_total": None,
            "yearly_min": 3.0, "yearly_max": 3.4}
     assert stories._day_rain_in(mid) == pytest.approx(0.4)
     jan1 = {**mid, "day": "2026-01-01"}
-    assert stories._day_rain_in(jan1) is None
+    assert stories._day_rain_in(jan1) == pytest.approx(0.4)
+    reset = {"day": "2026-01-01", "rain_total": None,
+             "yearly_min": 0.0, "yearly_max": 20.0}
+    assert stories._day_rain_in(reset) is None
     assert stories._day_rain_in({"day": "2026-06-04"}) is None
     # A measured zero survives as a zero.
     assert stories._day_rain_in({"day": "2026-06-04", "rain_total": 0.0}) == 0.0

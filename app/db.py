@@ -2,10 +2,11 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import sqlite3
 import threading
+import asyncio
+import contextvars
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -296,6 +297,20 @@ CREATE TABLE IF NOT EXISTS webhooks (
 -- measure each provider's skill per lead time against the station's own
 -- readings. Verification is impossible retroactively — that is the
 -- entire reason this table ships a release before its UI.
+-- The Zambretti daily ledger (2.0; DDL moved here from
+-- zambretti_ledger.py in 2.1): one slide-rule call per station per
+-- station-local day, measured once and never revised. The ledger module
+-- still creates it on first use so a table dropped by hand comes back.
+CREATE TABLE IF NOT EXISTS zambretti_calls (
+    mac       TEXT NOT NULL,
+    day       TEXT NOT NULL,      -- station-local YYYY-MM-DD
+    issued_ms INTEGER NOT NULL,   -- the observation the call was read from
+    slp_inhg  REAL NOT NULL,      -- sea-level pressure at issue
+    trend     TEXT NOT NULL,      -- rising | steady | falling
+    call      TEXT NOT NULL,      -- the slide rule's sentence
+    PRIMARY KEY (mac, day)
+);
+
 CREATE TABLE IF NOT EXISTS forecast_snapshots (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     provider   TEXT NOT NULL,
@@ -433,6 +448,31 @@ CREATE TABLE IF NOT EXISTS imported_days (
     PRIMARY KEY (mac, day, source)
 );
 
+-- Stored reports (2.1). The morning report and every storm summary kept
+-- as a row you can open again: the Reports pane lists them, a push or a
+-- Live Activity tap deep-links straight into one. Written at the moment
+-- the report is SENT, from the same object the email was rendered from,
+-- so the page and the mail can never disagree about the numbers.
+--
+-- `payload_json` is the wire the apps decode (app/reports.py builds it,
+-- bin/tests/test_report_wire_parity.py pins it against the Swift structs).
+-- `dedupe` makes the write idempotent: the morning report retries its
+-- phone half on its own stamp and a failed storm summary re-attempts next
+-- tick, and neither may leave a second row behind.
+CREATE TABLE IF NOT EXISTS reports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,
+    mac          TEXT,                  -- NULL: server-wide (the morning report)
+    ts_ms        INTEGER NOT NULL,      -- when the report was made
+    for_date     TEXT,                  -- the local day it describes, ISO
+    title        TEXT NOT NULL,
+    summary      TEXT,                  -- the one line the list shows
+    payload_json TEXT NOT NULL,
+    dedupe       TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS reports_ts ON reports(ts_ms DESC);
+CREATE INDEX IF NOT EXISTS reports_kind_ts ON reports(kind, ts_ms DESC);
+
 -- Closed, reported storm episodes (1.9): the structured record behind
 -- the Storm Report share card. Newest 50 per station; the observations
 -- and rollups stay the real archive.
@@ -470,6 +510,51 @@ CREATE TABLE IF NOT EXISTS storm_history (
     pressure_change_inhg REAL,   -- mean(after) − mean(before), signed
     dew_change_f         REAL    -- mean(after) − mean(before), signed
 );
+
+-- OAuth 2.1 for the MCP server (2.1; app/oauth.py). This backend is its
+-- own authorization server so claude.ai / ChatGPT connectors, which speak
+-- OAuth and cannot send a bearer header, can reach POST /mcp. Codes and
+-- tokens are stored as SHA-256 hashes only; the raw strings live in the
+-- issuing response and nowhere else. Every table is bounded: codes expire
+-- in five minutes and are single-use, access tokens in an hour, refresh
+-- tokens in thirty days (rotated on use, by `family`), rows per client
+-- capped, idle clients swept. Rotating API_TOKEN leaves these alone;
+-- revoking a client (DELETE /api/oauth/clients/{id}) is the kill switch.
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id     TEXT PRIMARY KEY,
+    client_name   TEXT,
+    redirect_uris TEXT NOT NULL,      -- JSON array; exact-match at authorize
+    created_ms    INTEGER NOT NULL,
+    last_used_ms  INTEGER,
+    approved_ms   INTEGER             -- the owner's approval (SEC-1); NULL = pending
+);
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code_hash      TEXT PRIMARY KEY,
+    client_id      TEXT NOT NULL,
+    redirect_uri   TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,     -- PKCE S256
+    scope          TEXT NOT NULL,
+    resource       TEXT NOT NULL,     -- RFC 8707 audience: this server's /mcp
+    role           TEXT NOT NULL,     -- owner | guest, from the token typed
+    created_ms     INTEGER NOT NULL,
+    expires_ms     INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token_hash   TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,       -- access | refresh
+    client_id    TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    family       TEXT NOT NULL,       -- one login; rotation deletes by family
+    created_ms   INTEGER NOT NULL,
+    expires_ms   INTEGER NOT NULL,
+    last_used_ms INTEGER,
+    consumed_ms  INTEGER,             -- a rotated refresh token: reuse = breach
+    resource     TEXT                 -- RFC 8707 audience the grant named
+);
+CREATE INDEX IF NOT EXISTS oauth_tokens_client ON oauth_tokens(client_id, created_ms);
+CREATE INDEX IF NOT EXISTS oauth_tokens_family ON oauth_tokens(family);
+CREATE INDEX IF NOT EXISTS oauth_codes_client ON oauth_codes(client_id);
 
 CREATE TABLE IF NOT EXISTS guest_tokens (
     token        TEXT PRIMARY KEY,
@@ -813,9 +898,15 @@ async def _kv_in(db, key: str) -> str | None:
     return row[0] if row else None
 
 
-async def init_db() -> None:
-    _ensure_dir()
-    async with aiosqlite.connect(settings.database_path) as db:
+async def init_db(path: str | None = None) -> None:
+    """Create or migrate the database. `path` names a file OTHER than the
+    live one (the restore migrates its candidate in place before the
+    cutover, R21-02); the in-memory auth caches are refreshed only for
+    the live database, since an upload's tokens are not this process's."""
+    live = path is None
+    if live:
+        _ensure_dir()
+    async with aiosqlite.connect(path or settings.database_path) as db:
         # WAL lets the constant ingest writes and the chart-history reads run
         # without blocking each other. Under the default rollback journal a
         # multi-second history aggregation holds a lock that stalls ingest for
@@ -873,9 +964,14 @@ async def init_db() -> None:
         # Insights rollup tables (see app/insights.py). Created even when
         # the INSIGHTS flag is off — empty tables cost nothing and let the
         # flag flip on without a schema step.
-        from .insights import SCHEMA as INSIGHTS_SCHEMA
+        from .insights import SCHEMA as INSIGHTS_SCHEMA, drop_staging
         had_comfort = await _table_exists(db, "comfort_rollups")
         await db.executescript(INSIGHTS_SCHEMA)
+        # 2.1: a rebuild folds into staging twins and swaps at the end; a
+        # process killed mid-rebuild leaves the twins behind. Harmless
+        # (the live tables were never touched) but they hold a copy of
+        # the ledger's worth of space, so sweep them here.
+        await drop_staging(db)
         if not had_comfort:
             # 2.0: comfort_rollups is folded at insert time from here on,
             # but an archive that predates it has years of readings the
@@ -1054,6 +1150,16 @@ async def init_db() -> None:
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE hour_rollups ADD COLUMN {col} {decl}")
+        # 2.1: the OAuth tables gained three columns after they first
+        # shipped (approval, consumed-refresh marking, the audience). The
+        # list lives with the module that owns the tables; it is applied
+        # here at boot like every other ALTER, so a table created by an
+        # earlier 2.1 build is current before the first request.
+        from .oauth import _LATE_COLUMNS as _OAUTH_LATE
+        for _t, _c, _d in _OAUTH_LATE:
+            cur = await db.execute(f"PRAGMA table_info({_t})")
+            if _c not in {r[1] for r in await cur.fetchall()}:
+                await db.execute(f"ALTER TABLE {_t} ADD COLUMN {_c} {_d}")
         # Same migration for wu_station_map: the 1.5 live-upload columns came
         # after the table shipped in 1.4. NULL upload_key / upload_enabled read
         # as "forwarding not configured", so existing associations keep their
@@ -1175,9 +1281,10 @@ async def init_db() -> None:
     # Load app-minted share tokens into the auth cache. Here rather than in
     # the lifespan hook so every entry point that prepares the DB (app boot,
     # tests, maintenance scripts) gets a coherent auth view.
-    await refresh_guest_token_cache()
-    await refresh_ingest_token_cache()
-    await refresh_ingest_assignment_cache()
+    if live:
+        await refresh_guest_token_cache()
+        await refresh_ingest_token_cache()
+        await refresh_ingest_assignment_cache()
 
 
 # In-process mirror of the guest_tokens table for the auth gate:
@@ -1641,8 +1748,128 @@ async def mark_ingest_assignment_adopted(mac: str, now_ms: int) -> None:
     await refresh_ingest_assignment_cache()
 
 
+# ───────────────── the maintenance lease (2.1 restore, R21-01) ─────────────
+#
+# A database restore renames the live file. SQLite documents that renaming
+# or unlinking an open database and reusing its name confuses journals and
+# WALs, and a connection opened before the rename keeps writing into the
+# file that is now the pre-restore copy. `_CHART_INDEX_BUILDING` only parks
+# INGEST; every other user of connect() (config writes, pollers, alerts,
+# backups, rollups, auth) ran straight through it. The lease is the real
+# transition: while it is held, new connections wait (bounded, then
+# DatabaseUnavailable, a 503 at the API), and the holder first DRAINS the
+# connections already open. Event and counter are process state; the Event
+# is rebuilt when the loop changes (the suite runs one loop per test).
+class DatabaseUnavailable(RuntimeError):
+    """The database is closed for a maintenance transition (a restore is
+    swapping files). Retry in a few seconds."""
+
+
+class LeaseBusy(RuntimeError):
+    """Open connections did not drain inside the lease's timeout; the
+    transition was NOT started."""
+
+
+_GATE_CLOSED = False
+# True inside the task that holds the lease: its own init_db and cache
+# refreshes go through connect() and must not wait on themselves.
+_LEASE_HOLDER: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "zw_lease_holder", default=False)
+_GATE_EVENT: "asyncio.Event | None" = None
+_GATE_LOOP: "asyncio.AbstractEventLoop | None" = None
+_ACTIVE_CONNECTIONS = 0
+GATE_WAIT_S = 20.0          # how long a new connection waits for a transition
+DRAIN_TIMEOUT_S = 15.0      # how long the lease waits for open connections
+_DRAIN_POLL_S = 0.01
+
+
+def _gate_event() -> "asyncio.Event":
+    """The open/closed signal, bound to the running loop."""
+    global _GATE_EVENT, _GATE_LOOP
+    loop = asyncio.get_running_loop()
+    if _GATE_EVENT is None or _GATE_LOOP is not loop:
+        _GATE_EVENT = asyncio.Event()
+        _GATE_LOOP = loop
+        if not _GATE_CLOSED:
+            _GATE_EVENT.set()
+    return _GATE_EVENT
+
+
+def is_open() -> bool:
+    """False while a maintenance lease holds the database (sync callers:
+    the write-lock probe, thread-side maintenance)."""
+    return not _GATE_CLOSED
+
+
+async def wait_open(timeout_s: float | None = None) -> None:
+    """Return when the database is open, or raise DatabaseUnavailable.
+    The flag is re-read on a short cadence as well as the Event: the
+    Event is per loop, and a request served on another loop (the
+    TestClient's) must still see the lease lift."""
+    if not _GATE_CLOSED:
+        return
+    limit = GATE_WAIT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + limit
+    while _GATE_CLOSED:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DatabaseUnavailable("the database is closed for a restore; "
+                                      "try again in a few seconds")
+        try:
+            await asyncio.wait_for(_gate_event().wait(), min(remaining, 0.25))
+        except asyncio.TimeoutError:
+            continue
+
+
+def active_connections() -> int:
+    return _ACTIVE_CONNECTIONS
+
+
+@asynccontextmanager
+async def maintenance_lease(drain_timeout_s: float | None = None
+                            ) -> AsyncIterator[None]:
+    """Close the gate, drain every open connection, hand the caller an
+    exclusive window, reopen. Raises LeaseBusy (gate reopened, nothing
+    changed) when the drain times out; raises DatabaseUnavailable when
+    another lease is already held."""
+    global _GATE_CLOSED
+    if _GATE_CLOSED:
+        raise DatabaseUnavailable("another maintenance transition is in progress")
+    event = _gate_event()
+    _GATE_CLOSED = True
+    event.clear()
+    token = _LEASE_HOLDER.set(True)
+    try:
+        timeout = DRAIN_TIMEOUT_S if drain_timeout_s is None else drain_timeout_s
+        deadline = time.monotonic() + timeout
+        while _ACTIVE_CONNECTIONS > 0:
+            if time.monotonic() >= deadline:
+                raise LeaseBusy(f"{_ACTIVE_CONNECTIONS} database connection(s) "
+                                f"still open after {timeout:.0f}s; the "
+                                "transition was not started")
+            await asyncio.sleep(_DRAIN_POLL_S)
+        yield
+    finally:
+        _LEASE_HOLDER.reset(token)
+        _GATE_CLOSED = False
+        event.set()
+
+
 @asynccontextmanager
 async def connect() -> AsyncIterator[aiosqlite.Connection]:
+    global _ACTIVE_CONNECTIONS
+    if not _LEASE_HOLDER.get():
+        await wait_open()
+    _ACTIVE_CONNECTIONS += 1
+    try:
+        async with _connect_unguarded() as db:
+            yield db
+    finally:
+        _ACTIVE_CONNECTIONS -= 1
+
+
+@asynccontextmanager
+async def _connect_unguarded() -> AsyncIterator[aiosqlite.Connection]:
     # daemon BEFORE the await that starts the thread: aiosqlite's
     # Connection IS a Thread, and a task abandoned on a dying event loop
     # (fire-and-forget webhook dispatch in a test's TestClient, a cancelled
@@ -1661,7 +1888,89 @@ async def connect() -> AsyncIterator[aiosqlite.Connection]:
         # an immediate "database is locked" 500 (seen in production the
         # night INSIGHTS=1 first went live).
         await db.execute("PRAGMA busy_timeout = 10000")
-        yield db
+        _trace_transactions(db)
+        try:
+            yield db
+        finally:
+            _OPEN_TX.pop(id(db), None)
+
+
+# ───────────────── who holds the writer? (2.1) ─────────────────
+#
+# Every connection from connect() notes the last statement it ran while a
+# transaction was open, and when that transaction started. The write-lock
+# watchdog's dump (main.dump_all_threads) prints these beside the thread
+# stacks: a stack names the function that is waiting or holding, this
+# names the STATEMENT and how long the transaction has been open, which
+# is what the 2026-09-02 investigation spent thirty-five minutes without.
+# Recorded on the calling side of aiosqlite's thread hop, so the cost is
+# a dict write per statement; nothing here touches the database.
+_OPEN_TX: dict[int, dict[str, Any]] = {}
+_TRACE_SQL_CHARS = 160
+
+
+def open_transactions() -> list[dict[str, Any]]:
+    """Connections with a transaction open right now: how long it has been
+    open and the last statement they ran. Newest last."""
+    now = time.monotonic()
+    out = []
+    for rec in _OPEN_TX.values():
+        out.append({"open_s": round(now - rec["since"], 1),
+                    "sql": rec["sql"]})
+    out.sort(key=lambda r: -r["open_s"])
+    return out
+
+
+def _trace_transactions(db) -> None:
+    """Wrap the connection's statement + commit methods so _OPEN_TX tracks
+    its transaction. Plain coroutine wrappers: nothing in the app uses the
+    `async with db.execute(...)` cursor form."""
+    key = id(db)
+    orig_execute = db.execute
+    orig_executemany = db.executemany
+    orig_executescript = db.executescript
+    orig_commit = db.commit
+    orig_rollback = db.rollback
+
+    def note(sql: str) -> None:
+        text = " ".join(str(sql).split())[:_TRACE_SQL_CHARS]
+        if db.in_transaction:
+            rec = _OPEN_TX.get(key)
+            if rec is None:
+                _OPEN_TX[key] = {"since": time.monotonic(), "sql": text}
+            else:
+                rec["sql"] = text
+        else:
+            _OPEN_TX.pop(key, None)
+
+    async def execute(sql, parameters=None):
+        cur = await orig_execute(sql, parameters)
+        note(sql)
+        return cur
+
+    async def executemany(sql, parameters):
+        cur = await orig_executemany(sql, parameters)
+        note(sql)
+        return cur
+
+    async def executescript(script):
+        cur = await orig_executescript(script)
+        note(script)
+        return cur
+
+    async def commit():
+        await orig_commit()
+        _OPEN_TX.pop(key, None)
+
+    async def rollback():
+        await orig_rollback()
+        _OPEN_TX.pop(key, None)
+
+    db.execute = execute
+    db.executemany = executemany
+    db.executescript = executescript
+    db.commit = commit
+    db.rollback = rollback
 
 
 async def upsert_device(mac: str, info: dict[str, Any]) -> None:
@@ -2062,7 +2371,8 @@ async def delete_device(mac: str) -> dict[str, int]:
     return {"devices": n_devs, "observations": n_obs,
             "alert_prefs": n_pref, "alert_state": n_state,
             "rule_state": n_rule, "location": n_loc,
-            "smart_alert_state": n_smart, "wu_station": n_wu,
+            "smart_alert_state": n_smart, "storm_state": n_storm,
+            "pending_devices": n_pend, "ingest_token_assignments": n_asgn, "wu_station": n_wu,
             "daily_rollups": n_daily, "hour_rollups": n_hour}
 
 
@@ -2272,6 +2582,31 @@ async def list_alert_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
              "changed_ms": r["changed_ms"] or None} for r in rows]
 
 
+async def replace_alert_rules(rules: list[tuple[Any, str, str, float, bool, str]]) -> int:
+    """Delete every rule and insert `rules` (target_mac, field, comparator,
+    threshold, enabled, severity) in ONE transaction, so a failure midway
+    leaves the previous set intact (round-four review R21-05). Validation
+    is the caller's; this is the atomic apply."""
+    now = int(__import__("time").time() * 1000)
+    async with connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute("DELETE FROM alert_rule_state")
+            await db.execute("DELETE FROM alert_rules")
+            for target, field, comparator, threshold, enabled, severity in rules:
+                await db.execute(
+                    "INSERT INTO alert_rules (target_mac, field, comparator, "
+                    "threshold, enabled, created_ms, severity) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (target, field, comparator, threshold,
+                     1 if enabled else 0, now, severity))
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    return len(rules)
+
+
 async def delete_alert_rule(rule_id: int) -> int:
     async with connect() as db:
         cur = await db.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
@@ -2418,6 +2753,141 @@ async def upsert_smart_alert_state(mac: str, kind: str, triggered: int,
             (mac, kind, triggered, changed_ms),
         )
         await db.commit()
+
+
+_REPORT_MAX_ROWS = 900          # see reports.MAX_ROWS; kept here so
+                                # storage never imports a builder
+# 2.1: the bound is a setting. The app writes this kv key through
+# /api/reports/retention; REPORTS_MAX_ROWS in the env is the fallback;
+# the default above is the fallback's fallback. Clamped in
+# effective_report_retention() to the same floor/ceiling reports.py
+# documents (30..5000), duplicated here for the same import reason.
+_REPORT_RETENTION_KV_KEY = "reports_max_rows"
+_REPORT_ROWS_FLOOR = 30
+_REPORT_ROWS_CEILING = 5000
+
+
+def _clamp_report_rows(v: Any) -> int | None:
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return max(_REPORT_ROWS_FLOOR, min(_REPORT_ROWS_CEILING, n))
+
+
+async def effective_report_retention() -> dict[str, Any]:
+    """{'max_rows': n, 'source': 'app'|'env'|'default'} — the bound
+    insert_report prunes to, and where it came from."""
+    raw = await get_kv(_REPORT_RETENTION_KV_KEY)
+    n = _clamp_report_rows(raw) if raw is not None else None
+    if n is not None:
+        return {"max_rows": n, "source": "app"}
+    env = settings.reports_max_rows
+    n = _clamp_report_rows(env) if env else None
+    if n is not None:
+        return {"max_rows": n, "source": "env"}
+    return {"max_rows": _REPORT_MAX_ROWS, "source": "default"}
+
+
+async def set_report_retention(max_rows: int | None) -> dict[str, Any]:
+    """Store the app's bound (None forgets it: env, then default, take
+    over), prune to the new effective value at once, and return it."""
+    if max_rows is None:
+        await set_kv(_REPORT_RETENTION_KV_KEY, None)
+    else:
+        n = _clamp_report_rows(max_rows)
+        if n is None:
+            raise ValueError("max_rows must be an integer")
+        await set_kv(_REPORT_RETENTION_KV_KEY, str(n))
+    eff = await effective_report_retention()
+    await prune_reports(eff["max_rows"])
+    return eff
+
+
+async def prune_reports(limit: int) -> int:
+    """Keep the newest `limit` rows. Returns how many went."""
+    async with connect() as db:
+        cur = await db.execute(
+            "DELETE FROM reports WHERE id NOT IN "
+            "(SELECT id FROM reports ORDER BY ts_ms DESC, id DESC LIMIT ?)",
+            (int(limit),))
+        await db.commit()
+        return cur.rowcount or 0
+
+
+# 2.1: how many closed storms storm_history keeps PER STATION was a hard
+# 50 (2.0 pre-flight: "make it a setting"). Same shape as the reports
+# bound: app value through /api/storms/retention, STORM_HISTORY_MAX in
+# the env as the fallback, then the default. Storm reports (the Reports
+# pane's storm rows) are bounded separately by the reports table; this
+# bounds the structured ledger the share card and the backfill read.
+_STORM_RETENTION_KV_KEY = "storm_history_max"
+STORM_HISTORY_DEFAULT = 200
+STORM_HISTORY_FLOOR = 10
+STORM_HISTORY_CEILING = 1000
+
+
+def _clamp_storm_rows(v: Any) -> int | None:
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return max(STORM_HISTORY_FLOOR, min(STORM_HISTORY_CEILING, n))
+
+
+async def effective_storm_retention() -> dict[str, Any]:
+    """{'max_per_station': n, 'source': 'app'|'env'|'default'}."""
+    raw = await get_kv(_STORM_RETENTION_KV_KEY)
+    n = _clamp_storm_rows(raw) if raw is not None else None
+    if n is not None:
+        return {"max_per_station": n, "source": "app"}
+    env = settings.storm_history_max
+    n = _clamp_storm_rows(env) if env else None
+    if n is not None:
+        return {"max_per_station": n, "source": "env"}
+    return {"max_per_station": STORM_HISTORY_DEFAULT, "source": "default"}
+
+
+async def set_storm_retention(max_per_station: int | None) -> dict[str, Any]:
+    """Store the app's bound (None forgets it), prune every station to the
+    new effective value at once, and return it."""
+    if max_per_station is None:
+        await set_kv(_STORM_RETENTION_KV_KEY, None)
+    else:
+        n = _clamp_storm_rows(max_per_station)
+        if n is None:
+            raise ValueError("max_per_station must be an integer")
+        await set_kv(_STORM_RETENTION_KV_KEY, str(n))
+    eff = await effective_storm_retention()
+    await prune_storm_history(eff["max_per_station"])
+    return eff
+
+
+async def prune_storm_history(limit: int, mac: str | None = None) -> int:
+    """Keep the newest `limit` closed storms per station (one station when
+    `mac` is given). Returns how many rows went."""
+    async with connect() as db:
+        if mac:
+            macs = [mac]
+        else:
+            cur = await db.execute("SELECT DISTINCT mac FROM storm_history")
+            macs = [r[0] for r in await cur.fetchall()]
+        gone = 0
+        for m in macs:
+            cur = await db.execute(
+                "DELETE FROM storm_history WHERE mac = ? AND id NOT IN "
+                "(SELECT id FROM storm_history WHERE mac = ? "
+                " ORDER BY ended_ms DESC LIMIT ?)", (m, m, int(limit)))
+            gone += cur.rowcount or 0
+        await db.commit()
+    return gone
+
+
+async def count_storm_history() -> int:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT COUNT(*) FROM storm_history")).fetchone()
+    return int(row[0]) if row else 0
 
 
 async def get_storm_state(mac: str) -> dict[str, Any] | None:
@@ -3483,25 +3953,192 @@ async def yearly_rain_at_or_before(mac: str, cutoff_ms: int) -> float | None:
     return await _rain_col_at_or_before(mac, "yearlyrainin", cutoff_ms)
 
 
+# A counter that reads LOWER than it did at a period boundary by more than
+# this has been reset — a replaced gauge, a factory reset, a relay reflash.
+# Calibration wobble is hundredths; a reset is inches.
+RAIN_RESET_DROP_IN = 0.5
+
+
+async def _min_rain_col_after(mac: str, col: str, since_ms: int) -> float | None:
+    """Lowest value of a cumulative rain column strictly after `since_ms`.
+    On a monotonic counter that is the first reading after a reset.
+    Same internal-whitelist rule as _rain_col_at_or_before: a raise, not
+    an assert."""
+    if col not in _COLUMNS:
+        raise ValueError(f"refusing to interpolate unknown column {col!r}")
+    async with connect() as db:
+        row = await (await db.execute(
+            f"SELECT MIN({col}) AS v FROM observations "
+            f"WHERE mac = ? AND dateutc_ms > ? AND {col} IS NOT NULL",
+            (mac, since_ms),
+        )).fetchone()
+    return row["v"] if row and row["v"] is not None else None
+
+
+# (mac, boundary_ms) -> (expires_monotonic, prior). The counter's value at or
+# before a FIXED instant (January 1) cannot change short of a backfill, and
+# finding it walks back through every null row on a station whose counter
+# history begins mid-year: 1.4 s + a 1.0 s fallback on the WH24, per
+# /current, per poll (live profile 2026-09-06). Six hours of memory.
+_YEAR_PRIOR_CACHE: dict[tuple[str, int], tuple[float, float | None]] = {}
+_YEAR_PRIOR_TTL_S = 6 * 3600.0
+
+
+_YEAR_PRIOR_CACHE_MAX = 1024
+
+
+async def _cached_rain_lookup(key: tuple, cached: bool, compute, *,
+                              stale_if=None):
+    """Memoise a rain lookup whose answer is fixed by a past instant (the
+    counter at a boundary, the lowest reading since it). Six hours; a
+    backfill shows up at the next expiry. `stale_if(value)` names a cached
+    answer that cannot be right any more (a reset floor above the counter
+    after a SECOND reset, round-three review BE-F2): it is recomputed now
+    rather than believed for the rest of the window."""
+    if cached:
+        hit = _YEAR_PRIOR_CACHE.get(key)
+        if hit is not None and time.monotonic() < hit[0] \
+                and not (stale_if is not None and stale_if(hit[1])):
+            return hit[1]
+    value = await compute()
+    if cached:
+        if len(_YEAR_PRIOR_CACHE) > _YEAR_PRIOR_CACHE_MAX:
+            # Prune what has expired first; only a cache full of LIVE
+            # entries is cleared outright (a boundary key per hour per
+            # station accrues over a day).
+            now = time.monotonic()
+            for k in [k for k, v in _YEAR_PRIOR_CACHE.items() if v[0] <= now]:
+                _YEAR_PRIOR_CACHE.pop(k, None)
+            if len(_YEAR_PRIOR_CACHE) > _YEAR_PRIOR_CACHE_MAX:
+                _YEAR_PRIOR_CACHE.clear()
+        _YEAR_PRIOR_CACHE[key] = (time.monotonic() + _YEAR_PRIOR_TTL_S, value)
+    return value
+
+
+async def _yearly_prior(mac: str, boundary_ms: int, cached: bool) -> float | None:
+    async def compute():
+        return _tolerant_float(await yearly_rain_at_or_before(mac, boundary_ms))
+    return await _cached_rain_lookup((mac, boundary_ms, "prior"), cached, compute)
+
+
+async def _yearly_rise_since(mac: str, cur_year: float, boundary_ms: int,
+                             cached: bool = False) -> float | None:
+    """The yearly counter's rise since `boundary_ms`, reset-aware.
+
+    Differencing against the pre-reset value clamps every bucket to 0.00
+    until the counter climbs back past it — the rest of the YEAR for the
+    year bucket after an 18-inch replacement (round-two review BE-N2).
+    When the counter has dropped by more than RAIN_RESET_DROP_IN since the
+    boundary, re-difference from the lowest reading after it: the rain
+    since the reset. Honest if partial (rain before the reset inside the
+    same period is not recoverable from a counter that forgot it)."""
+    prior = await _yearly_prior(mac, boundary_ms, cached)
+    if prior is None:
+        return None
+    if cur_year - prior < -RAIN_RESET_DROP_IN:
+        async def compute():
+            return _tolerant_float(await _min_rain_col_after(mac, "yearlyrainin", boundary_ms))
+        # The MIN over everything since the boundary is a full scan of the
+        # station's year (2.8 s on the Davis, live 2026-09-06); memoised
+        # with the prior for EVERY boundary (round-three review BE-F3: the
+        # hour, day, week and month boundaries re-scanned on every call
+        # for as long as they predated the reset). A cached floor ABOVE the
+        # counter is a second reset: recomputed, not believed (BE-F2).
+        floor = await _cached_rain_lookup(
+            (mac, boundary_ms, "floor"), cached, compute,
+            stale_if=lambda f: f is not None and f > cur_year + 1e-9)
+        if floor is not None and floor <= cur_year + 1e-9:
+            prior = floor
+    return round(max(0.0, cur_year - prior), 3)
+
+
+async def rain_last_hour_in(mac: str, now_ms: int | None = None) -> float | None:
+    """Rain that fell in the trailing hour, in inches, from the counters —
+    what the WU protocol's `rainin` and CWOP's `r` mean. `hourlyrainin` is
+    a RATE (in/hr) by the repo's own rule and was published as this
+    accumulation (round-three review BE-F6). The yearly counter's rise
+    over the hour when the station has one; else the daily counter's rise
+    (its midnight reset inside the hour leaves "since midnight", which is
+    the hour's rain then); else None, and the senders omit the field."""
+    now_ms = now_ms or int(time.time() * 1000)
+    cutoff = now_ms - 3_600_000
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT yearlyrainin, dailyrainin FROM observations WHERE mac = ? "
+            "ORDER BY dateutc_ms DESC LIMIT 1", (mac,))).fetchone()
+    if not row:
+        return None
+    cur_year = _tolerant_float(row["yearlyrainin"])
+    if cur_year is not None:
+        prior = _tolerant_float(await _rain_col_at_or_before(
+            mac, "yearlyrainin", cutoff, fallback_earliest=False))
+        if prior is None:
+            return None
+        if cur_year - prior < -RAIN_RESET_DROP_IN:
+            # A gauge reset inside the hour: the rise since its lowest
+            # reading is the honest answer, as in _yearly_rise_since.
+            floor = _tolerant_float(await _min_rain_col_after(mac, "yearlyrainin", cutoff))
+            prior = floor if floor is not None and floor <= cur_year else cur_year
+        return round(max(0.0, cur_year - prior), 3)
+    cur_day = _tolerant_float(row["dailyrainin"])
+    if cur_day is not None:
+        prior = _tolerant_float(await _rain_col_at_or_before(
+            mac, "dailyrainin", cutoff, fallback_earliest=False))
+        if prior is None:
+            return None
+        return round(cur_day if prior > cur_day else cur_day - prior, 3)
+    return None
+
+
 async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None]:
     """Compute hourly/daily/weekly/monthly rain by differencing the current
     yearlyrainin against historical yearlyrainin at the start of each period
     boundary (in local time per `tz_name`). Returns None for any period we
     can't compute (no qualifying row before the boundary). Clamps negatives
     to 0 to handle counter resets / calibration changes."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from zoneinfo import ZoneInfo
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = ZoneInfo("UTC")
+    # Bounded to the last week (2026-09-06, live profile): a source that
+    # has a counter posts it on every reading, so a week decides the tier
+    # either way — while the unbounded form walked the Tempest's whole
+    # history (no counter, ever) on EVERY /current, 6.7 s cold on a 2 GB
+    # file, and monthlyrainin is not in the covering index.
+    now_ms = int(time.time() * 1000)
     async with connect() as db:
+        # The station's NEWEST row decides the tier (round-three review,
+        # BE-F1): a counter source posts its counter on every reading, so
+        # one indexed row says which shape this is — and a lifetime-counter
+        # station that fell silent for a week keeps its year-to-date
+        # instead of serving the lifetime total again. Only a newest row
+        # with neither counter falls to the bounded lookups below.
         row = await (await db.execute(
             "SELECT yearlyrainin, monthlyrainin FROM observations WHERE mac = ? "
-            "AND (yearlyrainin IS NOT NULL OR monthlyrainin IS NOT NULL) "
-            "ORDER BY dateutc_ms DESC LIMIT 1",
-            (mac,),
-        )).fetchone()
+            "ORDER BY dateutc_ms DESC LIMIT 1", (mac,))).fetchone()
+        if row and _tolerant_float(row["yearlyrainin"]) is None \
+                and _tolerant_float(row["monthlyrainin"]) is None:
+            row = None
+        # yearlyrainin is in the covering index (idx_obs_chart), so this is
+        # an index walk; monthlyrainin is not, so the monthly-only fallback
+        # (no source posts it without a yearly today) looks at one day
+        # rather than dragging a week of table rows off a cold disk.
+        if not row:
+            row = await (await db.execute(
+                "SELECT yearlyrainin, monthlyrainin FROM observations WHERE mac = ? "
+                "AND dateutc_ms > ? AND yearlyrainin IS NOT NULL "
+                "ORDER BY dateutc_ms DESC LIMIT 1",
+                (mac, now_ms - 7 * 86_400_000),
+            )).fetchone()
+        if not row:
+            row = await (await db.execute(
+                "SELECT yearlyrainin, monthlyrainin FROM observations WHERE mac = ? "
+                "AND dateutc_ms > ? AND monthlyrainin IS NOT NULL "
+                "ORDER BY dateutc_ms DESC LIMIT 1",
+                (mac, now_ms - 86_400_000),
+            )).fetchone()
     if not row:
         # No yearly and no monthly counter, ever. Tempest is this shape: the
         # WeatherFlow REST response carries a per-day accumulator and a
@@ -3539,11 +4176,26 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
                             ("monthly_in", start_of_month)):
         boundary_ms = int(boundary.timestamp() * 1000)
         if yearly_ok:
-            prior = _tolerant_float(await yearly_rain_at_or_before(mac, boundary_ms))
-            out[name] = None if prior is None else round(max(0.0, cur_year - prior), 3)
+            out[name] = await _yearly_rise_since(mac, cur_year, boundary_ms,
+                                                 cached=True)
         else:
             out[name] = await _rollup_from_monthly(
                 mac, name, boundary_ms, start_of_month_ms, cur_month)
+    # `yearly_in`: the counter differenced against the start of the LOCAL
+    # year, the same way the shorter periods are. For a station whose
+    # yearlyrainin resets on Jan 1 this equals the counter and nothing
+    # reads it; for an SDR/LilyGO LIFETIME counter it is the only honest
+    # year-to-date — the counter itself is "rain since the sensor was
+    # powered". Before the first row of the year exists the boundary
+    # lookup falls back to the earliest reading (rain since install), the
+    # same rule the daily/weekly fallback has always used. The 2026-08-11
+    # ingest.py note explains why this is read-side and never an ingest offset.
+    if yearly_ok:
+        start_of_year_ms = int(start_of_today.replace(month=1, day=1).timestamp() * 1000)
+        out["yearly_in"] = await _yearly_rise_since(mac, cur_year, start_of_year_ms,
+                                                    cached=True)
+    else:
+        out["yearly_in"] = None
     return out
 
 
@@ -3619,8 +4271,8 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
     `hourly_in`/`daily_in` stay None on purpose: a source in this tier posts
     those itself, and its own (revisable) current value is the truth — a MAX
     here could contradict the number the station is showing right now.
-    `yearly_in` is a true calendar YTD, unlike the sensor-native lifetime
-    counters tier 1 works from — which is why only this tier reports it.
+    `yearly_in` is a true calendar YTD here; tier 1 reports the same
+    thing by differencing its counter against Jan 1.
 
     Cached ~60s per (mac, local day) — R5-33, measured on Doren's guest
     2026-08-23: at 1.15M rows the two scans below cost 0.5–3.0s on a cold
@@ -3707,7 +4359,7 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
 # TTL; stale-day entries are pruned on store, so the dict stays a handful of
 # entries. TTL is a module var, not a constant, so tests can zero it.
 _DAILY_ROLLUP_CACHE: dict[tuple[str, str], tuple[float, dict[str, float | None]]] = {}
-_DAILY_ROLLUP_TTL_S = 60.0
+_DAILY_ROLLUP_TTL_S = 300.0   # was 60: a 6.7 s cold scan per minute per client is too much
 
 
 def _rollup_cache_store(key: tuple[str, str], value: dict[str, float | None],
@@ -3999,7 +4651,7 @@ async def _raw_period_fields(db, mac: str, cols: list[tuple[str, str]],
                 return None
             r = await (await db.execute(
                 f"SELECT dateutc_ms FROM observations WHERE mac = ? "
-                f"AND dateutc_ms >= ? AND dateutc_ms <= ? AND {col} = ? "
+                f"AND dateutc_ms >= ? AND dateutc_ms <= ? AND {col} = ? "  # noqa: B023 (awaited in this iteration)
                 f"ORDER BY dateutc_ms ASC LIMIT 1",
                 (mac, start_ms, end_ms, val),
             )).fetchone()
@@ -4359,15 +5011,17 @@ _STORM_CAPTURE_COLS = ("pre_tempf", "post_tempf", "temp_drop_f",
 async def record_storm(mac: str, s: dict) -> None:
     """Persist one CLOSED, reported storm episode — the structured stats
     the Storm Report share card renders. Written at summary delivery
-    (the same moment the notification fires), pruned to the newest 50
-    per station: a share card wants recent storms, not an archive (the
-    raw history and rollups remain the archive).
+    (the same moment the notification fires), pruned to the newest
+    `effective_storm_retention()` per station (200 by default, a setting
+    since 2.1): a share card wants recent storms, not an archive (the raw
+    history and rollups remain the archive).
 
     The 2.0 capture fields ride the same dict and are plain `.get()`s: a
     caller that did not capture them (or a station whose sensors did not
     report) stores NULL, which is the only honest value for a measurement
     nobody took.
     """
+    keep = (await effective_storm_retention())["max_per_station"]
     async with connect() as db:
         await db.execute(
             "INSERT INTO storm_history (mac, started_ms, ended_ms, "
@@ -4383,8 +5037,183 @@ async def record_storm(mac: str, s: dict) -> None:
         await db.execute(
             "DELETE FROM storm_history WHERE mac = ? AND id NOT IN "
             "(SELECT id FROM storm_history WHERE mac = ? "
-            " ORDER BY ended_ms DESC LIMIT 50)", (mac, mac))
+            " ORDER BY ended_ms DESC LIMIT ?)", (mac, mac, keep))
         await db.commit()
+
+
+# ── stored reports (2.1) ────────────────────────────────────────────────
+
+async def insert_report(kind: str, mac: str | None, ts_ms: int,
+                        for_date: str | None, title: str,
+                        summary: str | None, payload: dict[str, Any],
+                        dedupe: str) -> int | None:
+    """Store one report. Idempotent on `dedupe`: a retried send updates the
+    row it already wrote rather than stacking a second one, and the id
+    stays put so a push that already went out still deep-links correctly.
+    Returns the row id, or None when the write could not be resolved."""
+    import json as _json
+    payload_json = _json.dumps(payload, allow_nan=False)
+    # Resolve the bound BEFORE the write transaction opens: the helper
+    # reads server_kv on its own connection (CodeRabbit, PR #36).
+    keep = (await effective_report_retention())["max_rows"]
+    async with connect() as db:
+        await db.execute(
+            "INSERT INTO reports (kind, mac, ts_ms, for_date, title, "
+            "summary, payload_json, dedupe) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(dedupe) DO UPDATE SET "
+            "  ts_ms = excluded.ts_ms, title = excluded.title, "
+            "  summary = excluded.summary, "
+            "  payload_json = excluded.payload_json",
+            (kind, mac, ts_ms, for_date, title, summary, payload_json,
+             dedupe))
+        row = await (await db.execute(
+            "SELECT id FROM reports WHERE dedupe = ?", (dedupe,))).fetchone()
+        # Bounded like storm_history: reports are a few hundred bytes, and
+        # a self-hosted box must not grow a table forever. The bound is
+        # the operator's (2.1), read per write so a change applies to the
+        # next report without a restart.
+        await db.execute(
+            "DELETE FROM reports WHERE id NOT IN "
+            "(SELECT id FROM reports ORDER BY ts_ms DESC, id DESC LIMIT ?)",
+            (keep,))
+        await db.commit()
+    return row[0] if row else None
+
+
+async def insert_report_if_absent(kind: str, mac: str | None, ts_ms: int,
+                                  for_date: str | None, title: str,
+                                  summary: str | None,
+                                  payload: dict[str, Any],
+                                  dedupe: str) -> bool:
+    """Store a report ONLY if nothing carries its dedupe key yet. The
+    storm-history backfill (2.1) uses this: a storm the live path already
+    reported keeps the row it wrote, timestamps and all. True when a row
+    was added. Does not prune: the caller does once at the end."""
+    import json as _json
+    payload_json = _json.dumps(payload, allow_nan=False)
+    async with connect() as db:
+        cur = await db.execute(
+            "INSERT INTO reports (kind, mac, ts_ms, for_date, title, "
+            "summary, payload_json, dedupe) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(dedupe) DO NOTHING",
+            (kind, mac, ts_ms, for_date, title, summary, payload_json,
+             dedupe))
+        await db.commit()
+        return bool(cur.rowcount)
+
+
+async def insert_reports_if_absent(rows: list[dict[str, Any]]) -> int:
+    """insert_report_if_absent for a batch, one connection and one commit:
+    the storm-history backfill used to open a connection per storm row
+    (2.1 pre-release review BE-10). Each row carries the keyword arguments
+    insert_report_if_absent takes. Returns how many were added."""
+    import json as _json
+    if not rows:
+        return 0
+    added = 0
+    async with connect() as db:
+        for r in rows:
+            cur = await db.execute(
+                "INSERT INTO reports (kind, mac, ts_ms, for_date, title, "
+                "summary, payload_json, dedupe) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(dedupe) DO NOTHING",
+                (r["kind"], r["mac"], r["ts_ms"], r["for_date"], r["title"],
+                 r["summary"], _json.dumps(r["payload"], allow_nan=False),
+                 r["dedupe"]))
+            added += int(bool(cur.rowcount))
+        await db.commit()
+    return added
+
+
+async def all_storm_history() -> list[dict[str, Any]]:
+    """Every stored storm episode, every station, oldest first — the
+    backfill's input. Bounded by storm_history's own per-station cap
+    (a setting since 2.1, 200 by default)."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, started_ms, ended_ms, total_in, peak_rate_in_hr, "
+            "max_gust_mph, min_tempf, max_tempf, "
+            + ", ".join(_STORM_CAPTURE_COLS) + " FROM storm_history "
+            "ORDER BY ended_ms")).fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_reports(kind: str | None = None, limit: int = 30,
+                       before_ms: int | None = None,
+                       before_id: int | None = None,
+                       with_payload: bool = False) -> list[dict[str, Any]]:
+    """Newest first, optionally one kind, optionally a page older than the
+    (`before_ms`, `before_id`) keyset. With both, rows at the same
+    millisecond page through in id order (round-three review BE-F4: a
+    plain `ts_ms <` skipped every same-millisecond row after the first
+    page); `before_ms` alone keeps its old meaning. The payload is NOT
+    returned to the wire — a list of
+    thirty reports must not carry thirty payloads; `with_payload` reads
+    it for the caller that re-renders the summary in the reader's units
+    and drops it again (2.1, `payload` key, parsed)."""
+    import json as _json
+    # A LITERAL select list: bin/tests/test_report_wire_parity.py reads
+    # these column names out of the source and pins them against the
+    # Swift decode struct.
+    sql = "SELECT id, kind, mac, ts_ms, for_date, title, summary"
+    if with_payload:
+        sql += ", payload_json"
+    sql += " FROM reports"
+    where, args = [], []
+    if kind:
+        where.append("kind = ?")
+        args.append(kind)
+    if before_ms is not None and before_id is not None:
+        where.append("(ts_ms < ? OR (ts_ms = ? AND id < ?))")
+        args.extend([int(before_ms), int(before_ms), int(before_id)])
+    elif before_ms is not None:
+        where.append("ts_ms < ?")
+        args.append(int(before_ms))
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    # id as the tiebreaker: two reports written in the same millisecond
+    # (the storm backfill) must page in one stable order.
+    sql += " ORDER BY ts_ms DESC, id DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 200)))
+    async with connect() as db:
+        rows = await (await db.execute(sql, tuple(args))).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if with_payload:
+            raw = d.pop("payload_json", None)
+            try:
+                d["payload"] = _json.loads(raw) if raw else {}
+            except ValueError:
+                d["payload"] = {}
+        out.append(d)
+    return out
+
+
+async def get_report(report_id: int) -> dict[str, Any] | None:
+    import json as _json
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT * FROM reports WHERE id = ?", (int(report_id),))
+        ).fetchone()
+    if row is None:
+        return None
+    out = dict(row)
+    try:
+        out["payload"] = _json.loads(out.pop("payload_json"))
+    except (ValueError, TypeError):
+        # A row we cannot parse is a row we cannot serve as a report; the
+        # list entry still stands on its title and summary.
+        out.pop("payload_json", None)
+        out["payload"] = None
+    return out
+
+
+async def count_reports() -> int:
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT COUNT(*) FROM reports")).fetchone()
+    return int(row[0]) if row else 0
 
 
 async def list_storms(mac: str, limit: int = 10) -> list[dict[str, Any]]:

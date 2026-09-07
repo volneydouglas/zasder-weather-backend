@@ -8,6 +8,7 @@ into the alert monitor alongside email so a device-down alert can also push.
 The .p8 is an EC P-256 private key; PyJWT[crypto] signs the provider JWT.
 """
 import logging
+import re
 import time
 
 import httpx
@@ -55,16 +56,42 @@ def _provider_jwt() -> str:
 INTERRUPTION_LEVELS = ("active", "time-sensitive")
 
 
+# Where a push may send the app when the user taps it (2.1). A ROUTE, not
+# a payload: the value lands in userInfo["route"] and the app matches it
+# against routes it already knows, so a push can never talk the app into
+# an arbitrary URL. Shape is "<verb>" or "<verb>/<id>"; anything else is
+# dropped rather than forwarded.
+_ROUTE_RE = re.compile(r"^[a-z][a-z0-9_]{0,15}(/[A-Za-z0-9_.-]{1,64})?$")
+
+
+def valid_route(route: str | None) -> str | None:
+    """The route to stamp, or None. Deliberately total: every caller can
+    hand this whatever it has, and a malformed value degrades to a push
+    that opens the app normally."""
+    if not route or not isinstance(route, str):
+        return None
+    return route if _ROUTE_RE.match(route) else None
+
+
 def build_payload(title: str, body: str,
-                  interruption_level: str | None = None) -> dict:
+                  interruption_level: str | None = None,
+                  route: str | None = None) -> dict:
     """Standard alert aps payload. `interruption_level` is only stamped
     when it's a non-default level we know — an unknown string must not
-    reach Apple, and omitting the key IS "active"."""
+    reach Apple, and omitting the key IS "active".
+
+    `route` (2.1) rides ALONGSIDE aps, which is where APNs puts custom
+    keys and where iOS hands them back as userInfo. Validated, never
+    interpolated into aps itself."""
     aps: dict = {"alert": {"title": title, "body": body}, "sound": "default"}
     if interruption_level in INTERRUPTION_LEVELS and \
             interruption_level != "active":
         aps["interruption-level"] = interruption_level
-    return {"aps": aps}
+    out: dict = {"aps": aps}
+    r = valid_route(route)
+    if r:
+        out["route"] = r
+    return out
 
 
 def build_live_activity_start(attributes_type: str, attributes: dict,
@@ -201,7 +228,8 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
                           url: str, token: str,
                           la_payload: dict | None = None,
                           push_type: str = "liveactivity",
-                          interruption_level: str | None = None) -> dict:
+                          interruption_level: str | None = None,
+                          route: str | None = None) -> dict:
     """Send through a shared relay instead of signing locally. For self-hosters
     who don't run their own APNs key: the relay holds the key, fans out to
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
@@ -230,17 +258,29 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
         # the caller sees failed, not silent wrong-shape pushes.
         payload["push_type"] = push_type
         payload["payload"] = la_payload
+    stamped_route = valid_route(route)
+    if stamped_route and la_payload is None:
+        # Alert pushes only. Same shape rule as interruption_level: the
+        # relay does not forward it, it BUILDS the payload from it, so the
+        # payload lock stands. Omitted when there is no route so a pre-2.1
+        # relay (extra=forbid) still sees a byte-identical body.
+        payload["route"] = stamped_route
     headers = {"authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.post(url, headers=headers, json=payload)
-            if (r.status_code == 422 and "interruption_level" in payload):
-                # Pre-1.9 relay: degrade to a NORMAL push rather than no
-                # push at all — an urgent alert that arrives quietly beats
-                # one that never arrives.
-                log.warning("relay rejected interruption_level (pre-1.9 "
-                            "relay?) — retrying as a standard push")
-                payload.pop("interruption_level")
+            # A relay older than the field we just used answers 422
+            # (extra=forbid). Degrade rather than lose the push: an urgent
+            # alert that arrives quietly, or a report push that opens the
+            # app instead of the report, beats one that never arrives.
+            # Both extras go in one retry — a 1.8 relay rejects the pair.
+            extras = [k for k in ("interruption_level", "route")
+                      if k in payload]
+            if r.status_code == 422 and extras:
+                log.warning("relay rejected %s (older relay?) — retrying as "
+                            "a standard push", " and ".join(extras))
+                for k in extras:
+                    payload.pop(k)
                 r = await client.post(url, headers=headers, json=payload)
     except Exception as e:
         log.warning("relay push failed: %s", e)
@@ -391,7 +431,8 @@ async def push_configured() -> bool:
 
 
 async def send_to_all(title: str, body: str,
-                      interruption_level: str | None = None) -> dict:
+                      interruption_level: str | None = None,
+                      route: str | None = None) -> dict:
     """Push to every registered token, split by platform:
       * iOS tokens → local APNs key (preferred) or the hosted relay.
       * Android tokens → FCM (HTTP v1).
@@ -399,7 +440,11 @@ async def send_to_all(title: str, body: str,
     when that platform's push isn't configured.
 
     `interruption_level` (1.9): "time-sensitive" for the urgent tier —
-    iOS-only, FCM ignores it (Android priority is a separate scheme)."""
+    iOS-only, FCM ignores it (Android priority is a separate scheme).
+
+    `route` (2.1): where a tap should land, e.g. "report/12". iOS-only for
+    now on both transports; a relay too old to know the field is detected
+    and retried without it, so a route can never cost a delivery."""
     from . import fcm
     own = settings.apns_configured
     relay_url, relay_token = await effective_relay()
@@ -419,7 +464,7 @@ async def send_to_all(title: str, body: str,
     if ios and own:
         res = await _push_tokens(
             ios, title, body,
-            payload=build_payload(title, body, interruption_level))
+            payload=build_payload(title, body, interruption_level, route))
         sent += res.get("sent", 0)
         failed += res.get("failed", 0)
         dead += res.get("dead", [])
@@ -443,7 +488,8 @@ async def send_to_all(title: str, body: str,
         if sendable:
             res = await _push_via_relay([t["token"] for t in sendable], title,
                                         body, relay_url, relay_token,  # type: ignore[arg-type]
-                                        interruption_level=interruption_level)
+                                        interruption_level=interruption_level,
+                                        route=route)
             sent += res.get("sent", 0)
             failed += res.get("failed", 0)
             # Prune only tokens whose env was their OWN stored value. For a

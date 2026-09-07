@@ -421,7 +421,14 @@ _PLAUSIBLE_BANDS: dict[str, tuple[float, float]] = {
     "windgustmph":    (0.0, 254.0),
     "maxdailygust":   (0.0, 254.0),
     "winddir":        (0.0, 360.0),
-    "hourlyrainin":   (0.0, 15.0),
+    # A RATE (in/hr), not an accumulation: ecowitt.py and the WeeWX bridge
+    # fill this slot with the station's instantaneous rate, and a
+    # cloudburst reads 20-40 in/hr for minutes at a time. The 15 in ceiling
+    # was sized for the hourly-accumulation record and nulled exactly the
+    # peak the storm report exists to quote (2.1 pre-release review BE-7).
+    # 60 in/hr sits above any credible momentary rate and still catches
+    # decode garbage (a 3276.7 bit-flip).
+    "hourlyrainin":   (0.0, 60.0),
     "eventrainin":    (0.0, 100.0),
     "dailyrainin":    (0.0, 80.0),
     "weeklyrainin":   (0.0, 150.0),
@@ -772,7 +779,20 @@ def _device_label(normalized: dict[str, Any]) -> tuple[str | None, str | None]:
     "AcuRite Atlas (SDR)") doesn't flip the name on every UPSERT."""
     dev = _dev_block(normalized)
     explicit_name = dev.get("name")
+    # The same rule the rename route and the config restore apply: one
+    # line, bounded, no control characters. A name that fails it is
+    # DROPPED, never a refused reading: a `\r` posted with an ingest token
+    # used to malform /metrics and make every alert email for that station
+    # fail silently (2.1 pre-release review SEC-9).
+    try:
+        explicit_name = db.clean_display_name(explicit_name)
+    except ValueError:
+        explicit_name = None
     location = dev.get("location")
+    try:
+        location = db.clean_display_name(location)
+    except ValueError:
+        location = None
     return explicit_name, location
 
 
@@ -816,7 +836,21 @@ def _auto_device_name(normalized: dict[str, Any]) -> str:
         # from it land here — and "Davis Wll Local" is not a name to ship.
         "davis-wll-local": "Davis WeatherLink Live",
     }.get(src, src.replace("-", " ").title())
-    return f"{pretty}{f' ({model})' if model and model.lower() not in pretty.lower() else ''}"
+    composed = f"{pretty}{f' ({model})' if model and model.lower() not in pretty.lower() else ''}"
+    # `device.model` is the poster's string, same as `device.name`: a
+    # control character in it reaches the alert subject and kills that
+    # station's mail (SEC-9's symptom through a second door, round-two
+    # review BE-N3). Fall back to the source alone.
+    # `source` is the poster's string too, so the fallback is validated
+    # the same way, and a name that fails both ways is a fixed constant.
+    for candidate in (composed, pretty):
+        try:
+            cleaned = db.clean_display_name(candidate)
+        except ValueError:
+            continue
+        if cleaned:
+            return cleaned
+    return "Weather Station"
 
 
 def _sea_level_pressure(abs_inhg: float, elevation_ft: float) -> float | None:

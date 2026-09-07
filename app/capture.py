@@ -13,7 +13,9 @@ When CAPTURE_TOKEN isn't set, the endpoint is disabled entirely (returns
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 import os
 import time
 from pathlib import Path
@@ -58,8 +60,33 @@ def _require_capture_token(authorization: str | None, query_token: str | None) -
 # Headers + query-params we redact before writing to the JSONL log so the
 # capture token doesn't end up in plaintext where anyone with the API token
 # could read it back via /api/captures/{slug}.
-_REDACT_HEADERS = {"authorization", "cookie", "x-capture-token", "proxy-authorization"}
-_REDACT_QUERY   = {"t", "token", "api_key", "apikey", "auth"}
+# X-Ingest-Token is the shared WRITE credential relays send on every POST;
+# a capture of an ingest request stored it in clear (R17 small items).
+_REDACT_HEADERS = {"authorization", "cookie", "x-capture-token",
+                   "proxy-authorization", "x-ingest-token"}
+# `ID` and `PASSWORD` are the Weather Underground upload protocol's
+# station credential, sent as query parameters on every reading — the
+# endpoint's main use, and stored in clear until round-two review BE-N6.
+_REDACT_QUERY   = {"t", "token", "api_key", "apikey", "auth", "id", "password"}
+
+
+# Ecowitt-protocol stations post their gateway PASSKEY in the form body;
+# it is the station's credential to ecowitt.net and must not sit in a
+# capture log that /api/captures re-emits. Form and JSON shapes.
+_BODY_SECRET_RE = re.compile(
+    r'(?i)(PASSKEY=)[^&\s]*|("PASSKEY"\s*:\s*")[^"]*')
+
+
+def _redact_body(text: str) -> str:
+    return _BODY_SECRET_RE.sub(lambda m: (m.group(1) or m.group(2)) + "<redacted>", text)
+
+
+def _append_line(slug: str, line: str) -> None:
+    try:
+        with _log_path(slug).open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 def _redact_dict(d: dict[str, Any], drop_keys: set[str]) -> dict[str, Any]:
@@ -83,7 +110,7 @@ async def _capture(request: Request, slug: str, full_path: str) -> dict[str, Any
     # Try to decode as text so a human can grep it; fall back to base64 marker.
     body_text: str | None
     try:
-        body_text = body_bytes.decode("utf-8")
+        body_text = _redact_body(body_bytes.decode("utf-8"))
     except UnicodeDecodeError:
         import base64
         body_text = "<binary base64=" + base64.b64encode(body_bytes).decode() + ">"
@@ -103,11 +130,9 @@ async def _capture(request: Request, slug: str, full_path: str) -> dict[str, Any
     }
     line = json.dumps(record, ensure_ascii=False)
     # Append to the on-disk log AND echo to stdout so `fly logs` shows it live.
-    try:
-        with _log_path(slug).open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
+    # In a thread: this is the request path, and a slow volume must not
+    # hold the event loop (2.1 pre-release review BE-10).
+    await asyncio.to_thread(_append_line, slug, line)
     print(f"CAPTURE {slug} {request.method} /{full_path} body={len(body_bytes)}b", flush=True)
     return record
 

@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from . import db, ingest
+from . import ingest
 from . import source_status
 from .govee_cloud_client import GoveeCloudClient
 
@@ -40,7 +40,13 @@ SOURCE = "govee"
 MIN_INTERVAL_S = 30
 # Unchanged values are re-posted at least this often, so the station's
 # last_seen keeps moving while the room does not.
-REPOST_AFTER_S = 10 * 60
+# Well under any stale threshold a person would set: Doren's five-minute
+# threshold against the old ten-minute window flapped his Govee CO2
+# "stopped reporting" / "reporting again" every five minutes (2026-09-06).
+REDISCOVER_AFTER_S = 10 * 60
+REPOST_AFTER_S = 2 * 60
+# A typed suffix shorter than this matches too easily to trust.
+SUFFIX_MIN_HEX = 4
 # Govee device types / capability instances that mark an air monitor.
 AIR_TYPE = "devices.types.air_quality_monitor"
 AIR_INSTANCES = ("carbonDioxideConcentration", "pm25")
@@ -68,6 +74,44 @@ def parse_device_ids(raw: str | None) -> list[str]:
         if p and p not in out:
             out.append(p)
     return out
+
+
+def _hex_only(device_id: str) -> str:
+    return "".join(c for c in device_id.upper() if c in "0123456789ABCDEF")
+
+
+def resolve_device_ids(wanted: list[str], listed: list[str]) -> tuple[list[str], list[str]]:
+    """Match the ids a person typed against the ids the account lists.
+
+    Govee prints an eight-pair id (04:B5:DC:B4:D9:F2:DE:20) but the app's
+    device page shows the last six pairs, so people type those (Doren,
+    2026-09-06: "Can't connect", DC:B4:D9:F2:DE:20 against an account that
+    had 04:B5:DC:B4:D9:F2:DE:20). An exact match wins; otherwise a typed id
+    that is the SUFFIX of exactly one listed id resolves to it. Two listed
+    ids sharing a suffix stay unresolved rather than guessing. Returns
+    (resolved full ids in the typed order, ids that matched nothing)."""
+    full = {_hex_only(i): i.upper() for i in listed if i}
+    resolved: list[str] = []
+    unresolved: list[str] = []
+    for w in wanted:
+        key = _hex_only(w)
+        if not key:
+            unresolved.append(w)
+            continue
+        if key in full:
+            resolved.append(full[key])
+            continue
+        if len(key) < SUFFIX_MIN_HEX:
+            # "20" is the tail of most ids on most accounts; refuse rather
+            # than resolve a typo to a device (round-two review BE-N8).
+            unresolved.append(w)
+            continue
+        hits = [full[k] for k in full if k.endswith(key)]
+        if len(hits) == 1:
+            resolved.append(hits[0])
+        else:
+            unresolved.append(w)
+    return resolved, unresolved
 
 
 def _unwrap(value: Any) -> Any:
@@ -195,6 +239,13 @@ class GoveeCloudPoller:
                         else [d.upper() for d in (devices or [])])
         self._name = name
         self._devices: dict[str, dict[str, Any]] = {}     # id -> listing
+        # Typed ids the account did not list: reported as failures and
+        # re-resolved every tick, never polled (CodeRabbit, PR #36).
+        self._unresolved: list[str] = []
+        # Re-resolution of a typed id the account did not list runs at
+        # most every REDISCOVER_AFTER_S, not every tick (round-three
+        # review BE-F12: a typo cost 1,440 listing calls a day).
+        self._last_discover_mono: float = -1e9
         self._last_print: dict[str, tuple[str, float]] = {}
         self._task = None
         import asyncio
@@ -204,6 +255,7 @@ class GoveeCloudPoller:
         return self._name if self._name and len(self._devices) == 1 else None
 
     async def _discover(self) -> None:
+        self._last_discover_mono = time.monotonic()
         try:
             listed = await self._client.list_devices()
         except Exception as e:                       # noqa: BLE001
@@ -212,7 +264,13 @@ class GoveeCloudPoller:
         found = {str(d.get("device", "")).upper(): d for d in listed
                  if d.get("device") and is_air_monitor_listing(d)}
         if self._wanted:
-            self._devices = {i: found.get(i, {"device": i}) for i in self._wanted}
+            # A typed suffix polls the full id it resolves to; an id the
+            # account does not list is kept as typed so the failure shows.
+            resolved, unresolved = resolve_device_ids(self._wanted, list(found))
+            self._devices = {i: found[i] for i in resolved}
+            self._unresolved = list(unresolved)
+            for i in unresolved:
+                log.warning("govee device %s is not on this account", i)
         else:
             self._devices = found
         for i, d in self._devices.items():
@@ -220,14 +278,16 @@ class GoveeCloudPoller:
                      d.get("deviceName"))
 
     async def start(self) -> None:
+        """Register the task and return; discovery runs inside it
+        (app/poller_lifecycle.py)."""
         import asyncio
-        await self._discover()
         self._task = asyncio.create_task(self._run(), name="govee-poller")
 
     async def stop(self) -> None:
+        from .poller_lifecycle import reap
         self._stop.set()
-        if self._task:
-            await self._task
+        task, self._task = self._task, None
+        await reap(task, "govee-poller")
 
     async def _poll_one(self, device_id: str, listing: dict[str, Any]) -> int:
         sku = str(listing.get("sku") or "")
@@ -254,9 +314,18 @@ class GoveeCloudPoller:
         return int((result or {}).get("inserted", 0))
 
     async def _tick(self) -> None:
-        if not self._devices:
+        need = not self._devices or bool(self._unresolved)
+        if need and (self._last_discover_mono < 0
+                     or time.monotonic() - self._last_discover_mono >= REDISCOVER_AFTER_S):
+            # A typed id the account did not list may appear later (a
+            # monitor added to the account after the config was saved);
+            # asked again every ten minutes, not every tick.
             await self._discover()
         rows, failures = 0, 0
+        last_error: str | None = None
+        if self._unresolved:
+            failures += len(self._unresolved)
+            last_error = f"device {self._unresolved[0]} is not on this Govee account"
         for device_id, listing in list(self._devices.items()):
             try:
                 rows += await self._poll_one(device_id, listing)
@@ -264,13 +333,27 @@ class GoveeCloudPoller:
                 failures += 1
                 log.warning("govee poll failed for %s: %s", device_id, e)
                 last_error = str(e)
-        if failures and rows == 0:
-            source_status.record_failure(SOURCE, last_error)
+        if failures:
+            # Partial failures report as failures (the AirGradient R11
+            # rule): a clean record_success wiped the other device's
+            # last_error (2.1 pre-release review BE-9).
+            note = last_error or "unknown"
+            if rows:
+                total = len(self._devices) + len(self._unresolved)
+                note = (f"{total - failures}/{total} "
+                        f"device(s) ok; first failure: {note}")
+            source_status.record_failure(SOURCE, note)
         else:
             source_status.record_success(SOURCE, rows=rows)
 
     async def _run(self) -> None:
         import asyncio
+        try:
+            await self._discover()
+        except asyncio.CancelledError:
+            raise
+        except Exception:                            # noqa: BLE001
+            log.exception("govee discovery failed; the tick retries")
         while not self._stop.is_set():
             try:
                 await self._tick()

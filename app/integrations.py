@@ -209,7 +209,23 @@ def _check_macs(configured: Any, devices: list[dict[str, Any]]) -> str | None:
             f"(available: {avail})")
 
 
+# The settings PUT awaits this probe before answering (R18 finding 6): a
+# vendor that neither answers nor refuses used to hold the response for
+# the client's full 15 s timeout, past most proxies' patience. The values
+# are saved either way; past this budget the response says so instead of
+# waiting.
+PROBE_BUDGET_S = 8.0
+
+
 async def probe(provider: str) -> str | None:
+    try:
+        return await asyncio.wait_for(_probe(provider), timeout=PROBE_BUDGET_S)
+    except asyncio.TimeoutError:
+        return (f"{provider} did not answer within {PROBE_BUDGET_S:.0f} s; "
+                "saved — the poller keeps trying in the background")
+
+
+async def _probe(provider: str) -> str | None:
     """One cheap authenticated upstream call with the effective credentials.
     Returns None when they work, else a short human-readable reason. Wrong
     keys used to save as a silent success — "On" in the UI, the failure
@@ -260,12 +276,23 @@ async def probe(provider: str) -> str | None:
                         for d in listed if is_air_monitor_listing(d)}
             wanted = parse_device_ids(eff.get("devices"))
             if wanted:
-                missing = [w for w in wanted if w not in monitors]
+                from .govee_cloud_poller import resolve_device_ids
+                resolved, missing = resolve_device_ids(wanted, sorted(monitors))
                 if missing:
                     return (f"key works but these device ids are not air "
                             f"monitors on the account: {', '.join(missing)}"
                             + (f" (it has: {', '.join(sorted(monitors))})"
                                if monitors else ""))
+                if resolved != wanted and await db.get_kv(
+                        _kv_key(provider, "devices")) not in (None, ""):
+                    # A typed suffix resolved to the account's full id:
+                    # store the full form so the poller, the next probe
+                    # and the settings screen all show what Govee shows.
+                    # Only when the list came from the app: an env-only
+                    # list must stay an env setting, not become an app
+                    # override that outlives the next .env edit (BE-N8).
+                    await db.set_kv(_kv_key(provider, "devices"),
+                                    ",".join(resolved))
             elif not monitors:
                 return ("key works but no air monitors are visible — only "
                         "Wi-Fi Govee devices appear on the API")
@@ -325,12 +352,23 @@ class IntegrationManager:
                 await self._teardown(provider)
 
     async def _teardown(self, provider: str) -> None:
+        # Bounded: a poller or client that will not close must not hold
+        # the settings PUT or the lifespan (2.1 pre-release review BE-4).
+        # Each poller's stop() already reaps with its own timeout; this is
+        # the belt over those braces.
+        from .poller_lifecycle import STOP_TIMEOUT_S
         poller = self._pollers.pop(provider, None)
         if poller is not None:
-            await poller.stop()
+            try:
+                await asyncio.wait_for(poller.stop(), timeout=STOP_TIMEOUT_S + 1)
+            except asyncio.TimeoutError:
+                log.warning("%s poller did not stop in time; abandoned", provider)
         client = self._clients.pop(provider, None)
         if client is not None and hasattr(client, "aclose"):
-            await client.aclose()
+            try:
+                await asyncio.wait_for(client.aclose(), timeout=STOP_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log.warning("%s client did not close in time; abandoned", provider)
 
     async def apply(self, provider: str) -> bool:
         """(Re)start the provider's poller from effective credentials.

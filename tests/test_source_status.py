@@ -208,3 +208,100 @@ def test_custom_ingest_reports_healthy_once_something_posts(client):
     after = {s["name"]: s for s in client.get("/api/sources", headers=H).json()["sources"]}
     assert after["custom-ingest"]["healthy"] is True
     assert after["custom-ingest"]["last_rows"] == 1
+
+
+# ── 2.2: who has to act, and since when ──────────────────────────────────
+
+@pytest.mark.parametrize("error,kind", [
+    ("AirGradient request failed: ReadTimeout", "upstream"),
+    ("AirGradient HTTP 500 on /public/api/v1/locations/measures/current", "upstream"),
+    ("HTTP 503 Service Unavailable", "upstream"),
+    ("ConnectError", "upstream"),
+    ("AirGradient response is not a list", "upstream"),
+    ("401 Unauthorized", "credentials"),
+    ("HTTP 403 Forbidden", "credentials"),
+    ("WU rejected the station ID/key", "credentials"),
+    ("Tempest HTTP 429 on /observations", "rate_limit"),
+    ("Govee: rate limit exceeded", "rate_limit"),
+    ("KeyError: 'obs'", "ours"),
+    ("", "ours"),
+    (None, "ours"),
+])
+def test_classify_sorts_errors_by_who_must_act(ss, error, kind):
+    assert ss.classify(error) == kind
+
+
+def test_failing_since_is_the_first_failure_of_the_streak(ss, monkeypatch):
+    """"Not answering since 13:27" needs the START of the streak; last_error_ms
+    is the latest retry and moves every tick."""
+    clock = {"t": 1_000_000}
+    monkeypatch.setattr(ss, "_now_ms", lambda: clock["t"])
+    ss.declare("airgradient", True)
+    ss.record_success("airgradient", rows=2)
+    clock["t"] += 120_000
+    ss.record_failure("airgradient", "AirGradient request failed: ReadTimeout")
+    first = clock["t"]
+    clock["t"] += 120_000
+    ss.record_failure("airgradient", "AirGradient HTTP 500 on /x")
+    s = by_name(ss.snapshot(), "airgradient")
+    assert s["failing_since_ms"] == first
+    assert s["last_error_ms"] == clock["t"]
+    assert s["consecutive_failures"] == 2
+    assert s["last_error_kind"] == "upstream"
+    assert s["label"] == "AirGradient"
+    ss.record_success("airgradient", rows=2)
+    s = by_name(ss.snapshot(), "airgradient")
+    assert s["failing_since_ms"] is None and s["last_error_kind"] is None
+
+
+def test_health_for_device_joins_a_polled_device_to_its_source(ss):
+    ss.declare("tempest", True)
+    ss.record_failure("tempest", "ConnectTimeout")
+    h = ss.health_for_device("tempest")
+    assert h["name"] == "tempest" and h["label"] == "Tempest"
+    assert h["healthy"] is False and h["last_error_kind"] == "upstream"
+    # The WeatherLink poller stamps its own source string.
+    ss.declare("davis-cloud", True)
+    assert ss.health_for_device("davis-vp2-cloud")["name"] == "davis-cloud"
+
+
+def test_health_for_device_is_none_for_local_and_unknown_feeds(ss):
+    """A relay board, the WLL bridge or a local Ecowitt push has no vendor
+    to blame; and a poller not declared this boot must not judge anything."""
+    ss.declare("tempest", True)
+    assert ss.health_for_device("fineoffset-wh24-lilygo") is None
+    assert ss.health_for_device("davis-wll-local") is None
+    assert ss.health_for_device("ecowitt") is None
+    assert ss.health_for_device(None) is None
+    assert ss.health_for_device("govee") is None, "govee never declared this boot"
+
+
+def test_devices_endpoint_carries_source_health(client):
+    """The app reads /api/devices, not /api/sources: the verdict rides on
+    the device row, None for devices nobody polls for."""
+    from app import source_status
+    source_status.declare("tempest", True)
+    source_status.record_failure("tempest", "Tempest request failed: ReadTimeout")
+    hdr = {"Authorization": "Bearer test-ingest-token"}
+    def obs(dev_id, source, ts, tempf):
+        return {"device": {"id": dev_id, "model": "Test"},
+                "timestamp_utc": ts,
+                "outdoor": {"tempf": tempf, "humidity": 50},
+                "wind": {}, "rain": {}, "pressure": {}, "source": source}
+    # Two MACs that differ in many bits: a near-twin of a known MAC sits in
+    # new-device probation (device_probation.py) and would be quarantined.
+    polled = obs("AABBCCDDEE01", "tempest", "2026-09-08T06:00:00Z", 70)
+    local = obs("112233445566", "fineoffset-wh24-lilygo", "2026-09-08T06:01:00Z", 64)
+    for body in (polled, local):
+        r = client.post("/ingest/custom", headers=hdr, json=body)
+        assert r.status_code == 200 and r.json()["inserted"] == 1, r.json()
+    api = {"Authorization": "Bearer test-api-token"}
+    # Keyed by what the device posts as its source: the relay path files its
+    # device under a synthetic MAC, so the MAC is not the stable handle here.
+    rows = {(d.get("info") or {}).get("source"): d
+            for d in client.get("/api/devices", headers=api).json()}
+    h = rows["tempest"]["source_health"]
+    assert h["label"] == "Tempest" and h["healthy"] is False
+    assert h["last_error_kind"] == "upstream" and h["consecutive_failures"] == 1
+    assert rows["fineoffset-wh24-lilygo"]["source_health"] is None, "a relay board has no vendor"
+

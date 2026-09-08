@@ -526,7 +526,11 @@ printf '%s\n' \
 
 Tune how long offline counts as "down" per device (SDRs tight, cloud feeds
 looser) with `ALERT_STALE_MINUTES` + the per-MAC `ALERT_STALE_MINUTES_BY_MAC`
-map (set a MAC to `0` to stop watching it). See `.env.example` for all knobs.
+map (set a MAC to `0` to stop watching it). A cloud poller that keeps
+failing for `SOURCE_ALERT_MINUTES` (default 60) raises one alert that names
+the vendor and whether it is their outage, a rejected key, a rate limit, or
+a storing error here; the app shows the same verdict on the station. See
+`.env.example` for all knobs.
 
 Everything except the SMTP password can also be managed from the **iOS app**
 (Settings → Notifications) via the `/api/alerts` endpoints — recipients,

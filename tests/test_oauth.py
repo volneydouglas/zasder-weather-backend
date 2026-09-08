@@ -438,6 +438,31 @@ def test_a_connect_code_works_on_an_approved_client_too(client):
     assert client.post("/api/oauth/connect-code").status_code == 401
 
 
+def test_a_connect_code_minted_for_one_client_approves_only_that_client(client):
+    """SEC-G5 (2.2): the owner mints the code for the pending app they are
+    looking at; a look-alike registration cannot spend it, and the code is
+    still there for the right one. An unbound code keeps working anywhere."""
+    good = _register(client, name="Codex", approve=False)
+    imposter = _register(client, name="Codex ", approve=False)
+    _, challenge = _pkce()
+    minted = client.post("/api/oauth/connect-code", headers=H,
+                         json={"client_id": good["client_id"]}).json()
+    assert minted["client_id"] == good["client_id"]
+    code = minted["code"]
+    # The imposter's page refuses it and stays unapproved.
+    page = _consent(client, _authorize_params(imposter["client_id"], challenge), code)
+    assert page.status_code == 401
+    assert "not a connect code" in page.text
+    # The intended client spends it: approved and connected in one step.
+    assert _code_from(_consent(client, _authorize_params(good["client_id"], challenge), code))
+    # Once spent, gone.
+    assert _consent(client, _authorize_params(good["client_id"], challenge), code).status_code == 401
+    # An unbound code still works for anyone, as before.
+    loose = client.post("/api/oauth/connect-code", headers=H).json()
+    assert loose["client_id"] is None
+    assert _code_from(_consent(client, _authorize_params(imposter["client_id"], challenge), loose["code"]))
+
+
 def test_the_owner_approve_route_is_write_gated_and_404s_unknowns(client):
     assert client.post("/api/oauth/clients/zwo_nope/approve", headers=H).status_code == 404
     reg = _register(client, approve=False)

@@ -263,6 +263,8 @@ ALERT_SEVERITY: dict[str, str] = {
     "first_frost": "info",
     "digest": "info",
     "sensor_recovered": "info",
+    # 2.2 source watchdog: the recovery is good news.
+    "source_recovered": "info",
     "device_recovered": "info",
     "battery_recovered": "info",
     "disk_recovered": "info",
@@ -1064,6 +1066,13 @@ class AlertMonitor:
                 await health_watch.check(cfg, devices, now_ms, _deliver)
             except Exception:
                 log.exception("health watch failed")
+        # 2.2 source watchdog: a cloud poller failing for an hour is an
+        # outage, so it runs whether or not the smart alerts are on.
+        from . import health_watch as _hw
+        try:
+            await _hw.check_sources(cfg, now_ms, _deliver)
+        except Exception:
+            log.exception("source watchdog failed")
         # ── NWS relay (1.8): severe weather through OUR channels, not
         # just the foregrounded app. Warning tier — breaks quiet hours.
         from . import nws_watch

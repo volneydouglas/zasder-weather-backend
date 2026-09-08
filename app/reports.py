@@ -34,9 +34,11 @@ KIND_STORM = "storm"
 # period, so the Reports pane is where every report lives.
 KIND_NOAA_MONTH = "noaa_month"
 KIND_NOAA_YEAR = "noaa_year"
-KINDS = (KIND_MORNING, KIND_STORM, KIND_NOAA_MONTH, KIND_NOAA_YEAR)
+# 2.2 (Doren): "a day version in the NOAA style" — hour rows for one day.
+KIND_NOAA_DAY = "noaa_day"
+KINDS = (KIND_MORNING, KIND_STORM, KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY)
 # The kinds `POST /api/reports/run` builds on demand.
-RUNNABLE_KINDS = (KIND_NOAA_MONTH, KIND_NOAA_YEAR)
+RUNNABLE_KINDS = (KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY)
 
 # How many report rows a server keeps, by default. They are a few hundred
 # bytes each (a NOAA month is a few KB); this is two years of mornings
@@ -152,7 +154,7 @@ def summary_line(kind: str, payload: dict[str, Any], units: Any = None) -> str:
         return morning_summary(payload, units)
     if kind == KIND_STORM:
         return storm_summary_line(payload, units)
-    if kind in (KIND_NOAA_MONTH, KIND_NOAA_YEAR):
+    if kind in (KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY):
         return noaa_summary_line(payload, units)
     return ""
 
@@ -238,15 +240,17 @@ def storm_duration_minutes(payload: dict[str, Any]) -> int | None:
 
 def noaa_payload(kind: str, mac: str, station: str, year: int,
                  month: int | None, text: str,
-                 numbers: dict[str, Any]) -> dict[str, Any]:
+                 numbers: dict[str, Any], day: str | None = None) -> dict[str, Any]:
     """The rendered fixed-width table (the thing the page shows, verbatim,
     in a monospaced face) plus the headline numbers the list row, the
-    share card and a future comparison read without parsing text."""
+    share card and a future comparison read without parsing text. `day`
+    (YYYY-MM-DD) only on the daily kind; a 2.1 app ignores the key."""
     return {
         "station": station,
         "mac": mac,
         "year": int(year),
         "month": _int(month),
+        "day": day,
         "text": text,
         "days": _int(numbers.get("days")),
         "mean_f": _num(numbers.get("mean_f")),
@@ -262,7 +266,11 @@ def noaa_payload(kind: str, mac: str, station: str, year: int,
 
 
 def noaa_title(kind: str, station: str, year: int,
-               month: int | None) -> str:
+               month: int | None, day: str | None = None) -> str:
+    if kind == KIND_NOAA_DAY and day:
+        from datetime import date as _date
+        d = _date.fromisoformat(day)
+        return f"{station} · {d:%B} {d.day}, {d.year} climate report"
     if kind == KIND_NOAA_MONTH and month:
         import calendar
         return f"{station} · {calendar.month_name[month]} {year} climate report"
@@ -282,8 +290,12 @@ def noaa_summary_line(payload: dict[str, Any], units: Any = None) -> str:
     if rain is not None:
         bits.append(f"{u.rain_amount(rain)} rain")
     days = payload.get("days")
-    if days:
+    if days and not payload.get("day"):
         bits.append(f"{days} day{'s' if days != 1 else ''}")
+    gust = payload.get("gust_mph")
+    if payload.get("day") and gust is not None:
+        bits.append(f"gust {u.wind_speed(gust)}" if hasattr(u, "wind_speed")
+                    else f"gust {round(gust)} mph")
     return " · ".join(bits) or "No rollup data for this period"
 
 
@@ -302,9 +314,12 @@ def storm_key(mac: str, started_ms: int) -> str:
     return f"{KIND_STORM}:{mac}:{int(started_ms)}"
 
 
-def noaa_key(kind: str, mac: str, year: int, month: int | None) -> str:
+def noaa_key(kind: str, mac: str, year: int, month: int | None,
+             day: str | None = None) -> str:
     """One row per station and period: re-running a month that is still
     in progress updates its row rather than stacking a copy per run."""
+    if kind == KIND_NOAA_DAY and day:
+        return f"{kind}:{mac}:{day}"
     if kind == KIND_NOAA_MONTH:
         return f"{kind}:{mac}:{int(year)}-{int(month or 0):02d}"
     return f"{kind}:{mac}:{int(year)}"

@@ -786,21 +786,33 @@ async def mcp_post(
     try:
         msg = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return JSONResponse(_error(None, PARSE_ERROR, "Parse error"),
-                            status_code=400)
+        return _rejected(_error(None, PARSE_ERROR, "Parse error"), method=None,
+                         size=len(raw))
     if isinstance(msg, list):
         # Batches went away in 2025-06-18 and were optional before; one
         # message per POST keeps the transport a function call.
-        return JSONResponse(
+        return _rejected(
             _error(None, INVALID_REQUEST,
                    "Invalid Request: send one JSON-RPC message per POST"),
-            status_code=400)
+            method="<batch>", size=len(raw))
     reply = await handle_message(msg, role)
     if reply is None:
         return Response(status_code=202)
     if "error" in reply and reply.get("id") is None:
-        return JSONResponse(reply, status_code=400)
+        return _rejected(reply, method=msg.get("method") if isinstance(msg, dict) else None,
+                         size=len(raw))
     return JSONResponse(reply)
+
+
+def _rejected(reply: dict[str, Any], *, method: str | None, size: int) -> JSONResponse:
+    """A 400 with its JSON-RPC error code and the offending method in the
+    log (2.2, item 9 of the 2.2 plan): claude.ai's connector 400s once per
+    handshake and the log said only 'POST /mcp 400', which is not a clue.
+    Never the body: a malformed message may carry a token."""
+    err = reply.get("error") or {}
+    log.info("mcp 400: code=%s message=%r method=%s bytes=%d",
+             err.get("code"), str(err.get("message", ""))[:120], method, size)
+    return JSONResponse(reply, status_code=400)
 
 
 @router.get("/mcp")

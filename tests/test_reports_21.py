@@ -414,6 +414,14 @@ def test_run_stores_a_day_report_from_history_rows(insights_on):
     assert p["rain_in"] == 0.30, p["rain_in"]
     assert p["gust_mph"] == 12.0
     assert "Hours with data: 3" in p["text"]
+    # The hourly fallback agrees with the rollup: the 0.10 → 0.25 rise that
+    # straddles the 09:00 boundary is credited to the 09 hour, not lost.
+    from app import climate
+    from datetime import date as _date
+    hours = asyncio.run(climate.day_hours(MAC, _date(2025, 10, 2)))
+    by_hour = {h["hour"]: h["rain"] for h in hours if h["samples"]}
+    assert by_hour == {8: 0.10, 9: 0.15, 10: 0.05}, by_hour
+    assert round(sum(by_hour.values()), 2) == 0.30
     # Same day again: one row, updated.
     r2 = client.post("/api/reports/run", headers=AUTH,
                      json={"kind": "noaa_day", "mac": MAC, "year": 2025,

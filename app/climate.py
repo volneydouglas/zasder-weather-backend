@@ -281,6 +281,12 @@ def _hour_bucket_stats(rows: list[dict[str, Any]], tz) -> list[dict[str, Any]]:
                 and r[key] == r[key]]
 
     out = []
+    # The daily counter is carried ACROSS hours: an hour's rain is the rise
+    # from the previous hour's last reading, not from its own first one, or
+    # the tip that lands on the boundary is credited to no hour and the
+    # fallback day total comes up short (CodeRabbit, PR #37). A drop is the
+    # midnight reset, whose landing value is all new rain.
+    carried: float | None = None
     for h in range(24):
         rs = sorted(by_hour.get(h, []), key=lambda r: r.get("dateutc_ms") or r.get("dateutc") or 0)
         temps = nums(rs, "tempf")
@@ -291,17 +297,18 @@ def _hour_bucket_stats(rows: list[dict[str, Any]], tz) -> list[dict[str, Any]]:
         gusts = nums(rs, "windgustmph_max") or nums(rs, "windgustmph")
         daily = nums(rs, "dailyrainin")
         rain = None
-        if len(daily) >= 1:
-            # The counter's rise inside the hour; a drop mid-hour is the
-            # midnight reset (hour 0), whose landing value is all new rain.
+        if daily:
             total = 0.0
-            prev = daily[0]
-            for v in daily[1:]:
-                if v < prev:
+            prev = carried
+            for v in daily:
+                if prev is None:
+                    pass
+                elif v < prev:
                     total += v
                 else:
                     total += v - prev
                 prev = v
+            carried = prev
             rain = round(total, 2)
         out.append({
             "hour": h,

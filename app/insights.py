@@ -146,6 +146,12 @@ CREATE TABLE IF NOT EXISTS daily_rollups (
     pm25_min REAL, pm25_max REAL, pm25_sum REAL, pm25_n INTEGER,
     co2_min REAL, co2_max REAL, co2_sum REAL, co2_n INTEGER,
     tempinf_min REAL, tempinf_max REAL,
+    -- The yearly counter's first and last reading of the day, with their
+    -- times, so "did the counter reset today" is a fact (last < first)
+    -- rather than the min/max signature guess, and the day's rain from a
+    -- lifetime counter is last - first (2.2, ref_rain_counters).
+    yearly_first REAL, yearly_first_ms INTEGER,
+    yearly_last REAL, yearly_last_ms INTEGER,
     PRIMARY KEY (mac, day)
 );
 
@@ -200,6 +206,8 @@ ROLLUP_LATE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("pm25_min", "REAL"), ("pm25_max", "REAL"), ("pm25_sum", "REAL"), ("pm25_n", "INTEGER"),
     ("co2_min", "REAL"), ("co2_max", "REAL"), ("co2_sum", "REAL"), ("co2_n", "INTEGER"),
     ("tempinf_min", "REAL"), ("tempinf_max", "REAL"),
+    ("yearly_first", "REAL"), ("yearly_first_ms", "INTEGER"),
+    ("yearly_last", "REAL"), ("yearly_last_ms", "INTEGER"),
 )
 
 # (column stem) -> the rollup_params key that feeds it, for the sum/n pairs.
@@ -238,7 +246,8 @@ INSERT INTO daily_rollups (mac, day,
     baromrelin_sum, baromrelin_n,
     pm25_min, pm25_max, pm25_sum, pm25_n,
     co2_min, co2_max, co2_sum, co2_n,
-    tempinf_min, tempinf_max)
+    tempinf_min, tempinf_max,
+    yearly_first, yearly_first_ms, yearly_last, yearly_last_ms)
 VALUES (:mac, :day,
     :tempf, :tempf, :tempf, :tempf_n,
     :humidity, :humidity, :windspeedmph, :windgustmph,
@@ -249,7 +258,9 @@ VALUES (:mac, :day,
     :baromrelin, :baromrelin_n,
     :pm25, :pm25, :pm25, :pm25_n,
     :co2, :co2, :co2, :co2_n,
-    :tempinf, :tempinf)
+    :tempinf, :tempinf,
+    :yearlyrainin, CASE WHEN :yearlyrainin IS NULL THEN NULL ELSE :ts END,
+    :yearlyrainin, CASE WHEN :yearlyrainin IS NULL THEN NULL ELSE :ts END)
 ON CONFLICT(mac, day) DO UPDATE SET
     tempf_min = MIN(COALESCE(tempf_min, :tempf), COALESCE(:tempf, tempf_min)),
     tempf_max = MAX(COALESCE(tempf_max, :tempf), COALESCE(:tempf, tempf_max)),
@@ -286,7 +297,21 @@ ON CONFLICT(mac, day) DO UPDATE SET
     co2_sum = COALESCE(co2_sum, 0) + COALESCE(:co2, 0),
     co2_n   = COALESCE(co2_n, 0) + :co2_n,
     tempinf_min = MIN(COALESCE(tempinf_min, :tempinf), COALESCE(:tempinf, tempinf_min)),
-    tempinf_max = MAX(COALESCE(tempinf_max, :tempinf), COALESCE(:tempinf, tempinf_max))
+    tempinf_max = MAX(COALESCE(tempinf_max, :tempinf), COALESCE(:tempinf, tempinf_max)),
+    -- Ordered by the reading's own time, not arrival: a history import
+    -- or a resumed relay folds rows out of order.
+    yearly_first = CASE WHEN :yearlyrainin IS NULL THEN yearly_first
+                        WHEN yearly_first_ms IS NULL OR :ts < yearly_first_ms THEN :yearlyrainin
+                        ELSE yearly_first END,
+    yearly_first_ms = CASE WHEN :yearlyrainin IS NULL THEN yearly_first_ms
+                           WHEN yearly_first_ms IS NULL OR :ts < yearly_first_ms THEN :ts
+                           ELSE yearly_first_ms END,
+    yearly_last = CASE WHEN :yearlyrainin IS NULL THEN yearly_last
+                       WHEN yearly_last_ms IS NULL OR :ts >= yearly_last_ms THEN :yearlyrainin
+                       ELSE yearly_last END,
+    yearly_last_ms = CASE WHEN :yearlyrainin IS NULL THEN yearly_last_ms
+                          WHEN yearly_last_ms IS NULL OR :ts >= yearly_last_ms THEN :ts
+                          ELSE yearly_last_ms END
 """
 
 _UPSERT_HOUR = """
@@ -367,6 +392,7 @@ def rollup_params(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any] | None:
     return {
         "mac": row.get("_mac"),          # filled by caller
         "day": local.strftime("%Y-%m-%d"),
+        "ts": int(ts),
         "_year": local.year,
         "_month": local.month,
         "_hour": local.hour,

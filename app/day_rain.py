@@ -60,6 +60,16 @@ def day_rain_in(row: Any) -> float | None:
     total = _num(get("rain_total"))
     if total is not None:
         return max(0.0, total)
+    # 2.2: the counter's first and last reading of the day, when the
+    # rollup has them. last >= first is the day's rain, full stop; last
+    # < first is a reset inside the day, and what the restarted counter
+    # holds is what fell since. The min/max signature below stays for
+    # rows folded before the columns existed.
+    first, last = _num(get("yearly_first")), _num(get("yearly_last"))
+    if first is not None and last is not None:
+        rain = last - first if last >= first else last
+        rain = max(0.0, rain)
+        return None if rain > DAY_RAIN_MAX_IN else rain
     lo, hi = _num(get("yearly_min")), _num(get("yearly_max"))
     if lo is not None and hi is not None:
         delta = max(0.0, hi - lo)

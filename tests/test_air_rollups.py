@@ -118,3 +118,34 @@ def test_mcp_daily_summary_reports_air_and_means(client, monkeypatch):
     assert d["pm25_mean"] == 8.0 and d["co2_mean"] == 640.0
     assert d["tempinf_max"] == 74.0
     assert d["tempf_mean"] is None and d["humidity_mean"] is None
+
+
+def test_rebuild_folds_air_and_indoor_from_history(client, monkeypatch):
+    """The rebuild scan reads a fixed column list; the first production
+    rebuild folded humidity means but left pm25/co2/tempinf NULL for every
+    past day because the list predated them (2026-09-09)."""
+    from app import insights, config
+    monkeypatch.setattr(config.settings, "insights", True)
+    monkeypatch.setattr(insights.settings, "insights", True)
+    mac = "5D:5D:07:00:00:44"
+    for i, (pm, co2) in enumerate(((6.0, 600.0), (10.0, 800.0))):
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token",
+                             "Content-Type": "application/json"},
+                    json={"device": {"id": mac, "name": "Rebuilt air"},
+                          "timestamp_utc": f"2026-06-02T1{i}:00:00Z",
+                          "indoor": {"tempf": 70.0 + i, "humidity": 40.0},
+                          "air": {"pm25": pm, "co2": co2}})
+    stats = asyncio.run(insights.rebuild(mac))
+    assert stats["rows"] >= 2, stats
+    from app import db
+
+    async def row():
+        async with db.connect() as conn:
+            return await (await conn.execute(
+                "SELECT * FROM daily_rollups WHERE mac = ? AND day = '2026-06-02'",
+                (mac,))).fetchone()
+    r = asyncio.run(row())
+    assert (r["pm25_min"], r["pm25_max"], r["pm25_n"]) == (6.0, 10.0, 2)
+    assert insights.rollup_mean(r, "co2") == 700.0
+    assert (r["tempinf_min"], r["tempinf_max"]) == (70.0, 71.0)

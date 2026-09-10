@@ -163,18 +163,37 @@ _STORM_BASELINE_MAX_AGE_MS = 6 * 3_600_000
 _STORM_GUST_LEAD_MS = 30 * 60_000
 
 
-def rule_triggered(comparator: str, threshold: float, value: float) -> bool:
+# Half-window for an `equalTo` rule per field, API-native units, the
+# app's AlertField.equalityTolerance mirrored (CodeRabbit, PR #37): one
+# fixed ±0.5 served every field, so "pressure equals 29.92" fired nearly
+# always and "CO2 equals 1000" could only fire between 999.5 and 1000.5.
+EQUALITY_TOLERANCE: dict[str, float] = {
+    "tempf": 0.5, "feelsLike": 0.5, "dewPoint": 0.5,    # °F
+    "humidity": 0.5,                                     # %
+    "windspeedmph": 1.0, "windgustmph": 1.0,             # mph
+    "dailyrainin": 0.01, "hourlyrainin": 0.01,           # in
+    "baromrelin": 0.005,                                 # inHg
+    "uv": 0.5,
+    "co2": 25.0,                                         # ppm
+    "pm25": 1.0,                                         # µg/m³
+}
+_DEFAULT_EQUALITY_TOLERANCE = 0.5
+
+
+def rule_triggered(comparator: str, threshold: float, value: float,
+                   tolerance: float = _DEFAULT_EQUALITY_TOLERANCE) -> bool:
     if comparator == "above":
         return value > threshold
     if comparator == "below":
         return value < threshold
-    return abs(value - threshold) < 0.5   # equalTo — tolerance for noisy sensors
+    return abs(value - threshold) < tolerance   # equalTo — noisy sensors
 
 
 def evaluate_rule(comparator: str, threshold: float, value: float,
-                  prev_triggered: int) -> tuple[bool, bool]:
+                  prev_triggered: int,
+                  tolerance: float = _DEFAULT_EQUALITY_TOLERANCE) -> tuple[bool, bool]:
     """(now_triggered, fire). Edge-triggered: fire only on clear→triggered."""
-    now = rule_triggered(comparator, threshold, value)
+    now = rule_triggered(comparator, threshold, value, tolerance)
     return now, (now and not prev_triggered)
 
 
@@ -1149,7 +1168,9 @@ class AlertMonitor:
                 except (TypeError, ValueError):
                     continue
                 prev, clear_since = rstates.get((rule["id"], d["mac"]), (0, None))
-                now_trig, fire = evaluate_rule(rule["comparator"], rule["threshold"], val, prev)
+                now_trig, fire = evaluate_rule(
+                    rule["comparator"], rule["threshold"], val, prev,
+                    EQUALITY_TOLERANCE.get(rule["field"], _DEFAULT_EQUALITY_TOLERANCE))
                 if fire:
                     # Reviewer P2: only persist triggered=1 AFTER delivery succeeds.
                     # If SMTP/APNs/relay fails, leave state at 0 so the next tick

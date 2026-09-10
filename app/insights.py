@@ -687,10 +687,15 @@ def in_flight() -> str | None:
                _time.monotonic() - p.get("batch_started", _time.monotonic())))
 
 
+# Every column rollup_params reads. Live ingest hands it the whole
+# reading; the rebuild hands it THIS list, so a rollup column fed by a
+# field missing here fills from today on and never from history (the
+# 2.2 air pair, found on the first production rebuild, 2026-09-09).
 _SCAN_SELECT = (
     "SELECT mac, dateutc_ms, tempf, humidity, windspeedmph, "
     "windgustmph, baromrelin, dew_point, feels_like, uv, "
-    "solarradiation, dailyrainin, yearlyrainin, lightning_last_1hr "
+    "solarradiation, dailyrainin, yearlyrainin, lightning_last_1hr, "
+    "pm25, co2, tempinf "
     "FROM observations WHERE mac = ? AND dateutc_ms > ? "
     "ORDER BY dateutc_ms LIMIT ?")
 
@@ -706,7 +711,8 @@ async def _fold_batch(db, batch, tz, wm_day: str | None) -> int:
                "feelsLike": b[8], "uv": b[9],
                "solarradiation": b[10], "dailyrainin": b[11],
                "yearlyrainin": b[12],
-               "lightning_last_1hr": b[13]}
+               "lightning_last_1hr": b[13],
+               "pm25": b[14], "co2": b[15], "tempinf": b[16]}
         p = rollup_params(row, tz)
         if p is None:
             continue

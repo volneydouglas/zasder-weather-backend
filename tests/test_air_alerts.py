@@ -11,12 +11,13 @@ H = {"Authorization": "Bearer test-api-token"}
 
 
 def test_every_rule_field_has_label_unit_and_deadband(client):
-    from app.alerts import (AIR_FIELDS, THRESHOLD_FIELDS, _FIELD_LABELS,
-                            _FIELD_UNITS, _REARM_MARGIN)
+    from app.alerts import (AIR_FIELDS, EQUALITY_TOLERANCE, THRESHOLD_FIELDS,
+                            _FIELD_LABELS, _FIELD_UNITS, _REARM_MARGIN)
     for f in THRESHOLD_FIELDS:
         assert f in _FIELD_LABELS, f
         assert f in _FIELD_UNITS, f
         assert f in _REARM_MARGIN, f
+        assert f in EQUALITY_TOLERANCE, f
     assert AIR_FIELDS <= THRESHOLD_FIELDS
 
 
@@ -81,3 +82,19 @@ def test_air_rule_fires_on_the_monitor_and_skips_the_station(client, monkeypatch
     assert first == [("5D:5D:07:00:00:01", "Govee: CO2 alert",
                       "CO2 is 1180 ppm (> 1000 ppm)")]
     assert total == 1
+
+
+def test_equal_to_uses_the_field_tolerance(client):
+    """An equalTo rule's window is per field (the app's table): ±25 ppm for
+    CO2, ±1 µg/m³ for PM2.5, ±0.005 inHg for pressure, not one ±0.5."""
+    from app.alerts import EQUALITY_TOLERANCE, evaluate_rule
+    co2 = EQUALITY_TOLERANCE["co2"]
+    assert evaluate_rule("equalTo", 1000.0, 1010.0, 0, co2) == (True, True)
+    assert evaluate_rule("equalTo", 1000.0, 1030.0, 0, co2) == (False, False)
+    pm = EQUALITY_TOLERANCE["pm25"]
+    assert evaluate_rule("equalTo", 35.0, 35.8, 0, pm)[0]
+    assert not evaluate_rule("equalTo", 35.0, 36.2, 0, pm)[0]
+    inhg = EQUALITY_TOLERANCE["baromrelin"]
+    assert not evaluate_rule("equalTo", 29.92, 30.10, 0, inhg)[0]
+    # No tolerance given: the historical ±0.5 (test_pure pins it).
+    assert evaluate_rule("equalTo", 50.0, 50.3, 0)[0]

@@ -36,7 +36,11 @@ KIND_NOAA_MONTH = "noaa_month"
 KIND_NOAA_YEAR = "noaa_year"
 # 2.2 (Doren): "a day version in the NOAA style" — hour rows for one day.
 KIND_NOAA_DAY = "noaa_day"
-KINDS = (KIND_MORNING, KIND_STORM, KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY)
+# 2.2 (Doren): the forecast at a chosen time, tomorrow's in the evening or
+# today's in the morning, from the owner's source (app/outlook.py).
+KIND_OUTLOOK = "outlook"
+KINDS = (KIND_MORNING, KIND_STORM, KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY,
+         KIND_OUTLOOK)
 # The kinds `POST /api/reports/run` builds on demand.
 RUNNABLE_KINDS = (KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY)
 
@@ -308,6 +312,47 @@ def noaa_summary_line(payload: dict[str, Any], units: Any = None) -> str:
 
 def morning_key(for_date: str) -> str:
     return f"{KIND_MORNING}:{for_date}"
+
+
+def outlook_payload(report: Any) -> dict[str, Any]:
+    """An `outlook.OutlookReport` as the stored/served payload."""
+    return {
+        "date_label": report.date_label,
+        "for_date": report.for_date,
+        "when": report.when,
+        "hi_f": _num(report.hi_f),
+        "lo_f": _num(report.lo_f),
+        "precip_pct": _int(report.precip_pct),
+        "wind_max_mph": _num(report.wind_max_mph),
+        "sky": report.sky,
+        "narrative": report.narrative,
+        "sunrise": report.sunrise,
+        "sunset": report.sunset,
+        "source": report.source,
+        "fallback_from": report.fallback_from,
+    }
+
+
+def outlook_summary(payload: dict[str, Any], units: Any = None) -> str:
+    u = _units(units)
+    bits: list[str] = []
+    if payload.get("sky"):
+        bits.append(str(payload["sky"]).capitalize())
+    hi, lo = payload.get("hi_f"), payload.get("lo_f")
+    if hi is not None and lo is not None:
+        bits.append(f"{round(u.temp(hi))}/{round(u.temp(lo))}")
+    elif hi is not None:
+        bits.append(f"high {round(u.temp(hi))}")
+    pp = payload.get("precip_pct")
+    if pp is not None:
+        bits.append(f"{pp}% rain")
+    return ", ".join(bits) if bits else "Forecast"
+
+
+def outlook_key(for_date: str, when: str) -> str:
+    """One row per described day and slot: the evening report about
+    tomorrow and the next morning's about the same day are two reports."""
+    return f"{KIND_OUTLOOK}:{for_date}:{when}"
 
 
 def storm_key(mac: str, started_ms: int) -> str:

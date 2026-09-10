@@ -2826,6 +2826,10 @@ class AlertPrefsIn(BaseModel):
     digest_hour: int | None = Field(default=None, ge=-1, le=23)
     # 2.0: minute past the hour; -1 clears back to :00.
     digest_minute: int | None = Field(default=None, ge=-1, le=59)
+    # 2.2 outlook report: hour/minute (-1 clears) and the source.
+    outlook_hour: int | None = Field(default=None, ge=-1, le=23)
+    outlook_minute: int | None = Field(default=None, ge=-1, le=59)
+    outlook_source: str | None = Field(default=None, pattern="^(open-meteo|twc)$")
 
 
 class DeviceAlertIn(BaseModel):
@@ -2900,6 +2904,9 @@ async def _alerts_state() -> dict[str, Any]:
         "quiet_end_min": cfg.quiet_end_min,
         "digest_hour": cfg.digest_hour,
         "digest_minute": cfg.digest_minute,
+        "outlook_hour": cfg.outlook_hour,
+        "outlook_minute": cfg.outlook_minute,
+        "outlook_source": cfg.outlook_source,
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -3136,10 +3143,12 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             detail="quiet_start_min and quiet_end_min must be set together "
                    "(use -1 for both to clear)")
     for f in ("quiet_start_min", "quiet_end_min", "digest_hour",
-              "digest_minute"):
+              "digest_minute", "outlook_hour", "outlook_minute"):
         v = getattr(body, f)
         if v is not None:
             fields[f] = None if v < 0 else v
+    if body.outlook_source is not None:
+        fields["outlook_source"] = body.outlook_source
     if body.storm_quiet_minutes is not None:
         fields["storm_quiet_minutes"] = body.storm_quiet_minutes
     if body.storm_min_total_in is not None:

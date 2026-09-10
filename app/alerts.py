@@ -709,6 +709,11 @@ class EffectiveAlertConfig:
     # sent at 7:29 will likely be seen before one at 7am" (Volney): the
     # on-the-hour report lands in the same minute as everyone else's.
     digest_minute: int | None = None
+    # 2.2 outlook report (Doren): local hour/minute to send (None = off)
+    # and the forecast source, "open-meteo" (default) or "twc".
+    outlook_hour: int | None = None
+    outlook_minute: int | None = None
+    outlook_source: str | None = None
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -772,7 +777,10 @@ async def effective_config() -> EffectiveAlertConfig:
         quiet_start_min=_int_or_none(p.get("quiet_start_min")),
         quiet_end_min=_int_or_none(p.get("quiet_end_min")),
         digest_hour=_int_or_none(p.get("digest_hour")),
-        digest_minute=_int_or_none(p.get("digest_minute")))
+        digest_minute=_int_or_none(p.get("digest_minute")),
+        outlook_hour=_int_or_none(p.get("outlook_hour")),
+        outlook_minute=_int_or_none(p.get("outlook_minute")),
+        outlook_source=(str(p["outlook_source"]) if p.get("outlook_source") else None))
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -1133,6 +1141,10 @@ class AlertMonitor:
             await self._maybe_send_digest(cfg, devices, now_ms)
         except Exception:
             log.exception("morning report failed")
+        try:
+            await self._maybe_send_outlook(cfg, devices, now_ms)
+        except Exception:
+            log.exception("outlook report failed")
         # ── storm summary: one report per event, after the rain stops. Not
         # gated on smart_alerts — it is a different kind of thing, and the
         # rain counter it watches needs no derived inputs.
@@ -1521,6 +1533,84 @@ class AlertMonitor:
                      len(stations), len(rows))
         except Exception:
             log.exception("digest send failed; will retry next tick")
+
+    async def _maybe_send_outlook(self, cfg, devices, now_ms: int) -> None:
+        """2.2 (Doren): the forecast at a chosen time. Once per local day
+        at/after outlook_hour: tomorrow's forecast when the hour is noon
+        or later, today's before; from the owner's source; stored as a
+        report, pushed with its deep link, and emailed to the digest's
+        recipients. Stamped only when something was delivered (or there
+        was nobody to deliver to), so a transient failure retries next
+        tick, the morning report's rule."""
+        if cfg.outlook_hour is None:
+            return
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        local = datetime.fromtimestamp(now_ms / 1000, tz)
+        minute = int(cfg.outlook_minute or 0)
+        if local.hour * 60 + local.minute < int(cfg.outlook_hour) * 60 + minute:
+            return
+        if await db.get_kv("alerts.outlook.day") == local.date().isoformat():
+            return
+        from . import forecast_snapshots as fs
+        from . import outlook as ol
+        from . import reports as rp
+        coords = fs._coords(devices)
+        if coords is None:
+            log.info("outlook report skipped: no station coordinates")
+            await db.set_kv("alerts.outlook.day", local.date().isoformat())
+            return
+        source = cfg.outlook_source if cfg.outlook_source in ol.SOURCES else ol.SOURCE_OPEN_METEO
+        wu_key = None
+        if source == ol.SOURCE_TWC:
+            from .main import effective_wu_key
+            wu_key = await effective_wu_key()
+        daily, narrative, used, fallback = await self._fetch_outlook(
+            coords, source, wu_key, settings.timezone)
+        report = ol.build(daily, narrative=narrative, when=ol.slot_for(local.hour),
+                          now_local=local, source=used, fallback_from=fallback)
+        report_id = None
+        try:
+            payload = rp.outlook_payload(report)
+            report_id = await db.insert_report(
+                kind=rp.KIND_OUTLOOK, mac=None, ts_ms=now_ms,
+                for_date=report.for_date, title=ol.title(report),
+                summary=rp.outlook_summary(payload), payload=payload,
+                dedupe=rp.outlook_key(report.for_date, report.when))
+        except Exception:
+            log.exception("outlook report not stored; sending it anyway")
+        title, body = ol.push_text(report)
+        sent_any = False
+        had_targets = False
+        try:
+            if await apns.push_configured():
+                res = await apns.send_to_all(
+                    title, body,
+                    route=(f"report/{report_id}" if report_id else None))
+                sent_any = bool(res.get("sent"))
+                had_targets = bool(res.get("total"))
+        except Exception:
+            had_targets = True
+            log.exception("outlook push failed")
+        if cfg.enabled and cfg.recipients:
+            had_targets = True
+            try:
+                await asyncio.to_thread(_send_sync, "[Zasder Weather] " + title,
+                                        ol.text(report), cfg.recipients, cfg)
+                sent_any = True
+            except Exception:
+                log.exception("outlook email failed; will retry next tick")
+        if sent_any or not had_targets:
+            await db.set_kv("alerts.outlook.day", local.date().isoformat())
+            log.info("outlook report sent (%s, %s)", report.when, report.source)
+
+    async def _fetch_outlook(self, coords, source, wu_key, tz_name):
+        """Seam for tests: the provider call, nothing else."""
+        from . import outlook as ol
+        return await ol.fetch_daily(coords[0], coords[1], source=source,
+                                    wu_key=wu_key, tz_name=tz_name)
 
     async def _send_morning_phone(self, report, stations, local,
                                   now_ms: int,

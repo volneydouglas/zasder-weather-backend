@@ -125,21 +125,29 @@ def build_push(event: str, name: str, last_seen_ms: int | None,
 
 # ───────────────────────── threshold rules ─────────────────────────
 # Field keys match the iOS AlertRule / observation JSON keys.
+# The air-monitor pair (2.2, Doren: "a variable for air monitoring
+# alerts?") reads the columns the AirGradient and Govee pollers already
+# store; a station without them is skipped by the None check below, so
+# an "any device" CO2 rule only ever fires on a monitor.
 THRESHOLD_FIELDS = {
     "tempf", "feelsLike", "humidity", "dewPoint", "windspeedmph",
     "windgustmph", "dailyrainin", "hourlyrainin", "baromrelin", "uv",
+    "co2", "pm25",
 }
+AIR_FIELDS = {"co2", "pm25"}
 THRESHOLD_COMPARATORS = {"above", "below", "equalTo"}
 _FIELD_LABELS = {
     "tempf": "Temperature", "feelsLike": "Feels Like", "humidity": "Humidity",
     "dewPoint": "Dew Point", "windspeedmph": "Wind Speed", "windgustmph": "Wind Gust",
     "dailyrainin": "Rain Today", "hourlyrainin": "Rain Rate",
     "baromrelin": "Pressure", "uv": "UV Index",
+    "co2": "CO2", "pm25": "PM2.5",
 }
 _FIELD_UNITS = {
     "tempf": "°F", "feelsLike": "°F", "dewPoint": "°F", "humidity": "%",
     "windspeedmph": " mph", "windgustmph": " mph", "dailyrainin": " in",
     "hourlyrainin": " in/hr", "baromrelin": " inHg", "uv": "",
+    "co2": " ppm", "pm25": " µg/m³",
 }
 _COMPARATOR_SYM = {"above": ">", "below": "<", "equalTo": "="}
 
@@ -182,6 +190,11 @@ _REARM_MARGIN: dict[str, float] = {
     "dailyrainin": 0.02, "hourlyrainin": 0.02,          # in
     "baromrelin": 0.02,                                 # inHg
     "uv": 0.5,
+    # Air: a CO2 sensor drifts tens of ppm between reads and Govee's
+    # cloud repeats values for minutes, so a 1000 ppm rule needs a real
+    # deadband; PM2.5 is noisy at the low end where a 12 µg/m³ rule sits.
+    "co2": 50.0,                                        # ppm
+    "pm25": 3.0,                                        # µg/m³
 }
 
 

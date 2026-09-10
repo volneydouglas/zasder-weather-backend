@@ -1134,11 +1134,25 @@ async def init_db(path: str | None = None) -> None:
         # table shipped (1.6). Existing days read NULL (= "no data") until a
         # rebuild folds history in — never 0, a station with no detector
         # must stay absent from lightning records.
+        # 2.2 widened the list (sums for means, the air-monitor pair,
+        # indoor temperature); insights.ROLLUP_LATE_COLUMNS is the one
+        # place they are named. Adding any marks the rollups dirty so
+        # the lifespan rebuild folds history in (same nonce rule as the
+        # backfill above).
         cur = await db.execute("PRAGMA table_info(daily_rollups)")
         existing = {r[1] for r in await cur.fetchall()}
-        if "lightning_max" not in existing:
+        from .insights import ROLLUP_LATE_COLUMNS
+        added_rollup_cols = False
+        for col, decl in ROLLUP_LATE_COLUMNS:
+            if col not in existing:
+                await db.execute(
+                    f"ALTER TABLE daily_rollups ADD COLUMN {col} {decl}")
+                added_rollup_cols = True
+        if added_rollup_cols and existing:
             await db.execute(
-                "ALTER TABLE daily_rollups ADD COLUMN lightning_max REAL")
+                "INSERT INTO server_kv (k, v) VALUES "
+                "('rollups_dirty', lower(hex(randomblob(8)))) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v")
         # Same migration for hour_rollups: feels_* came after the table
         # shipped. Existing rows get 0/0 (= "no data"), so the feels-like
         # diurnal grid stays empty until a rebuild folds history in.

@@ -288,11 +288,15 @@ _DAILY_COLS = (
     "windspeedmph_max", "windgustmph_max", "baromrelin_min", "baromrelin_max",
     "dew_point_min", "dew_point_max", "feels_like_min", "feels_like_max",
     "uv_max", "solarradiation_max", "rain_total", "lightning_max",
+    # 2.2: the air-monitor pair and indoor temperature.
+    "pm25_min", "pm25_max", "co2_min", "co2_max", "tempinf_min", "tempinf_max",
 )
+# Means from the day's sum/n pairs (2.2); reported as <stem>_mean.
+_DAILY_MEANS = ("humidity", "windspeedmph", "baromrelin", "pm25", "co2")
 
 
 async def _daily_summary(args: dict, role: str) -> dict:
-    from . import climate
+    from . import climate, insights
     _require_insights()
     mac = await _known_mac(args.get("mac"))
     first = _day(args.get("start_day"), "start_day")
@@ -314,11 +318,14 @@ async def _daily_summary(args: dict, role: str) -> dict:
         total = r["tempf_sum"] if "tempf_sum" in keys else None
         d["tempf_mean"] = (round(total / n, 2)
                            if n and total is not None else None)
+        for stem in _DAILY_MEANS:
+            d[f"{stem}_mean"] = insights.rollup_mean(r, stem)
         days.append(d)
     return {"mac": mac, "start_day": first, "end_day": last,
             "count": len(days), "days": days,
-            "note": "rain_total is the day's gauge total; tempf_mean is the "
-                    "mean of every reading that day, not (min+max)/2"}
+            "note": "rain_total is the day's gauge total; every *_mean is the "
+                    "mean of that day's readings, not (min+max)/2; pm25 in "
+                    "µg/m³ and co2 in ppm are null on a weather station"}
 
 
 async def _records(args: dict, role: str) -> dict:

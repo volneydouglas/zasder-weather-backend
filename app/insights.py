@@ -137,6 +137,15 @@ CREATE TABLE IF NOT EXISTS daily_rollups (
     rain_total REAL,                    -- max(dailyrainin) seen that day
     yearly_min REAL, yearly_max REAL,   -- fallback rain delta for SDR sources
     lightning_max REAL,                 -- peak strikes/hr that day (1.6; ALTERed in)
+    -- 2.2 (ALTERed in; db.init_db lists them in ROLLUP_LATE_COLUMNS):
+    -- sums for the long-period means the MCP analyses asked for, and the
+    -- air-monitor pair so daily_summary answers for an AirGradient/Govee.
+    humidity_sum REAL, humidity_n INTEGER,
+    windspeedmph_sum REAL, windspeedmph_n INTEGER,
+    baromrelin_sum REAL, baromrelin_n INTEGER,
+    pm25_min REAL, pm25_max REAL, pm25_sum REAL, pm25_n INTEGER,
+    co2_min REAL, co2_max REAL, co2_sum REAL, co2_n INTEGER,
+    tempinf_min REAL, tempinf_max REAL,
     PRIMARY KEY (mac, day)
 );
 
@@ -179,19 +188,68 @@ CREATE TABLE IF NOT EXISTS comfort_rollups (
 COMFORT_LOW_F = 60.0
 COMFORT_HIGH_F = 80.0
 
+# daily_rollups columns that arrived after the table shipped, with their
+# DDL. db.init_db ALTERs any that are missing and marks the rollups dirty
+# so the lifespan rebuild folds history into them; until then old days
+# read NULL (= "no data"), never 0.
+ROLLUP_LATE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("lightning_max", "REAL"),
+    ("humidity_sum", "REAL"), ("humidity_n", "INTEGER"),
+    ("windspeedmph_sum", "REAL"), ("windspeedmph_n", "INTEGER"),
+    ("baromrelin_sum", "REAL"), ("baromrelin_n", "INTEGER"),
+    ("pm25_min", "REAL"), ("pm25_max", "REAL"), ("pm25_sum", "REAL"), ("pm25_n", "INTEGER"),
+    ("co2_min", "REAL"), ("co2_max", "REAL"), ("co2_sum", "REAL"), ("co2_n", "INTEGER"),
+    ("tempinf_min", "REAL"), ("tempinf_max", "REAL"),
+)
+
+# (column stem) -> the rollup_params key that feeds it, for the sum/n pairs.
+MEAN_STEMS: tuple[tuple[str, str], ...] = (
+    ("humidity", "humidity"), ("windspeedmph", "windspeedmph"),
+    ("baromrelin", "baromrelin"), ("pm25", "pm25"), ("co2", "co2"),
+)
+
+
+def rollup_mean(row: Any, stem: str) -> float | None:
+    """Mean of a day's readings from its sum/n pair, None when absent.
+    Rows are sqlite Row or dict; a pre-2.2 row without the columns is None."""
+    try:
+        keys = row.keys()
+        if f"{stem}_sum" not in keys or f"{stem}_n" not in keys:
+            return None
+        total, n = row[f"{stem}_sum"], row[f"{stem}_n"]
+    except (AttributeError, KeyError, IndexError):
+        return None
+    if not n or total is None:
+        return None
+    try:
+        v = float(total) / float(n)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return round(v, 2) if math.isfinite(v) else None
+
 _UPSERT_DAILY = """
 INSERT INTO daily_rollups (mac, day,
     tempf_min, tempf_max, tempf_sum, tempf_n,
     humidity_min, humidity_max, windspeedmph_max, windgustmph_max,
     baromrelin_min, baromrelin_max, dew_point_min, dew_point_max,
     feels_like_min, feels_like_max, uv_max, solarradiation_max,
-    rain_total, yearly_min, yearly_max, lightning_max)
+    rain_total, yearly_min, yearly_max, lightning_max,
+    humidity_sum, humidity_n, windspeedmph_sum, windspeedmph_n,
+    baromrelin_sum, baromrelin_n,
+    pm25_min, pm25_max, pm25_sum, pm25_n,
+    co2_min, co2_max, co2_sum, co2_n,
+    tempinf_min, tempinf_max)
 VALUES (:mac, :day,
     :tempf, :tempf, :tempf, :tempf_n,
     :humidity, :humidity, :windspeedmph, :windgustmph,
     :baromrelin, :baromrelin, :dew_point, :dew_point,
     :feels_like, :feels_like, :uv, :solarradiation,
-    :dailyrainin, :yearlyrainin, :yearlyrainin, :lightning)
+    :dailyrainin, :yearlyrainin, :yearlyrainin, :lightning,
+    :humidity, :humidity_n, :windspeedmph, :windspeedmph_n,
+    :baromrelin, :baromrelin_n,
+    :pm25, :pm25, :pm25, :pm25_n,
+    :co2, :co2, :co2, :co2_n,
+    :tempinf, :tempinf)
 ON CONFLICT(mac, day) DO UPDATE SET
     tempf_min = MIN(COALESCE(tempf_min, :tempf), COALESCE(:tempf, tempf_min)),
     tempf_max = MAX(COALESCE(tempf_max, :tempf), COALESCE(:tempf, tempf_max)),
@@ -212,7 +270,23 @@ ON CONFLICT(mac, day) DO UPDATE SET
     rain_total = MAX(COALESCE(rain_total, :dailyrainin), COALESCE(:dailyrainin, rain_total)),
     yearly_min = MIN(COALESCE(yearly_min, :yearlyrainin), COALESCE(:yearlyrainin, yearly_min)),
     yearly_max = MAX(COALESCE(yearly_max, :yearlyrainin), COALESCE(:yearlyrainin, yearly_max)),
-    lightning_max = MAX(COALESCE(lightning_max, :lightning), COALESCE(:lightning, lightning_max))
+    lightning_max = MAX(COALESCE(lightning_max, :lightning), COALESCE(:lightning, lightning_max)),
+    humidity_sum = COALESCE(humidity_sum, 0) + COALESCE(:humidity, 0),
+    humidity_n   = COALESCE(humidity_n, 0) + :humidity_n,
+    windspeedmph_sum = COALESCE(windspeedmph_sum, 0) + COALESCE(:windspeedmph, 0),
+    windspeedmph_n   = COALESCE(windspeedmph_n, 0) + :windspeedmph_n,
+    baromrelin_sum = COALESCE(baromrelin_sum, 0) + COALESCE(:baromrelin, 0),
+    baromrelin_n   = COALESCE(baromrelin_n, 0) + :baromrelin_n,
+    pm25_min = MIN(COALESCE(pm25_min, :pm25), COALESCE(:pm25, pm25_min)),
+    pm25_max = MAX(COALESCE(pm25_max, :pm25), COALESCE(:pm25, pm25_max)),
+    pm25_sum = COALESCE(pm25_sum, 0) + COALESCE(:pm25, 0),
+    pm25_n   = COALESCE(pm25_n, 0) + :pm25_n,
+    co2_min = MIN(COALESCE(co2_min, :co2), COALESCE(:co2, co2_min)),
+    co2_max = MAX(COALESCE(co2_max, :co2), COALESCE(:co2, co2_max)),
+    co2_sum = COALESCE(co2_sum, 0) + COALESCE(:co2, 0),
+    co2_n   = COALESCE(co2_n, 0) + :co2_n,
+    tempinf_min = MIN(COALESCE(tempinf_min, :tempinf), COALESCE(:tempinf, tempinf_min)),
+    tempinf_max = MAX(COALESCE(tempinf_max, :tempinf), COALESCE(:tempinf, tempinf_max))
 """
 
 _UPSERT_HOUR = """
@@ -288,6 +362,8 @@ def rollup_params(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any] | None:
         return None
 
     tempf = num("tempf")
+    humidity, wind, barom = num("humidity"), num("windspeedmph"), num("baromrelin")
+    pm25, co2 = num("pm25"), num("co2")
     return {
         "mac": row.get("_mac"),          # filled by caller
         "day": local.strftime("%Y-%m-%d"),
@@ -296,10 +372,20 @@ def rollup_params(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any] | None:
         "_hour": local.hour,
         "tempf": tempf,
         "tempf_n": 1 if tempf is not None else 0,
-        "humidity": num("humidity"),
-        "windspeedmph": num("windspeedmph"),
+        "humidity": humidity,
+        "humidity_n": 1 if humidity is not None else 0,
+        "windspeedmph": wind,
+        "windspeedmph_n": 1 if wind is not None else 0,
         "windgustmph": num("windgustmph"),
-        "baromrelin": num("baromrelin"),
+        "baromrelin": barom,
+        "baromrelin_n": 1 if barom is not None else 0,
+        # Air monitors (2.2): min/max/mean per day, so daily_summary
+        # answers for an AirGradient or Govee instead of a row of nulls.
+        "pm25": pm25,
+        "pm25_n": 1 if pm25 is not None else 0,
+        "co2": co2,
+        "co2_n": 1 if co2 is not None else 0,
+        "tempinf": num("tempinf"),
         "dew_point": num("dewPoint"),
         "feels_like": num("feelsLike"),
         "uv": num("uv"),

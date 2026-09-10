@@ -1089,6 +1089,8 @@ async def init_db(path: str | None = None) -> None:
             # 2.2 outlook report: send time + forecast source.
             ("outlook_hour", "INTEGER"), ("outlook_minute", "INTEGER"),
             ("outlook_source", "TEXT"),
+            # 2.2 sky notes.
+            ("sky_notes", "INTEGER"), ("sky_good_only", "INTEGER"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
@@ -2470,7 +2472,7 @@ _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipie
                     "heat_day", "heat_day_threshold_f",
                     "quiet_start_min", "quiet_end_min", "digest_hour",
                     "digest_minute", "outlook_hour", "outlook_minute",
-                    "outlook_source")
+                    "outlook_source", "sky_notes", "sky_good_only")
 
 
 async def get_alert_prefs() -> dict[str, Any]:

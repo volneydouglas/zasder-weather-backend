@@ -297,6 +297,8 @@ ALERT_SEVERITY: dict[str, str] = {
     "sensor_recovered": "info",
     # 2.2 source watchdog: the recovery is good news.
     "source_recovered": "info",
+    # 2.2 sky notes: sunset, the moon, and the scope's verdict.
+    "sky": "info",
     "device_recovered": "info",
     "battery_recovered": "info",
     "disk_recovered": "info",
@@ -714,6 +716,10 @@ class EffectiveAlertConfig:
     outlook_hour: int | None = None
     outlook_minute: int | None = None
     outlook_source: str | None = None
+    # 2.2 sky notes (Doren): a note around sunset with the sun, the moon
+    # and a stargazing verdict; `sky_good_only` sends it on good nights only.
+    sky_notes: bool = False
+    sky_good_only: bool = False
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -780,7 +786,9 @@ async def effective_config() -> EffectiveAlertConfig:
         digest_minute=_int_or_none(p.get("digest_minute")),
         outlook_hour=_int_or_none(p.get("outlook_hour")),
         outlook_minute=_int_or_none(p.get("outlook_minute")),
-        outlook_source=(str(p["outlook_source"]) if p.get("outlook_source") else None))
+        outlook_source=(str(p["outlook_source"]) if p.get("outlook_source") else None),
+        sky_notes=bool(p.get("sky_notes")),
+        sky_good_only=bool(p.get("sky_good_only")))
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -1145,6 +1153,10 @@ class AlertMonitor:
             await self._maybe_send_outlook(cfg, devices, now_ms)
         except Exception:
             log.exception("outlook report failed")
+        try:
+            await self._maybe_send_sky(cfg, devices, now_ms)
+        except Exception:
+            log.exception("sky note failed")
         # ── storm summary: one report per event, after the rain stops. Not
         # gated on smart_alerts — it is a different kind of thing, and the
         # rain counter it watches needs no derived inputs.
@@ -1605,6 +1617,73 @@ class AlertMonitor:
         if sent_any or not had_targets:
             await db.set_kv("alerts.outlook.day", local.date().isoformat())
             log.info("outlook report sent (%s, %s)", report.when, report.source)
+
+    async def _maybe_send_sky(self, cfg, devices, now_ms: int) -> None:
+        """2.2 sky notes: from 45 minutes before sunset, once per local
+        day. Tonight's clouds from the forecast, the rest from the
+        station's own reading and the almanac. On `sky_good_only` a fair
+        or poor night is stamped and never sent."""
+        if not cfg.sky_notes:
+            return
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        local = datetime.fromtimestamp(now_ms / 1000, tz)
+        day_key = local.date().isoformat()
+        if await db.get_kv("alerts.sky.day") == day_key:
+            return
+        from . import almanac, sky
+        from . import forecast_snapshots as fs
+        coords = fs._coords(devices)
+        if coords is None:
+            await db.set_kv("alerts.sky.day", day_key)
+            return
+        lat, lon = coords
+        sunset = almanac.sunset(lat, lon, local.date(), tz)
+        if sunset is None:
+            await db.set_kv("alerts.sky.day", day_key)
+            return
+        if local < sunset - timedelta(minutes=45):
+            return
+        # The station's reading: the first weather station with a temperature.
+        last: dict = {}
+        for d in devices:
+            ld = d.get("lastData") or {}
+            if isinstance(ld, dict) and ld.get("tempf") is not None and not db.is_air_monitor_device(d):
+                last = ld
+                break
+        tempf, dew = last.get("tempf"), last.get("dewPoint")
+        spread = (float(tempf) - float(dew)) if (tempf is not None and dew is not None) else None
+        evening = local.replace(hour=22, minute=0, second=0, microsecond=0)
+        illum = almanac.moon_illumination(evening)
+        moon_up = almanac.moon_altitude_deg(lat, lon, evening) > 0
+        clouds = await self._fetch_clouds(lat, lon, settings.timezone, local)
+        inputs = sky.SkyInputs(
+            cloud_pct=clouds,
+            humidity_pct=float(last["humidity"]) if last.get("humidity") is not None else None,
+            dew_spread_f=spread,
+            wind_mph=float(last["windspeedmph"]) if last.get("windspeedmph") is not None else None,
+            moon_illumination=illum, moon_up=moon_up)
+        sunrise_next = almanac.sunrise(lat, lon, local.date() + timedelta(days=1), tz)
+        title, body, v = sky.note(sunset_local=sunset, sunrise_next_local=sunrise_next,
+                                  moon_phase=almanac.moon_phase_name(evening),
+                                  moon_illumination=illum, inputs=inputs)
+        if cfg.sky_good_only and v != sky.GOOD:
+            await db.set_kv("alerts.sky.day", day_key)
+            log.info("sky note held: %s night", v)
+            return
+        delivered = await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
+                                   email_ok=cfg.email_scope == "all",
+                                   kind="sky", severity="info")
+        if delivered:
+            await db.set_kv("alerts.sky.day", day_key)
+            log.info("sky note sent: %s night", v)
+
+    async def _fetch_clouds(self, lat, lon, tz_name, now_local):
+        """Seam for tests: tonight's mean cloud cover, nothing else."""
+        from . import sky
+        return await sky.tonight_cloud_pct(lat, lon, tz_name, now_local)
 
     async def _fetch_outlook(self, coords, source, wu_key, tz_name):
         """Seam for tests: the provider call, nothing else."""

@@ -2830,6 +2830,9 @@ class AlertPrefsIn(BaseModel):
     outlook_hour: int | None = Field(default=None, ge=-1, le=23)
     outlook_minute: int | None = Field(default=None, ge=-1, le=59)
     outlook_source: str | None = Field(default=None, pattern="^(open-meteo|twc)$")
+    # 2.2 sky notes.
+    sky_notes: bool | None = None
+    sky_good_only: bool | None = None
 
 
 class DeviceAlertIn(BaseModel):
@@ -2907,6 +2910,8 @@ async def _alerts_state() -> dict[str, Any]:
         "outlook_hour": cfg.outlook_hour,
         "outlook_minute": cfg.outlook_minute,
         "outlook_source": cfg.outlook_source,
+        "sky_notes": cfg.sky_notes,
+        "sky_good_only": cfg.sky_good_only,
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -3149,6 +3154,10 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             fields[f] = None if v < 0 else v
     if body.outlook_source is not None:
         fields["outlook_source"] = body.outlook_source
+    for f in ("sky_notes", "sky_good_only"):
+        v = getattr(body, f)
+        if v is not None:
+            fields[f] = 1 if v else 0
     if body.storm_quiet_minutes is not None:
         fields["storm_quiet_minutes"] = body.storm_quiet_minutes
     if body.storm_min_total_in is not None:

@@ -53,3 +53,37 @@ def test_a_guest_reads_the_name_but_cannot_set_it(client):
                       json={"name": "Mine now"}).status_code == 403
     assert client.get("/api/config/server-name").status_code == 401
     assert client.put("/api/config/server-name", json={"name": "x"}).status_code == 401
+
+
+# ── 2.2: identity and hosting ────────────────────────────────────────────
+
+def test_session_carries_a_stable_server_id(client):
+    """Minted once, kept in the database, the same on every call: the app
+    keys per-server caches and preferences by it, not by URL."""
+    import uuid
+    a = client.get("/api/session", headers=H).json()["server_id"]
+    b = client.get("/api/session", headers=H).json()["server_id"]
+    assert a == b
+    uuid.UUID(a)  # well-formed
+    guest = client.get("/api/session", headers={"Authorization": "Bearer test-share-token"})
+    if guest.status_code == 200:
+        assert guest.json()["server_id"] == a, "the identity is the server's, not the token's"
+
+
+def test_version_route_does_not_leak_the_server_id(client):
+    """/api/version is open; an install id there would fingerprint every
+    self-hoster to anyone who can reach the port."""
+    body = client.get("/api/version").json()
+    assert "server_id" not in body
+
+
+def test_hosting_info_reads_the_platform_env(client, monkeypatch):
+    monkeypatch.delenv("FLY_APP_NAME", raising=False)
+    monkeypatch.delenv("FLY_REGION", raising=False)
+    assert client.get("/api/session", headers=H).json()["hosted"] == {
+        "platform": "other", "region": None, "app": None}
+    monkeypatch.setenv("FLY_APP_NAME", "zasder-weather-guest-doren")
+    monkeypatch.setenv("FLY_REGION", "iad")
+    assert client.get("/api/session", headers=H).json()["hosted"] == {
+        "platform": "fly", "region": "iad", "app": "zasder-weather-guest-doren"}
+

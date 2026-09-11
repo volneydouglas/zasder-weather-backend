@@ -30,11 +30,73 @@ class SourceState:
     last_error: str | None = None
     last_error_ms: int | None = None
     consecutive_failures: int = 0
+    # When the CURRENT failing streak began (the first failure after the last
+    # success). "Not responding since 13:27" is the sentence a user wants,
+    # and it is not derivable from last_error_ms, which is the latest retry.
+    failing_since_ms: int | None = None
     # Rows actually stored on the most recent successful tick. Zero over a long
     # run is its own kind of failure: the credentials work and the API answers,
     # but nothing new is arriving.
     last_rows: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+# Human names for the sources the apps show ("AirGradient's service has not
+# answered…"). custom-ingest has no vendor behind it and is deliberately
+# absent: its health is per device, not per source.
+LABELS: dict[str, str] = {
+    "ambientweather": "AmbientWeather",
+    "davis-cloud": "WeatherLink",
+    "tempest": "Tempest",
+    "airgradient": "AirGradient",
+    "airgradient-local": "AirGradient (local)",
+    "ecowitt-cloud": "Ecowitt",
+    "govee": "Govee",
+}
+
+# What a poller stamps into a device's `info.source` → the status name it
+# reports under. Anything not listed (relay boards, the WLL bridge, the
+# local Ecowitt push, custom scripts) is fed by a device on the user's own
+# network and has no vendor service to blame or absolve.
+DEVICE_SOURCES: dict[str, str] = {
+    "airgradient": "airgradient",
+    "airgradient-local": "airgradient-local",
+    "tempest": "tempest",
+    "ecowitt-cloud": "ecowitt-cloud",
+    "govee": "govee",
+    "davis-vp2-cloud": "davis-cloud",
+    "ambientweather": "ambientweather",
+}
+
+# Error kinds, in the order the tests pin them. The point is the sentence
+# the app can honestly show: a vendor outage is not the user's fault and not
+# ours; bad credentials are the user's to fix; anything else is ours.
+KIND_UPSTREAM = "upstream"
+KIND_CREDENTIALS = "credentials"
+KIND_RATE_LIMIT = "rate_limit"
+KIND_OURS = "ours"
+
+_CREDENTIALS = re.compile(
+    r"(?i)\b(401|403)\b|unauthori[sz]ed|forbidden|rejected the|invalid (api )?key|"
+    r"invalid token|bad credentials|authentication")
+_RATE_LIMIT = re.compile(r"(?i)\b429\b|rate.?limit|too many requests|quota")
+_UPSTREAM = re.compile(
+    r"(?i)\bHTTP 5\d\d\b|\b5\d\d (bad gateway|service unavailable|gateway timeout|"
+    r"internal server error)|timeout|timed out|connecterror|connectionerror|"
+    r"remoteprotocolerror|request failed|dns|name or service|unreachable|"
+    r"connection (refused|reset)|not a list|non-json|unexpected shape")
+
+
+def classify(error: str | None) -> str:
+    """Sort an upstream error message into who has to act."""
+    text = error or ""
+    if _CREDENTIALS.search(text):
+        return KIND_CREDENTIALS
+    if _RATE_LIMIT.search(text):
+        return KIND_RATE_LIMIT
+    if _UPSTREAM.search(text):
+        return KIND_UPSTREAM
+    return KIND_OURS
 
 
 # Process-global, like the other caches in main.py, and reset the same way in
@@ -73,6 +135,7 @@ def record_success(name: str, rows: int | None = None) -> None:
         st.last_success_ms = _now_ms()
         st.consecutive_failures = 0
         st.last_error = None
+        st.failing_since_ms = None
         if rows is not None:
             st.last_rows = rows
 
@@ -111,9 +174,49 @@ def redact(text: str) -> str:
 def record_failure(name: str, error: str) -> None:
     with _LOCK:
         st = _STATES.setdefault(name, SourceState(name=name))
+        now = _now_ms()
         st.last_error = redact(error or "")[:300]   # bounded + credential-free
-        st.last_error_ms = _now_ms()
+        st.last_error_ms = now
+        if st.consecutive_failures == 0:
+            st.failing_since_ms = now
         st.consecutive_failures += 1
+
+
+def _health(st: SourceState, now: int) -> dict[str, Any]:
+    age_s = None if st.last_success_ms is None else (now - st.last_success_ms) / 1000
+    return {
+        "name": st.name,
+        "label": LABELS.get(st.name),
+        "configured": st.configured,
+        "healthy": st.configured and st.consecutive_failures == 0
+                   and st.last_success_ms is not None,
+        "last_success_ms": st.last_success_ms,
+        "seconds_since_success": None if age_s is None else round(age_s, 1),
+        "last_error": st.last_error,
+        "last_error_kind": classify(st.last_error) if st.last_error else None,
+        "last_error_ms": st.last_error_ms,
+        "failing_since_ms": st.failing_since_ms,
+        "consecutive_failures": st.consecutive_failures,
+        "last_rows": st.last_rows,
+    }
+
+
+def health_for_device(info_source: str | None) -> dict[str, Any] | None:
+    """The health of the poller behind a device, for `/api/devices`.
+
+    None for a device nobody polls for (relay boards, the WLL bridge, local
+    pushes): their health is their own last-seen. Also None for a poller the
+    server has not declared this boot, so a stale row from a retired
+    integration does not carry a phantom verdict.
+    """
+    name = DEVICE_SOURCES.get(info_source or "")
+    if name is None:
+        return None
+    with _LOCK:
+        st = _STATES.get(name)
+        if st is None:
+            return None
+        return _health(st, _now_ms())
 
 
 def snapshot() -> list[dict[str, Any]]:
@@ -124,19 +227,9 @@ def snapshot() -> list[dict[str, Any]]:
         states = list(_STATES.values())
     out = []
     for st in states:
-        age_s = None if st.last_success_ms is None else (now - st.last_success_ms) / 1000
-        out.append({
-            "name": st.name,
-            "configured": st.configured,
-            "healthy": st.configured and st.consecutive_failures == 0
-                       and st.last_success_ms is not None,
-            "last_success_ms": st.last_success_ms,
-            "seconds_since_success": None if age_s is None else round(age_s, 1),
-            "last_error": st.last_error,
-            "last_error_ms": st.last_error_ms,
-            "consecutive_failures": st.consecutive_failures,
-            "last_rows": st.last_rows,
-            **({"extra": st.extra} if st.extra else {}),
-        })
+        row = _health(st, now)
+        if st.extra:
+            row["extra"] = st.extra
+        out.append(row)
     out.sort(key=lambda d: (d["healthy"], not d["configured"], d["name"]))
     return out

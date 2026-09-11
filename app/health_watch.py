@@ -219,3 +219,78 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
                 await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
         elif not flat and prev:
             await db.upsert_smart_alert_state(mac, kind, 0, now_ms)
+
+
+# ── source watchdog (2.2) ─────────────────────────────────────────────────
+# A configured cloud poller that keeps failing used to be invisible: the
+# station went quiet and looked like dead hardware. One alert per episode
+# names the vendor and the kind of failure; one more says it recovered.
+# State rides in smart_alert_state under a pseudo-MAC so the recovery edge
+# survives restarts the way the sensor edges do.
+
+_SOURCE_KIND = "source_down"
+
+
+def _source_key(name: str) -> str:
+    return f"source:{name}"
+
+
+def source_down_copy(label: str, kind: str, hours: float,
+                     last_error: str | None) -> tuple[str, str]:
+    """Title and body for a failing source, honest about whose problem it is."""
+    err = f" ({last_error})" if last_error else ""
+    h = f"{hours:.0f} h" if hours >= 1 else f"{hours * 60:.0f} min"
+    if kind == "credentials":
+        return (f"{label} is rejecting the saved credentials",
+                f"{label} has refused this server's credentials for {h}{err}. "
+                f"Check the key under Settings → Data & Integrations. "
+                f"Your station is fine; nothing arrives until the key is.")
+    if kind == "rate_limit":
+        return (f"{label} is rate-limiting this server",
+                f"{label} has been turning requests away for {h}{err}. "
+                f"Readings resume when their quota resets.")
+    if kind == "upstream":
+        return (f"{label}'s service is not answering",
+                f"{label}'s service has not answered this server for {h}{err}. "
+                f"Your station and this server are fine; readings resume "
+                f"on their own when {label} does.")
+    return (f"Readings from {label} are not being stored",
+            f"{label} answers, but this server has failed to store its "
+            f"readings for {h}{err}. This one is on the server.")
+
+
+async def check_sources(cfg, now_ms: int, deliver,
+                        quiet_minutes: float | None = None) -> None:
+    from . import source_status
+    from .config import settings
+
+    minutes = settings.source_alert_minutes if quiet_minutes is None else quiet_minutes
+    if not minutes or minutes <= 0:
+        return
+    quiet_ms = int(minutes * 60_000)
+    states = await db.get_smart_alert_states()
+    for src in source_status.snapshot():
+        name = src["name"]
+        label = src.get("label")
+        if not src["configured"] or label is None:
+            continue
+        key = _source_key(name)
+        prev = states.get((key, _SOURCE_KIND), 0)
+        since = src.get("failing_since_ms")
+        failing = src["consecutive_failures"] > 0 and since is not None
+        if failing and not prev and now_ms - int(since) >= quiet_ms:
+            hours = (now_ms - int(since)) / 3_600_000
+            kind = src.get("last_error_kind") or "ours"
+            title, body = source_down_copy(label, kind, hours, src.get("last_error"))
+            # Same channel rule as device-down: an outage is the one thing a
+            # device_down email scope exists for.
+            if await deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
+                             email_ok=True, kind=_SOURCE_KIND, mac=None):
+                await db.upsert_smart_alert_state(key, _SOURCE_KIND, 1, now_ms)
+        elif prev and not failing and src["last_success_ms"] is not None:
+            title = f"{label} is answering again"
+            body = f"{label}'s readings are arriving again."
+            if await deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
+                             email_ok=True, kind="source_recovered", mac=None):
+                await db.upsert_smart_alert_state(key, _SOURCE_KIND, 0, now_ms)
+

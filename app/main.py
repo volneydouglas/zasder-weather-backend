@@ -6,6 +6,7 @@ import html as _html
 import math
 import logging
 import os
+import uuid
 import re
 import secrets
 import shutil
@@ -304,6 +305,16 @@ async def lifespan(app: FastAPI):
     # the 1.8.0 upgrade crash-looped. Strong ref on app.state; charts are
     # slower-but-correct until it completes, and an interrupted run just
     # defers again next boot.
+    # 2.2: a stable identity for THIS server's data, minted once and kept
+    # in the database, so an app holding several connections can key its
+    # caches and per-station preferences by server rather than by URL
+    # (a renamed host or a second address is still the same server; a
+    # snapshot restored elsewhere brings its identity with its data).
+    # BEFORE the chart-index rebuild is kicked off: that job takes the
+    # SQLite write lock for minutes on a big archive, and a first-boot
+    # set_kv behind it would sit on busy_timeout past Fly's health check
+    # (CodeRabbit, PR #37).
+    await ensure_server_id()
     app.state.chart_index_task = None
     if db.chart_index_rebuild_needed():
         app.state.chart_index_task = asyncio.create_task(_chart_index_job())
@@ -2760,6 +2771,14 @@ async def get_devices(
     devices = await db.list_devices()
     if _is_limited_read(authorization):
         devices = _strip_device_pii(devices)
+    # 2.2: the health of the poller behind each device, so a quiet station
+    # can say "AirGradient's service is not answering" instead of looking
+    # like dead hardware. Process state, so it rides on here and not in
+    # db.list_devices; None for devices nobody polls for. Credentials never
+    # appear (source_status.redact), so guests get it too.
+    for d in devices:
+        d["source_health"] = source_status.health_for_device(
+            (d.get("info") or {}).get("source"))
     return JSONResponse(devices)
 
 
@@ -2807,6 +2826,13 @@ class AlertPrefsIn(BaseModel):
     digest_hour: int | None = Field(default=None, ge=-1, le=23)
     # 2.0: minute past the hour; -1 clears back to :00.
     digest_minute: int | None = Field(default=None, ge=-1, le=59)
+    # 2.2 outlook report: hour/minute (-1 clears) and the source.
+    outlook_hour: int | None = Field(default=None, ge=-1, le=23)
+    outlook_minute: int | None = Field(default=None, ge=-1, le=59)
+    outlook_source: str | None = Field(default=None, pattern="^(open-meteo|twc)$")
+    # 2.2 sky notes.
+    sky_notes: bool | None = None
+    sky_good_only: bool | None = None
 
 
 class DeviceAlertIn(BaseModel):
@@ -2881,6 +2907,13 @@ async def _alerts_state() -> dict[str, Any]:
         "quiet_end_min": cfg.quiet_end_min,
         "digest_hour": cfg.digest_hour,
         "digest_minute": cfg.digest_minute,
+        "outlook_hour": cfg.outlook_hour,
+        "outlook_minute": cfg.outlook_minute,
+        # Effective, never null: the app shows the Outlook controls when a
+        # server answers this field at all (CodeRabbit, PR #37).
+        "outlook_source": cfg.outlook_source or "open-meteo",
+        "sky_notes": cfg.sky_notes,
+        "sky_good_only": cfg.sky_good_only,
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -2932,7 +2965,40 @@ async def get_session(
     name = await effective_server_name()
     return JSONResponse({"can_write": can_write, "forecast_source": src,
                          "server_name": name["name"],
-                         "role": "owner" if can_write else "guest"})
+                         "role": "owner" if can_write else "guest",
+                         # 2.2: stable identity + where this server runs, so
+                         # the app can say "Hosted on Fly.io, iad" and key
+                         # its per-server state by something a URL change
+                         # does not break. Token-gated: an install id is
+                         # a fingerprint and does not belong on /api/version.
+                         "server_id": await ensure_server_id(),
+                         "hosted": hosting_info()})
+
+
+SERVER_ID_KEY = "server_id"
+
+
+async def ensure_server_id() -> str:
+    """The server's stable identity: a UUID minted on first boot and kept in
+    the database beside the data it identifies. Idempotent."""
+    existing = await db.get_kv(SERVER_ID_KEY)
+    if existing and len(existing) >= 8:
+        return existing
+    new = str(uuid.uuid4())
+    await db.set_kv(SERVER_ID_KEY, new)
+    # A concurrent first caller may have won; the stored value is the truth.
+    return (await db.get_kv(SERVER_ID_KEY)) or new
+
+
+def hosting_info() -> dict[str, Any]:
+    """Where this server runs, from the platform's own environment. Fly
+    injects FLY_APP_NAME and FLY_REGION into every machine; anything else
+    is reported as 'other' rather than guessed at."""
+    app_name = os.environ.get("FLY_APP_NAME")
+    if app_name:
+        return {"platform": "fly", "region": os.environ.get("FLY_REGION"),
+                "app": app_name}
+    return {"platform": "other", "region": None, "app": None}
 
 
 SERVER_NAME_MAX = 60
@@ -3027,14 +3093,21 @@ async def approve_oauth_client(client_id: str) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+class ConnectCodeIn(BaseModel):
+    """Optional: the pending client this code is for (2.2, SEC-G5)."""
+    client_id: str | None = Field(default=None, max_length=128)
+
+
 @app.post("/api/oauth/connect-code",
           dependencies=[Depends(require_mcp_enabled), Depends(require_write_token)])
-async def mint_oauth_connect_code() -> JSONResponse:
+async def mint_oauth_connect_code(body: ConnectCodeIn | None = None) -> JSONResponse:
     """A one-shot, ten-minute code the owner types on the consent page in
     place of the API token (SEC-1). Minting it is the proof: only the
-    write token can. Never logged; the response is the only copy."""
+    write token can. Never logged; the response is the only copy. With a
+    client_id the code approves only that registration (SEC-G5)."""
     from . import oauth
-    return JSONResponse(await oauth.mint_connect_code(),
+    cid = (body.client_id or "").strip() if body else ""
+    return JSONResponse(await oauth.mint_connect_code(cid or None),
                         headers={"Cache-Control": "no-store"})
 
 
@@ -3077,10 +3150,16 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             detail="quiet_start_min and quiet_end_min must be set together "
                    "(use -1 for both to clear)")
     for f in ("quiet_start_min", "quiet_end_min", "digest_hour",
-              "digest_minute"):
+              "digest_minute", "outlook_hour", "outlook_minute"):
         v = getattr(body, f)
         if v is not None:
             fields[f] = None if v < 0 else v
+    if body.outlook_source is not None:
+        fields["outlook_source"] = body.outlook_source
+    for f in ("sky_notes", "sky_good_only"):
+        v = getattr(body, f)
+        if v is not None:
+            fields[f] = 1 if v else 0
     if body.storm_quiet_minutes is not None:
         fields["storm_quiet_minutes"] = body.storm_quiet_minutes
     if body.storm_min_total_in is not None:
@@ -3572,6 +3651,8 @@ class ReportRunIn(BaseModel):
     mac: str = Field(min_length=1, max_length=64)
     year: int = Field(ge=1970, le=2100)
     month: int | None = Field(default=None, ge=1, le=12)
+    # 2.2: the daily kind names its day; year/month are ignored for it.
+    day: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
 
 
 @app.post("/api/reports/run", dependencies=[Depends(require_write_token)])
@@ -3592,6 +3673,16 @@ async def run_report(body: ReportRunIn) -> JSONResponse:
     if body.kind == rp.KIND_NOAA_MONTH and body.month is None:
         raise HTTPException(status_code=400,
                             detail="month is required for noaa_month")
+    day_obj = None
+    if body.kind == rp.KIND_NOAA_DAY:
+        if body.day is None:
+            raise HTTPException(status_code=400,
+                                detail="day (YYYY-MM-DD) is required for noaa_day")
+        from datetime import date as _date
+        try:
+            day_obj = _date.fromisoformat(body.day)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="day is not a calendar date")
     from .ingest import _format_mac
     norm = _format_mac(body.mac)
     dev = next((d for d in await db.list_devices() if d["mac"] == norm), None)
@@ -3599,22 +3690,28 @@ async def run_report(body: ReportRunIn) -> JSONResponse:
         raise HTTPException(status_code=404, detail="no such device")
     name = dev.get("name") or norm
     month = body.month if body.kind == rp.KIND_NOAA_MONTH else None
-    if month is not None:
+    year = day_obj.year if day_obj else body.year
+    if day_obj is not None:
+        text = await climate.noaa_day_report(norm, name, day_obj)
+        numbers = await climate.noaa_day_numbers(norm, day_obj)
+    elif month is not None:
         text = await climate.noaa_month_report(norm, name, body.year, month)
         numbers = await climate.noaa_month_numbers(norm, body.year, month)
     else:
         text = await climate.noaa_year_report(norm, name, body.year)
         numbers = await climate.noaa_year_numbers(norm, body.year)
-    payload = rp.noaa_payload(body.kind, norm, name, body.year, month,
-                              text, numbers)
+    day_str = day_obj.isoformat() if day_obj else None
+    payload = rp.noaa_payload(body.kind, norm, name, year, month,
+                              text, numbers, day=day_str)
     now_ms = int(time.time() * 1000)
-    for_date = (f"{body.year}-{month:02d}-01" if month
+    for_date = (day_str if day_str
+                else f"{body.year}-{month:02d}-01" if month
                 else f"{body.year}-01-01")
     rid = await db.insert_report(
         kind=body.kind, mac=norm, ts_ms=now_ms, for_date=for_date,
-        title=rp.noaa_title(body.kind, name, body.year, month),
+        title=rp.noaa_title(body.kind, name, year, month, day=day_str),
         summary=rp.noaa_summary_line(payload), payload=payload,
-        dedupe=rp.noaa_key(body.kind, norm, body.year, month))
+        dedupe=rp.noaa_key(body.kind, norm, year, month, day=day_str))
     row = await db.get_report(rid) if rid is not None else None
     if row is None:
         raise HTTPException(status_code=500,

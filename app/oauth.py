@@ -457,12 +457,17 @@ async def approve_client(client_id: str) -> bool:
         return bool(cur.rowcount)
 
 
-async def mint_connect_code() -> dict[str, Any]:
+async def mint_connect_code(client_id: str | None = None) -> dict[str, Any]:
     """A one-shot, ten-minute code the owner mints in the app and types
     on the consent page in place of the API token. Stored hashed in
-    oauth_codes with scope 'connect' (no client, no redirect: it is not
-    an authorization code, it is proof of ownership). Minting is
-    write-token gated, so whoever holds one was the owner minutes ago."""
+    oauth_codes with scope 'connect' (no redirect: it is not an
+    authorization code, it is proof of ownership). Minting is
+    write-token gated, so whoever holds one was the owner minutes ago.
+
+    `client_id` (2.2, SEC-G5): mint the code FOR the pending client the
+    owner is looking at. A bound code approves only that registration, so
+    a look-alike registration that appears at the same moment cannot
+    spend it. Unbound codes keep working for any client, as before."""
     from . import db
     raw = CONNECT_PREFIX + secrets.token_urlsafe(18)
     now = _now_ms()
@@ -470,15 +475,17 @@ async def mint_connect_code() -> dict[str, Any]:
         await conn.execute(
             "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, "
             " scope, resource, role, created_ms, expires_ms) VALUES (?,?,?,?,?,?,?,?,?)",
-            (_hash(raw), "", "", "connect", "connect", "", "owner", now,
+            (_hash(raw), client_id or "", "", "connect", "connect", "", "owner", now,
              now + CONNECT_TTL_MS))
         await conn.commit()
-    return {"code": raw, "expires_in": CONNECT_TTL_MS // 1000}
+    return {"code": raw, "expires_in": CONNECT_TTL_MS // 1000,
+            "client_id": client_id or None}
 
 
-async def _consume_connect_code(raw: str) -> bool:
+async def _consume_connect_code(raw: str, client_id: str = "") -> bool:
     """Spend a connect code: True once, then never (single use under the
-    writer, like an authorization code)."""
+    writer, like an authorization code). A code minted for a specific
+    client is spent only on that client's page; an unbound one anywhere."""
     from . import db
     if not raw.startswith(CONNECT_PREFIX):
         return False
@@ -487,7 +494,8 @@ async def _consume_connect_code(raw: str) -> bool:
         await conn.execute("BEGIN IMMEDIATE")
         cur = await conn.execute(
             "DELETE FROM oauth_codes WHERE code_hash = ? AND scope = 'connect' "
-            "AND expires_ms >= ?", (_hash(raw), now))
+            "AND expires_ms >= ? AND (client_id = '' OR client_id = ?)",
+            (_hash(raw), now, client_id))
         await conn.commit()
         return (cur.rowcount or 0) == 1
 
@@ -909,12 +917,16 @@ async def authorize_submit(
         return got
     client, fields = got
     typed = (token or connect_code or "").strip()
-    if await _consume_connect_code(typed):
+    if await _consume_connect_code(typed, client["client_id"]):
         # The owner minted this minutes ago in the app: it proves ownership
-        # and, for a client not yet approved, IS the approval.
+        # and, for a client not yet approved, IS the approval. Logged
+        # (SEC-G5): an approval is the one event in this flow worth a
+        # line, and the name is the registration's own claim.
         role = "owner"
         if not client.get("approved"):
             await approve_client(client["client_id"])
+            log.info("oauth: client %s (%r) approved with a connect code",
+                     client["client_id"], str(client.get("client_name") or "")[:60])
     elif not client.get("approved"):
         # SEC-1: an unapproved client's page never takes the API token, so
         # a registration with a borrowed name cannot phish it.

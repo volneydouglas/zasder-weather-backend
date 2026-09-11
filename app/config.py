@@ -438,6 +438,12 @@ class Settings(BaseSettings):
     # normalization as the rain offsets. Set a MAC to 0 to stop monitoring it.
     alert_stale_minutes_by_mac: dict[str, float] = {}
     alert_check_interval_seconds: int = 60
+    # 2.2 source watchdog: minutes a configured cloud poller (AirGradient,
+    # Tempest, Ecowitt, Govee, WeatherLink, AmbientWeather) may keep failing
+    # before one alert says so, naming the vendor and the reason. 0 disables.
+    # Distinct from the device-down alert: that one says a STATION is quiet,
+    # this one says WHY when the answer is the vendor's service.
+    source_alert_minutes: int = 60
     # 0 = one email when a device goes stale (+ one when it recovers).
     # >0 = also re-send a reminder every N hours while it stays stale.
     alert_repeat_hours: float = 0.0

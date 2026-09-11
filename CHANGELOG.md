@@ -8,6 +8,172 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.2.0] — 2026-09-11
+
+### Added
+- **A quiet station now says whose fault it is.** Every device row from
+  `/api/devices` carries `source_health` for stations fed by a cloud poller
+  (AirGradient, Tempest, Ecowitt cloud, Govee, WeatherLink, AmbientWeather):
+  whether the poller is healthy, what it last said, when the failing streak
+  began, and a verdict on who has to act: the vendor's service is not
+  answering (`upstream`), the saved credentials were rejected
+  (`credentials`), the vendor is rate-limiting (`rate_limit`), or this
+  server failed to store the readings (`ours`). `/api/sources` reports the
+  same `label`, `last_error_kind` and `failing_since_ms`. Stations fed from
+  your own network (relay boards, the WeatherLink Live bridge, a local
+  Ecowitt push) carry `null`; their health is their own last-seen.
+- **Daily climate report.** History → Reports → Run a report can build
+  the NOAA-style table for a single day: one row per hour with mean, high
+  and low temperature, humidity, rain, peak gust and pressure, and the
+  day's totals, in the same fixed-width dress as the month and year
+  reports. `POST /api/reports/run` takes `kind: noaa_day` with a `day`
+  (YYYY-MM-DD); one row per station and day, a re-run updates it.
+- **A connect code can be minted for one pending app.** Connected apps
+  offers "Code for this app" beside Approve on a waiting registration;
+  that code approves only that app on its sign-in page, so a look-alike
+  registration that shows up at the same moment cannot spend it. The
+  plain connect code still works for any app. An approval by code is
+  logged with the app's name. (`POST /api/oauth/connect-code` takes an
+  optional `client_id`.)
+- **Source watchdog.** A cloud poller that keeps failing for
+  `SOURCE_ALERT_MINUTES` (default 60, 0 disables) raises one alert naming
+  the vendor and the reason, in the words above, and one notice when it
+  answers again. Delivered like a device-down alert, so a
+  device-offline-only email scope still gets it.
+
+- **Air-monitor alert rules.** CO2 (ppm) and PM2.5 (µg/m³) join the
+  threshold rule fields, read from the readings the AirGradient and Govee
+  pollers already store; a weather station, which has neither, is skipped.
+  Each field carries its own re-arm deadband (50 ppm, 3 µg/m³) and its own
+  equality window, and every rule field now has a per-field equality
+  window instead of one ±0.5 for all (a pressure rule at 29.92 inHg used
+  to fire nearly always).
+- **Daily rollups carry more.** Humidity, wind and pressure means, PM2.5
+  and CO2 min/max/mean, indoor temperature, and the yearly rain counter's
+  first and last reading of each day (ordered by the reading's own time,
+  so an import folding out of order cannot swap them). The MCP
+  `daily_summary` reports every `*_mean` and the air columns. Existing
+  installs rebuild in the background at first boot; old days read null
+  for the new fields until that finishes, never 0. A lifetime counter's
+  day is now last minus first, and a reset inside the day is a fact.
+- **Outlook report.** A forecast at a chosen time: tomorrow's in the
+  evening, today's before noon, from Open-Meteo or The Weather Company
+  through your WU key (falls back to Open-Meteo and says so). Sky, high,
+  low, precipitation chance, wind, sunrise and sunset, and the provider's
+  own prose when it has some. Stored in Reports, pushed with its link,
+  emailed to the digest's recipients; once per local day at
+  `outlook_hour`/`outlook_minute`, with `outlook_source` on the alert
+  preferences. It runs even with every alert channel off, so the report
+  still lands in Reports.
+- **Sky notes.** From 45 minutes before sunset, once a day: sunset and the
+  next sunrise, the moon's phase and how much of it is lit, and a verdict
+  for the telescope scored from tonight's cloud cover (Open-Meteo hourly,
+  20:00 to 02:00), the station's own humidity, dew spread and wind, and the
+  moon's light (weighted like cloud, free when it is below the horizon);
+  an overcast is poor whatever else is true, and every reason that cost
+  points is named. `sky_notes` turns it on and `sky_good_only` holds fair
+  and poor nights. Delivered through the alert channels as kind `sky`.
+- **Setup links open from inside Safari.** The `/setup` page offers an
+  Open in Zasder Weather button on the app's own `zasder://setup` scheme,
+  because a Universal Link opened inside Safari stays a web page.
+
+### Added (apps)
+- **Siri and Shortcuts.** Get Current Conditions returns a spoken sentence
+  and a typed value a Shortcut can pick apart: temperature, feels like,
+  humidity, dew point, wind and gust, rain today and rate, pressure, UV,
+  CO2 and PM2.5, each in your display units with the unit beside it and
+  the reading's own time, and only the fields the station measured. Open a
+  Chart opens the app on a station's chart. Both are offered to Siri with
+  the app's name ("current conditions in Zasder Weather"). Intents talk to
+  your own server, never the site in view. iPhone and Mac.
+- **Outlook report and Sky notes** have their switches under Alerts →
+  Quiet hours: send time and forecast source for the outlook, and the
+  "Only on good nights" choice for sky notes. The outlook opens from
+  Reports with its tiles, sun times, prose and source; the sky note lands
+  in the alert list with a moon icon.
+- **The app says whether your phone is offline or your server is down.**
+  A failed refresh is classified from the error, the device's own network
+  path, and a probe of the public internet: No internet connection (your
+  server may be fine, the last readings stay), Your connection is having
+  trouble (a captive portal or dropped link), Your server isn't reachable
+  (the internet answers, your box does not), Server address not found,
+  Your server returned an error, and Your server refused the token. The
+  Dashboard, the header's short label and Settings → Stations all say
+  which. iPhone and Mac.
+- **Share this detailed chart.** The Charts page has a fourth share
+  button that puts the whole page on one card: the summary tiles, the
+  chart, the other fields with their sparklines and, with two or more
+  stations, the comparison. It works on the live window and on any past
+  day opened from Explore, which makes it the day card: the day's rain
+  total, peak rate, start and duration, exportable at last.
+- **Sites.** Your own server is the default site; the people who share
+  a server with you give you a site. Settings → Sites lists the default
+  first and the sites you have added, takes a setup code or link to add
+  one, and lets you rename a site, mark a development box (it wears a
+  badge) or remove it. When you have more than one site, a switcher row
+  appears at the bottom of the Dashboard: tap a site and the whole app
+  looks at it, for this session. Push, widgets, the Watch and every
+  launch stay on the default site. Share this site creates a read-only
+  or a read-and-write site link for the site in view; whoever opens it
+  gets that site beside their own server, while a link opened on a phone
+  with no server yet still sets it up as before. Station order and
+  hidden stations are kept per site, so hiding a station at a shared
+  site never hides one of yours. iPhone and Mac.
+
+### Changed (apps)
+- **Sites: the switcher sits under the header** on the Dashboard as a
+  scope control (up to three sites as equal segments, more as a scrolling
+  row), a switch paints the site's last-known readings at once with its
+  own "as of" time, every site carries a freshness dot, a development
+  site shows its badge in the header on every page, and the header's
+  Updated line leads with the site's name whenever a site other than
+  your own is in view. Settings → Server & Sites holds the Sites page.
+- **Selectors have three tiers with one dress each.** Charts, History,
+  Records, Explore and Insights use one square segmented row for the
+  page's scope (station or pane), filled capsules for the choice within
+  it (field or station), and an outlined bar for the range (window or
+  period). Station names get room instead of truncating.
+- **A site link's code pasted into Quick Setup adds a site** on a
+  configured app instead of replacing your own server.
+- **Settings → Server & Backups → This server says where the server
+  runs** ("Hosted on Fly.io, iad", or your own machine), from the
+  server's own environment.
+- **Per-station preferences follow the server, not the address.** Tile
+  and chart-field layouts per station are now keyed by the server's
+  stable identity, so two servers that reuse a station id keep separate
+  layouts and a changed address keeps yours. Layouts made before 2.2
+  keep applying and move over on their next edit. Lightning-detector
+  flags are kept per server the same way.
+- **A quiet station says whose fault it is, on the Dashboard and under
+  Settings → Stations.** While a cloud poller is failing, the station
+  shows one orange line in the server's words, for example "AirGradient's
+  service is not answering since 1:27 PM (6 tries, ReadTimeout). Your
+  station and this server are fine." Rejected credentials point at
+  Settings; a rate limit says when readings resume; a storing failure
+  says it is on the server. Nothing shows while the poller is healthy or
+  for stations fed from your own network. iPhone and Mac.
+- **The "Air outside is wetter / drier" note shows once a day.** It used
+  to sit on the Dashboard all day, every day, because a desert's indoor
+  versus outdoor dew-point gap is always there. It now shows for a quarter
+  hour the first time it is true each day, and again only when the gap
+  moves 4°F or flips direction. Latched per station.
+
+### Fixed (apps)
+- **A Tempest day no longer double-counts after a big RainCheck
+  correction.** The day tile read 0.81 in against the server's 0.51 when
+  RainCheck pulled the counter down by more than a quarter in the middle
+  of the morning: the size rule alone called that a midnight reset and
+  restarted the day at zero. A big drop is now a reset only across a
+  local-day boundary; a drop to zero still is one at any hour.
+- **The station comparison for rain says it is a rate** (in/hr), so it is
+  not read as a running total next to the tiles.
+- **The connect code says where it goes and where it does not:** on the
+  sign-in page the assistant opens, never in the assistant's own fields,
+  with the server added as a remote or URL type connector.
+- **A saved token no longer looks like an empty field.** The hidden
+  Bearer Token field on the Server page paints its bullets whenever a
+  token is stored and nobody is typing; tapping them edits as before.
+
 ## [2.1.0] — 2026-09-07
 
 ### Added

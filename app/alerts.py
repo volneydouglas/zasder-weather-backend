@@ -125,21 +125,29 @@ def build_push(event: str, name: str, last_seen_ms: int | None,
 
 # ───────────────────────── threshold rules ─────────────────────────
 # Field keys match the iOS AlertRule / observation JSON keys.
+# The air-monitor pair (2.2, Doren: "a variable for air monitoring
+# alerts?") reads the columns the AirGradient and Govee pollers already
+# store; a station without them is skipped by the None check below, so
+# an "any device" CO2 rule only ever fires on a monitor.
 THRESHOLD_FIELDS = {
     "tempf", "feelsLike", "humidity", "dewPoint", "windspeedmph",
     "windgustmph", "dailyrainin", "hourlyrainin", "baromrelin", "uv",
+    "co2", "pm25",
 }
+AIR_FIELDS = {"co2", "pm25"}
 THRESHOLD_COMPARATORS = {"above", "below", "equalTo"}
 _FIELD_LABELS = {
     "tempf": "Temperature", "feelsLike": "Feels Like", "humidity": "Humidity",
     "dewPoint": "Dew Point", "windspeedmph": "Wind Speed", "windgustmph": "Wind Gust",
     "dailyrainin": "Rain Today", "hourlyrainin": "Rain Rate",
     "baromrelin": "Pressure", "uv": "UV Index",
+    "co2": "CO2", "pm25": "PM2.5",
 }
 _FIELD_UNITS = {
     "tempf": "°F", "feelsLike": "°F", "dewPoint": "°F", "humidity": "%",
     "windspeedmph": " mph", "windgustmph": " mph", "dailyrainin": " in",
     "hourlyrainin": " in/hr", "baromrelin": " inHg", "uv": "",
+    "co2": " ppm", "pm25": " µg/m³",
 }
 _COMPARATOR_SYM = {"above": ">", "below": "<", "equalTo": "="}
 
@@ -155,18 +163,37 @@ _STORM_BASELINE_MAX_AGE_MS = 6 * 3_600_000
 _STORM_GUST_LEAD_MS = 30 * 60_000
 
 
-def rule_triggered(comparator: str, threshold: float, value: float) -> bool:
+# Half-window for an `equalTo` rule per field, API-native units, the
+# app's AlertField.equalityTolerance mirrored (CodeRabbit, PR #37): one
+# fixed ±0.5 served every field, so "pressure equals 29.92" fired nearly
+# always and "CO2 equals 1000" could only fire between 999.5 and 1000.5.
+EQUALITY_TOLERANCE: dict[str, float] = {
+    "tempf": 0.5, "feelsLike": 0.5, "dewPoint": 0.5,    # °F
+    "humidity": 0.5,                                     # %
+    "windspeedmph": 1.0, "windgustmph": 1.0,             # mph
+    "dailyrainin": 0.01, "hourlyrainin": 0.01,           # in
+    "baromrelin": 0.005,                                 # inHg
+    "uv": 0.5,
+    "co2": 25.0,                                         # ppm
+    "pm25": 1.0,                                         # µg/m³
+}
+_DEFAULT_EQUALITY_TOLERANCE = 0.5
+
+
+def rule_triggered(comparator: str, threshold: float, value: float,
+                   tolerance: float = _DEFAULT_EQUALITY_TOLERANCE) -> bool:
     if comparator == "above":
         return value > threshold
     if comparator == "below":
         return value < threshold
-    return abs(value - threshold) < 0.5   # equalTo — tolerance for noisy sensors
+    return abs(value - threshold) < tolerance   # equalTo — noisy sensors
 
 
 def evaluate_rule(comparator: str, threshold: float, value: float,
-                  prev_triggered: int) -> tuple[bool, bool]:
+                  prev_triggered: int,
+                  tolerance: float = _DEFAULT_EQUALITY_TOLERANCE) -> tuple[bool, bool]:
     """(now_triggered, fire). Edge-triggered: fire only on clear→triggered."""
-    now = rule_triggered(comparator, threshold, value)
+    now = rule_triggered(comparator, threshold, value, tolerance)
     return now, (now and not prev_triggered)
 
 
@@ -182,6 +209,11 @@ _REARM_MARGIN: dict[str, float] = {
     "dailyrainin": 0.02, "hourlyrainin": 0.02,          # in
     "baromrelin": 0.02,                                 # inHg
     "uv": 0.5,
+    # Air: a CO2 sensor drifts tens of ppm between reads and Govee's
+    # cloud repeats values for minutes, so a 1000 ppm rule needs a real
+    # deadband; PM2.5 is noisy at the low end where a 12 µg/m³ rule sits.
+    "co2": 50.0,                                        # ppm
+    "pm25": 3.0,                                        # µg/m³
 }
 
 
@@ -263,6 +295,10 @@ ALERT_SEVERITY: dict[str, str] = {
     "first_frost": "info",
     "digest": "info",
     "sensor_recovered": "info",
+    # 2.2 source watchdog: the recovery is good news.
+    "source_recovered": "info",
+    # 2.2 sky notes: sunset, the moon, and the scope's verdict.
+    "sky": "info",
     "device_recovered": "info",
     "battery_recovered": "info",
     "disk_recovered": "info",
@@ -675,6 +711,15 @@ class EffectiveAlertConfig:
     # sent at 7:29 will likely be seen before one at 7am" (Volney): the
     # on-the-hour report lands in the same minute as everyone else's.
     digest_minute: int | None = None
+    # 2.2 outlook report (Doren): local hour/minute to send (None = off)
+    # and the forecast source, "open-meteo" (default) or "twc".
+    outlook_hour: int | None = None
+    outlook_minute: int | None = None
+    outlook_source: str | None = None
+    # 2.2 sky notes (Doren): a note around sunset with the sun, the moon
+    # and a stargazing verdict; `sky_good_only` sends it on good nights only.
+    sky_notes: bool = False
+    sky_good_only: bool = False
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -738,7 +783,12 @@ async def effective_config() -> EffectiveAlertConfig:
         quiet_start_min=_int_or_none(p.get("quiet_start_min")),
         quiet_end_min=_int_or_none(p.get("quiet_end_min")),
         digest_hour=_int_or_none(p.get("digest_hour")),
-        digest_minute=_int_or_none(p.get("digest_minute")))
+        digest_minute=_int_or_none(p.get("digest_minute")),
+        outlook_hour=_int_or_none(p.get("outlook_hour")),
+        outlook_minute=_int_or_none(p.get("outlook_minute")),
+        outlook_source=(str(p["outlook_source"]) if p.get("outlook_source") else None),
+        sky_notes=bool(p.get("sky_notes")),
+        sky_good_only=bool(p.get("sky_good_only")))
 
 
 # ───────────────────────── SMTP delivery ─────────────────────────
@@ -993,6 +1043,13 @@ class AlertMonitor:
             await share_targets.check(devices, now_ms)
         except Exception:
             log.exception("share fan-out failed")
+        # The outlook report is a stored report first and a delivery second:
+        # with every channel off it must still land in Reports and stamp
+        # its day, so it runs BEFORE the channel gate (CodeRabbit, PR #37).
+        try:
+            await self._maybe_send_outlook(cfg, devices, now_ms)
+        except Exception:
+            log.exception("outlook report failed")
         # Run the ALERT sections when any alert channel can deliver: email,
         # push, or an enabled webhook (1.8 — webhooks carry every handled
         # alert, so they count as a channel; _deliver treats muted email+push
@@ -1064,6 +1121,13 @@ class AlertMonitor:
                 await health_watch.check(cfg, devices, now_ms, _deliver)
             except Exception:
                 log.exception("health watch failed")
+        # 2.2 source watchdog: a cloud poller failing for an hour is an
+        # outage, so it runs whether or not the smart alerts are on.
+        from . import health_watch as _hw
+        try:
+            await _hw.check_sources(cfg, now_ms, _deliver)
+        except Exception:
+            log.exception("source watchdog failed")
         # ── NWS relay (1.8): severe weather through OUR channels, not
         # just the foregrounded app. Warning tier — breaks quiet hours.
         from . import nws_watch
@@ -1092,6 +1156,10 @@ class AlertMonitor:
             await self._maybe_send_digest(cfg, devices, now_ms)
         except Exception:
             log.exception("morning report failed")
+        try:
+            await self._maybe_send_sky(cfg, devices, now_ms)
+        except Exception:
+            log.exception("sky note failed")
         # ── storm summary: one report per event, after the rain stops. Not
         # gated on smart_alerts — it is a different kind of thing, and the
         # rain counter it watches needs no derived inputs.
@@ -1127,7 +1195,9 @@ class AlertMonitor:
                 except (TypeError, ValueError):
                     continue
                 prev, clear_since = rstates.get((rule["id"], d["mac"]), (0, None))
-                now_trig, fire = evaluate_rule(rule["comparator"], rule["threshold"], val, prev)
+                now_trig, fire = evaluate_rule(
+                    rule["comparator"], rule["threshold"], val, prev,
+                    EQUALITY_TOLERANCE.get(rule["field"], _DEFAULT_EQUALITY_TOLERANCE))
                 if fire:
                     # Reviewer P2: only persist triggered=1 AFTER delivery succeeds.
                     # If SMTP/APNs/relay fails, leave state at 0 so the next tick
@@ -1478,6 +1548,172 @@ class AlertMonitor:
                      len(stations), len(rows))
         except Exception:
             log.exception("digest send failed; will retry next tick")
+
+    async def _maybe_send_outlook(self, cfg, devices, now_ms: int) -> None:
+        """2.2 (Doren): the forecast at a chosen time. Once per local day
+        at/after outlook_hour: tomorrow's forecast when the hour is noon
+        or later, today's before; from the owner's source; stored as a
+        report, pushed with its deep link, and emailed to the digest's
+        recipients. Stamped only when something was delivered (or there
+        was nobody to deliver to), so a transient failure retries next
+        tick, the morning report's rule."""
+        if cfg.outlook_hour is None:
+            return
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        local = datetime.fromtimestamp(now_ms / 1000, tz)
+        minute = int(cfg.outlook_minute or 0)
+        if local.hour * 60 + local.minute < int(cfg.outlook_hour) * 60 + minute:
+            return
+        if await db.get_kv("alerts.outlook.day") == local.date().isoformat():
+            return
+        from . import forecast_snapshots as fs
+        from . import outlook as ol
+        from . import reports as rp
+        coords = fs._coords(devices)
+        if coords is None:
+            log.info("outlook report skipped: no station coordinates")
+            await db.set_kv("alerts.outlook.day", local.date().isoformat())
+            return
+        source = cfg.outlook_source if cfg.outlook_source in ol.SOURCES else ol.SOURCE_OPEN_METEO
+        wu_key = None
+        if source == ol.SOURCE_TWC:
+            from .main import effective_wu_key
+            wu_key = await effective_wu_key()
+        daily, narrative, used, fallback = await self._fetch_outlook(
+            coords, source, wu_key, settings.timezone)
+        report = ol.build(daily, narrative=narrative, when=ol.slot_for(local.hour),
+                          now_local=local, source=used, fallback_from=fallback)
+        # Three facts, kept apart (2.2 release review R22-09): the archive
+        # row, the delivery, and the day. The day is stamped only when
+        # the row exists AND the channels are done; a stored row with a
+        # failed send retries the send, a failed row with a done send
+        # retries the row without sending twice (the delivery marker).
+        report_id = None
+        try:
+            payload = rp.outlook_payload(report)
+            report_id = await db.insert_report(
+                kind=rp.KIND_OUTLOOK, mac=None, ts_ms=now_ms,
+                for_date=report.for_date, title=ol.title(report),
+                summary=rp.outlook_summary(payload), payload=payload,
+                dedupe=rp.outlook_key(report.for_date, report.when))
+        except Exception:
+            log.exception("outlook report not stored; will retry next tick")
+        sent_key = f"alerts.outlook.sent:{report.for_date}:{report.when}"
+        already_sent = bool(await db.get_kv(sent_key))
+        sent_any = False
+        had_targets = False
+        if not already_sent:
+            title, body = ol.push_text(report)
+            try:
+                if await apns.push_configured():
+                    res = await apns.send_to_all(
+                        title, body,
+                        route=(f"report/{report_id}" if report_id else None))
+                    sent_any = bool(res.get("sent"))
+                    had_targets = bool(res.get("total"))
+            except Exception:
+                had_targets = True
+                log.exception("outlook push failed")
+            if cfg.enabled and cfg.recipients:
+                had_targets = True
+                try:
+                    await asyncio.to_thread(_send_sync, "[Zasder Weather] " + title,
+                                            ol.text(report), cfg.recipients, cfg)
+                    sent_any = True
+                except Exception:
+                    log.exception("outlook email failed; will retry next tick")
+            if sent_any or not had_targets:
+                await db.set_kv(sent_key, "1")
+                already_sent = True
+        if report_id is not None and already_sent:
+            await db.set_kv("alerts.outlook.day", local.date().isoformat())
+            log.info("outlook report done (%s, %s): stored %s, delivered %s",
+                     report.when, report.source, report_id, sent_any)
+
+    async def _maybe_send_sky(self, cfg, devices, now_ms: int) -> None:
+        """2.2 sky notes: from 45 minutes before sunset, once per local
+        day. Tonight's clouds from the forecast, the rest from the
+        station's own reading and the almanac. On `sky_good_only` a fair
+        or poor night is stamped and never sent."""
+        if not cfg.sky_notes:
+            return
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        local = datetime.fromtimestamp(now_ms / 1000, tz)
+        day_key = local.date().isoformat()
+        if await db.get_kv("alerts.sky.day") == day_key:
+            return
+        from . import almanac, sky
+        from . import forecast_snapshots as fs
+        coords = fs._coords(devices)
+        if coords is None:
+            await db.set_kv("alerts.sky.day", day_key)
+            return
+        lat, lon = coords
+        sunset = almanac.sunset(lat, lon, local.date(), tz)
+        if sunset is None:
+            await db.set_kv("alerts.sky.day", day_key)
+            return
+        if local < sunset - timedelta(minutes=45):
+            return
+        # The station's reading: the first weather station with a temperature.
+        last: dict = {}
+        for d in devices:
+            ld = d.get("lastData") or {}
+            if not isinstance(ld, dict) or ld.get("tempf") is None or db.is_air_monitor_device(d):
+                continue
+            # Fresh only, the seasonal alerts' 30-minute rule: a station
+            # that stopped hours ago must not score tonight (CodeRabbit).
+            obs_ms = ld.get("dateutc")
+            if not isinstance(obs_ms, (int, float)) or abs(now_ms - obs_ms) > 30 * 60_000:
+                continue
+            last = ld
+            break
+        tempf, dew = last.get("tempf"), last.get("dewPoint")
+        spread = (float(tempf) - float(dew)) if (tempf is not None and dew is not None) else None
+        evening = local.replace(hour=22, minute=0, second=0, microsecond=0)
+        illum = almanac.moon_illumination(evening)
+        moon_up = almanac.moon_altitude_deg(lat, lon, evening) > 0
+        clouds = await self._fetch_clouds(lat, lon, settings.timezone, local)
+        inputs = sky.SkyInputs(
+            cloud_pct=clouds,
+            humidity_pct=float(last["humidity"]) if last.get("humidity") is not None else None,
+            dew_spread_f=spread,
+            wind_mph=float(last["windspeedmph"]) if last.get("windspeedmph") is not None else None,
+            moon_illumination=illum, moon_up=moon_up)
+        sunrise_next = almanac.sunrise(lat, lon, local.date() + timedelta(days=1), tz)
+        title, body, v = sky.note(sunset_local=sunset, sunrise_next_local=sunrise_next,
+                                  moon_phase=almanac.moon_phase_name(evening),
+                                  moon_illumination=illum, inputs=inputs)
+        if cfg.sky_good_only and v != sky.GOOD:
+            # An unknown night is not held for the day: the station or the
+            # forecast may answer on a later tick before the window closes.
+            if v != sky.UNKNOWN or local >= sunset + timedelta(hours=2):
+                await db.set_kv("alerts.sky.day", day_key)
+            log.info("sky note held: %s night", v)
+            return
+        delivered = await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
+                                   email_ok=cfg.email_scope == "all",
+                                   kind="sky", severity="info")
+        if delivered:
+            await db.set_kv("alerts.sky.day", day_key)
+            log.info("sky note sent: %s night", v)
+
+    async def _fetch_clouds(self, lat, lon, tz_name, now_local):
+        """Seam for tests: tonight's mean cloud cover, nothing else."""
+        from . import sky
+        return await sky.tonight_cloud_pct(lat, lon, tz_name, now_local)
+
+    async def _fetch_outlook(self, coords, source, wu_key, tz_name):
+        """Seam for tests: the provider call, nothing else."""
+        from . import outlook as ol
+        return await ol.fetch_daily(coords[0], coords[1], source=source,
+                                    wu_key=wu_key, tz_name=tz_name)
 
     async def _send_morning_phone(self, report, stations, local,
                                   now_ms: int,

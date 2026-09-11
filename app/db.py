@@ -1086,6 +1086,11 @@ async def init_db(path: str | None = None) -> None:
             ("digest_hour", "INTEGER"),
             # 2.0 minute past the hour for the morning report.
             ("digest_minute", "INTEGER"),
+            # 2.2 outlook report: send time + forecast source.
+            ("outlook_hour", "INTEGER"), ("outlook_minute", "INTEGER"),
+            ("outlook_source", "TEXT"),
+            # 2.2 sky notes.
+            ("sky_notes", "INTEGER"), ("sky_good_only", "INTEGER"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
@@ -1134,11 +1139,25 @@ async def init_db(path: str | None = None) -> None:
         # table shipped (1.6). Existing days read NULL (= "no data") until a
         # rebuild folds history in — never 0, a station with no detector
         # must stay absent from lightning records.
+        # 2.2 widened the list (sums for means, the air-monitor pair,
+        # indoor temperature); insights.ROLLUP_LATE_COLUMNS is the one
+        # place they are named. Adding any marks the rollups dirty so
+        # the lifespan rebuild folds history in (same nonce rule as the
+        # backfill above).
         cur = await db.execute("PRAGMA table_info(daily_rollups)")
         existing = {r[1] for r in await cur.fetchall()}
-        if "lightning_max" not in existing:
+        from .insights import ROLLUP_LATE_COLUMNS
+        added_rollup_cols = False
+        for col, decl in ROLLUP_LATE_COLUMNS:
+            if col not in existing:
+                await db.execute(
+                    f"ALTER TABLE daily_rollups ADD COLUMN {col} {decl}")
+                added_rollup_cols = True
+        if added_rollup_cols and existing:
             await db.execute(
-                "ALTER TABLE daily_rollups ADD COLUMN lightning_max REAL")
+                "INSERT INTO server_kv (k, v) VALUES "
+                "('rollups_dirty', lower(hex(randomblob(8)))) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v")
         # Same migration for hour_rollups: feels_* came after the table
         # shipped. Existing rows get 0/0 (= "no data"), so the feels-like
         # diurnal grid stays empty until a rebuild folds history in.
@@ -2452,7 +2471,8 @@ _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipie
                     "rain_start", "storm_channels",
                     "heat_day", "heat_day_threshold_f",
                     "quiet_start_min", "quiet_end_min", "digest_hour",
-                    "digest_minute")
+                    "digest_minute", "outlook_hour", "outlook_minute",
+                    "outlook_source", "sky_notes", "sky_good_only")
 
 
 async def get_alert_prefs() -> dict[str, Any]:

@@ -276,19 +276,19 @@ def test_staging_twins_carry_the_primary_key_and_altered_columns(engine):
             await insights._create_staging(conn)
             cur = await conn.execute("PRAGMA table_info(daily_rollups_staging)")
             cols = {r[1]: r[5] for r in await cur.fetchall()}   # name -> pk
-            # The upsert's ON CONFLICT(mac, day) needs the key.
-            await conn.execute(insights._UPSERT_DAILY_STAGING, {
-                "mac": MAC, "day": "2025-01-01", "tempf": 70.0, "tempf_n": 1,
-                "humidity": None, "windspeedmph": None, "windgustmph": None,
-                "baromrelin": None, "dew_point": None, "feels_like": None,
-                "uv": None, "solarradiation": None, "dailyrainin": None,
-                "yearlyrainin": None, "lightning": None})
-            await conn.execute(insights._UPSERT_DAILY_STAGING, {
-                "mac": MAC, "day": "2025-01-01", "tempf": 75.0, "tempf_n": 1,
-                "humidity": None, "windspeedmph": None, "windgustmph": None,
-                "baromrelin": None, "dew_point": None, "feels_like": None,
-                "uv": None, "solarradiation": None, "dailyrainin": None,
-                "yearlyrainin": None, "lightning": None})
+            # The upsert's ON CONFLICT(mac, day) needs the key. Params come
+            # from rollup_params so this test cannot drift from the column
+            # list (2.2 widened it).
+            from zoneinfo import ZoneInfo
+            def params(tempf: float) -> dict:
+                p = insights.rollup_params(
+                    {"dateutc": 1_735_776_000_000, "tempf": tempf}, ZoneInfo("UTC"))
+                for k in ("_year", "_month", "_hour"):
+                    p.pop(k)
+                p["mac"] = MAC
+                return p
+            await conn.execute(insights._UPSERT_DAILY_STAGING, params(70.0))
+            await conn.execute(insights._UPSERT_DAILY_STAGING, params(75.0))
             cur = await conn.execute(
                 "SELECT tempf_n, tempf_max FROM daily_rollups_staging")
             merged = tuple(await cur.fetchone())
@@ -298,6 +298,7 @@ def test_staging_twins_carry_the_primary_key_and_altered_columns(engine):
     cols, merged = asyncio.run(run())
     assert cols["mac"] == 1 and cols["day"] == 2
     assert "lightning_max" in cols
+    assert "co2_n" in cols and "humidity_sum" in cols     # 2.2 columns ride along
     assert merged == (2, 75.0)
     with pytest.raises(ValueError):
         insights.staging_table("observations")

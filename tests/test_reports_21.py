@@ -376,3 +376,62 @@ def test_paging_across_a_same_millisecond_tie_returns_every_row_once(client):
     assert client.get(f"/api/reports?before_ms={ts}", headers=AUTH).json()["reports"] == []
     assert len(client.get(f"/api/reports?before_ms={ts + 1}", headers=AUTH)
                .json()["reports"]) == 5
+
+
+def test_run_stores_a_day_report_from_history_rows(insights_on):
+    """2.2 (Doren): the day version of the NOAA table. Hour rows come from
+    the history query for the station's local day; the day's rain is the
+    rollup's when there is one, else the hourly rises."""
+    from app import db
+    client = insights_on
+    asyncio.run(db.upsert_device(MAC, {"name": "Chaucer Drive", "info": {}}))
+    hdr = {"Authorization": "Bearer test-ingest-token"}
+    # Two readings an hour across three morning hours on 2025-10-02,
+    # Phoenix (UTC-7): 08:00 local = 15:00Z. dailyrainin climbs 0 → 0.30.
+    plan = [("15:00", 70.0, 0.00), ("15:30", 72.0, 0.10),
+            ("16:00", 75.0, 0.10), ("16:30", 77.0, 0.25),
+            ("17:00", 80.0, 0.30), ("17:30", 81.0, 0.30)]
+    for hhmm, tempf, rain in plan:
+        r = client.post("/ingest/custom", headers=hdr, json={
+            "device": {"id": MAC.replace(":", ""), "model": "Test"},
+            "timestamp_utc": f"2025-10-02T{hhmm}:00Z",
+            "outdoor": {"tempf": tempf, "humidity": 40},
+            "wind": {"gust_mph": 12.0}, "rain": {"daily_in": rain},
+            "pressure": {"relative_inhg": 29.90}, "source": "test"})
+        assert r.status_code == 200, r.text
+    r = client.post("/api/reports/run", headers=AUTH,
+                    json={"kind": "noaa_day", "mac": MAC, "year": 2025,
+                          "day": "2025-10-02"})
+    assert r.status_code == 200, r.text
+    rep = r.json()["report"]
+    assert rep["kind"] == "noaa_day" and rep["for_date"] == "2025-10-02"
+    assert rep["title"] == "Chaucer Drive · October 2, 2025 climate report"
+    p = rep["payload"]
+    assert p["day"] == "2025-10-02" and p["month"] is None
+    assert "DAILY CLIMATOLOGICAL SUMMARY for October 2, 2025" in p["text"]
+    assert "   08:00" in p["text"] and "   10:00" in p["text"], p["text"]
+    assert p["high_f"] == 81.0 and p["low_f"] == 70.0 and p["days"] == 1
+    assert p["rain_in"] == 0.30, p["rain_in"]
+    assert p["gust_mph"] == 12.0
+    assert "Hours with data: 3" in p["text"]
+    # The hourly fallback agrees with the rollup: the 0.10 → 0.25 rise that
+    # straddles the 09:00 boundary is credited to the 09 hour, not lost.
+    from app import climate
+    from datetime import date as _date
+    hours = asyncio.run(climate.day_hours(MAC, _date(2025, 10, 2)))
+    by_hour = {h["hour"]: h["rain"] for h in hours if h["samples"]}
+    assert by_hour == {8: 0.10, 9: 0.15, 10: 0.05}, by_hour
+    assert round(sum(by_hour.values()), 2) == 0.30
+    # Same day again: one row, updated.
+    r2 = client.post("/api/reports/run", headers=AUTH,
+                     json={"kind": "noaa_day", "mac": MAC, "year": 2025,
+                           "day": "2025-10-02"})
+    assert r2.json()["report"]["id"] == rep["id"]
+    # The kind needs its day.
+    assert client.post("/api/reports/run", headers=AUTH,
+                       json={"kind": "noaa_day", "mac": MAC, "year": 2025}
+                       ).status_code == 400
+    assert client.post("/api/reports/run", headers=AUTH,
+                       json={"kind": "noaa_day", "mac": MAC, "year": 2025,
+                             "day": "2025-13-40"}).status_code == 400
+

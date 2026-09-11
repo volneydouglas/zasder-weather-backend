@@ -261,6 +261,154 @@ async def noaa_month_report(mac: str, name: str, year: int,
     return "\n".join(lines) + "\n"
 
 
+# ── the NOAA-style DAILY summary (2.2, Doren) ────────────────────────────
+
+def _hour_bucket_stats(rows: list[dict[str, Any]], tz) -> list[dict[str, Any]]:
+    """Fold history rows (raw or bucketed, either shape) into 24 hour rows
+    in the station's zone. Absent stays None: an hour with no rows is a
+    row of blanks, not zeros."""
+    from datetime import datetime
+    by_hour: dict[int, list[dict[str, Any]]] = {}
+    for r in rows:
+        ms = r.get("dateutc_ms") or r.get("dateutc")
+        if not isinstance(ms, (int, float)):
+            continue
+        h = datetime.fromtimestamp(ms / 1000, tz).hour
+        by_hour.setdefault(h, []).append(r)
+
+    def nums(rs, key):
+        return [float(r[key]) for r in rs if isinstance(r.get(key), (int, float))
+                and r[key] == r[key]]
+
+    out = []
+    # The daily counter is carried ACROSS hours: an hour's rain is the rise
+    # from the previous hour's last reading, not from its own first one, or
+    # the tip that lands on the boundary is credited to no hour and the
+    # fallback day total comes up short (CodeRabbit, PR #37). A drop is the
+    # midnight reset, whose landing value is all new rain.
+    carried: float | None = None
+    for h in range(24):
+        rs = sorted(by_hour.get(h, []), key=lambda r: r.get("dateutc_ms") or r.get("dateutc") or 0)
+        temps = nums(rs, "tempf")
+        highs = nums(rs, "tempf_max") or temps
+        lows = nums(rs, "tempf_min") or temps
+        hums = nums(rs, "humidity")
+        press = nums(rs, "baromrelin")
+        gusts = nums(rs, "windgustmph_max") or nums(rs, "windgustmph")
+        daily = nums(rs, "dailyrainin")
+        rain = None
+        if daily:
+            total = 0.0
+            prev = carried
+            for v in daily:
+                if prev is None:
+                    pass
+                elif v < prev:
+                    total += v
+                else:
+                    total += v - prev
+                prev = v
+            carried = prev
+            rain = round(total, 2)
+        out.append({
+            "hour": h,
+            "mean": round(sum(temps) / len(temps), 1) if temps else None,
+            "tmax": max(highs) if highs else None,
+            "tmin": min(lows) if lows else None,
+            "humidity": round(sum(hums) / len(hums)) if hums else None,
+            "rain": rain,
+            "gust": max(gusts) if gusts else None,
+            "pressure": round(sum(press) / len(press), 2) if press else None,
+            "samples": len(rs),
+        })
+    return out
+
+
+async def day_hours(mac: str, day: "date") -> list[dict[str, Any]]:
+    """The 24 hour rows for one local day, from /history's own query."""
+    from datetime import datetime, time as _time
+    from zoneinfo import ZoneInfo
+    from . import config, db
+    # Resolved through the module at call time, not the import-time
+    # binding: a test that reloads app.config (source_status's fixture)
+    # leaves the bound name on a stale Settings object.
+    try:
+        tz = ZoneInfo(config.settings.timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    start = datetime.combine(day, _time.min, tz)
+    end = datetime.combine(day + timedelta(days=1), _time.min, tz)
+    # db.history's BETWEEN is inclusive: the next midnight's reading
+    # landed in this day's hour 0 (2.2 release review R22-07). Half-open.
+    rows = await db.history(mac, int(start.timestamp() * 1000),
+                            int(end.timestamp() * 1000) - 1, limit=20000)
+    return _hour_bucket_stats(rows, tz)
+
+
+async def noaa_day_numbers(mac: str, day: "date") -> dict[str, Any]:
+    hours = await day_hours(mac, day)
+    with_temp = [h for h in hours if h["mean"] is not None]
+    hi = max((h["tmax"] for h in with_temp), default=None)
+    lo = min((h["tmin"] for h in with_temp), default=None)
+    mean = (round(sum(h["mean"] for h in with_temp) / len(with_temp), 1)
+            if with_temp else None)
+    # The day's rain from the rollup when it has one (the same number the
+    # charts and records trust), else the hourly rises.
+    rows = await _rollup_rows(mac, day.isoformat(), day.isoformat())
+    rain = day_rain_in(rows[0]) if rows else None
+    if rain is None:
+        rain = _round2(sum_or_none(h["rain"] for h in hours))
+    return {
+        "day": day.isoformat(),
+        "days": 1 if with_temp else 0,
+        "mean_f": mean,
+        "high_f": hi,
+        "high_day": day.isoformat() if hi is not None else None,
+        "low_f": lo,
+        "low_day": day.isoformat() if lo is not None else None,
+        "rain_in": rain,
+        "hdd": round(max(0.0, 65.0 - mean), 1) if mean is not None else None,
+        "cdd": round(max(0.0, mean - 65.0), 1) if mean is not None else None,
+        "gust_mph": max((h["gust"] for h in hours if h["gust"] is not None),
+                        default=None),
+        "hours_with_data": sum(1 for h in hours if h["samples"]),
+    }
+
+
+async def noaa_day_report(mac: str, name: str, day: "date") -> str:
+    """Hour rows for one day in the month report's fixed-width dress."""
+    hours = await day_hours(mac, day)
+    numbers = await noaa_day_numbers(mac, day)
+    lines = [
+        f"   DAILY CLIMATOLOGICAL SUMMARY for {day:%B} {day.day}, {day.year}",
+        "",
+        f"   Station: {name}",
+        "",
+        "          Temperature (F)      Humid    Rain     Wind     Press",
+        "   Hour   Mean   High    Low    (%)     (in)  Gust(mph)  (inHg)",
+        "   " + "-" * 62,
+    ]
+    for h in hours:
+        if not h["samples"]:
+            continue
+        lines.append(
+            f"   {h['hour']:02d}:00"
+            f"{_fmt(h['mean'], 7)}{_fmt(h['tmax'], 7)}{_fmt(h['tmin'], 7)}"
+            f"{_fmt(h['humidity'], 7, 0)}"
+            f"{_fmt(h['rain'], 9, 2)}{_fmt(h['gust'], 9, 0)}{_fmt(h['pressure'], 10, 2)}")
+    lines.append("   " + "-" * 62)
+    if numbers["days"]:
+        lines.append(
+            f"        {_fmt(numbers['mean_f'], 7)}{_fmt(numbers['high_f'], 7)}"
+            f"{_fmt(numbers['low_f'], 7)}       "
+            f"{_fmt(numbers['rain_in'], 9, 2)}{_fmt(numbers['gust_mph'], 9, 0)}")
+    else:
+        lines.append("   (no data for this day)")
+    lines.append("")
+    lines.append(f"   Hours with data: {numbers['hours_with_data']}")
+    return "\n".join(lines) + "\n"
+
+
 async def noaa_year_report(mac: str, name: str, year: int) -> str:
     """Month rows for one year — the NOAA yearly summary."""
     summary = await year_summary(mac, year)

@@ -288,11 +288,15 @@ _DAILY_COLS = (
     "windspeedmph_max", "windgustmph_max", "baromrelin_min", "baromrelin_max",
     "dew_point_min", "dew_point_max", "feels_like_min", "feels_like_max",
     "uv_max", "solarradiation_max", "rain_total", "lightning_max",
+    # 2.2: the air-monitor pair and indoor temperature.
+    "pm25_min", "pm25_max", "co2_min", "co2_max", "tempinf_min", "tempinf_max",
 )
+# Means from the day's sum/n pairs (2.2); reported as <stem>_mean.
+_DAILY_MEANS = ("humidity", "windspeedmph", "baromrelin", "pm25", "co2")
 
 
 async def _daily_summary(args: dict, role: str) -> dict:
-    from . import climate
+    from . import climate, insights
     _require_insights()
     mac = await _known_mac(args.get("mac"))
     first = _day(args.get("start_day"), "start_day")
@@ -314,11 +318,14 @@ async def _daily_summary(args: dict, role: str) -> dict:
         total = r["tempf_sum"] if "tempf_sum" in keys else None
         d["tempf_mean"] = (round(total / n, 2)
                            if n and total is not None else None)
+        for stem in _DAILY_MEANS:
+            d[f"{stem}_mean"] = insights.rollup_mean(r, stem)
         days.append(d)
     return {"mac": mac, "start_day": first, "end_day": last,
             "count": len(days), "days": days,
-            "note": "rain_total is the day's gauge total; tempf_mean is the "
-                    "mean of every reading that day, not (min+max)/2"}
+            "note": "rain_total is the day's gauge total; every *_mean is the "
+                    "mean of that day's readings, not (min+max)/2; pm25 in "
+                    "µg/m³ and co2 in ppm are null on a weather station"}
 
 
 async def _records(args: dict, role: str) -> dict:
@@ -786,21 +793,33 @@ async def mcp_post(
     try:
         msg = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return JSONResponse(_error(None, PARSE_ERROR, "Parse error"),
-                            status_code=400)
+        return _rejected(_error(None, PARSE_ERROR, "Parse error"), method=None,
+                         size=len(raw))
     if isinstance(msg, list):
         # Batches went away in 2025-06-18 and were optional before; one
         # message per POST keeps the transport a function call.
-        return JSONResponse(
+        return _rejected(
             _error(None, INVALID_REQUEST,
                    "Invalid Request: send one JSON-RPC message per POST"),
-            status_code=400)
+            method="<batch>", size=len(raw))
     reply = await handle_message(msg, role)
     if reply is None:
         return Response(status_code=202)
     if "error" in reply and reply.get("id") is None:
-        return JSONResponse(reply, status_code=400)
+        return _rejected(reply, method=msg.get("method") if isinstance(msg, dict) else None,
+                         size=len(raw))
     return JSONResponse(reply)
+
+
+def _rejected(reply: dict[str, Any], *, method: str | None, size: int) -> JSONResponse:
+    """A 400 with its JSON-RPC error code and the offending method in the
+    log (2.2, item 9 of the 2.2 plan): claude.ai's connector 400s once per
+    handshake and the log said only 'POST /mcp 400', which is not a clue.
+    Never the body: a malformed message may carry a token."""
+    err = reply.get("error") or {}
+    log.info("mcp 400: code=%s message=%r method=%s bytes=%d",
+             err.get("code"), str(err.get("message", ""))[:120], method, size)
+    return JSONResponse(reply, status_code=400)
 
 
 @router.get("/mcp")

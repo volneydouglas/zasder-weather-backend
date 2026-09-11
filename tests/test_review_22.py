@@ -11,16 +11,26 @@ I = {"Authorization": "Bearer test-ingest-token", "Content-Type": "application/j
 
 
 def test_backup_round_trips_the_2_2_preferences(client):
-    """R22-06: export carried none of the five, import ignored them."""
+    """R22-06: export carried none of the five, import ignored them. The
+    whole path: set, export, change, restore through the API, read back."""
     from app import config_backup
-    client.put("/api/alerts", headers=H, json={
-        "outlook_hour": 19, "outlook_minute": 30, "outlook_source": "twc",
-        "sky_notes": True, "sky_good_only": True})
+    original = {"outlook_hour": 19, "outlook_minute": 30, "outlook_source": "twc",
+                "sky_notes": True, "sky_good_only": True}
+    assert client.put("/api/alerts", headers=H, json=original).status_code == 200
     exported = asyncio.run(config_backup.export_config())
-    prefs = exported["alert_prefs"] if "alert_prefs" in exported else exported
-    flat = str(exported)
-    for k in ("outlook_hour", "outlook_minute", "outlook_source", "sky_notes", "sky_good_only"):
-        assert k in flat, k
+    prefs = exported["alert_prefs"]
+    assert prefs["outlook_hour"] == 19 and prefs["outlook_minute"] == 30
+    assert prefs["outlook_source"] == "twc"
+    assert prefs["sky_notes"] in (1, True) and prefs["sky_good_only"] in (1, True)
+    # Change everything, then restore the export and read it back.
+    client.put("/api/alerts", headers=H, json={
+        "outlook_hour": 6, "outlook_minute": 0, "outlook_source": "open-meteo",
+        "sky_notes": False, "sky_good_only": False})
+    r = client.post("/api/config/restore", headers=H, json=exported)
+    assert r.status_code == 200, r.text
+    g = client.get("/api/alerts", headers=H).json()
+    assert (g["outlook_hour"], g["outlook_minute"], g["outlook_source"]) == (19, 30, "twc")
+    assert g["sky_notes"] is True and g["sky_good_only"] is True
     # Coercion: bounds and the enum hold on import.
     assert config_backup._coerce_alert_pref("outlook_hour", 24) is config_backup._INVALID
     assert config_backup._coerce_alert_pref("outlook_minute", 59) == 59

@@ -154,7 +154,7 @@ def text(r: OutlookReport) -> str:
     if r.lo_f is not None:
         bits.append(f"low around {r.lo_f:.0f}F")
     if r.precip_pct is not None:
-        bits.append(f"{r.precip_pct}% chance of rain")
+        bits.append(f"{r.precip_pct}% chance of precipitation")
     if r.wind_max_mph is not None:
         bits.append(f"wind up to {r.wind_max_mph:.0f} mph")
     if bits:
@@ -186,7 +186,7 @@ def push_text(r: OutlookReport) -> tuple[str, str]:
     elif r.hi_f is not None:
         bits.append(f"high {r.hi_f:.0f}")
     if r.precip_pct is not None:
-        bits.append(f"{r.precip_pct}% rain")
+        bits.append(f"{r.precip_pct}% precipitation")
     body = ", ".join(bits) if bits else "Open for the forecast."
     return title(r), body
 

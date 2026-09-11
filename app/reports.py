@@ -345,7 +345,7 @@ def outlook_summary(payload: dict[str, Any], units: Any = None) -> str:
         bits.append(f"high {round(u.temp(hi))}")
     pp = payload.get("precip_pct")
     if pp is not None:
-        bits.append(f"{pp}% rain")
+        bits.append(f"{pp}% precipitation")
     return ", ".join(bits) if bits else "Forecast"
 
 

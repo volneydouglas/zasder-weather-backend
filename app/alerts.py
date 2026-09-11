@@ -1043,6 +1043,13 @@ class AlertMonitor:
             await share_targets.check(devices, now_ms)
         except Exception:
             log.exception("share fan-out failed")
+        # The outlook report is a stored report first and a delivery second:
+        # with every channel off it must still land in Reports and stamp
+        # its day, so it runs BEFORE the channel gate (CodeRabbit, PR #37).
+        try:
+            await self._maybe_send_outlook(cfg, devices, now_ms)
+        except Exception:
+            log.exception("outlook report failed")
         # Run the ALERT sections when any alert channel can deliver: email,
         # push, or an enabled webhook (1.8 — webhooks carry every handled
         # alert, so they count as a channel; _deliver treats muted email+push
@@ -1149,10 +1156,6 @@ class AlertMonitor:
             await self._maybe_send_digest(cfg, devices, now_ms)
         except Exception:
             log.exception("morning report failed")
-        try:
-            await self._maybe_send_outlook(cfg, devices, now_ms)
-        except Exception:
-            log.exception("outlook report failed")
         try:
             await self._maybe_send_sky(cfg, devices, now_ms)
         except Exception:
@@ -1650,9 +1653,15 @@ class AlertMonitor:
         last: dict = {}
         for d in devices:
             ld = d.get("lastData") or {}
-            if isinstance(ld, dict) and ld.get("tempf") is not None and not db.is_air_monitor_device(d):
-                last = ld
-                break
+            if not isinstance(ld, dict) or ld.get("tempf") is None or db.is_air_monitor_device(d):
+                continue
+            # Fresh only, the seasonal alerts' 30-minute rule: a station
+            # that stopped hours ago must not score tonight (CodeRabbit).
+            obs_ms = ld.get("dateutc")
+            if not isinstance(obs_ms, (int, float)) or abs(now_ms - obs_ms) > 30 * 60_000:
+                continue
+            last = ld
+            break
         tempf, dew = last.get("tempf"), last.get("dewPoint")
         spread = (float(tempf) - float(dew)) if (tempf is not None and dew is not None) else None
         evening = local.replace(hour=22, minute=0, second=0, microsecond=0)

@@ -2909,7 +2909,9 @@ async def _alerts_state() -> dict[str, Any]:
         "digest_minute": cfg.digest_minute,
         "outlook_hour": cfg.outlook_hour,
         "outlook_minute": cfg.outlook_minute,
-        "outlook_source": cfg.outlook_source,
+        # Effective, never null: the app shows the Outlook controls when a
+        # server answers this field at all (CodeRabbit, PR #37).
+        "outlook_source": cfg.outlook_source or "open-meteo",
         "sky_notes": cfg.sky_notes,
         "sky_good_only": cfg.sky_good_only,
         # Smart-alert firing state, so a client with no push channel of its

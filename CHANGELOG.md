@@ -41,7 +41,65 @@ the backend checks GitHub daily and shows an "update available" banner
   answers again. Delivered like a device-down alert, so a
   device-offline-only email scope still gets it.
 
+- **Air-monitor alert rules.** CO2 (ppm) and PM2.5 (µg/m³) join the
+  threshold rule fields, read from the readings the AirGradient and Govee
+  pollers already store; a weather station, which has neither, is skipped.
+  Each field carries its own re-arm deadband (50 ppm, 3 µg/m³) and its own
+  equality window, and every rule field now has a per-field equality
+  window instead of one ±0.5 for all (a pressure rule at 29.92 inHg used
+  to fire nearly always).
+- **Daily rollups carry more.** Humidity, wind and pressure means, PM2.5
+  and CO2 min/max/mean, indoor temperature, and the yearly rain counter's
+  first and last reading of each day (ordered by the reading's own time,
+  so an import folding out of order cannot swap them). The MCP
+  `daily_summary` reports every `*_mean` and the air columns. Existing
+  installs rebuild in the background at first boot; old days read null
+  for the new fields until that finishes, never 0. A lifetime counter's
+  day is now last minus first, and a reset inside the day is a fact.
+- **Outlook report.** A forecast at a chosen time: tomorrow's in the
+  evening, today's before noon, from Open-Meteo or The Weather Company
+  through your WU key (falls back to Open-Meteo and says so). Sky, high,
+  low, precipitation chance, wind, sunrise and sunset, and the provider's
+  own prose when it has some. Stored in Reports, pushed with its link,
+  emailed to the digest's recipients; once per local day at
+  `outlook_hour`/`outlook_minute`, with `outlook_source` on the alert
+  preferences. It runs even with every alert channel off, so the report
+  still lands in Reports.
+- **Sky notes.** From 45 minutes before sunset, once a day: sunset and the
+  next sunrise, the moon's phase and how much of it is lit, and a verdict
+  for the telescope scored from tonight's cloud cover (Open-Meteo hourly,
+  20:00 to 02:00), the station's own humidity, dew spread and wind, and the
+  moon's light (weighted like cloud, free when it is below the horizon);
+  an overcast is poor whatever else is true, and every reason that cost
+  points is named. `sky_notes` turns it on and `sky_good_only` holds fair
+  and poor nights. Delivered through the alert channels as kind `sky`.
+- **Setup links open from inside Safari.** The `/setup` page offers an
+  Open in Zasder Weather button on the app's own `zasder://setup` scheme,
+  because a Universal Link opened inside Safari stays a web page.
+
 ### Added (apps)
+- **Siri and Shortcuts.** Get Current Conditions returns a spoken sentence
+  and a typed value a Shortcut can pick apart: temperature, feels like,
+  humidity, dew point, wind and gust, rain today and rate, pressure, UV,
+  CO2 and PM2.5, each in your display units with the unit beside it and
+  the reading's own time, and only the fields the station measured. Open a
+  Chart opens the app on a station's chart. Both are offered to Siri with
+  the app's name ("current conditions in Zasder Weather"). Intents talk to
+  your own server, never the site in view. iPhone and Mac.
+- **Outlook report and Sky notes** have their switches under Alerts →
+  Quiet hours: send time and forecast source for the outlook, and the
+  "Only on good nights" choice for sky notes. The outlook opens from
+  Reports with its tiles, sun times, prose and source; the sky note lands
+  in the alert list with a moon icon.
+- **The app says whether your phone is offline or your server is down.**
+  A failed refresh is classified from the error, the device's own network
+  path, and a probe of the public internet: No internet connection (your
+  server may be fine, the last readings stay), Your connection is having
+  trouble (a captive portal or dropped link), Your server isn't reachable
+  (the internet answers, your box does not), Server address not found,
+  Your server returned an error, and Your server refused the token. The
+  Dashboard, the header's short label and Settings → Stations all say
+  which. iPhone and Mac.
 - **Share this detailed chart.** The Charts page has a fourth share
   button that puts the whole page on one card: the summary tiles, the
   chart, the other fields with their sparklines and, with two or more
@@ -63,6 +121,20 @@ the backend checks GitHub daily and shows an "update available" banner
   site never hides one of yours. iPhone and Mac.
 
 ### Changed (apps)
+- **Sites: the switcher sits under the header** on the Dashboard as a
+  scope control (up to three sites as equal segments, more as a scrolling
+  row), a switch paints the site's last-known readings at once with its
+  own "as of" time, every site carries a freshness dot, a development
+  site shows its badge in the header on every page, and the header's
+  Updated line leads with the site's name whenever a site other than
+  your own is in view. Settings → Server & Sites holds the Sites page.
+- **Selectors have three tiers with one dress each.** Charts, History,
+  Records, Explore and Insights use one square segmented row for the
+  page's scope (station or pane), filled capsules for the choice within
+  it (field or station), and an outlined bar for the range (window or
+  period). Station names get room instead of truncating.
+- **A site link's code pasted into Quick Setup adds a site** on a
+  configured app instead of replacing your own server.
 - **Settings → Server & Backups → This server says where the server
   runs** ("Hosted on Fly.io, iad", or your own machine), from the
   server's own environment.

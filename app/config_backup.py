@@ -57,6 +57,10 @@ _ALERT_PREF_KEYS = (
     "rain_start", "storm_channels",
     "heat_day", "heat_day_threshold_f",
     "quiet_start_min", "quiet_end_min", "digest_hour", "digest_minute",
+    # 2.2: the outlook report's schedule and source, and sky notes
+    # (2.2 release review R22-06: export dropped them, import ignored them).
+    "outlook_hour", "outlook_minute", "outlook_source",
+    "sky_notes", "sky_good_only",
 )
 RULE_SEVERITIES = ("minor", "standard", "major", "urgent")
 
@@ -100,6 +104,7 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
     if v is None:
         return None
     if key in ("enabled", "smtp_tls", "smtp_ssl", "storm_summary",
+               "sky_notes", "sky_good_only",
                "rain_start", "heat_day"):
         if isinstance(v, bool) or v in (0, 1):
             return 1 if v else 0
@@ -117,11 +122,14 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
         except (TypeError, ValueError):
             return _INVALID
         return f if math.isfinite(f) else _INVALID
+    if key == "outlook_source":
+        return v if v in ("open-meteo", "twc") else _INVALID
     if key in ("quiet_start_min", "quiet_end_min", "digest_hour",
-               "digest_minute"):
+               "digest_minute", "outlook_hour", "outlook_minute"):
         # The same bounds PUT /api/alerts enforces.
         hi = {"quiet_start_min": 1439, "quiet_end_min": 1439,
-              "digest_hour": 23, "digest_minute": 59}[key]
+              "digest_hour": 23, "digest_minute": 59,
+              "outlook_hour": 23, "outlook_minute": 59}[key]
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             return _INVALID
         n = int(v)

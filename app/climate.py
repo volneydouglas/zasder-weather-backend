@@ -338,8 +338,10 @@ async def day_hours(mac: str, day: "date") -> list[dict[str, Any]]:
         tz = ZoneInfo("UTC")
     start = datetime.combine(day, _time.min, tz)
     end = datetime.combine(day + timedelta(days=1), _time.min, tz)
+    # db.history's BETWEEN is inclusive: the next midnight's reading
+    # landed in this day's hour 0 (2.2 release review R22-07). Half-open.
     rows = await db.history(mac, int(start.timestamp() * 1000),
-                            int(end.timestamp() * 1000), limit=20000)
+                            int(end.timestamp() * 1000) - 1, limit=20000)
     return _hour_bucket_stats(rows, tz)
 
 

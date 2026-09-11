@@ -32,6 +32,14 @@ class SkyInputs:
 GOOD = "good"
 FAIR = "fair"
 POOR = "poor"
+# No cloud forecast and no station reading: the moon alone is not a sky
+# (2.2 release review R22-08). The note then carries the sun and moon
+# and says it cannot judge the night.
+UNKNOWN = "unknown"
+
+
+def has_weather_evidence(i: SkyInputs) -> bool:
+    return any(v is not None for v in (i.cloud_pct, i.humidity_pct, i.dew_spread_f, i.wind_mph))
 
 
 def score(i: SkyInputs) -> tuple[float, list[str]]:
@@ -84,7 +92,7 @@ def note(*, sunset_local: datetime | None, sunrise_next_local: datetime | None,
     """(title, body, verdict). Plain words; the sun and moon first, the
     scope's verdict last with its reasons."""
     s, reasons = score(inputs)
-    v = verdict(s)
+    v = verdict(s) if has_weather_evidence(inputs) else UNKNOWN
     bits: list[str] = []
     if sunset_local is not None:
         bits.append(f"Sunset {sunset_local.strftime('%-I:%M %p')}")
@@ -98,7 +106,10 @@ def note(*, sunset_local: datetime | None, sunrise_next_local: datetime | None,
             m += ", below the horizon this evening"
         bits.append(m)
     lead = ". ".join(bits) + "." if bits else ""
-    if v == GOOD:
+    if v == UNKNOWN:
+        head = "Sky tonight"
+        tail = "No station reading or cloud forecast to judge the night by."
+    elif v == GOOD:
         head = "Good night for the scope"
         tail = "Clear, dry and calm." if not reasons else "Mostly clear; " + ", ".join(reasons) + "."
     elif v == FAIR:

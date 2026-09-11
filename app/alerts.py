@@ -1586,6 +1586,11 @@ class AlertMonitor:
             coords, source, wu_key, settings.timezone)
         report = ol.build(daily, narrative=narrative, when=ol.slot_for(local.hour),
                           now_local=local, source=used, fallback_from=fallback)
+        # Three facts, kept apart (2.2 release review R22-09): the archive
+        # row, the delivery, and the day. The day is stamped only when
+        # the row exists AND the channels are done; a stored row with a
+        # failed send retries the send, a failed row with a done send
+        # retries the row without sending twice (the delivery marker).
         report_id = None
         try:
             payload = rp.outlook_payload(report)
@@ -1595,31 +1600,38 @@ class AlertMonitor:
                 summary=rp.outlook_summary(payload), payload=payload,
                 dedupe=rp.outlook_key(report.for_date, report.when))
         except Exception:
-            log.exception("outlook report not stored; sending it anyway")
-        title, body = ol.push_text(report)
+            log.exception("outlook report not stored; will retry next tick")
+        sent_key = f"alerts.outlook.sent:{report.for_date}:{report.when}"
+        already_sent = bool(await db.get_kv(sent_key))
         sent_any = False
         had_targets = False
-        try:
-            if await apns.push_configured():
-                res = await apns.send_to_all(
-                    title, body,
-                    route=(f"report/{report_id}" if report_id else None))
-                sent_any = bool(res.get("sent"))
-                had_targets = bool(res.get("total"))
-        except Exception:
-            had_targets = True
-            log.exception("outlook push failed")
-        if cfg.enabled and cfg.recipients:
-            had_targets = True
+        if not already_sent:
+            title, body = ol.push_text(report)
             try:
-                await asyncio.to_thread(_send_sync, "[Zasder Weather] " + title,
-                                        ol.text(report), cfg.recipients, cfg)
-                sent_any = True
+                if await apns.push_configured():
+                    res = await apns.send_to_all(
+                        title, body,
+                        route=(f"report/{report_id}" if report_id else None))
+                    sent_any = bool(res.get("sent"))
+                    had_targets = bool(res.get("total"))
             except Exception:
-                log.exception("outlook email failed; will retry next tick")
-        if sent_any or not had_targets:
+                had_targets = True
+                log.exception("outlook push failed")
+            if cfg.enabled and cfg.recipients:
+                had_targets = True
+                try:
+                    await asyncio.to_thread(_send_sync, "[Zasder Weather] " + title,
+                                            ol.text(report), cfg.recipients, cfg)
+                    sent_any = True
+                except Exception:
+                    log.exception("outlook email failed; will retry next tick")
+            if sent_any or not had_targets:
+                await db.set_kv(sent_key, "1")
+                already_sent = True
+        if report_id is not None and already_sent:
             await db.set_kv("alerts.outlook.day", local.date().isoformat())
-            log.info("outlook report sent (%s, %s)", report.when, report.source)
+            log.info("outlook report done (%s, %s): stored %s, delivered %s",
+                     report.when, report.source, report_id, sent_any)
 
     async def _maybe_send_sky(self, cfg, devices, now_ms: int) -> None:
         """2.2 sky notes: from 45 minutes before sunset, once per local
@@ -1679,7 +1691,10 @@ class AlertMonitor:
                                   moon_phase=almanac.moon_phase_name(evening),
                                   moon_illumination=illum, inputs=inputs)
         if cfg.sky_good_only and v != sky.GOOD:
-            await db.set_kv("alerts.sky.day", day_key)
+            # An unknown night is not held for the day: the station or the
+            # forecast may answer on a later tick before the window closes.
+            if v != sky.UNKNOWN or local >= sunset + timedelta(hours=2):
+                await db.set_kv("alerts.sky.day", day_key)
             log.info("sky note held: %s night", v)
             return
         delivered = await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body,

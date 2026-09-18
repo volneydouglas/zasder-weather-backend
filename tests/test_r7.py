@@ -375,3 +375,42 @@ def test_nws_legacy_per_station_seen_seeds_global(client, monkeypatch):
         await nw.check(cfg, dev, int(time.time() * 1000), deliver)
     asyncio.run(run())
     assert calls == [], "legacy-seen id must not re-push after the upgrade"
+
+
+def test_ingest_refuses_coords_that_are_not_a_place(client):
+    """R23: "nan" and 999 parsed as floats and were STORED as a location,
+    so the forecast, NWS and the map beacon all took them as a place.
+    Not finite or off the globe is no coordinates at all."""
+    from app import ingest, forecast_snapshots as fs
+    assert ingest._payload_coords({"coords": {"lat": "nan", "lon": -111.9}}) is None
+    assert ingest._payload_coords({"coords": {"lat": 999, "lon": -111.9}}) is None
+    assert ingest._payload_coords({"coords": {"lat": 33.3, "lon": "inf"}}) is None
+    assert ingest._payload_coords({"coords": {"lat": 33.3, "lon": -181}}) is None
+    # A bool is not a coordinate either: float(True) is 1.0, and
+    # {"lat": true, "lon": false} was stored as a place in the Gulf of Guinea.
+    assert ingest._payload_coords({"coords": {"lat": True, "lon": False}}) is None
+    assert ingest._payload_coords({"coords": {"lat": 33.3, "lon": True}}) is None
+    assert ingest.valid_coords(True, False) is False
+    assert ingest.valid_coords(1.0, 0.0) is True
+    assert ingest._payload_coords({"coords": {"lat": 33.3, "lon": -111.9}}) == {
+        "location": None, "coords": {"lat": 33.3, "lon": -111.9}}
+    for bad in ("nan", 999):
+        client.post("/ingest/custom",
+                    headers={"Authorization": "Bearer test-ingest-token",
+                             "Content-Type": "application/json"},
+                    json={"device": {"id": "AA:BB:CC:DD:EE:61", "name": "Nowhere",
+                                     "coords": {"lat": bad, "lon": -111.9}},
+                          "timestamp_utc": "2026-09-15T15:00:00Z",
+                          "outdoor": {"tempf": 99}})
+    devs = [d for d in client.get("/api/devices", headers=H).json()
+            if d["mac"] == "AA:BB:CC:DD:EE:61"]
+    assert devs and not ((devs[0].get("info") or {}).get("coords") or {}).get("coords")
+    # A record stored before this check is skipped, not forecast for.
+    stored_bad = [{"mac": "AA:BB:CC:DD:EE:62", "name": "Old",
+                   "info": {"coords": {"coords": {"lat": float("nan"), "lon": -111.9}}}},
+                  {"mac": "AA:BB:CC:DD:EE:63", "name": "Far",
+                   "info": {"coords": {"coords": {"lat": 999, "lon": -111.9}}}},
+                  {"mac": "AA:BB:CC:DD:EE:64", "name": "Here",
+                   "info": {"coords": {"coords": {"lat": 33.3, "lon": -111.9}}}}]
+    assert fs.coords_device(stored_bad)["mac"] == "AA:BB:CC:DD:EE:64"
+    assert fs._coords(stored_bad[:2]) is None

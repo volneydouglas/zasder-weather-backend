@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -33,21 +34,43 @@ _KV_LAST = "forecast_snapshots.last_ms"
 _KEEP_DAYS = 400
 
 
-def _coords(devices: list[dict[str, Any]]) -> tuple[float, float] | None:
+def coords_device(devices: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The station whose sky this server forecasts — the first non-air
+    station with usable coordinates, the one-sky-per-server rule.
+
+    Public because the scorecard (`forecast_skill`) has to name it: the
+    archive holds THIS station's sky whichever station the reader is
+    scoring, and two modules picking it by two rules would eventually
+    disagree about whose forecast was being graded.
+    """
     for d in devices:
         if db.is_air_monitor_device(d):
             continue
         info = d.get("info") or {}
         coords = (info.get("coords") or {}).get("coords") or {}
         lat, lon = coords.get("lat"), coords.get("lon")
-        if lat is not None and lon is not None:
-            # Stored coords are operator data — one non-numeric record must
-            # skip to the next station, not raise (the nws_watch lesson).
-            try:
-                return float(lat), float(lon)
-            except (TypeError, ValueError):
+        if lat is None or lon is None:
+            continue
+        # Stored coords are operator data — one non-numeric record must
+        # skip to the next station, not raise (the nws_watch lesson), and
+        # a stored "nan" or 999 (pre-R23 ingest let them through) is no
+        # place to forecast for either.
+        from .ingest import valid_coords
+        try:
+            if not valid_coords(float(lat), float(lon)):
                 continue
+        except (TypeError, ValueError):
+            continue
+        return d
     return None
+
+
+def _coords(devices: list[dict[str, Any]]) -> tuple[float, float] | None:
+    d = coords_device(devices)
+    if d is None:
+        return None
+    coords = ((d.get("info") or {}).get("coords") or {}).get("coords") or {}
+    return float(coords["lat"]), float(coords["lon"])
 
 
 async def _fetch_daily(lat: float, lon: float) -> dict[str, Any] | None:
@@ -147,3 +170,25 @@ async def day_ahead_calls(provider: str, since: _dt.date, *,
         # freshest issue.
         out[r["valid_date"]] = dict(r)
     return out
+
+
+async def latest_low_f(provider: str, valid_date: str) -> float | None:
+    """The newest issued low for one local date (YYYY-MM-DD), or None when
+    the archive holds no call for it. The freeze-night card's read of the
+    archive: one indexed lookup on (provider, valid_date), newest issue
+    first, and rows without a low are skipped at the SQL — a call that
+    lost its low in transit is not a forecast of 0°F."""
+    from . import db as dbmod
+    async with dbmod.connect() as conn:
+        row = await (await conn.execute(
+            "SELECT tmin_f FROM forecast_snapshots "
+            "WHERE provider = ? AND valid_date = ? AND tmin_f IS NOT NULL "
+            "ORDER BY issued_ms DESC LIMIT 1",
+            (provider, valid_date))).fetchone()
+    if row is None:
+        return None
+    try:
+        v = float(row[0])
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None

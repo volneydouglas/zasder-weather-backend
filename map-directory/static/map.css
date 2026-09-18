@@ -1,0 +1,89 @@
+html, body { margin: 0; height: 100%; background: #0b0d12; color: #e8ecf2;
+             font: 14px -apple-system, "Segoe UI", Arial, sans-serif; }
+#map { position: absolute; inset: 0; background: #0b0d12; }
+.dark-tiles { filter: invert(1) hue-rotate(180deg) brightness(.72) contrast(.92) saturate(.55); }
+#bar { position: absolute; top: 12px; left: 12px; right: 12px; z-index: 1000;
+       display: flex; justify-content: space-between; align-items: center; pointer-events: none; }
+#bar > * { pointer-events: auto; }
+.brand { background: rgba(11,13,18,.85); border: 1px solid #262c38; border-radius: 10px;
+         padding: 8px 12px; font-weight: 300; font-size: 13px; color: #8a93a3; }
+.brand b { color: #e8ecf2; letter-spacing: 1px; }
+.count { background: rgba(11,13,18,.85); border: 1px solid #262c38; border-radius: 10px;
+         padding: 8px 12px; font-size: 12px; color: #8a93a3; }
+/* Pins are coloured by class, not an inline style: the CSP allows no inline styles. */
+.pin { width: 34px; height: 34px; border-radius: 17px; border: 2px solid rgba(255,255,255,.85);
+       display: flex; align-items: center; justify-content: center; font-weight: 800;
+       font-size: 12px; color: #0b0d12; box-shadow: 0 2px 8px rgba(0,0,0,.5); }
+.leaflet-popup-content-wrapper { background: #151922; color: #e8ecf2; border: 1px solid #262c38;
+       border-radius: 12px; }
+.leaflet-popup-tip { background: #151922; }
+.card h3 { margin: 0 0 4px; font-size: 15px; }
+.card .muted { color: #8a93a3; font-size: 11px; }
+/* The assigned public id: a handle to read aloud or quote, so it
+   wants the shape of an identifier rather than of prose. */
+.card .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            letter-spacing: 0.08em; margin-top: 6px; }
+.card table { border-collapse: collapse; margin-top: 8px; }
+.card td { padding: 2px 10px 2px 0; font-size: 13px; }
+.card td.k { color: #8a93a3; font-size: 11px; letter-spacing: .8px; text-transform: uppercase; }
+.card a { color: #4fa6f2; }
+.marker-cluster div { background: rgba(79,166,242,.75); color: #fff; }
+.marker-cluster { background: rgba(79,166,242,.35); }
+.pin.t-none { background: #8a93a3; }
+.pin.t-hot { background: #ff5c47; }
+.pin.t-warm { background: #ff9a4d; }
+.pin.t-mild { background: #f5c04f; }
+.pin.t-cool { background: #7fd28a; }
+.pin.t-cold { background: #4fa6f2; }
+.pin.t-freeze { background: #a78bfa; }
+
+/* The metric chips: what the pins show. Bottom of the screen on purpose —
+   the top bar is already two blocks wide on a phone, and this is the one
+   control on the page a reader taps more than once. Scrolls rather than
+   wraps so the map keeps its height. */
+#metrics { position: absolute; left: 0; right: 0; bottom: 12px; z-index: 1000;
+           display: flex; gap: 6px; overflow-x: auto; padding: 0 12px 2px;
+           scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+#metrics::-webkit-scrollbar { display: none; }
+.chip { flex: 0 0 auto; background: rgba(11,13,18,.85); border: 1px solid #262c38;
+        color: #e8ecf2; border-radius: 999px; padding: 9px 14px; font: inherit;
+        font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.chip:hover { border-color: #3a4152; }
+.chip.on { background: #4fa6f2; border-color: #4fa6f2; color: #0b0d12; }
+.chip:focus-visible { outline: 2px solid #4fa6f2; outline-offset: 2px; }
+
+/* Pin ramps, one per metric family. Each family bands its OWN reading:
+   two inches of rain is not "hot" and a 70°F dew point is not "warm", so
+   a single intensity ramp would say the wrong thing about half of them.
+   Twins of MapMetric.tint in the app's StationMapView.swift. */
+.pin.r-dry { background: #8a93a3; }
+.pin.r-trace { background: #9ad0f5; }
+.pin.r-light { background: #4fa6f2; }
+.pin.r-mod { background: #3d7fd4; }
+.pin.r-heavy { background: #a78bfa; }
+.pin.w-calm { background: #8a93a3; }
+.pin.w-breezy { background: #7fd28a; }
+.pin.w-windy { background: #f5c04f; }
+.pin.w-strong { background: #ff9a4d; }
+.pin.w-gale { background: #ff5c47; }
+.pin.h-dry { background: #f5c04f; }
+.pin.h-ok { background: #7fd28a; }
+.pin.h-humid { background: #4fa6f2; }
+.pin.h-sat { background: #3d7fd4; }
+.pin.d-dry { background: #4fa6f2; }
+.pin.d-ok { background: #7fd28a; }
+.pin.d-sticky { background: #f5c04f; }
+.pin.d-muggy { background: #ff9a4d; }
+.pin.d-oppressive { background: #ff5c47; }
+.pin.d-severe { background: #a78bfa; }
+.pin.p-low { background: #4fa6f2; }
+.pin.p-normal { background: #7fd28a; }
+.pin.p-high { background: #f5c04f; }
+.pin.u-low { background: #7fd28a; }
+.pin.u-mod { background: #f5c04f; }
+.pin.u-high { background: #ff9a4d; }
+.pin.u-vhigh { background: #ff5c47; }
+.pin.u-extreme { background: #a78bfa; }
+/* Long readings (0.12 in, 29.92 inHg) step down inside the same circle. */
+.pin.small { font-size: 11px; }
+.pin.tiny { font-size: 9.5px; letter-spacing: -.02em; }

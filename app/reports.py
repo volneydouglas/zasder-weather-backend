@@ -39,8 +39,10 @@ KIND_NOAA_DAY = "noaa_day"
 # 2.2 (Doren): the forecast at a chosen time, tomorrow's in the evening or
 # today's in the morning, from the owner's source (app/outlook.py).
 KIND_OUTLOOK = "outlook"
+# 2.3 (Doren): the sky note, kept so its push has a page to land on.
+KIND_SKY = "sky"
 KINDS = (KIND_MORNING, KIND_STORM, KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY,
-         KIND_OUTLOOK)
+         KIND_OUTLOOK, KIND_SKY)
 # The kinds `POST /api/reports/run` builds on demand.
 RUNNABLE_KINDS = (KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY)
 
@@ -160,6 +162,8 @@ def summary_line(kind: str, payload: dict[str, Any], units: Any = None) -> str:
         return storm_summary_line(payload, units)
     if kind in (KIND_NOAA_MONTH, KIND_NOAA_YEAR, KIND_NOAA_DAY):
         return noaa_summary_line(payload, units)
+    if kind == KIND_SKY:
+        return sky_summary_line(payload, units)
     return ""
 
 
@@ -357,6 +361,57 @@ def outlook_key(for_date: str, when: str) -> str:
 
 def storm_key(mac: str, started_ms: int) -> str:
     return f"{KIND_STORM}:{mac}:{int(started_ms)}"
+
+
+# ── sky note (2.3) ──────────────────────────────────────────────────────
+
+def sky_payload(*, headline: str, body: str, verdict: str, score: float,
+                reasons: list[str], sunset: str | None, sunrise_next: str | None,
+                moon_phase: str | None, moon_illumination: float | None,
+                moon_up: bool | None, inputs: Any) -> dict[str, Any]:
+    """The sky note as stored: the words the push carried plus the
+    numbers behind the verdict, so the page can show its working."""
+    return {
+        "headline": headline,
+        "body": body,
+        "verdict": verdict,
+        "score": _num(score),
+        "reasons": [str(r) for r in reasons],
+        "sunset": sunset,
+        "sunrise_next": sunrise_next,
+        "moon_phase": moon_phase,
+        "moon_illumination": _num(moon_illumination),
+        "moon_up": bool(moon_up) if moon_up is not None else None,
+        "cloud_pct": _num(getattr(inputs, "cloud_pct", None)),
+        "humidity_pct": _num(getattr(inputs, "humidity_pct", None)),
+        "dew_spread_f": _num(getattr(inputs, "dew_spread_f", None)),
+        "wind_mph": _num(getattr(inputs, "wind_mph", None)),
+    }
+
+
+def sky_summary_line(payload: dict[str, Any], units: Any = None) -> str:
+    u = _units(units)
+    bits: list[str] = []
+    v = payload.get("verdict")
+    if v == "good":
+        bits.append("Good night for the scope")
+    elif v == "fair":
+        bits.append("A fair night")
+    elif v == "poor":
+        bits.append("Not a night for the scope")
+    else:
+        bits.append("Sky tonight")
+    c = payload.get("cloud_pct")
+    if c is not None:
+        bits.append(f"{round(c)}% cloud")
+    m = payload.get("moon_illumination")
+    if m is not None:
+        bits.append(f"moon {round(m * 100)}% lit")
+    return " · ".join(bits)
+
+
+def sky_key(day: str) -> str:
+    return f"{KIND_SKY}:{day}"
 
 
 def noaa_key(kind: str, mac: str, year: int, month: int | None,

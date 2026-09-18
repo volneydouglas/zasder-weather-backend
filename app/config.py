@@ -388,6 +388,10 @@ class Settings(BaseSettings):
     # to derive location from stored coordinates, so what appears is exactly
     # what the operator chose to reveal, at whatever coarseness they chose.
     public_dashboard_location: str | None = None
+    # 2.3 shared station map: where the opt-in beacons go. The default is
+    # the public directory at maps.zasder.com; a club running its own
+    # directory (the directory ships open source) points here instead.
+    map_directory_url: str = "https://maps.zasder.com"
     # 2.1: what this server calls itself ("Chaucer Drive"). App-managed
     # through /api/config/server-name; this env value is the fallback, and
     # the public-dashboard location the fallback's fallback. Read by the

@@ -329,7 +329,14 @@ def roll_back(live: Path, pre: Path) -> None:
     name, the sidecars and the marker go."""
     if live.exists():
         live.unlink()
-    _sidecars(live)
+    try:
+        _sidecars(live)
+    except OSError as e:
+        # Best-effort: the sidecars were truncated before the first
+        # rename, and a stale one must not stop the old database from
+        # getting its name back (REC-01: the same fault that failed the
+        # swap fails here too, and then nothing was live).
+        log.warning("rollback: could not remove a stale sidecar (%s); continuing", e)
     if pre.exists():
         os.replace(pre, live)
     _marker(live).unlink(missing_ok=True)
@@ -425,9 +432,21 @@ def swap_in(upload: Path, live: Path, stamp: str | None = None) -> Path:
                                  "for one more attempt")
         _marker(live).write_text(json.dumps({"pre": str(pre), "upload": str(upload),
                                              "stamp": stamp}))
-        os.replace(live, pre)
-    _sidecars(live)
+        try:
+            os.replace(live, pre)
+        except BaseException:
+            # Nothing moved: the live file is where it was, and a marker
+            # beside a usable database would only cost the next boot a
+            # log line. Never roll_back here: it would unlink the live
+            # file and have no pre-restore copy to put back.
+            _marker(live).unlink(missing_ok=True)
+            raise
+    # From here to the second rename the live name is EMPTY, so every step
+    # is inside the rollback boundary (REC-01, 2026-09-16 review: the
+    # sidecar unlink sat outside it, and an error there reached the job's
+    # handler with the old database only under its pre-restore name).
     try:
+        _sidecars(live)
         os.replace(upload, live)
     except BaseException:
         # The old database goes straight back under its own name; the
@@ -437,6 +456,55 @@ def swap_in(upload: Path, live: Path, stamp: str | None = None) -> Path:
     # The pre-restore prune waits for commit_restore(): until the restored
     # file has proven usable, every earlier copy is still a safety net.
     return pre
+
+
+async def _swap_holding_the_lease(upload: Path, live: Path) -> Path:
+    """`swap_in` on a worker thread, waited for to the end even when this
+    task is cancelled (REC-02, 2026-09-16 review). Cancelling a task that
+    awaits `to_thread` does not stop the thread; it only stops the wait,
+    and the maintenance lease around this call then exited and reopened
+    the database while the renames were still happening. The wait here
+    survives the cancellation (and any repeat of it), the thread's result
+    is inspected, a swap that did complete is rolled back, because the
+    restore is not going to finish, and only then is the cancellation
+    re-raised so the lease releases behind a finished transition."""
+    worker = asyncio.ensure_future(asyncio.to_thread(swap_in, upload, live))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.wait([worker])
+            except asyncio.CancelledError:
+                continue
+        if not worker.cancelled() and worker.exception() is None:
+            pre = worker.result()
+            undo = asyncio.ensure_future(asyncio.to_thread(roll_back, live, pre))
+            while not undo.done():
+                try:
+                    await asyncio.wait([undo])
+                except asyncio.CancelledError:
+                    continue
+            if undo.exception() is not None:
+                log.error("restore cancelled and the rollback failed: %s", undo.exception())
+        raise
+
+
+def _live_name_lost(live: Path) -> bool:
+    """True when a swap left nothing to serve under the live name: the
+    file is gone, or the transition marker still stands beside a file
+    that does not open (a torn candidate the rollback could not replace)."""
+    if not live.exists():
+        return True
+    return _marker(live).exists() and not _usable(live)
+
+
+# What every refused connection says when a failed restore left no usable
+# database under the live name. Boot recovery (`recover_at_boot`) reads the
+# marker and puts the pre-restore copy back.
+HELD_REASON = ("a database restore failed and the previous database could not "
+               "be put back under its own name; the database is closed until the "
+               "server restarts, and the restart reinstalls the pre-restore copy")
 
 
 # ───────────────────────── the job ─────────────────────────
@@ -545,18 +613,34 @@ async def _validate_and_swap(upload: Path, live: Path) -> None:
         db._CHART_INDEX_BUILDING = True
         try:
             async with db.maintenance_lease():
-                pre = await asyncio.to_thread(swap_in, upload, live)
                 try:
-                    await db.init_db()
+                    pre = await _swap_holding_the_lease(upload, live)
+                    try:
+                        await db.init_db()
+                    except BaseException as e:
+                        # The restored file cannot be served: put the old
+                        # one back before anyone can connect (R21-02).
+                        await asyncio.to_thread(roll_back, live, pre)
+                        raise RuntimeError(
+                            "the restored database could not be initialised, so "
+                            f"the previous database is back in place: {e!s:.200}"
+                        ) from e
+                    await asyncio.to_thread(commit_restore, live, pre)
                 except BaseException as e:
-                    # The restored file cannot be served: put the old one
-                    # back before anyone can connect (R21-02).
-                    await asyncio.to_thread(roll_back, live, pre)
-                    raise RuntimeError(
-                        "the restored database could not be initialised, so "
-                        f"the previous database is back in place: {e!s:.200}"
-                    ) from e
-                await asyncio.to_thread(commit_restore, live, pre)
+                    # Ordinary database access reopens only over the old
+                    # database or the restored one (REC-01). A failure
+                    # whose rollback also failed leaves the live name
+                    # empty, or the marker beside a torn candidate; the
+                    # lease then stays closed rather than let the next
+                    # connection create an empty database there. A
+                    # refusal before anything moved (checkpoint busy, a
+                    # failed first rename) leaves the file as it was and
+                    # reopens as before.
+                    if await asyncio.to_thread(_live_name_lost, live):
+                        db.hold_closed(HELD_REASON)
+                        if not isinstance(e, asyncio.CancelledError):
+                            raise RuntimeError(f"{HELD_REASON} ({e!s:.200})") from e
+                    raise
         finally:
             db._CHART_INDEX_BUILDING = False
         # Reconcile the running process with the restored state (R21-03):

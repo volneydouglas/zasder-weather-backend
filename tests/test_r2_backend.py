@@ -201,6 +201,32 @@ def test_rule_cleared_requires_margin():
     assert alerts.rule_cleared("equalTo", 50.0, 50.8, 1.0) is False
     assert alerts.rule_cleared("equalTo", 50.0, 51.6, 1.0) is True
 
+def test_rule_cleared_clamps_the_deadband_to_the_sensor_scale():
+    """The "Rain starting" preset (Rain Rate above 0.00) could never
+    re-arm: the 0.02 in rain deadband asked for a rate of -0.02, so the
+    rule fired once, ever (Doren, 2026-09-13). At the floor of the scale
+    the gauge reading zero is the all-clear."""
+    m = alerts._REARM_MARGIN["hourlyrainin"]
+    fl = alerts._SENSOR_FLOOR["hourlyrainin"]
+    # Without the floor: impossible. With it: zero clears, a trace does not.
+    assert alerts.rule_cleared("above", 0.0, 0.0, m) is False
+    assert alerts.rule_cleared("above", 0.0, 0.0, m, floor=fl) is True
+    assert alerts.rule_cleared("above", 0.0, 0.01, m, floor=fl) is False
+    # A 0.01 rule (under the deadband) clears at zero too.
+    assert alerts.rule_cleared("above", 0.01, 0.0, m, floor=fl) is True
+    # Well above the floor the deadband is untouched.
+    assert alerts.rule_cleared("above", 0.10, 0.09, m, floor=fl) is False
+    assert alerts.rule_cleared("above", 0.10, 0.08, m, floor=fl) is True
+    # The mirror image: "humidity below 100" re-arms at 100, not 102.
+    hm = alerts._REARM_MARGIN["humidity"]
+    assert alerts.rule_cleared("below", 100.0, 100.0, hm) is False
+    assert alerts.rule_cleared("below", 100.0, 100.0, hm,
+                               ceiling=alerts._SENSOR_CEILING["humidity"]) is True
+    # Every clamped field has a margin, so the clamp is never a no-op by accident.
+    for f in alerts._SENSOR_FLOOR:
+        assert f in alerts._REARM_MARGIN, f
+
+
 def test_rearm_transition_requires_continuous_dwell():
     """The dwell clock behind wind-chatter suppression (Doren, 2026-08-23:
     instantaneous wind poked over a 10 mph rule every ~8 min while lulls

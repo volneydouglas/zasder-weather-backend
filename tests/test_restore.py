@@ -163,9 +163,33 @@ def test_a_damaged_database_is_refused(client, temp_env, tmp_path):
     snap = tmp_path / "snap.db"
     _snapshot_of(temp_env, snap)
     data = bytearray(snap.read_bytes())
-    # Scribble over the middle of the file, past the header.
-    for i in range(len(data) // 2, min(len(data), len(data) // 2 + 512)):
+    # Scribble over the middle of the file, past the header. Whole PAGES,
+    # not 512 bytes: a fixed little window lands wherever the schema
+    # happens to put it, and adding one column to daily_rollups (2.3,
+    # yearly_rise) moved it onto bytes SQLite did not mind — so the test
+    # went green while checking nothing. Four pages from a page boundary
+    # is certain to hit a b-tree.
+    page = int.from_bytes(data[16:18], "big") or 4096
+    start = ((len(data) // 2) // page) * page
+    for i in range(start, min(len(data), start + page * 4)):
         data[i] = 0xFF
+    # And PROVE the file is damaged before asking the server to notice.
+    # Without this the assertions below pass for a corrupted file and for
+    # a perfectly good one that was never really corrupted.
+    probe = tmp_path / "probe.db"
+    probe.write_bytes(bytes(data))
+    con = sqlite3.connect(probe)
+    try:
+        # A badly damaged file makes the PRAGMA itself raise rather than
+        # return a verdict; either way it is not "ok".
+        try:
+            verdict = con.execute("PRAGMA integrity_check").fetchone()[0]
+        except sqlite3.DatabaseError:
+            verdict = "raised"
+        assert verdict != "ok", \
+            "the scribble missed: this test would pass without checking anything"
+    finally:
+        con.close()
     c = client.post("/api/backup/database/restore/challenge", headers=H).json()
     assert _upload(client, bytes(data), c["challenge"]).status_code == 200
     st = _wait_done(client)

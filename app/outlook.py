@@ -120,7 +120,10 @@ def build(daily: dict[str, Any], *, narrative: list[Any] | None, when: str,
     code = _at(daily, "weather_code", i)
     sky = SKY_WORDS.get(int(code)) if isinstance(code, (int, float)) else None
     pp = _num(_at(daily, "precipitation_probability_max", i))
+    # Whitespace-only prose is no prose (CodeRabbit, PR #39): the push
+    # and the HTML card key off truthiness.
     text = _narrative_for(narrative, when)
+    text = " ".join(text.split()) or None if text else None
     return OutlookReport(
         date_label=target.strftime("%A, %B %-d"),
         for_date=target.isoformat(),
@@ -188,7 +191,68 @@ def push_text(r: OutlookReport) -> tuple[str, str]:
     if r.precip_pct is not None:
         bits.append(f"{r.precip_pct}% precipitation")
     body = ", ".join(bits) if bits else "Open for the forecast."
+    # 2.3 (Doren, 09-11): the push carries the forecast the email carries.
+    # APNs caps the payload at 4 KB; a TWC narrative is a sentence or two,
+    # and a long one is cut at a sentence end well inside that.
+    if r.narrative:
+        body = (body + ". " if bits else "") + _clip_narrative(r.narrative)
     return title(r), body
+
+
+PUSH_NARRATIVE_MAX = 600
+
+
+def _clip_narrative(text: str, limit: int = PUSH_NARRATIVE_MAX) -> str:
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(". ", 0, limit)
+    return text[:cut + 1] if cut > limit // 2 else text[:limit].rstrip() + "…"
+
+
+def build_html(r: OutlookReport) -> str:
+    """The outlook email in the morning report's dress (2.3): the day and
+    its sky as the headline, the four numbers as tiles, sun times, the
+    provider's own prose, and the credit. The plain text stays the
+    alternative for clients that refuse HTML."""
+    from . import email_card as ec
+    import html as _h
+    when = "Tomorrow" if r.when == "tomorrow" else "Today"
+    inner = ec.section_label(when.upper(), padding="14px 0 6px")
+    inner += (f'<div style="font:800 18px {ec.FONT};color:{ec.TEXT};">'
+              f'{_h.escape(r.date_label)}</div>')
+    if r.sky:
+        inner += (f'<div style="font:400 14px {ec.FONT};color:{ec.DIM};'
+                  f'padding-top:2px;">{_h.escape(r.sky.capitalize())}</div>')
+    tiles: list[str] = []
+    if r.hi_f is not None:
+        tiles.append(ec.tile("HIGH", f"{r.hi_f:.0f}&deg;F", ec.WARM))
+    if r.lo_f is not None:
+        tiles.append(ec.tile("LOW", f"{r.lo_f:.0f}&deg;F", ec.ACCENT))
+    if r.precip_pct is not None:
+        tiles.append(ec.tile("PRECIP", f"{r.precip_pct}%",
+                             ec.ACCENT if r.precip_pct >= 40 else ec.TEXT))
+    if r.wind_max_mph is not None:
+        tiles.append(ec.tile("WIND", f"{r.wind_max_mph:.0f} mph",
+                             ec.WARM if r.wind_max_mph >= 30 else ec.TEXT))
+    inner += ec.tile_row(tiles, margin_top=10)
+    sun: list[str] = []
+    if r.sunrise:
+        sun.append(ec.tile("SUNRISE", _h.escape(r.sunrise), width="50%"))
+    if r.sunset:
+        sun.append(ec.tile("SUNSET", _h.escape(r.sunset), width="50%"))
+    inner += ec.tile_row(sun, margin_top=6)
+    if r.narrative:
+        inner += ec.section_label("THE FORECAST")
+        inner += ec.prose(r.narrative)
+    src = "The Weather Company" if r.source == SOURCE_TWC else "Open-Meteo"
+    if r.fallback_from:
+        src += " (the Weather Company forecast was unavailable)"
+    inner += (f'<div style="font:400 11px {ec.FONT};color:{ec.DIM};'
+              f'padding-top:10px;">Forecast by {_h.escape(src)}.</div>')
+    return ec.shell(title(r), f"{when}, {r.date_label}", inner,
+                    "The outlook at the hour you chose. "
+                    "Every report lives in the app's Reports pane.")
 
 
 async def fetch_daily(lat: float, lon: float, *, source: str, wu_key: str | None,

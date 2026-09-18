@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zasder Weather · station map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<!-- Pinned with SRI like Leaflet above: the hashes are sha256 over the
+     exact files at these URLs (curl the file, openssl dgst -sha256 -binary
+     | openssl base64 -A). Moving the version means recomputing them. -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"
+      integrity="sha256-YU3qCpj/P06tdPBJGPax0bm6Q1wltfwjsho5TR4+TYc=" crossorigin="">
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"
+      integrity="sha256-YSWCMtmNZNwqex4CEw1nQhvFub2lmU7vcCKP+XVwwXA=" crossorigin="">
+<link rel="stylesheet" href="/static/map.css">
+</head>
+<body>
+<div id="map" role="application" aria-label="Map of shared weather stations"></div>
+<div id="bar">
+  <div class="brand"><i>zasder</i><b>WEATHER</b> &nbsp;·&nbsp; stations people chose to share</div>
+  <div class="count" id="count">loading…</div>
+</div>
+<!-- What the pins show. Populated by map.js: the CSP forbids inline
+     script, and the list of readings lives with the bands that colour
+     them. -->
+<div id="metrics" role="group" aria-label="What the pins show"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"
+        integrity="sha256-Hk4dIpcqOSb0hZjgyvFOP+cEmDXUKKNE/tT542ZbNQg=" crossorigin=""></script>
+<script src="/static/map.js"></script>
+</body>
+</html>

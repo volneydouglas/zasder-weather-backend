@@ -87,3 +87,26 @@ def test_hosting_info_reads_the_platform_env(client, monkeypatch):
     assert client.get("/api/session", headers=H).json()["hosted"] == {
         "platform": "fly", "region": "iad", "app": "zasder-weather-guest-doren"}
 
+
+
+def test_session_names_the_zone_and_the_directory(client, monkeypatch):
+    """2.3: `timezone` is the IANA zone the rollups are cut in, so the app
+    can label a server's day as that server's day; `map_directory_url`
+    (F07) is the directory this server publishes to, non-secret, so a
+    read-token client browses the directory its server is actually on."""
+    from zoneinfo import ZoneInfo
+    from app.config import settings
+    monkeypatch.setattr(settings, "timezone", "America/Phoenix")
+    monkeypatch.setattr(settings, "map_directory_url", "https://maps.example.org/")
+    body = client.get("/api/session", headers=H).json()
+    assert body["timezone"] == "America/Phoenix"
+    ZoneInfo(body["timezone"])                     # a real IANA name
+    assert body["map_directory_url"] == "https://maps.example.org"
+    # A guest sees both too: neither is a secret, and the guest's app
+    # needs both to read the server's days and browse its map.
+    r = client.post("/api/guest-tokens", headers=H, json={"label": "t"})
+    guest = {"Authorization": f"Bearer {r.json()['token']}"}
+    body = client.get("/api/session", headers=guest).json()
+    assert body["role"] == "guest"
+    assert body["timezone"] == "America/Phoenix"
+    assert body["map_directory_url"] == "https://maps.example.org"

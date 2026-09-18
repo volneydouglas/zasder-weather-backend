@@ -180,9 +180,13 @@ async def test_year_prior_is_looked_up_once_and_tier_check_is_bounded(db_module,
     n1 = len(calls)
     r2 = await db.rain_rollups(mac, "America/Phoenix")
     assert r1["yearly_in"] == r2["yearly_in"] == 2.47
-    # Second pass: no boundary is looked up again (round-three review
-    # BE-F3: every boundary's prior and reset floor are memoised).
-    assert len(calls) == n1, (n1, len(calls))
+    # Second pass: no PAST-ANCHORED boundary is looked up again (round-three
+    # review BE-F3: the day, week, month and year priors and reset floors
+    # are memoised). The hour is the one exception since 2.3: its prior is
+    # a single bounded index probe per call and is deliberately not
+    # cached, so that on a server whose ledger answers the longer periods
+    # the cache is never written at all (see _YEAR_PRIOR_CACHE).
+    assert len(calls) == n1 + 1, (n1, len(calls))
     # A gauge that reset (the Davis started at 14.6 and reads 1.59): the
     # year-since-reset floor is a full scan, so it is memoised too.
     reset = "5D:5D:05:00:00:01"

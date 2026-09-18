@@ -249,6 +249,55 @@ def test_severity_defaults_and_warnings():
     assert severity_of("brand_new_kind") == "watch"
 
 
+def test_morning_report_switched_on_in_the_evening_waits_for_morning(client, monkeypatch):
+    """Doren, 2026-09-13: "Good morning · Chaucer Drive" landed at 8:04 PM
+    with the report set to 10:00 AM. The gate was "first tick at or after
+    the hour, once a day" with no upper bound, so a report switched on or
+    rescheduled in the evening fired on the spot. Past the grace window
+    the day is over; the next morning is the first report."""
+    import app.alerts as al
+    from types import SimpleNamespace
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from app.config import settings as _settings
+
+    sent = []
+    monkeypatch.setattr(
+        al, "_send_sync",
+        lambda subject, body, to, cfg, html=None: sent.append(subject))
+    cfg = SimpleNamespace(enabled=True, recipients=["v@z.com"],
+                          digest_hour=10, digest_minute=0, smtp_host="h",
+                          smtp_port=465, smtp_username=None,
+                          smtp_password=None, smtp_from=None,
+                          smtp_tls=False, smtp_ssl=True, email_scope="all")
+    try:
+        tz = ZoneInfo(_settings.timezone)
+    except Exception:
+        tz = _dt.timezone.utc
+
+    def ms_at(day, hour, minute=0):
+        return int(_dt.datetime(2026, 9, day, hour, minute,
+                                tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        from app import db
+        # Something to report each day, so an empty report is not the reason.
+        for day in (13, 14, 15):
+            await db.log_alert(ms_at(day, 3), "rule", "AA", "Wind Gust alert",
+                               "18 mph", 1)
+        mon = al.AlertMonitor()
+        await mon._maybe_send_digest(cfg, [], ms_at(13, 20, 4))   # switched on at 8:04 PM
+        assert sent == [], "ten hours past its hour is not a morning"
+        await mon._maybe_send_digest(cfg, [], ms_at(13, 23, 30))  # still the same evening
+        assert sent == []
+        await mon._maybe_send_digest(cfg, [], ms_at(14, 10, 5))   # the next morning
+        assert len(sent) == 1
+        await mon._maybe_send_digest(cfg, [], ms_at(15, 13, 0))   # 3 h late: inside the grace
+        assert len(sent) == 2
+
+    asyncio.run(run())
+
+
 def test_digest_sends_once_per_day(client, monkeypatch):
     import app.alerts as al
     from app import db

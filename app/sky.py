@@ -59,7 +59,12 @@ def score(i: SkyInputs) -> tuple[float, list[str]]:
             # Weighted like cloud: a full moon up washes out the deep sky
             # the way an overcast does, whatever the rest of the night.
             s = 1.0 if m <= 0.25 else 0.7 if m <= 0.55 else 0.35 if m <= 0.85 else 0.0
-        parts.append((s, 3.0, None if s == 1.0 else f"moon {m * 100:.0f}% lit"))
+        # The note's lead already says "First Quarter, 38% lit"; a reason
+        # that repeated the number read twice in one push (Doren, 09-17:
+        # "First Quarter, 38% lit ... moon 38% lit"). The reason names the
+        # effect, the lead keeps the figure.
+        parts.append((s, 3.0, None if s == 1.0
+                      else "a bright moon up" if m > 0.85 else "moonlight"))
     if i.dew_spread_f is not None:
         d = i.dew_spread_f
         s = 1.0 if d >= 8 else 0.6 if d >= 4 else 0.2

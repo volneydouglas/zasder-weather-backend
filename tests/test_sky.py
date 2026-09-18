@@ -17,7 +17,7 @@ def test_score_and_verdict(client):
     moon_up = sky.SkyInputs(5, 30, 25, 3, 0.98, True)
     assert sky.score(moon_down)[0] == 1.0
     s_up, r_up = sky.score(moon_up)
-    assert sky.verdict(s_up) != sky.GOOD and r_up == ["moon 98% lit"]
+    assert sky.verdict(s_up) != sky.GOOD and r_up == ["a bright moon up"]
     # Overcast is poor whatever else is true; the reason leads with cloud.
     over = sky.SkyInputs(90, 30, 25, 3, 0.1, True)
     s_o, r_o = sky.score(over)
@@ -124,3 +124,103 @@ def test_note_goes_out_once_after_sunset_and_good_only_holds(client, monkeypatch
         await alerts.AlertMonitor()._maybe_send_sky(cfg, devs, dusk)
         return await db.get_kv("alerts.sky.day")
     assert asyncio.run(run2()) == "2026-09-10" and sent == []
+
+
+def test_the_note_prints_the_station_clock_not_utc(client, monkeypatch):
+    """2.2 printed "Sunset 11:35 PM" in Pennsylvania: the almanac's UTC
+    instants went to the note unconverted (Doren, 09-11). Irwin PA on
+    Sep 11 sets at 7:35 PM EDT and rises at 6:56 AM."""
+    from app import alerts, db, config
+    monkeypatch.setattr(config.settings, "timezone", "America/New_York")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token",
+                         "Content-Type": "application/json"},
+                json={"device": {"id": "AA:BB:CC:DD:EE:34", "name": "Chaucer",
+                                 "coords": {"lat": 40.32, "lon": -79.70}},
+                      "timestamp_utc": "2026-09-11T22:40:00Z",
+                      "outdoor": {"tempf": 70, "humidity": 89, "dew_point_f": 67},
+                      "wind": {"speed_mph": 0}})
+    client.put("/api/alerts", headers=H, json={"sky_notes": True})
+    sent = []
+
+    async def fake_deliver(cfg, subject, text, title, body, **kw):
+        sent.append(body)
+        return True
+
+    async def fake_clouds(self, lat, lon, tz_name, now_local):
+        return 50.0
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+    monkeypatch.setattr(alerts.AlertMonitor, "_fetch_clouds", fake_clouds)
+    tz = ZoneInfo("America/New_York")
+    at = int(datetime(2026, 9, 11, 18, 55, tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        devs = await db.list_devices()
+        devs[0]["lastData"]["dateutc"] = at - 60_000
+        await alerts.AlertMonitor()._maybe_send_sky(cfg, devs, at)
+    asyncio.run(run())
+    assert len(sent) == 1
+    assert sent[0].startswith("Sunset 7:35 PM. sunrise 6:56 AM.")
+    assert "11:35" not in sent[0]
+
+
+def test_the_note_is_filed_as_a_report_and_the_push_names_it(client, monkeypatch):
+    """2.3 (Doren, 09-13): the sky note is stored BEFORE it goes out and
+    the push carries route report/<id>; a retried delivery updates the
+    same row (dedupe on the day)."""
+    from app import alerts, db, config
+    monkeypatch.setattr(config.settings, "timezone", "America/New_York")
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token",
+                         "Content-Type": "application/json"},
+                json={"device": {"id": "AA:BB:CC:DD:EE:35", "name": "Chaucer",
+                                 "coords": {"lat": 40.32, "lon": -79.70}},
+                      "timestamp_utc": "2026-09-11T22:40:00Z",
+                      "outdoor": {"tempf": 70, "humidity": 89, "dew_point_f": 67},
+                      "wind": {"speed_mph": 0}})
+    client.put("/api/alerts", headers=H, json={"sky_notes": True})
+    sent = []
+
+    async def fake_deliver(cfg, subject, text, title, body, **kw):
+        sent.append((title, kw.get("route")))
+        return len(sent) > 1          # the first delivery fails, the retry lands
+
+    async def fake_clouds(self, lat, lon, tz_name, now_local):
+        return 50.0
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+    monkeypatch.setattr(alerts.AlertMonitor, "_fetch_clouds", fake_clouds)
+    tz = ZoneInfo("America/New_York")
+    at = int(datetime(2026, 9, 11, 18, 55, tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        devs = await db.list_devices()
+        devs[0]["lastData"]["dateutc"] = at - 60_000
+        mon = alerts.AlertMonitor()
+        await mon._maybe_send_sky(cfg, devs, at)
+        await mon._maybe_send_sky(cfg, devs, at + 60_000)
+        return await db.list_reports(kind="sky")
+    rows = asyncio.run(run())
+    assert len(rows) == 1 and rows[0]["kind"] == "sky"
+    rid = rows[0]["id"]
+    assert sent == [("A fair night for the scope", f"report/{rid}")] * 2
+    detail = client.get(f"/api/reports/{rid}", headers=H).json()["report"]
+    p = detail["payload"]
+    assert p["verdict"] == "fair" and p["sunset"] == "19:35" and p["sunrise_next"] == "06:56"
+    assert p["cloud_pct"] == 50.0 and p["humidity_pct"] == 89.0 and p["moon_phase"]
+    assert any("humidity" in r for r in p["reasons"])
+    assert "fair night" in detail["summary"].lower() and "50% cloud" in detail["summary"]
+
+
+def test_the_note_states_the_moon_figure_once():
+    from app import sky
+    # Doren's 2026-09-17 push read "First Quarter, 38% lit ... moon 38%
+    # lit": the lead and the reason both carried the percentage.
+    sunset = datetime(2026, 9, 17, 19, 25)
+    half = sky.SkyInputs(92, 80, 7, 2, 0.38, True)
+    _title, body, v = sky.note(sunset_local=sunset, sunrise_next_local=None,
+                               moon_phase="First Quarter", moon_illumination=0.38, inputs=half)
+    assert v == sky.POOR
+    assert body.count("38% lit") == 1 and "moonlight" in body
+

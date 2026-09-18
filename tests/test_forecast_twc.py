@@ -250,10 +250,20 @@ def test_transform_carries_the_written_forecast():
     out = forecast_twc.transform(fixture)
     # The expired day-0 daytime half is dropped, not padded — so index 0 is
     # always "the half we are in now".
+    #
+    # Each entry also says which calendar DAY it belongs to (2.3): the
+    # dayparts interleave day/night two per day, and the drop above destroys
+    # that alignment, so the date has to be read off the index BEFORE it.
+    # Tonight is still day 0's night even though day 0's daytime half is
+    # gone — an entry tagged with its own position in the surviving list
+    # would put it on the wrong day.
     assert out["narrative"] == [
-        {"name": "Tonight", "text": "Mainly clear skies. Low near 85F."},
-        {"name": "Tomorrow", "text": "A mix of clouds and sun. Hot."},
-        {"name": "Tomorrow night", "text": "Partly cloudy. Low 84F."},
+        {"name": "Tonight", "text": "Mainly clear skies. Low near 85F.",
+         "night": True, "date": "2026-08-12"},
+        {"name": "Tomorrow", "text": "A mix of clouds and sun. Hot.",
+         "night": False, "date": "2026-08-13"},
+        {"name": "Tomorrow night", "text": "Partly cloudy. Low 84F.",
+         "night": True, "date": "2026-08-13"},
     ]
 
 
@@ -272,4 +282,25 @@ def test_transform_skips_blank_narrative_entries():
                                daypartName=["Today", "Tonight", None, "X"],
                                narrative=["   ", "Clear.", "orphaned", None])]
     out = forecast_twc.transform(fixture)
-    assert out["narrative"] == [{"name": "Tonight", "text": "Clear."}]
+    assert out["narrative"] == [{"name": "Tonight", "text": "Clear.",
+                                 "night": True, "date": "2026-08-12"}]
+
+
+def test_a_narrative_past_the_last_known_day_carries_no_date(): 
+    """The daypart array can run longer than validTimeLocal. Such an entry
+    still has prose worth showing at the top of the card, but it belongs to
+    no cell in the strip — so it carries no date rather than the last day's,
+    which would file a Saturday forecast under Friday."""
+    from app import forecast_twc
+    fixture = dict(TWC_FIXTURE)
+    fixture["daypart"] = [dict(TWC_FIXTURE["daypart"][0],
+                               daypartName=["Today", "Tonight", "Thu", "Thu night",
+                                            "Fri", "Fri night"],
+                               narrative=["a", "b", "c", "d", "e", "f"])]
+    out = forecast_twc.transform(fixture)
+    dated = [e for e in out["narrative"] if "date" in e]
+    assert len(dated) == 4, "two known days, two halves each"
+    assert [e["date"] for e in dated] == ["2026-08-12", "2026-08-12",
+                                          "2026-08-13", "2026-08-13"]
+    assert [e["name"] for e in out["narrative"][4:]] == ["Fri", "Fri night"]
+    assert all("date" not in e for e in out["narrative"][4:])

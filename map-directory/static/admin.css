@@ -1,0 +1,17 @@
+html, body { margin: 0; background: #0b0d12; color: #e8ecf2;
+             font: 14px -apple-system, "Segoe UI", Arial, sans-serif; }
+body { padding: 20px; }
+h1 { font-weight: 300; font-size: 16px; color: #8a93a3; }
+h1 b { color: #e8ecf2; letter-spacing: 1px; }
+.muted { color: #8a93a3; font-size: 12px; max-width: 70ch; }
+input { background: #151922; color: #e8ecf2; border: 1px solid #262c38; border-radius: 6px; padding: 6px 8px; width: 28ch; }
+button { background: #151922; color: #e8ecf2; border: 1px solid #262c38; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+button.danger { border-color: #ff5c47; color: #ff5c47; }
+table { border-collapse: collapse; margin-top: 16px; width: 100%; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #262c38; font-size: 13px; vertical-align: top; }
+th { color: #8a93a3; font-size: 11px; letter-spacing: .8px; text-transform: uppercase; }
+td.key { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #8a93a3; }
+tr.blocked td { color: #8a93a3; }
+.pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; border: 1px solid #262c38; }
+.pill.on { color: #7fd28a; border-color: #7fd28a; }
+.pill.off { color: #ff5c47; border-color: #ff5c47; }

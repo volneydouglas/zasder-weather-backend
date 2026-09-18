@@ -8,6 +8,355 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.3.0] — 2026-09-18
+
+### Added
+- **The outlook report and the storm summary email in the morning report's
+  dress.** Both now ride as HTML with the plain text as the alternative:
+  the day and its sky, the numbers as tiles, the sun times, the provider's
+  own forecast prose, and the credit; the storm summary shows when it
+  rained and its total, peak rate, gust and temperature range as tiles.
+  Threshold and device alerts stay plain text. `app/email_card.py` holds
+  the shared palette and shell.
+- **The outlook push carries the forecast.** The notification used to say
+  "Thunderstorms, 81/63, 91% precipitation" while the email carried the
+  narrative; now the push carries the narrative too, cut at a sentence end
+  well inside the 4 KB push limit.
+
+- **A switch for severe weather pushes, and warnings only.** The server
+  relays Severe and Extreme National Weather Service alerts as urgent
+  pushes, and until now nothing could turn that off: the app's Severe
+  weather toggle governs the dashboard banner and the widget triangle on
+  that device only. `nws_push` (on unless turned off) and
+  `nws_warnings_only` on `PUT /api/alerts`; the apps' new Severe weather
+  door writes them.
+- **A reissued NWS alert no longer pushes again.** The Weather Service
+  mints a new id for every update of the same alert, so an extended Flood
+  Watch pushed twice and one Extreme Heat Warning pushed five times in
+  three days. An Update or Cancel whose references name an alert already
+  pushed is recorded without a push.
+
+- **A note on a threshold rule, and a push that names its rule.** `note`
+  on `POST`/`PATCH /api/alerts/rules` (up to 120 characters, one line) is
+  appended to the alert body: "Rain Rate is 0.12 in/hr (> 0.1 in/hr). Park
+  the 115H". The push carries `route: rule/<id>`, so the app can open
+  whatever the phone keeps for that rule; the push itself never carries a
+  link. The note rides in config backups.
+
+- **Tapping a storm summary push opens its Storm Report, and the sky note
+  has a page of its own.** The Storm Report is filed before the summary
+  goes out and the push carries its route. The sky note is stored as a
+  report of kind `sky` (the verdict, the sun and moon, the readings and the
+  reasons behind the call) and its push opens that page. `GET
+  /api/reports` lists the new kind.
+
+- **Share on the map.** An opt-in switch (`GET`/`PUT /api/map`, owner
+  token) puts the station on the shared map at maps.zasder.com: every ten
+  minutes the server signs a beacon with the location snapped to a 0.5 km
+  grid, the outdoor conditions, and a display name and visit link only if
+  you turn them on, and posts it to the directory (`MAP_DIRECTORY_URL`,
+  default `https://maps.zasder.com`). Switching off sends a signed
+  withdrawal; beacons expire after three hours on their own. The station
+  id is a hash, never the MAC; indoor and air-monitor readings never
+  leave the server. `POST /api/map/test` sends one now. The directory
+  itself ships in `map-directory/` so a club can run its own.
+- **Today's highlights.** `GET /api/devices/{mac}/highlights` ranks
+  today's high, overnight low, gust, rain and humidity against the
+  station's own daily rollups for the same time of year, across every
+  year on record: "Hottest mid-September day in 8 years", "Hotter than
+  94% of mid-September days here", "No rain in 47 days". Records and
+  rankings from your record, never a made-up normal; empty under two
+  years of rollups and on an ordinary day. The apps show the lines under
+  the hero.
+
+- **`last_rain_day` on the highlights payload:** the last day with
+  measurable rain in the station's rollups, for the apps' "when did it
+  last rain" Siri answer.
+
+- **The storm watch on the lock screen has its own switch.** `storm_live_activity`
+  in the alert preferences (on by default, `GET`/`PUT /api/alerts`). The
+  Live Activity used to follow only the storm-summary master switch, so
+  choosing email-only summaries still put the card on the lock screen.
+  Off gates the start; a card already up keeps updating and ends normally.
+
+- **Map signing key rotation.** `POST /api/map/rotate` mints a new key
+  and sends the directory the old key's blessing of it; every beacon
+  carries the proof until the directory acknowledges. `GET /api/map`
+  reports the public key and whether a rotation is pending. The directory
+  (`map-directory/`) gained the matching check, a 16-station cap per
+  server, `GET /v1/stats`, `GET /v1/stations/{id}`, an operator blocklist
+  (`MAP_ADMIN_TOKEN`, `/admin`), and a strict Content-Security-Policy with
+  the page's code moved out of the HTML.
+
+- **Map location as a three-way choice, and the link is your own public
+  page or nothing.** `location_precision` on `/api/map` is `exact`,
+  `area` (a 0.5 km grid, the default) or `city` (a 10 km grid); the beacon
+  carries `precision`. The typed visit link is gone: `visit_public_page`
+  links the server's own public page, offered only while that page is on
+  and the server knows its https address (`PUBLIC_BASE_URL` or Fly), and
+  dropped from the next beacon the moment the page is turned off.
+
+- **How accurate is the forecast here.** `GET /api/devices/{mac}/forecast-accuracy`
+  scores the forecast archive the server has been filling since 1.8
+  against the station's own readings, one row per lead time, and the
+  Reports pane has a page for it. Bias is signed forecast minus measured,
+  so a positive number means the model promised more than the backyard
+  delivered; the mean absolute error rides beside it, because a model that
+  is eight degrees high half the time and eight low the rest has no bias
+  and is still wrong. Today is never scored, a station with no rain gauge
+  has no rain calls to grade rather than a perfect record, and a lead
+  nobody filed reads as empty rather than flawless. `available: false`
+  means the archive has nothing to score yet, which on a fresh server is
+  simply the truth: a forecast cannot be verified after the fact, which is
+  why the collector shipped a release before anything read it.
+- **The pins on the shared map show the reading you came for.** Temperature,
+  feels like, rain today, rain rate, wind, gust, humidity, dew point,
+  pressure or UV, chosen from a row of chips in the app and on
+  maps.zasder.com. Every one of them already rode the beacon, so the
+  switch costs no request and no server change. Each reading is banded on
+  its own scale, because two inches of rain is not "hot" and a 70F dew
+  point is not "warm", it is oppressive. A station that does not measure
+  the reading you picked gets a plain grey pin and the caption counts it
+  out loud, so a missing sensor never reads as a dry gauge.
+- **Tapping a day in the six-day forecast reveals that day's written
+  forecast.** The prose was already in the payload the strip is built
+  from, so this costs no extra call. Each written half now carries the day
+  it belongs to, sent as a date rather than a position, so a day the strip
+  could not draw cannot shift Tuesday's forecast onto Monday. Only days
+  with prose behind them offer the tap, which means an Open-Meteo forecast
+  looks exactly as it did.
+- **A dashboard widget the size of a Home Screen page.** Large, extra
+  large, and on iOS 27 and macOS 27 the tall extra large: current
+  conditions, the last 24 hours as a curve, the week ahead, sunrise and
+  sunset, one line of today against the local climate normal, and your
+  other stations as tiles. A tile shows what its station measures, so an
+  air monitor shows its CO2 and a station that has reported nothing says
+  so rather than showing a zero.
+
+- **A pin can carry an assigned id instead of your server's address.**
+  `link_mode` on `/api/map` is `direct` (the visit link is your public
+  page), `id` (the default: the directory mints a short id such as
+  `AZ...` on the first beacon that asks for one, and the pin links to
+  `/s/<id>` on the directory) or `none`. Switching the shared station
+  withdraws the old pin in the same save, the directory's refusals read
+  as sentences in the app, and the public dashboard no longer prints the
+  server's origin line. The operator can reissue a badly minted id with
+  `POST /v1/admin/servers/{id}/public-id` (admin token; an id is never
+  reissued on its own because links already handed out must keep
+  working).
+- **Siri answers rain totals, records, the last rain and runs a climate
+  report.** Four App Intents with Shortcut phrases: Get Rain Total (today,
+  this week, this month, this year, from the station's own counters; an
+  absent counter is "no rain total", never zero), Get a Record (highest or
+  lowest temperature, strongest gust, with the moment it happened), When
+  Did It Last Rain, and Run a Climate Report. Switch Site is a shortcut
+  the next launch or foreground consumes.
+- **The hero row answers "is today unusual".** VS YESTERDAY and VS
+  FORECAST replace the mean and median that never left each other on a
+  diurnal day. Wind Speed and Wind Gust charts gain a strip of arrows
+  showing where the wind came from; the dashboard curves mark sunrise,
+  solar noon and sunset; the outlook report shares as a picture.
+- **The Sun & Moon card gets its moon.** An arc on the ring for the hours
+  the moon is up, a drawn phase glyph lit by the real illuminated
+  fraction, moonrise and moonset, next full and next new, and the
+  day-length change under the daylight hours. The Almanac names solar
+  noon and the fully dark sky (astronomical dusk to dawn).
+- **Settings say what happens.** Quiet hours list what still pushes
+  overnight, a report time inside the quiet window gets a live caution,
+  storm summaries show what comes while it rains. The hero reflows two by
+  two at accessibility text sizes.
+- **The map in the app.** A Map card under the sun dial opens the shared
+  map as a page-level sheet on iOS and a Map pane on the Mac; the Sharing
+  page's map section picks which station the pin carries.
+
+- **Push from a site you own.** Under Settings → Sites, "Push from this
+  site" lets a second server you own push its alerts, reports and storm
+  summaries to this phone beside your default site's. The app hands the
+  same relay key to each site and registers the phone there; every push
+  now names the server that sent it, so tapping a notification from
+  another site opens the app on that site. Guests never push; Live
+  Activities and widgets stay with the default site.
+- **Siri answers any one reading, and the forecast for a day.** "What's
+  the gust in Zasder Weather", temperature, feels like, humidity, dew
+  point, wind, rain today, rain rate, pressure, UV, solar, lightning,
+  indoor temperature or air quality, in your units, with the station's
+  name and the reading's age when it is stale, and a plain "isn't
+  measuring" for a sensor the station lacks. "Will it rain tomorrow"
+  answers the high, the low and the chance of rain as a percentage, plus
+  the first sentence of the written forecast, for today, tonight,
+  tomorrow or the day after.
+- **Three more Live Activities: lightning, a wind ramp, a freeze night.**
+  Lightning within your chosen distance opens a card with the nearest
+  strike, its trend, the hour's count and a countdown to all clear. Gusts
+  ramping past your threshold open one with the gust against the
+  episode's peak, the direction, the sustained speed and an easing state.
+  A forecast low at or below freezing, or the station itself heading
+  there in the evening, opens one that follows the temperature to
+  sunrise, marks the moment it froze and keeps the night's minimum. Each
+  has a switch beside the Storm Watch one, and the lightning radius and
+  gust threshold are set in your units (`lightning_live_activity`,
+  `wind_live_activity`, `freeze_live_activity`, `lightning_live_mi`,
+  `wind_live_mph` on `/api/alerts`, in config backups).
+- **The map signing key can be rotated from the Sharing page**, which
+  shows the key's fingerprint, asks first, and says whether the
+  directory took the new key or will confirm on the next beacon.
+- **The dashboard's rain periods come from the daily ledger** on a
+  station that reports only a lifetime counter: today, this week, this
+  month and this year sum the days' measured rain, so a day the gauge
+  was reset twice, or reset and then caught more rain, reads its full
+  total, and a manual change to the counter is not shown as rain.
+  Readings delivered in a batch (a relay catching up, an import) are
+  folded in time order, so those days keep their measured total.
+
+### Changed
+- **The day's rain from a lifetime counter is now the sum of the
+  counter's rises.** `last - first` is right for a day with no reset and
+  for a day with exactly one; it reads short when a gauge resets twice, or
+  resets and then catches more rain than it had counted before. The new
+  `yearly_rise` column on the daily rollups adds up every rise and lets
+  every drop count for nothing, which is right whatever the counter did.
+  A station's own daily counter still wins where it has one. Existing
+  servers gain the column on upgrade and fill it in with the usual
+  background rollup rebuild; until that finishes, days read exactly as
+  they did before.
+- **Live Activity cards adapt to the room they are given.** On a wide
+  presentation the storm card stops stacking a heading over a number, the
+  morning report puts yesterday and today on one line instead of dropping
+  either, and the rain countdown keeps its size while everything around it
+  gives way.
+- **Email cards are easier to read.** Tile labels are 11px instead of 9px,
+  and the outlook and storm twins print temperatures with their unit.
+
+### Fixed
+- **A database worker thread could die reporting to a loop that was
+  already gone.** A task cancelled at shutdown while its connection was
+  still opening never reached the close path, so aiosqlite's thread
+  later raised "Event loop is closed" (a traceback on every such
+  shutdown, and flaky CI). Every raw connection now uses a worker thread
+  that drops a result nobody can receive and ends quietly, and shutdown
+  reaps every app-owned task before the loop closes.
+- **A morning report switched on in the evening said "Good morning" at
+  8 PM.** The report went on the first tick at or after its clock time
+  with no upper bound, so enabling or rescheduling it after that time,
+  or a server down all morning, sent it on the spot. It now has a
+  six-hour grace window; past that, the next morning is the first one.
+- **A "Rain starting" rule fired once, ever.** The preset is Rain Rate
+  above 0.00, and the re-arm deadband for rain is 0.02 in, so the rule
+  waited for a rate of -0.02 before it could fire again. The deadband is
+  now clamped to the sensor's scale: a dry gauge held for the dwell is
+  the all-clear, and the next shower is a new alert. The same clamp
+  covers wind, UV, humidity and the air fields at zero, and humidity
+  at 100.
+- **An upgraded NWS alert pushes even when its earlier form was held.**
+  The reissue check now consults only the ids that were actually pushed,
+  so a Moderate alert updated to Severe, or a Watch held by warnings-only
+  that becomes a Warning, is delivered.
+- **Sky notes printed sunset and sunrise in UTC.** "Sunset 11:35 PM" in
+  Pennsylvania: the almanac's instants were formatted without converting
+  to the server's `TIMEZONE`. The 45-minute-before-sunset timing was
+  unaffected; only the printed clock was wrong.
+- **A crash between the NWS ledgers' two writes could push an alert
+  twice.** The pushed ledger is written before the seen ledger and folded
+  into it on load.
+- **The map directory's public-id index ran before the column it
+  indexes existed on a live database**, which took the directory down at
+  boot on upgrade. The index now follows the migration, and a test boots
+  against the real pre-2.3 schema.
+- **The review of the 2.3 cycle, before release (R23).** An NWS update
+  chain pushed every other update, because a suppressed reissue never
+  joined the pushed ledger; a chain now pushes once, and an update that
+  raises severity or turns a Watch into a Warning pushes again. Config
+  backups left out the NWS push switch, the warnings-only filter and the
+  storm Live Activity switch. Highlights reported a dry streak on
+  counter-only stations while it rained, never ranked their rain against
+  prior years, and counted the current year. A lifetime-counter step that
+  does not fit the time it took (a console set by hand) was credited as
+  rain; existing servers re-fold their rollups once on first boot. The
+  evening outlook and morning report pushes now appear in the alert
+  history and reach webhooks. Stations posting non-finite or off-globe
+  coordinates no longer get a location. Map sharing refuses a test beacon
+  or a key rotation while the switch is off, a lost rotation
+  acknowledgement no longer strands the server, and a withdrawal the
+  directory missed is retried until it lands.
+- **The map directory, hardened.** One station posting a malformed
+  reading blanked the map for everyone; readings are stored as numbers
+  and the page tolerates anything else. A stranger's bad admin tokens
+  could lock the operator out; the lockout is per address. Request bodies
+  are read under a hard 8 KB limit, replayed withdrawals and out-of-order
+  beacons are refused, posts are limited per address, the number of
+  listed servers is capped, and a pin's id-mode link opens a page naming
+  the destination server before you continue. The Fly deploy waits on a
+  health check and the base image is digest-pinned.
+- **The apps.** The forecast accuracy page reported "needs backend 2.3"
+  on every server because its window rode inside the URL path; it loads
+  now, and a server with insights switched off says so. Asking Siri for
+  the highest temperature this year answered with the strongest gust. VS
+  FORECAST compared a rolling 24-hour high with today's forecast. "When
+  did it last rain" claimed no rain on record when the server was
+  unreachable. A Siri site switch was lost to the next intent, and the
+  Mac ignored it with its window closed. Share on the map left a switch
+  flipped when the save failed, the station map had no retry after a
+  failed load, and the rain rate on a pin's card lacked its unit. The
+  dashboard widget labelled the week in the phone's time zone, asked for
+  the wrong station's forecast, and drew cloud icons nearly invisible in
+  light mode. The rain-start and morning cards showed inches and mph
+  regardless of your units.
+
+- **The second review round (R23b).** Rain that fell across midnight
+  was lost from both days on a lifetime-counter station: the first
+  counter step of a day is now measured from the previous day's last
+  reading, and rollups re-fold once on upgrade. The forecast scorecard
+  scored a day with a single noon reading as a whole day; it now scores
+  only days with twenty hours of observations, says how many it left
+  out and why, and the apps' headline waits for enough of them. "No rain
+  in N days" was asserted across a gap the gauge never recorded; the
+  streak needs the days in between, otherwise the card says when it last
+  recorded rain. Highlight lines carry their typed values and the apps
+  say them in your units. A redirect from the map directory counted as
+  success and dropped the retiring key. A pending withdrawal is visible
+  whenever the page is reopened, and the footer no longer promises
+  removal within minutes. `/api/session` names the server's timezone and
+  map directory: Siri's climate report and "when did it last rain" count
+  days on the server's clock, the daily-report grace note is judged on
+  it, and the native map browses the directory your server publishes to.
+  The map directory bounds every timestamp to what a phone can
+  represent, no longer locks out a server whose clock ran fast, and a
+  coordinate sent as true/false is not a place. Switching sites can no
+  longer leave the previous server's sharing settings editable against
+  the new one.
+
+- **The independent deep review (R23c).** A Save and verify that
+  overlapped switching map sharing off could put the pin straight back
+  after the withdrawal; nothing signs once the switch is off. Rotating
+  the map key while a rotation was still unacknowledged could leave the
+  server with no key the directory accepted; the pending hand-over is
+  resolved first, and the rotate is refused with a reason when it cannot
+  be. Turning sharing back on while the directory was unreachable left
+  the pin off the map for up to ten minutes once it came back; every
+  message carries a strictly later stamp and an obsolete queued
+  withdrawal is dropped. A database restore that failed after the live
+  file was renamed away could leave the server running without its
+  database; every step is inside the rollback and the database stays
+  closed rather than reopen over nothing. Cancelling a restore mid-swap
+  released the database while the file swap was still running.
+
+- **The watch says which address and what it got back.** A decode error
+  on the watch named the host without its port and hid the body, so a
+  LAN backend on a nonstandard port could fail for weeks with "response
+  wasn't valid JSON" and no way to tell why. The error now reads
+  host:port, says outright when the body was empty, and quotes the first
+  characters of anything else that was not JSON. The watch's manual
+  entry also refused every http address, which ruled out the one
+  workaround a LAN self-hoster could try; it now accepts http for an IP
+  address, a .local name or an unqualified host, the same cases App
+  Transport Security allows, and https anywhere.
+
+### Changed (platform)
+- **Zasder Weather requires iOS 18.** The rain-start countdown joins the
+  other Live Activities on the watch Smart Stack and in CarPlay, which
+  needs the iOS 18 activity families; iOS 18 runs on every iPhone that
+  ran iOS 17.
+
 ## [2.2.0] — 2026-09-11
 
 ### Added

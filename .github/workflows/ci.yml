@@ -19,3 +19,13 @@ jobs:
       - name: Run backend tests
         run: pytest -q
         working-directory: .
+      # The station map directory ships here too, with its own database and
+      # its own suite. A schema migration that only fails against a database
+      # that ALREADY exists went out green once and crash-looped on boot
+      # (2026-09-14), so what a club runs is tested with what it runs.
+      - name: Install map directory deps
+        run: pip install -r requirements-dev.txt
+        working-directory: map-directory
+      - name: Run map directory tests
+        run: pytest -q
+        working-directory: map-directory

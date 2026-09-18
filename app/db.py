@@ -13,6 +13,83 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 import aiosqlite
+from aiosqlite import core as _aiosqlite_core
+
+
+class _Connection(aiosqlite.Connection):
+    """aiosqlite's Connection with a worker thread that survives the loop
+    going away. The stock thread hands every result back with
+    `call_soon_threadsafe`; when the loop that queued the job has already
+    closed (a task cancelled at shutdown while it was still CONNECTING
+    never reaches __aexit__, so nothing stops the thread), that call
+    raises "Event loop is closed", the except branch calls it again for
+    the exception, and the thread dies with a traceback: the eleven-then-
+    seventeen CI-only PytestUnhandledThreadExceptionWarning sites
+    (2026-09-14). A result nobody can receive is dropped here, a sqlite3
+    connection it produced is closed, and the thread ends quietly."""
+
+    def run(self) -> None:                      # noqa: C901 - mirrors upstream
+        while True:
+            tx_item = self._tx.get()
+            if tx_item is _aiosqlite_core._STOP_RUNNING_SENTINEL:
+                break
+            future, function = tx_item
+            try:
+                result = function()
+            except BaseException as e:          # noqa: BLE001 - upstream shape
+                if not self._hand_back(future, _aiosqlite_core.set_exception, e):
+                    self._close_orphaned()
+                    break
+                continue
+            if not self._hand_back(future, _aiosqlite_core.set_result, result):
+                if isinstance(result, sqlite3.Connection):
+                    result.close()
+                self._close_orphaned()
+                break
+
+    def _close_orphaned(self) -> None:
+        """The loop died mid-query on an ESTABLISHED connection (R23): the
+        sqlite3 handle would otherwise live until the garbage collector
+        found it, holding the file open. Closed here, in the worker
+        thread that owns it — sqlite3 objects may only be used from the
+        thread that created them — and nulled so nothing reuses it."""
+        conn = self._connection
+        if conn is None:
+            return
+        self._connection = None
+        try:
+            conn.close()
+        except Exception:                       # noqa: BLE001 - best effort
+            pass
+
+    @staticmethod
+    def _hand_back(future, setter, value) -> bool:
+        try:
+            future.get_loop().call_soon_threadsafe(setter, future, value)
+            return True
+        except RuntimeError as e:               # the loop is closed
+            if "closed" not in str(e):
+                raise
+            return False
+
+
+# The private names above are what 0.20.0 (requirements.txt) exposes;
+# an upgrade that renames them must fail at import, not in a thread.
+for _name in ("_STOP_RUNNING_SENTINEL", "set_result", "set_exception"):
+    if not hasattr(_aiosqlite_core, _name):
+        raise ImportError(f"aiosqlite.core.{_name} missing; update db._Connection")
+
+
+def open_connection(path: str | Path, **kwargs: Any) -> _Connection:
+    """`aiosqlite.connect` with the tolerant worker thread. Every raw
+    connection in the app goes through here (db, the VACUUM INTO
+    backups, the self-updater)."""
+    loc = str(path)
+
+    def connector() -> sqlite3.Connection:
+        return sqlite3.connect(loc, **kwargs)
+
+    return _Connection(connector, 64)
 
 from .config import settings
 
@@ -906,7 +983,7 @@ async def init_db(path: str | None = None) -> None:
     live = path is None
     if live:
         _ensure_dir()
-    async with aiosqlite.connect(path or settings.database_path) as db:
+    async with open_connection(path or settings.database_path) as db:
         # WAL lets the constant ingest writes and the chart-history reads run
         # without blocking each other. Under the default rollback journal a
         # multi-second history aggregation holds a lock that stalls ingest for
@@ -1091,6 +1168,19 @@ async def init_db(path: str | None = None) -> None:
             ("outlook_source", "TEXT"),
             # 2.2 sky notes.
             ("sky_notes", "INTEGER"), ("sky_good_only", "INTEGER"),
+            # 2.3 NWS relay switch (NULL = on, the pre-2.3 behaviour) and
+            # the warnings-only filter (NULL = every Severe/Extreme alert).
+            ("nws_push", "INTEGER"), ("nws_warnings_only", "INTEGER"),
+            # 2.3 storm watch on the lock screen (NULL = on): the Live
+            # Activity only ever checked the storm_summary master switch.
+            ("storm_live_activity", "INTEGER"),
+            # 2.3 item 5: the lightning / wind-ramp / freeze-night cards
+            # (NULL = on) and their two trigger thresholds (miles, mph;
+            # NULL = the module default).
+            ("lightning_live_activity", "INTEGER"),
+            ("wind_live_activity", "INTEGER"),
+            ("freeze_live_activity", "INTEGER"),
+            ("lightning_live_mi", "REAL"), ("wind_live_mph", "REAL"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
@@ -1114,6 +1204,10 @@ async def init_db(path: str | None = None) -> None:
         if "severity" not in existing:
             await db.execute(
                 "ALTER TABLE alert_rules ADD COLUMN severity TEXT")
+        # 2.3 (Doren's mower): a note the owner types, appended to the push.
+        if "note" not in existing:
+            await db.execute(
+                "ALTER TABLE alert_rules ADD COLUMN note TEXT")
         cur = await db.execute("PRAGMA table_info(alert_log)")
         existing = {r[1] for r in await cur.fetchall()}
         if "severity" not in existing:
@@ -1158,6 +1252,26 @@ async def init_db(path: str | None = None) -> None:
                 "INSERT INTO server_kv (k, v) VALUES "
                 "('rollups_dirty', lower(hex(randomblob(8)))) "
                 "ON CONFLICT(k) DO UPDATE SET v = excluded.v")
+        # 2.3 (R23): the fold's RULES have a version too. A ledger folded
+        # under an older rule (the rate gate on yearly_rise) is marked
+        # dirty ONCE so the lifespan rebuild re-folds history; a fresh
+        # database has nothing to re-fold and just records the version.
+        from .insights import ROLLUP_FOLD_VERSION, ROLLUP_FOLD_VERSION_KEY
+        cur = await db.execute("SELECT v FROM server_kv WHERE k = ?",
+                               (ROLLUP_FOLD_VERSION_KEY,))
+        ver_row = await cur.fetchone()
+        if (ver_row[0] if ver_row else None) != str(ROLLUP_FOLD_VERSION):
+            has_rollups = await (await db.execute(
+                "SELECT 1 FROM daily_rollups LIMIT 1")).fetchone()
+            if has_rollups:
+                await db.execute(
+                    "INSERT INTO server_kv (k, v) VALUES "
+                    "('rollups_dirty', lower(hex(randomblob(8)))) "
+                    "ON CONFLICT(k) DO UPDATE SET v = excluded.v")
+            await db.execute(
+                "INSERT INTO server_kv (k, v) VALUES (?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                (ROLLUP_FOLD_VERSION_KEY, str(ROLLUP_FOLD_VERSION)))
         # Same migration for hour_rollups: feels_* came after the table
         # shipped. Existing rows get 0/0 (= "no data"), so the feels-like
         # diurnal grid stays empty until a rebuild folds history in.
@@ -1790,6 +1904,12 @@ class LeaseBusy(RuntimeError):
 
 
 _GATE_CLOSED = False
+# A reason the gate must STAY closed when the lease that closed it exits
+# (REC-01, 2026-09-16 review): a restore that failed past its first rename
+# and could not put the old database back has no usable file under the
+# live name, and reopening would let the next connection create an empty
+# database there. Cleared only by `release_hold` (boot recovery, a test).
+_GATE_HELD: str | None = None
 # True inside the task that holds the lease: its own init_db and cache
 # refreshes go through connect() and must not wait on themselves.
 _LEASE_HOLDER: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -1820,6 +1940,26 @@ def is_open() -> bool:
     return not _GATE_CLOSED
 
 
+def hold_closed(reason: str) -> None:
+    """Keep the gate closed after the current lease exits: the holder
+    could not leave a usable database under the live name. Every later
+    connection is refused with `reason` until `release_hold`."""
+    global _GATE_HELD
+    _GATE_HELD = reason
+
+
+def release_hold() -> None:
+    global _GATE_HELD, _GATE_CLOSED
+    _GATE_HELD = None
+    _GATE_CLOSED = False
+    if _GATE_EVENT is not None:
+        _GATE_EVENT.set()
+
+
+def held_reason() -> str | None:
+    return _GATE_HELD
+
+
 async def wait_open(timeout_s: float | None = None) -> None:
     """Return when the database is open, or raise DatabaseUnavailable.
     The flag is re-read on a short cadence as well as the Event: the
@@ -1827,9 +1967,13 @@ async def wait_open(timeout_s: float | None = None) -> None:
     TestClient's) must still see the lease lift."""
     if not _GATE_CLOSED:
         return
+    if _GATE_HELD:
+        raise DatabaseUnavailable(_GATE_HELD)
     limit = GATE_WAIT_S if timeout_s is None else timeout_s
     deadline = time.monotonic() + limit
     while _GATE_CLOSED:
+        if _GATE_HELD:
+            raise DatabaseUnavailable(_GATE_HELD)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DatabaseUnavailable("the database is closed for a restore; "
@@ -1870,8 +2014,11 @@ async def maintenance_lease(drain_timeout_s: float | None = None
         yield
     finally:
         _LEASE_HOLDER.reset(token)
-        _GATE_CLOSED = False
-        event.set()
+        if _GATE_HELD is None:
+            _GATE_CLOSED = False
+            event.set()
+        else:
+            log.error("database stays closed after the maintenance lease: %s", _GATE_HELD)
 
 
 @asynccontextmanager
@@ -1896,7 +2043,7 @@ async def _connect_unguarded() -> AsyncIterator[aiosqlite.Connection]:
     # orphaned non-daemon thread then blocks interpreter exit forever
     # (the 2026-08-26 suite exit-hang). Normal paths still close cleanly;
     # daemonizing only changes what an ABANDONED connection can hold up.
-    conn = aiosqlite.connect(settings.database_path)
+    conn = open_connection(settings.database_path)
     conn.daemon = True
     async with conn as db:
         db.row_factory = aiosqlite.Row
@@ -2130,7 +2277,16 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
         )
         if new_ts is not None:
             # Scrubbed + batch-deduped rows only — exactly what SQLite stored.
-            fresh = [scrubbed_by_ts[ts] for ts in new_ts if ts in scrubbed_by_ts]
+            # Folded in TIMESTAMP order (2.3): `new_ts` is a set, and a batch
+            # folded in set order reached the yearly_rise clause out of
+            # order, which abandons the day's sum (correctly — it cannot see
+            # the steps it skipped). One row per post never showed it; a
+            # relay resending a backlog, a poller catching up after a gap,
+            # or an import did, on every such batch. Within one batch the
+            # order is ours to choose, and time order is the one the rule
+            # is written for.
+            fresh = [scrubbed_by_ts[ts] for ts in sorted(new_ts)
+                     if ts in scrubbed_by_ts]
             await update_rollups(db, mac, fresh)
         await db.commit()
         return cur.rowcount or 0
@@ -2472,7 +2628,11 @@ _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipie
                     "heat_day", "heat_day_threshold_f",
                     "quiet_start_min", "quiet_end_min", "digest_hour",
                     "digest_minute", "outlook_hour", "outlook_minute",
-                    "outlook_source", "sky_notes", "sky_good_only")
+                    "outlook_source", "sky_notes", "sky_good_only",
+                    "nws_push", "nws_warnings_only", "storm_live_activity",
+                    "lightning_live_activity", "wind_live_activity",
+                    "freeze_live_activity", "lightning_live_mi",
+                    "wind_live_mph")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -2554,19 +2714,20 @@ async def upsert_device_alert_pref(mac: str, monitor: bool,
 
 async def create_alert_rule(target_mac: str | None, field: str,
                             comparator: str, threshold: float,
-                            severity: str = "minor") -> dict[str, Any]:
+                            severity: str = "minor",
+                            note: str | None = None) -> dict[str, Any]:
     now = int(__import__("time").time() * 1000)
     async with connect() as db:
         cur = await db.execute(
             "INSERT INTO alert_rules (target_mac, field, comparator, threshold, "
-            "enabled, created_ms, severity) VALUES (?, ?, ?, ?, 1, ?, ?)",
-            (target_mac, field, comparator, threshold, now, severity),
+            "enabled, created_ms, severity, note) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+            (target_mac, field, comparator, threshold, now, severity, note or None),
         )
         await db.commit()
         rid = cur.lastrowid
     return {"id": rid, "target_mac": target_mac, "field": field,
             "comparator": comparator, "threshold": threshold, "enabled": True,
-            "severity": severity}
+            "severity": severity, "note": note or None}
 
 
 async def list_alert_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -2582,7 +2743,8 @@ async def list_alert_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
     = False rather than omitted, so the client sees a complete list.
     """
     sql = ("SELECT r.id, r.target_mac, r.field, r.comparator, r.threshold, "
-           "r.enabled, r.severity, MAX(COALESCE(s.triggered, 0)) AS triggered, "
+           "r.enabled, r.severity, r.note, "
+           "MAX(COALESCE(s.triggered, 0)) AS triggered, "
            "MAX(COALESCE(s.changed_ms, 0)) AS changed_ms "
            "FROM alert_rules r LEFT JOIN alert_rule_state s ON s.rule_id = r.id")
     if enabled_only:
@@ -2598,13 +2760,14 @@ async def list_alert_rules(enabled_only: bool = False) -> list[dict[str, Any]]:
              "enabled": bool(r["enabled"]),
              # NULL = minor: the default Volney chose for existing rules.
              "severity": r["severity"] or "minor",
+             "note": r["note"] or None,
              "triggered": bool(r["triggered"]),
              "changed_ms": r["changed_ms"] or None} for r in rows]
 
 
-async def replace_alert_rules(rules: list[tuple[Any, str, str, float, bool, str]]) -> int:
+async def replace_alert_rules(rules: list[tuple[Any, ...]]) -> int:
     """Delete every rule and insert `rules` (target_mac, field, comparator,
-    threshold, enabled, severity) in ONE transaction, so a failure midway
+    threshold, enabled, severity[, note]) in ONE transaction, so a failure midway
     leaves the previous set intact (round-four review R21-05). Validation
     is the caller's; this is the atomic apply."""
     now = int(__import__("time").time() * 1000)
@@ -2613,13 +2776,14 @@ async def replace_alert_rules(rules: list[tuple[Any, str, str, float, bool, str]
         try:
             await db.execute("DELETE FROM alert_rule_state")
             await db.execute("DELETE FROM alert_rules")
-            for target, field, comparator, threshold, enabled, severity in rules:
+            for target, field, comparator, threshold, enabled, severity, *rest in rules:
+                note = rest[0] if rest else None
                 await db.execute(
                     "INSERT INTO alert_rules (target_mac, field, comparator, "
-                    "threshold, enabled, created_ms, severity) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "threshold, enabled, created_ms, severity, note) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (target, field, comparator, threshold,
-                     1 if enabled else 0, now, severity))
+                     1 if enabled else 0, now, severity, note or None))
             await db.commit()
         except BaseException:
             await db.rollback()
@@ -2639,7 +2803,9 @@ async def update_alert_rule(rule_id: int, *, enabled: bool | None = None,
                             threshold: float | None = None,
                             target_mac: str | None = None,
                             set_target: bool = False,
-                            severity: str | None = None) -> dict[str, Any] | None:
+                            severity: str | None = None,
+                            note: str | None = None,
+                            set_note: bool = False) -> dict[str, Any] | None:
     """Partial rule edit (1.7 — before this, changing a rule's threshold or
     station meant delete-and-recreate, and retargeting Doren's 28 rules took
     raw sqlite on his box). `set_target` distinguishes "leave the scope
@@ -2663,6 +2829,9 @@ async def update_alert_rule(rule_id: int, *, enabled: bool | None = None,
     if severity is not None:
         sets.append("severity = ?")
         args.append(severity)
+    if set_note:
+        sets.append("note = ?")
+        args.append(note or None)
     async with connect() as db:
         if sets:
             cur = await db.execute(
@@ -2677,13 +2846,14 @@ async def update_alert_rule(rule_id: int, *, enabled: bool | None = None,
             await db.commit()
         r = await (await db.execute(
             "SELECT id, target_mac, field, comparator, threshold, enabled, "
-            "severity FROM alert_rules WHERE id = ?", (rule_id,))).fetchone()
+            "severity, note FROM alert_rules WHERE id = ?", (rule_id,))).fetchone()
     if r is None:
         return None
     return {"id": r["id"], "target_mac": r["target_mac"], "field": r["field"],
             "comparator": r["comparator"], "threshold": r["threshold"],
             "enabled": bool(r["enabled"]),
-            "severity": r["severity"] or "minor"}
+            "severity": r["severity"] or "minor",
+            "note": r["note"] or None}
 
 
 async def set_alert_rule_enabled(rule_id: int, enabled: bool) -> dict[str, Any] | None:
@@ -2696,11 +2866,12 @@ async def set_alert_rule_enabled(rule_id: int, enabled: bool) -> dict[str, Any] 
             return None
         r = await (await db.execute(
             "SELECT id, target_mac, field, comparator, threshold, enabled, "
-            "severity FROM alert_rules WHERE id = ?", (rule_id,))).fetchone()
+            "severity, note FROM alert_rules WHERE id = ?", (rule_id,))).fetchone()
     return {"id": r["id"], "target_mac": r["target_mac"], "field": r["field"],
             "comparator": r["comparator"], "threshold": r["threshold"],
             "enabled": bool(r["enabled"]),
-            "severity": r["severity"] or "minor"}
+            "severity": r["severity"] or "minor",
+            "note": r["note"] or None}
 
 
 async def get_rule_states() -> dict[tuple[int, str], int]:
@@ -4000,6 +4171,16 @@ async def _min_rain_col_after(mac: str, col: str, since_ms: int) -> float | None
 # finding it walks back through every null row on a station whose counter
 # history begins mid-year: 1.4 s + a 1.0 s fallback on the WH24, per
 # /current, per poll (live profile 2026-09-06). Six hours of memory.
+#
+# 2.3: on a healthy server this cache is never written. The day, week,
+# month and year figures come from `daily_rollups` (_rain_ledger_periods)
+# and the hour's lookup is one bounded probe that is not memoised. The
+# cache is now the memory of the RAW FALLBACK only: INSIGHTS off, the
+# ledger marked dirty (the ~50 min rebuild after a fold-version bump, when
+# /current is still polled every minute), a period the ledger does not
+# reach, or a caller whose zone is not the fold's. Those are exactly the
+# calls that anchor at January 1 and scan for the reset floor, so the
+# cache stays until the fallback itself goes.
 _YEAR_PRIOR_CACHE: dict[tuple[str, int], tuple[float, float | None]] = {}
 _YEAR_PRIOR_TTL_S = 6 * 3600.0
 
@@ -4044,6 +4225,13 @@ async def _yearly_prior(mac: str, boundary_ms: int, cached: bool) -> float | Non
 async def _yearly_rise_since(mac: str, cur_year: float, boundary_ms: int,
                              cached: bool = False) -> float | None:
     """The yearly counter's rise since `boundary_ms`, reset-aware.
+
+    2.3: the HOUR's rule, and the fallback for the longer periods when
+    `_rain_ledger_periods` cannot answer them. It reads the counter at the
+    boundary and its lowest reading since, so it is right for zero or one
+    reset and short for two (or a reset the counter then climbed past);
+    the ledger's `yearly_rise` is right for any number, which is why it
+    ranks first for every period that has a rollup row.
 
     Differencing against the pre-reset value clamps every bucket to 0.00
     until the counter climbs back past it — the rest of the YEAR for the
@@ -4111,11 +4299,22 @@ async def rain_last_hour_in(mac: str, now_ms: int | None = None) -> float | None
 
 
 async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None]:
-    """Compute hourly/daily/weekly/monthly rain by differencing the current
-    yearlyrainin against historical yearlyrainin at the start of each period
-    boundary (in local time per `tz_name`). Returns None for any period we
-    can't compute (no qualifying row before the boundary). Clamps negatives
-    to 0 to handle counter resets / calibration changes."""
+    """Hourly/daily/weekly/monthly/yearly rain for a station that posts a
+    counter, in local time per `tz_name`. Returns None for any period it
+    cannot compute.
+
+    2.3: the day, week, month and year are read from `daily_rollups` when
+    the ledger can answer them (`_rain_ledger_periods`): the sum of each
+    finished day's `day_rain_in` plus today's row, which the live fold
+    keeps current on every insert. That is the only form that is right on
+    a day the counter reset twice, or reset and then climbed past where it
+    restarted, and it is one primary-key range read instead of a boundary
+    lookup per period. The HOUR has no rollup and keeps the raw counter
+    difference, bounded to the hour. The raw difference also remains the
+    fallback for every period the ledger cannot answer (INSIGHTS off, the
+    ledger dirty or frozen, a period it does not reach back to, a zone
+    that is not the fold's), reset-aware via `_yearly_rise_since` and
+    memoised in `_YEAR_PRIOR_CACHE` exactly as before."""
     from datetime import timedelta
     from zoneinfo import ZoneInfo
     try:
@@ -4189,15 +4388,34 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
     # cur_month is None there and the trusted yearly path is unchanged.
     yearly_ok = cur_year is not None and (cur_month is None or cur_year + 1e-6 >= cur_month)
 
+    start_of_year = start_of_today.replace(month=1, day=1)
+
+    # The ledger first (2.3): every period it can answer, it answers from
+    # daily_rollups. It is consulted only on the trusted-yearly path — the
+    # monthly-counter fallback below exists for a station whose counter is
+    # known broken, and the ledger's rises would be that counter's rises.
+    ledger: dict[str, float] = {}
+    if yearly_ok:
+        ledger = await _rain_ledger_periods(mac, tz, start_of_today, {
+            "daily_in": start_of_today, "weekly_in": start_of_week,
+            "monthly_in": start_of_month, "yearly_in": start_of_year})
+
     out: dict[str, float | None] = {}
     for name, boundary in (("hourly_in", top_of_hour),
                             ("daily_in", start_of_today),
                             ("weekly_in", start_of_week),
                             ("monthly_in", start_of_month)):
+        if name in ledger:
+            out[name] = ledger[name]
+            continue
         boundary_ms = int(boundary.timestamp() * 1000)
         if yearly_ok:
+            # The hour is one probe for the counter at the top of the hour
+            # and, only after a reset inside it, a MIN over the hour's
+            # rows: bounded by the boundary itself and not memoised. The
+            # past-anchored boundaries (the fallback's) are.
             out[name] = await _yearly_rise_since(mac, cur_year, boundary_ms,
-                                                 cached=True)
+                                                 cached=(name != "hourly_in"))
         else:
             out[name] = await _rollup_from_monthly(
                 mac, name, boundary_ms, start_of_month_ms, cur_month)
@@ -4210,12 +4428,122 @@ async def rain_rollups(mac: str, tz_name: str = "UTC") -> dict[str, float | None
     # lookup falls back to the earliest reading (rain since install), the
     # same rule the daily/weekly fallback has always used. The 2026-08-11
     # ingest.py note explains why this is read-side and never an ingest offset.
-    if yearly_ok:
-        start_of_year_ms = int(start_of_today.replace(month=1, day=1).timestamp() * 1000)
+    if "yearly_in" in ledger:
+        out["yearly_in"] = ledger["yearly_in"]
+    elif yearly_ok:
+        start_of_year_ms = int(start_of_year.timestamp() * 1000)
         out["yearly_in"] = await _yearly_rise_since(mac, cur_year, start_of_year_ms,
                                                     cached=True)
     else:
         out["yearly_in"] = None
+    return out
+
+
+# One primary-key range over the ledger: (mac, day) is daily_rollups' PK,
+# so this is an index seek and a walk of at most a year of rows. Named so
+# the query-plan test can hold it to that.
+_RAIN_LEDGER_SQL = (
+    "SELECT day, rain_total, yearly_min, yearly_max, "
+    "yearly_first, yearly_last, yearly_rise FROM daily_rollups "
+    "WHERE mac = ? AND day >= ? AND day <= ? ORDER BY day")
+
+
+async def _rain_ledger_periods(mac: str, tz, start_of_today,
+                               boundaries: dict[str, Any]) -> dict[str, float]:
+    """Period rain from `daily_rollups` (2.3): for each named boundary (a
+    local-midnight datetime), the sum of `day_rain_in` over the ledger's
+    rows from that day through today. Today's row is the live partial —
+    the fold updates it on every insert, so it carries every rise the
+    counter took since midnight, resets and all.
+
+    Returns only the periods it can answer. The caller keeps the raw
+    counter difference for the rest, so nothing here is ever a silent
+    None-for-zero:
+
+    * nothing at all unless INSIGHTS maintains the ledger, `tz` is the zone
+      the ledger is folded in (`rain_rollups` honours its caller's zone,
+      and a day string folded in another zone is a different day), the
+      ledger is not marked dirty, and it is current (the station's newest
+      observation is the last one its day row folded — INSIGHTS turned off
+      after a rebuild freezes the table while observations keep landing);
+    * a period only if the ledger reaches back to its start (or to the
+      station's first observation, for a period older than the station);
+    * a period is dropped if any row inside it has a counter but no
+      answer — a pre-2.2 row whose min/max signature refused a reset, a
+      rise past the plausibility ceiling — because a sum with a hole in it
+      is short and looks complete. A row with no rain columns at all (the
+      gauge was silent that day while other sensors posted) contributes
+      nothing, the same as a day with no row: on this path the station is
+      known to have a counter, and a day it did not move is a dry day.
+
+    Every read is an index endpoint or the PK range in `_RAIN_LEDGER_SQL`;
+    nothing touches `observations` beyond MIN/MAX on `(mac, dateutc_ms)`.
+    """
+    from datetime import datetime, timezone as _tzu
+    from .day_rain import day_rain_in, day_rain_provenance, PROVENANCE_NONE
+    from .insights import _tz as _fold_tz
+    if not settings.insights or not boundaries:
+        return {}
+    if getattr(tz, "key", None) != getattr(_fold_tz(), "key", None):
+        return {}
+    today = start_of_today.strftime("%Y-%m-%d")
+    wanted = {name: b.strftime("%Y-%m-%d") for name, b in boundaries.items()}
+    async with connect() as db:
+        dirty = await (await db.execute(
+            "SELECT v FROM server_kv WHERE k = 'rollups_dirty'")).fetchone()
+        if dirty is not None and dirty["v"] not in (None, "", "0"):
+            return {}
+        cov = await (await db.execute(
+            "SELECT MIN(day) AS lo, MAX(day) AS hi FROM daily_rollups "
+            "WHERE mac = ?", (mac,))).fetchone()
+        if not cov or cov["lo"] is None:
+            return {}
+        span = await (await db.execute(
+            "SELECT MIN(dateutc_ms) AS lo, MAX(dateutc_ms) AS hi "
+            "FROM observations WHERE mac = ?", (mac,))).fetchone()
+        if not span or span["lo"] is None:
+            return {}
+
+        def _day(ms: int) -> str:
+            return (datetime.fromtimestamp(ms / 1000, tz=_tzu.utc)
+                    .astimezone(tz).strftime("%Y-%m-%d"))
+        first_obs_day, last_obs_day = _day(span["lo"]), _day(span["hi"])
+        # Current means the newest observation has been FOLDED, not merely
+        # that its day has a row: a day row is written by the first reading
+        # of the day, so "last rollup day == last observation day" cannot
+        # see a ledger that froze at 00:10 (INSIGHTS off, a fold that
+        # raised) while readings kept landing. The day's `obs_last_ms`
+        # (2.3, F01) is the last reading the fold saw; one PK probe.
+        newest = await (await db.execute(
+            "SELECT obs_last_ms FROM daily_rollups WHERE mac = ? AND day = ?",
+            (mac, last_obs_day))).fetchone()
+        if (newest is None or newest["obs_last_ms"] is None
+                or newest["obs_last_ms"] < span["hi"]):
+            return {}
+        covered = {name: day for name, day in wanted.items()
+                   if cov["lo"] <= max(day, first_obs_day)}
+        if not covered:
+            return {}
+        rows = await (await db.execute(
+            _RAIN_LEDGER_SQL, (mac, min(covered.values()), today))).fetchall()
+    # Absent is not zero: the ledger answers only once a row in the range
+    # proves the station carries a counter. A station with none has rows
+    # (temperature folds every day) and they are not dry days.
+    priced = [(r["day"], day_rain_in(r)) for r in rows
+              if day_rain_provenance(r) != PROVENANCE_NONE]
+    if not priced:
+        return {}
+    out: dict[str, float] = {}
+    for name, since in covered.items():
+        total = 0.0
+        for day, v in priced:
+            if day < since:
+                continue
+            if v is None:
+                break
+            total += v
+        else:
+            out[name] = round(total, 3)
     return out
 
 
@@ -4489,6 +4817,15 @@ RECORD_FIELDS = [
 # non-resetting value in dailyrainin — its "max" is then a lifetime total, not a
 # single-day record. If a period's MIN never drops near this floor, the counter
 # isn't resetting and its max is dropped as unreliable.
+#
+# Kept in 2.3, deliberately. This guards the CONTENT of `dailyrainin` (a
+# lifetime counter posted under the daily name, which /ingest/custom still
+# accepts), not a yearly-counter reset: records read the day's rain as
+# `rain_total` / MAX(dailyrainin), never through `day_rain_in`, so a
+# station that posts only a lifetime yearly counter has no wettest-day
+# record at all (the field is omitted) and a reset in that counter cannot
+# reach this path. `daily_rollups.yearly_rise` changes nothing here.
+# tests/test_rain_ledger.py pins both halves of that.
 _DAILY_RAIN_RESET_FLOOR_IN = 5.0
 
 

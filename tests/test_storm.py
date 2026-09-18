@@ -155,6 +155,7 @@ def test_duration_is_never_negative():
 # numbers pulled from stored history.
 
 import asyncio          # noqa: E402
+H = {"Authorization": "Bearer test-api-token"}
 import importlib        # noqa: E402
 
 
@@ -171,6 +172,13 @@ def wired(temp_env: str, monkeypatch):
 
     async def fake_deliver(cfg, subject, body, title, push_body, email_ok=True, **kw):
         sent.append((title, push_body))
+        # 2.3: the Storm Report must already exist when the summary goes
+        # out, and the push must name it (Doren, 09-13).
+        route = kw.get("route")
+        assert route and route.startswith("report/"), kw
+        rid = int(route.split("/")[1])
+        rows = await db.list_reports(kind="storm")
+        assert any(r["id"] == rid for r in rows), "report filed after the push"
         return True
 
     monkeypatch.setattr(alerts, "_deliver", fake_deliver)
@@ -829,3 +837,42 @@ def test_record_storm_placeholders_follow_the_capture_columns(wired, monkeypatch
     row = _storm_rows(db, mac)[0]
     assert row["total_in"] == pytest.approx(0.40)
     assert row["pre_tempf"] == 90.0 and row["temp_drop_f"] == 15.0
+
+
+def test_the_storm_summary_has_an_html_twin():
+    """2.3 (Doren, 09-11): the same numbers as the text, as tiles, in the
+    morning report's dress; an absent sensor gets no tile."""
+    from app import storm
+    s = _summary()
+    page = storm.build_storm_html("Davis", s, "America/Phoenix")
+    assert page.startswith("<!DOCTYPE html>") and "DAVIS" in page
+    assert "Davis Storm Summary" in page and "TOTAL" in page
+    assert f"{s.total_in:.2f}&quot;" in page
+    assert "<script" not in page and "http" not in page.lower()
+    bare = storm.StormSummary(started_ms=s.started_ms, ended_ms=s.ended_ms,
+                              total_in=0.5, peak_rate_in_hr=None,
+                              min_tempf=None, max_tempf=None, max_gust_mph=None)
+    page2 = storm.build_storm_html("Bad\nName", bare, "Not/AZone")
+    assert "MAX RATE" not in page2 and "GUST" not in page2 and "HI / LO" not in page2
+    assert "BAD NAME" in page2 and "0.50&quot;" in page2
+
+
+def test_deliver_hands_the_html_to_smtp(client, monkeypatch):
+    """_deliver's new html kwarg reaches _send_sync as the alternative."""
+    from app import alerts
+    client.put("/api/alerts", headers=H, json={
+        "enabled": True, "recipients": ["d@example.com"],
+        "smtp_host": "smtp.example.com", "smtp_port": 587,
+        "smtp_username": "u", "smtp_password": "p"})
+    got = []
+
+    def fake_send(subject, body, to_list, cfg, html=None):
+        got.append(html)
+    monkeypatch.setattr(alerts, "_send_sync", fake_send)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        return await alerts._deliver(cfg, "s", "b", "t", "pb", kind="storm",
+                                     html="<!DOCTYPE html>x")
+    assert asyncio.run(run()) is True
+    assert got == ["<!DOCTYPE html>x"]

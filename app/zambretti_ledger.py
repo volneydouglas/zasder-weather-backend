@@ -349,7 +349,8 @@ async def scorecard(mac: str, forecast_provider: str,
     day_lo, day_hi = calls[0]["day"], calls[-1]["day"]
     async with dbmod.connect() as conn:
         rain_rows = await (await conn.execute(
-            "SELECT day, rain_total, yearly_min, yearly_max FROM daily_rollups "
+            "SELECT day, rain_total, yearly_min, yearly_max, "
+            "yearly_first, yearly_last, yearly_rise FROM daily_rollups "
             "WHERE mac = ? AND day BETWEEN ? AND ?",
             (mac, day_lo, day_hi))).fetchall()
         fc_rows = await (await conn.execute(

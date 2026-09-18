@@ -11,7 +11,19 @@ retired the legacy feeds in Dec 2025 — this API is the only path now.
 
 Only Severe/Extreme severities push (the app's own NWS view still shows
 everything); each alert id pushes ONCE GLOBALLY, with the seen-set
-bounded and persisted in server_kv. Global, not per-station: three
+bounded and persisted in server_kv. 2.3 adds the owner's switch
+(`nws_push`, on unless turned off), a warnings-only filter, and reissue
+dedupe: NWS mints a new id for every update of the same alert, so a
+Flood Watch extended at 9 PM pushed twice (Doren, 2026-09-11) and one
+Extreme Heat Warning pushed five times in three days. An Update or
+Cancel whose `references` name an id already PUSHED is recorded silently
+and INHERITS the pushed status, so a chain u1 -> u2 -> u3 (each Update
+naming only the one before it, the common NWS shape: 75 of 95 live
+Updates on 2026-09-16 referenced exactly one message) pushes once, not
+every other time (R23). The one exception is an Update that ESCALATES
+what was pushed: a higher severity (Moderate < Severe < Extreme) or an
+event that has newly become a Warning pushes again, because the sky
+changed; an unchanged extension stays silent. Global, not per-station: three
 stations in one backyard share one sky, and the per-station sets pushed
 the same Extreme Heat Warning three times (Volney's phone, 2026-08-26).
 The alert is titled by whichever station's poll surfaced it first.
@@ -38,12 +50,141 @@ _PUSH_SEVERITIES = ("Severe", "Extreme")
 # would be a national emergency, not a cache-pressure problem.
 _SEEN_CAP = 120
 _SEEN_KEY = "nws_watch.seen"
+# 2.3: the ids that were actually PUSHED, apart from the seen-set, which
+# also holds filtered and non-push ids. Reissue dedupe consults this one:
+# an Update that upgrades a never-pushed alert (Moderate to Severe, or a
+# Watch under warnings-only becoming a Warning) must push (CodeRabbit
+# round on PR #39, then the 09-12 design docs' review).
+_PUSHED_KEY = "nws_watch.pushed"
+# R23: what each pushed id was pushed AS — [severity rank, is_warning] —
+# so an Update that escalates a pushed alert can be told from an
+# extension of it. An id in the ledger with no meta (pushed before this
+# key existed) is treated as already at the top: it never re-pushes.
+_PUSHED_META_KEY = "nws_watch.pushed_meta"
+_SEVERITY_RANK = {"Unknown": 0, "Minor": 1, "Moderate": 2, "Severe": 3, "Extreme": 4}
 
 _last_poll_ms: dict[str, int] = {}
 
 
 def _reset_for_tests() -> None:
     _last_poll_ms.clear()
+
+
+def is_warning(event: str) -> bool:
+    """NWS event names end in the product's class: "Tornado Warning",
+    "Flood Watch", "Wind Advisory", "Special Weather Statement"."""
+    return event.strip().lower().endswith("warning")
+
+
+def severity_rank(severity: Any) -> int:
+    return _SEVERITY_RANK.get(str(severity or ""), 0)
+
+
+def _referenced_pushed(alert: dict[str, Any], pushed: set[str]) -> list[str]:
+    out: list[str] = []
+    for r in alert.get("references") or []:
+        for ident in _reference_ids(r):
+            if ident in pushed and ident not in out:
+                out.append(ident)
+    return out
+
+
+def is_reissue(alert: dict[str, Any], pushed: set[str]) -> bool:
+    """An Update or Cancel that references an alert already PUSHED. A
+    new id whose references are all unknown (the server missed the
+    original, or filtered it) is new to us and pushes."""
+    if alert.get("messageType") not in ("Update", "Cancel"):
+        return False
+    if _referenced_pushed(alert, pushed):
+        return True
+    return alert.get("messageType") == "Cancel"
+
+
+def pushed_as(alert: dict[str, Any]) -> list:
+    """The meta a pushed id is recorded with: [severity rank, warning]."""
+    return [severity_rank(alert.get("severity")),
+            is_warning(alert.get("event") or "")]
+
+
+def _meta_of(ident: str, meta: dict[str, Any]) -> tuple[int, bool]:
+    m = meta.get(ident)
+    if (isinstance(m, list) and len(m) == 2 and isinstance(m[0], int)
+            and not isinstance(m[0], bool)):
+        return m[0], bool(m[1])
+    return max(_SEVERITY_RANK.values()), True     # legacy: never a raise
+
+
+def escalates(alert: dict[str, Any], pushed: set[str],
+              meta: dict[str, Any]) -> bool:
+    """R23 product decision: an Update of a pushed alert pushes again
+    when it RAISES the severity or newly becomes a Warning. What it is
+    compared against is the highest the chain was ever pushed at, so a
+    downgrade followed by a return to the old level is not a raise."""
+    if alert.get("messageType") != "Update":
+        return False
+    refs = _referenced_pushed(alert, pushed)
+    if not refs:
+        return False
+    rank, warning = pushed_as(alert)
+    top_rank = max(_meta_of(i, meta)[0] for i in refs)
+    was_warning = any(_meta_of(i, meta)[1] for i in refs)
+    return rank > top_rank or (warning and not was_warning)
+
+
+def inherited_meta(alert: dict[str, Any], pushed: set[str],
+                   meta: dict[str, Any]) -> list:
+    """A silent reissue joins the pushed ledger carrying the HIGHEST of
+    its own level and the levels it references (see `escalates`)."""
+    rank, warning = pushed_as(alert)
+    for i in _referenced_pushed(alert, pushed):
+        r, w = _meta_of(i, meta)
+        rank, warning = max(rank, r), warning or w
+    return [rank, warning]
+
+
+async def _load_pushed() -> list[str]:
+    raw = await db.get_kv(_PUSHED_KEY)
+    if raw is None:
+        return []
+    try:
+        lst = json.loads(raw)
+        return [x for x in lst if isinstance(x, str)] if isinstance(lst, list) else []
+    except ValueError:
+        return []
+
+
+async def _load_pushed_meta(pushed: list[str]) -> dict[str, Any]:
+    raw = await db.get_kv(_PUSHED_META_KEY)
+    if raw is None:
+        return {}
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    keep = set(pushed)
+    return {k: v for k, v in d.items() if k in keep}
+
+
+def _reference_ids(ref: Any) -> list[str]:
+    """The ids a reference may name, in the compact form the seen-set
+    stores (`properties.id`): `identifier` as given, and the last path
+    segment of the `@id` URL (CodeRabbit, PR #39: a reference carrying
+    only the URL form missed the seen id and pushed a duplicate)."""
+    if isinstance(ref, str):
+        return [ref, ref.rstrip("/").rsplit("/", 1)[-1]]
+    if not isinstance(ref, dict):
+        return []
+    out: list[str] = []
+    ident = ref.get("identifier")
+    if isinstance(ident, str) and ident:
+        out.append(ident)
+    at_id = ref.get("@id")
+    if isinstance(at_id, str) and at_id:
+        out.append(at_id)
+        out.append(at_id.rstrip("/").rsplit("/", 1)[-1])
+    return out
 
 
 def _coords(device: dict[str, Any]) -> tuple[float, float] | None:
@@ -111,9 +252,18 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
                 deliver) -> None:
     """One monitor-tick entry point; per-station poll cadence, ONE global
     dedup set across stations."""
+    if not getattr(cfg, "nws_push", True):
+        # Off: no poll at all. The seen-set is left as it is, so turning
+        # the switch back on during a long-lived alert pushes it once.
+        return
+    warnings_only = bool(getattr(cfg, "nws_warnings_only", False))
     seen: list[str] | None = None      # loaded lazily on the first due poll
     seen_set: set[str] = set()
+    pushed: list[str] = []
+    pushed_set: set[str] = set()
+    pushed_meta: dict[str, Any] = {}
     changed = False
+    pushed_changed = False
     for d in devices:
         # Air monitors carry coords too — polling them would double every
         # NWS push for the same sky.
@@ -132,6 +282,17 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
         if seen is None:
             raw_global = await db.get_kv(_SEEN_KEY)
             seen = await _load_seen(devices)
+            pushed = await _load_pushed()
+            pushed_set = set(pushed)
+            pushed_meta = await _load_pushed_meta(pushed)
+            # The pushed ledger is written FIRST below, so after a crash
+            # between the two writes a pushed id may be missing from seen;
+            # folding pushed into seen on load keeps it from pushing twice
+            # (CodeRabbit, PR #39).
+            for aid in pushed:
+                if aid not in seen:
+                    seen.append(aid)
+                    changed = True          # persist the repaired ledger
             seen_set = set(seen)
             if raw_global is None:
                 # First run under the global scheme: persist the merged
@@ -147,14 +308,25 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
             aid = a.get("id")
             if not aid or aid in seen_set:
                 continue
-            if a.get("severity") not in _PUSH_SEVERITIES:
-                # Non-push severities are recorded immediately — there is
-                # nothing to retry.
+            event = a.get("event") or "Weather alert"
+            reissue = (is_reissue(a, pushed_set)
+                       and not escalates(a, pushed_set, pushed_meta))
+            if (a.get("severity") not in _PUSH_SEVERITIES
+                    or (warnings_only and not is_warning(event))
+                    or reissue):
+                # Non-push severities, filtered events and reissues are
+                # recorded immediately — there is nothing to retry.
                 seen_set.add(aid)
                 seen.append(aid)
                 changed = True
+                if reissue:
+                    # The reissue stands in for what it references: the
+                    # next Update names only THIS id (R23).
+                    pushed_meta[aid] = inherited_meta(a, pushed_set, pushed_meta)
+                    pushed_set.add(aid)
+                    pushed.append(aid)
+                    pushed_changed = True
                 continue
-            event = a.get("event") or "Weather alert"
             headline = (a.get("headline") or a.get("description")
                         or "")[:180]
             title = f"{name}: {event}"
@@ -167,7 +339,16 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
                              kind="nws", mac=mac):
                 seen_set.add(aid)
                 seen.append(aid)
-                changed = True
+                pushed_set.add(aid)
+                pushed.append(aid)
+                pushed_meta[aid] = pushed_as(a)
+                changed = pushed_changed = True
                 log.info("NWS %s pushed (surfaced by %s)", event, name)
+    # Pushed first: see the load-time merge above for why the order matters.
+    if pushed_changed:
+        kept = pushed[-_SEEN_CAP:]
+        await db.set_kv(_PUSHED_KEY, json.dumps(kept))
+        await db.set_kv(_PUSHED_META_KEY, json.dumps(
+            {k: pushed_meta[k] for k in kept if k in pushed_meta}))
     if changed and seen is not None:
         await db.set_kv(_SEEN_KEY, json.dumps(seen[-_SEEN_CAP:]))

@@ -336,6 +336,24 @@ def test_apns_build_payload_interruption_level():
     for level in (None, "active", "critical", "passive", "junk"):
         assert "interruption-level" not in apns.build_payload("T", "B", level)["aps"], level
 
+def test_apns_build_payload_stamps_the_sender_beside_aps():
+    """2.3 Sites: a push says which server sent it, with or without a
+    route, so a phone holding several owned sites opens the tap in the
+    one that pushed. Same discipline as `route`: shape-checked, beside
+    aps, never inside it; a bad value is dropped, not forwarded."""
+    sid = "5f1c2d3e-9a8b-4c7d-8e6f-0a1b2c3d4e5f"
+    with_route = apns.build_payload("T", "B", route="report/12", server_id=sid)
+    assert with_route["server_id"] == sid and with_route["route"] == "report/12"
+    assert "server_id" not in with_route["aps"]
+    plain = apns.build_payload("T", "B", server_id=sid)
+    assert plain["server_id"] == sid and "route" not in plain
+    assert plain["aps"] == {"alert": {"title": "T", "body": "B"}, "sound": "default"}
+    for bad in (None, "", "short", "has space " + "x" * 8, "x" * 65, "a/b" + "c" * 8, 12345):
+        assert "server_id" not in apns.build_payload("T", "B", server_id=bad), bad
+    assert apns.valid_server_id(sid) == sid
+    assert apns.valid_server_id("../../etc") is None
+
+
 def test_apns_make_jwt_structure():
     import jwt as _jwt
     from cryptography.hazmat.primitives.asymmetric import ec
@@ -1356,6 +1374,77 @@ def test_push_via_relay_interruption_level_and_fallback(monkeypatch):
     assert len(posts) == 2
     assert "interruption_level" in posts[0]
     assert "interruption_level" not in posts[1]
+
+
+def test_push_via_relay_stamps_the_sender_and_falls_back(monkeypatch):
+    """2.3: the relay POST carries `server_id` beside `route` on alert
+    pushes only (a Live Activity payload rides verbatim), is omitted when
+    unknown, and a pre-2.3 relay's 422 costs the stamp, not the push."""
+    import asyncio
+    from app import apns as A
+
+    posts: list[dict] = []
+    old_relay = {"on": False}
+    sid = "5f1c2d3e-9a8b-4c7d-8e6f-0a1b2c3d4e5f"
+
+    class FakeResp:
+        def __init__(self, code, data):
+            self.status_code = code
+            self._d = data
+            self.text = "unknown field" if code == 422 else ""
+
+        def json(self):
+            return self._d
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            posts.append(dict(json))
+            if old_relay["on"] and "server_id" in json:
+                return FakeResp(422, {})
+            return FakeResp(200, {"sent": len(json["tokens"]),
+                                  "dead": [], "failed": 0})
+
+    monkeypatch.setattr(A.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(A.settings, "apns_env", "production")
+
+    res = asyncio.run(A._push_via_relay(["a" * 64], "t", "b",
+                                        "https://r.example/push", "rk",
+                                        la_payload=None, push_type="alert",
+                                        server_id=sid))
+    assert res["sent"] == 1 and posts[-1]["server_id"] == sid
+    assert "route" not in posts[-1], "no route is still a stamped sender"
+
+    posts.clear()
+    res = asyncio.run(A._push_via_relay(["a" * 64], "t", "b",
+                                        "https://r.example/push", "rk",
+                                        la_payload=None, push_type="alert"))
+    assert res["sent"] == 1 and "server_id" not in posts[-1]
+
+    posts.clear()
+    res = asyncio.run(A._push_via_relay(["a" * 64], "t", "b",
+                                        "https://r.example/push", "rk",
+                                        la_payload={"aps": {"event": "start"}},
+                                        server_id=sid))
+    assert res["sent"] == 1 and "server_id" not in posts[-1]
+
+    posts.clear()
+    old_relay["on"] = True
+    res = asyncio.run(A._push_via_relay(["a" * 64], "t", "b",
+                                        "https://r.example/push", "rk",
+                                        la_payload=None, push_type="alert",
+                                        route="report/3", server_id=sid))
+    assert res["sent"] == 1 and len(posts) == 2
+    assert "server_id" in posts[0] and "route" in posts[0]
+    assert "server_id" not in posts[1] and "route" not in posts[1]
 
 
 def test_public_dashboard_co2_only_monitor_leads_with_co2():

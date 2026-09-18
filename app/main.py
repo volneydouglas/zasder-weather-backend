@@ -39,6 +39,7 @@ from .alerts import AlertMonitor
 from .capture import router as capture_router
 from .config import settings, tokens_match
 from . import source_status
+from . import forecast_skill
 from . import config_backup
 from . import restore as _restore
 from . import public_dashboard as _pd
@@ -356,6 +357,8 @@ async def lifespan(app: FastAPI):
         _SHARE_TEST_LAST.clear()
         _wu._stats.clear()
         _st._last_send_ms.clear()
+        from . import map_beacon as _mb
+        _mb._last_publish_ms.clear()
         source_status.reset()
         source_status.declare("custom-ingest", True,
                               note="LilyGO boards, SDR relays and the WeatherLink "
@@ -621,6 +624,44 @@ async def lifespan(app: FastAPI):
             t.cancel()
         if reapers:
             await asyncio.gather(*reapers, return_exceptions=True)
+        # 2.3: the hand-kept list above cannot know every fire-and-forget
+        # task (a delivery's webhook post, a WU upload, a restore swap, a
+        # write-behind flush). Any task still alive whose coroutine lives
+        # in this package is ours: cancel and await it, then wait for the
+        # last aiosqlite connection to close, so no worker thread can
+        # call into a loop that is already gone. That call was the
+        # eleven CI-only "Event loop is closed" thread warnings
+        # (2026-09-14): a slow runner closed the test loop with an app
+        # task still mid-query.
+        await _reap_stray_app_tasks()
+
+
+_APP_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
+def _is_app_task(t: "asyncio.Task") -> bool:
+    """A task whose coroutine was written in this package (not starlette's,
+    anyio's or a test's) — the only ones a shutdown may cancel."""
+    try:
+        code = t.get_coro().cr_code          # type: ignore[union-attr]
+    except AttributeError:
+        return False
+    return os.path.abspath(code.co_filename).startswith(_APP_DIR)
+
+
+async def _reap_stray_app_tasks(drain_s: float = 5.0) -> None:
+    me = asyncio.current_task()
+    stray = [t for t in asyncio.all_tasks()
+             if t is not me and not t.done() and _is_app_task(t)]
+    for t in stray:
+        t.cancel()
+    if stray:
+        await asyncio.gather(*stray, return_exceptions=True)
+        log.info("shutdown reaped %d stray task(s): %s", len(stray),
+                 ", ".join(t.get_name() for t in stray))
+    deadline = time.monotonic() + drain_s
+    while db.active_connections() > 0 and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
 
 
 # How often the retention scheduler re-reads its knobs while waiting for
@@ -1700,14 +1741,13 @@ def _render_status_html(rows: list[dict], total_obs: int, uptime_s: float,
     # Version line + "update available" banner (from the daily GitHub check).
     ui = update_info or {}
     _repo_url = "https://github.com/volneydouglas/zasder-weather-backend"
+    # NO origin line here. This page is PUBLIC, and `describe_origin` answers
+    # with operator configuration advice ("Fly hostname (set PUBLIC_BASE_URL
+    # for a custom domain)") plus, behind a custom domain with PUBLIC_BASE_URL
+    # unset, the fly.dev hostname a visitor had not otherwise been given —
+    # the one thing the map's link modes exist to keep off a public surface.
+    # The boot log says all of it, once, where the operator looks (SEC-G2).
     version_html = f'<span class="ver">v{__version__}</span>'
-    try:
-        _origin, _why = oauth.describe_origin()
-        if _origin:
-            version_html += (f' <span class="ver">· origin {_html.escape(_origin)}'
-                             f' ({_html.escape(_why)})</span>')
-    except Exception:
-        pass
     update_banner = ""
     if ui.get("update_available") and ui.get("latest"):
         update_banner = (
@@ -1955,7 +1995,7 @@ async def _run_db_backup(job: dict[str, Any], dest: Path) -> None:
     import aiosqlite
     try:
         await db.wait_open()
-        conn = await aiosqlite.connect(settings.database_path)
+        conn = await db.open_connection(settings.database_path)
         try:
             await conn.execute("VACUUM INTO ?", (str(dest),))
         finally:
@@ -2058,7 +2098,7 @@ async def api_backup_database() -> FileResponse:
     import aiosqlite
     dest = _db_backup_dest()
     await db.wait_open()
-    conn = await aiosqlite.connect(settings.database_path)
+    conn = await db.open_connection(settings.database_path)
     try:
         await conn.execute("VACUUM INTO ?", (str(dest),))
     except Exception:
@@ -2833,6 +2873,21 @@ class AlertPrefsIn(BaseModel):
     # 2.2 sky notes.
     sky_notes: bool | None = None
     sky_good_only: bool | None = None
+    # 2.3 NWS relay: the push switch and the warnings-only filter.
+    nws_push: bool | None = None
+    nws_warnings_only: bool | None = None
+    # 2.3 storm watch on the lock screen: its own switch, but it needs
+    # storm_summary on (the card rides the summary's tracker).
+    storm_live_activity: bool | None = None
+    # 2.3 item 5: the lightning, wind-ramp and freeze-night Live
+    # Activities (default on) and their trigger thresholds, API-native
+    # like heat_day_threshold_f: miles for the nearest strike that opens
+    # the lightning card, mph for the gust that opens the wind card.
+    lightning_live_activity: bool | None = None
+    wind_live_activity: bool | None = None
+    freeze_live_activity: bool | None = None
+    lightning_live_mi: float | None = Field(default=None, ge=1, le=40)
+    wind_live_mph: float | None = Field(default=None, ge=10, le=120)
 
 
 class DeviceAlertIn(BaseModel):
@@ -2914,6 +2969,17 @@ async def _alerts_state() -> dict[str, Any]:
         "outlook_source": cfg.outlook_source or "open-meteo",
         "sky_notes": cfg.sky_notes,
         "sky_good_only": cfg.sky_good_only,
+        # 2.3: effective, never null, so the app shows the switch when a
+        # server answers the field at all.
+        "nws_push": cfg.nws_push,
+        "nws_warnings_only": cfg.nws_warnings_only,
+        "storm_live_activity": cfg.storm_live_activity,
+        # 2.3 item 5: effective, never null, same rule as above.
+        "lightning_live_activity": cfg.lightning_live_activity,
+        "wind_live_activity": cfg.wind_live_activity,
+        "freeze_live_activity": cfg.freeze_live_activity,
+        "lightning_live_mi": cfg.lightning_live_mi,
+        "wind_live_mph": cfg.wind_live_mph,
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -2972,7 +3038,15 @@ async def get_session(
                          # does not break. Token-gated: an install id is
                          # a fingerprint and does not belong on /api/version.
                          "server_id": await ensure_server_id(),
-                         "hosted": hosting_info()})
+                         "hosted": hosting_info(),
+                         # 2.3: the IANA zone the rollups (daily/monthly
+                         # rain, records, reports) are cut in, so the app
+                         # can label a server's day as that server's day.
+                         "timezone": settings.timezone,
+                         # F07: the map directory this server publishes to
+                         # (non-secret), so a read-token client browses
+                         # the directory its server is actually on.
+                         "map_directory_url": str(settings.map_directory_url).rstrip("/")})
 
 
 SERVER_ID_KEY = "server_id"
@@ -3156,10 +3230,16 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             fields[f] = None if v < 0 else v
     if body.outlook_source is not None:
         fields["outlook_source"] = body.outlook_source
-    for f in ("sky_notes", "sky_good_only"):
+    for f in ("sky_notes", "sky_good_only", "nws_push", "nws_warnings_only",
+              "storm_live_activity", "lightning_live_activity",
+              "wind_live_activity", "freeze_live_activity"):
         v = getattr(body, f)
         if v is not None:
             fields[f] = 1 if v else 0
+    for f in ("lightning_live_mi", "wind_live_mph"):
+        v = getattr(body, f)
+        if v is not None:
+            fields[f] = v
     if body.storm_quiet_minutes is not None:
         fields["storm_quiet_minutes"] = body.storm_quiet_minutes
     if body.storm_min_total_in is not None:
@@ -3508,6 +3588,31 @@ async def get_climate(mac: str,
         raise HTTPException(status_code=404, detail="insights not enabled")
     from .ingest import _format_mac
     return JSONResponse(await climate.year_summary(_format_mac(mac), year))
+
+
+@app.get("/api/devices/{mac}/forecast-accuracy",
+         dependencies=[Depends(require_token)])
+async def get_forecast_accuracy(
+    mac: str,
+    days: int = Query(forecast_skill.DEFAULT_DAYS, ge=7,
+                      le=forecast_skill.MAX_DAYS),
+    provider: str = Query("open-meteo", pattern="^[a-z0-9-]{1,32}$"),
+) -> JSONResponse:
+    """How wrong the forecast tends to be for THIS backyard (2.3).
+
+    `forecast_snapshots` has archived every forecast AS ISSUED since 1.8,
+    with its lead time; this scores those calls against the station's own
+    daily rollups at lead 1 through 6. Bias is signed forecast minus
+    measured in °F, so positive means the model ran warm. `available`
+    false means the archive has nothing to grade yet, which on a fresh
+    server is simply the truth — verification cannot be done
+    retroactively, which is why the collector shipped first.
+    """
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="insights not enabled")
+    from .ingest import _format_mac
+    return JSONResponse(await forecast_skill.scorecard(
+        _format_mac(mac), provider=provider, days=days))
 
 
 @app.get("/api/devices/{mac}/storms", dependencies=[Depends(require_token)])
@@ -4010,6 +4115,12 @@ async def push_unregister(body: PushUnregisterIn) -> JSONResponse:
                          "live_activity_removed": la_removed})
 
 
+# The Activities the server drives with per-activity update tokens: the
+# 1.7 rain-start countdown, the 1.8 storm and heat cards, and the 2.3
+# lightning / wind-ramp / freeze-night cards (item 5).
+_LIVE_ACTIVITIES = ("rain", "storm", "heat", "lightning", "wind", "freeze")
+
+
 class LiveActivityTokenIn(BaseModel):
     # Same bound + shape rationale as PushRegisterIn: ActivityKit tokens
     # are hex, but Apple documents no fixed length — printable ASCII with
@@ -4033,10 +4144,11 @@ async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONRespons
     activity = None
     if body.kind == "update":
         # 1.8: per-activity update tokens for the live-tracking Activities.
-        if body.activity not in ("rain", "storm", "heat"):
+        if body.activity not in _LIVE_ACTIVITIES:
             raise HTTPException(
                 status_code=400,
-                detail="update tokens need activity rain|storm|heat")
+                detail="update tokens need activity "
+                       + "|".join(_LIVE_ACTIVITIES))
         activity = body.activity
     elif body.kind == "widgets":
         # iOS 26 push-updated widgets: an extension-wide reload token, no
@@ -4049,7 +4161,7 @@ async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONRespons
         # starts; see db.list_live_activity_tokens, proven live
         # 2026-08-27). "morning" joined in 1.9.
         if body.activity is not None and body.activity not in (
-                "rain", "storm", "heat", "morning"):
+                _LIVE_ACTIVITIES + ("morning",)):
             raise HTTPException(status_code=400, detail="unknown activity")
         activity = body.activity or "rain"
     env = body.env if body.env in ("sandbox", "production") else None
@@ -4395,6 +4507,8 @@ class AlertRuleIn(BaseModel):
     threshold: float
     target_mac: str | None = None     # None = any device
     severity: str = "minor"           # minor | standard | major | urgent (major 1.9)
+    # 2.3: a line the owner types, appended to the push ("Park the 115H").
+    note: str | None = Field(default=None, max_length=400)
 
 
 @app.get("/api/alerts/rules", dependencies=[Depends(require_token)])
@@ -4425,9 +4539,11 @@ async def create_rule(body: AlertRuleIn) -> JSONResponse:
     if body.severity not in RULE_SEVERITIES:
         raise HTTPException(status_code=400,
                             detail=f"severity must be one of {list(RULE_SEVERITIES)}")
+    from .alerts import clean_rule_note
     mac = _format_mac(body.target_mac) if body.target_mac else None
     rule = await db.create_alert_rule(mac, body.field, body.comparator,
-                                      body.threshold, severity=body.severity)
+                                      body.threshold, severity=body.severity,
+                                      note=clean_rule_note(body.note))
     return JSONResponse(rule)
 
 
@@ -4439,6 +4555,7 @@ class AlertRulePatch(BaseModel):
     threshold: float | None = None
     target_mac: str | None = None
     severity: str | None = None       # minor | standard | major | urgent (major 1.9)
+    note: str | None = Field(default=None, max_length=400)   # "" clears (2.3)
 
 
 @app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_shared_write)])
@@ -4455,10 +4572,13 @@ async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
     set_target = body.target_mac is not None
     tgt = (_format_mac(body.target_mac)
            if set_target and body.target_mac != "" else None)
+    from .alerts import clean_rule_note
     rule = await db.update_alert_rule(rule_id, enabled=body.enabled,
                                       threshold=body.threshold,
                                       target_mac=tgt, set_target=set_target,
-                                      severity=body.severity)
+                                      severity=body.severity,
+                                      note=clean_rule_note(body.note),
+                                      set_note=body.note is not None)
     if rule is None:
         raise HTTPException(status_code=404, detail="rule not found")
     return JSONResponse(rule)
@@ -4485,7 +4605,9 @@ async def delete_device(mac: str) -> JSONResponse:
 
 async def _fill_rain_periods(mac: str, obs: dict[str, Any]) -> None:
     """Rain rollup enrichment: fill period totals the source doesn't post.
-    SDR posts only yearlyrainin (differenced at period boundaries), the
+    SDR posts only yearlyrainin (2.3: the day, week, month and year are
+    read from daily_rollups when the ledger can answer them, the counter
+    differenced at the boundary otherwise — see db.rain_rollups), the
     Tempest posts only hourly+daily (summed per-day, rain_rollups tier 3 —
     before that tier, the old yearlyrainin-only gate here meant a Tempest
     dashboard simply had no week/month/year). AWN-sourced rows ship every
@@ -4693,6 +4815,215 @@ async def get_history(
     start = end - hours * 3600 * 1000
     rows = await db.history(mac, start, end, limit=limit)
     return JSONResponse({"start": start, "end": end, "count": len(rows), "rows": rows})
+
+
+# ───────────────────────── the shared station map (2.3) ─────────────────
+
+class MapSharePut(BaseModel):
+    enabled: bool | None = None
+    mac: str | None = None                 # "" = the first weather station
+    name_visible: bool | None = None
+    # exact | area | city (09-14). No typed link: the only visit link is
+    # the server's own public page, and only while that page is on.
+    location_precision: str | None = None
+    visit_public_page: bool | None = None
+    # direct | id | none — how the map may reach this server from its pin.
+    link_mode: str | None = None
+
+
+@app.get("/api/map", dependencies=[Depends(require_write_token)])
+async def get_map_share() -> JSONResponse:
+    """The owner's map switch, its status, and a preview of exactly what a
+    stranger would see, so the choice is made with the beacon in view."""
+    from . import map_beacon as mb, share_targets as st
+    cfg = await mb.get_config()
+    status = await mb.get_status()
+    devices = await db.list_devices()
+    station = st.station_for(cfg, devices)
+    preview = None
+    page_on = await mb.public_page_enabled()
+    page_url = mb.public_page_url() if page_on else None
+    if station is not None:
+        preview = mb.build(server_id=await ensure_server_id(), station=station,
+                           cfg=cfg, now_ms=int(time.time() * 1000),
+                           visit_url=await mb.resolved_visit_url(cfg),
+                           region=await mb.region_hint())
+    return JSONResponse({
+        "enabled": bool(cfg.get("enabled")),
+        "mac": cfg.get("mac"),
+        "name_visible": bool(cfg.get("name_visible")),
+        "location_precision": mb.precision_of(cfg),
+        "precisions": list(mb.PRECISIONS),
+        # The public page: whether it is on, its address if the server
+        # can know it, and whether the owner chose to link it. The app
+        # shows the link switch only when the page is on AND addressable.
+        "public_page_enabled": page_on,
+        "public_page_url": page_url,
+        "visit_public_page": bool(cfg.get("visit_public_page")),
+        # How the pin may reach this server, the id the directory assigned
+        # for `id` mode, and the link it actually shows. The id arrives on
+        # the directory's reply to a beacon, so it is None until the first
+        # one lands.
+        "link_mode": mb.link_mode_of(cfg),
+        "link_modes": list(mb.LINK_MODES),
+        "public_id": status.get("public_id"),
+        "public_visit_url": status.get("visit"),
+        "region_hint": await mb.region_hint(),
+        "directory_url": mb.directory_url(),
+        "fuzz_km": mb.FUZZ_KM,
+        "city_km": mb.CITY_KM,
+        "last_ok_ms": status.get("last_ok_ms"),
+        "last_error": status.get("last_error"),
+        "last_error_ms": status.get("last_error_ms"),
+        "preview": preview,
+        # The server's map signing key (public half) and whether a
+        # rotation is still waiting for the directory's acknowledgement.
+        "pubkey": mb.public_key_b64(await mb.ensure_key()),
+        "rotation_pending": await mb.rotation_pending(),
+        # F06: withdrawals the directory has not taken yet, retried from
+        # the tick. PUT says so once in a sentence; this is the durable
+        # state, so reopening the app still sees the old pin may stand.
+        "pending_withdraw": [p["mac"] for p in await mb.pending_withdrawals()
+                             if isinstance(p.get("mac"), str)],
+    })
+
+
+# Serializes PUT /api/map (R23): the handler reads the config, awaits
+# the device list, then writes the whole dict back, so two overlapping
+# partial updates lost whichever field the earlier one set. Lazy, and
+# reset per test, like _PUBLIC_DASH_LOCK.
+_MAP_CFG_LOCK: asyncio.Lock | None = None
+
+
+@app.put("/api/map", dependencies=[Depends(require_write_token)])
+async def put_map_share(body: MapSharePut) -> JSONResponse:
+    global _MAP_CFG_LOCK
+    if _MAP_CFG_LOCK is None:            # no await between test and assignment
+        _MAP_CFG_LOCK = asyncio.Lock()
+    async with _MAP_CFG_LOCK:
+        return await _put_map_share_locked(body)
+
+
+async def _put_map_share_locked(body: MapSharePut) -> JSONResponse:
+    from . import map_beacon as mb
+    from .ingest import _format_mac
+    cfg = await mb.get_config()
+    was_on = bool(cfg.get("enabled"))
+    devices = await db.list_devices()
+    # The mac the directory currently lists us under, resolved BEFORE the
+    # edit. Beacons are keyed by station, so switching station A -> B only
+    # ever ADDED B: A sat on the map under its own pin until its three-hour
+    # TTL ran out, and the owner saw the station they had just switched away
+    # from (2026-09-14, two live pins for one server). The switch has to
+    # carry a tombstone for the station it leaves behind.
+    prev_mac = mb.effective_mac(cfg, devices) if was_on else None
+    if body.enabled is not None:
+        cfg["enabled"] = bool(body.enabled)
+    if body.mac is not None:
+        cfg["mac"] = _format_mac(body.mac) if body.mac.strip() else None
+    if body.name_visible is not None:
+        cfg["name_visible"] = bool(body.name_visible)
+    if body.location_precision is not None:
+        if body.location_precision not in mb.PRECISIONS:
+            raise HTTPException(status_code=400,
+                                detail="location_precision must be exact, area or city")
+        cfg["location_precision"] = body.location_precision
+        cfg.pop("exact_location", None)
+    if body.visit_public_page is not None:
+        cfg["visit_public_page"] = bool(body.visit_public_page)
+    if body.link_mode is not None:
+        if body.link_mode not in mb.LINK_MODES:
+            raise HTTPException(status_code=400,
+                                detail="link_mode must be direct, id or none")
+        cfg["link_mode"] = body.link_mode
+    cfg.pop("visit_url", None)             # typed links are gone (09-14)
+    now_ms = int(time.time() * 1000)
+    # A withdrawal the directory did not take is queued and retried from
+    # the tick (R23: the old pin stayed public for up to three hours and
+    # nothing retried, since the switch was already off). The save still
+    # succeeds; the response says so in a sentence.
+    withdraw_notice: str | None = None
+    if was_on and not cfg.get("enabled"):
+        # Off: the config write and the tombstone go out together under
+        # the publication lock (S1, 2026-09-16 review): a Save and verify
+        # that had passed its switch check and was awaiting the device
+        # list used to resume after this withdrawal and put the pin
+        # straight back. Now nothing signs once the switch is off.
+        res = await mb.turn_off(cfg, prev_mac, now_ms)
+        if prev_mac and not res.get("ok"):
+            withdraw_notice = mb.WITHDRAW_PENDING
+    else:
+        await mb.set_config(cfg)
+    if cfg.get("enabled"):
+        new_mac = mb.effective_mac(cfg, devices)
+        if prev_mac and prev_mac != new_mac:
+            # Best-effort: a directory that is down must not fail the save.
+            try:
+                res = await mb.withdraw_mac(prev_mac, now_ms)
+            except Exception:                # noqa: BLE001
+                log.exception("map: could not withdraw the previous station")
+                res = {"ok": False}
+            if not res.get("ok"):
+                withdraw_notice = mb.WITHDRAW_PENDING
+        if new_mac:
+            # Back on (or back to this station) while its withdrawal was
+            # still queued from an earlier off: that tombstone is obsolete
+            # and would take down the pin the next beacon renews (S3).
+            await mb.drop_pending_withdrawal(new_mac)
+        mb._last_publish_ms.clear()          # the next tick sends fresh
+    out = await get_map_share()
+    if withdraw_notice is None:
+        return out
+    payload = json.loads(out.body)
+    payload["withdraw_notice"] = withdraw_notice
+    return JSONResponse(payload)
+
+
+async def _require_map_share_on() -> None:
+    """R23: Save and verify and Rotate published while the switch was
+    off (API only; the app hides both), putting a pin on the map the
+    owner had said no to."""
+    from . import map_beacon as mb
+    if not (await mb.get_config()).get("enabled"):
+        raise HTTPException(status_code=409,
+                            detail="Map sharing is off. Turn it on before "
+                                   "sending a beacon or rotating the key.")
+
+
+@app.post("/api/map/test", dependencies=[Depends(require_write_token)])
+async def test_map_share() -> JSONResponse:
+    """One beacon right now: the Save and verify button."""
+    from . import map_beacon as mb
+    await _require_map_share_on()
+    result = await mb.publish_once(await db.list_devices(), int(time.time() * 1000))
+    return JSONResponse(result)
+
+
+@app.post("/api/map/rotate", dependencies=[Depends(require_write_token)])
+async def rotate_map_key() -> JSONResponse:
+    """Mint a new map signing key and send the old key's blessing of it
+    to the directory now. Until the directory acknowledges, every beacon
+    carries the proof. A key that is LOST cannot bless anything; that is
+    the directory operator's forget action."""
+    from . import map_beacon as mb
+    await _require_map_share_on()
+    try:
+        out = await mb.rotate(await db.list_devices(), int(time.time() * 1000))
+    except mb.RotationRefused as e:
+        # A rotation the directory has not acknowledged is resolved with a
+        # beacon first; when that cannot land, nothing rotates (S2).
+        raise HTTPException(status_code=409, detail=str(e))
+    return JSONResponse(out)
+
+
+@app.get("/api/devices/{mac}/highlights", dependencies=[Depends(require_token)])
+async def get_highlights(mac: str) -> JSONResponse:
+    """Today's highlights (2.3): the readings that make today unusual for
+    THIS station, ranked against its own daily rollups for the same time
+    of year. Empty (never invented) under two years of record."""
+    from . import highlights
+    from .ingest import _format_mac
+    return JSONResponse(await highlights.assemble(_format_mac(mac)))
 
 
 @app.get("/api/devices/{mac}/normals", dependencies=[Depends(require_token)])

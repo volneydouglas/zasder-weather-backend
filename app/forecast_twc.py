@@ -129,11 +129,26 @@ def transform(twc: dict[str, Any]) -> dict[str, Any]:
     # `days` — they are twice as many as the days and the first one expires at
     # mid-afternoon, so index 0 is simply "the half we are in now". Nulls are
     # dropped rather than kept as placeholders, which is what makes that true.
-    narrative = [
-        {"name": name, "text": text}
-        for name, text in zip(dp_name, dp_narrative)
-        if isinstance(name, str) and isinstance(text, str) and text.strip()
-    ]
+    # Each entry says WHICH DAY it belongs to (2.3, Doren: tapping a day in
+    # the strip should reveal that day's written forecast). The daypart
+    # arrays interleave day/night two per calendar day, so the index BEFORE
+    # the nulls are dropped is what carries that — after the drop it is
+    # gone, which is exactly why this loop replaced the comprehension.
+    #
+    # The day is sent as a DATE rather than an index because the app drops
+    # individual malformed days from the strip; an index would then point
+    # at the wrong cell, while a date still matches the right one or
+    # matches nothing.
+    narrative = []
+    for i, (name, text) in enumerate(zip(dp_name, dp_narrative)):
+        if not (isinstance(name, str) and isinstance(text, str) and text.strip()):
+            continue
+        day_i = i // 2
+        t = times[day_i] if day_i < len(times) else None
+        entry = {"name": name, "text": text, "night": i % 2 == 1}
+        if isinstance(t, str):
+            entry["date"] = t[:10]
+        narrative.append(entry)
     return {"daily": days, "timezone": None, "source": "twc",
             "narrative": narrative}
 

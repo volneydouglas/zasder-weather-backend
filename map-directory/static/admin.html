@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Zasder Weather · map directory operator</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<h1><i>zasder</i><b>WEATHER</b> &nbsp;·&nbsp; map directory operator</h1>
+<p class="muted">The token is kept in this tab only (sessionStorage) and sent as a bearer header. Blocking removes a server's stations from the map now and refuses its beacons until unblocked. Forgetting drops its key pin and stations so its owner starts over.</p>
+<form id="auth"><label>Admin token <input id="token" type="password" autocomplete="off"></label> <button type="submit">Load</button> <span id="status" class="muted"></span></form>
+<table id="servers" hidden>
+  <thead><tr><th>Server</th><th>Stations</th><th>Names</th><th>First seen</th><th>Last seen</th><th>Key</th><th>State</th><th></th></tr></thead>
+  <tbody></tbody>
+</table>
+<script src="/static/admin.js"></script>
+</body>
+</html>

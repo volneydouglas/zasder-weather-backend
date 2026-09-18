@@ -18,8 +18,8 @@ Design guards:
 - Edge-triggered with a cooldown, state in server_kv so a restart doesn't
   re-alert mid-event.
 - "Not already raining" gate uses hourlyrainin ONLY as a suppressor —
-  NEVER as onset detection (the storm-summary lesson: it's a trailing-hour
-  accumulation). Worst case a wet trailing hour suppresses a warning about
+  NEVER as onset detection (the storm-summary lesson: it's the trailing
+  60-minute accumulation, defined once beside FIELD_LABELS in alerts.py). Worst case a wet trailing hour suppresses a warning about
   rain the user can already hear.
 """
 from __future__ import annotations

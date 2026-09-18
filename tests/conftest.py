@@ -115,6 +115,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._STORAGE_JOB = {"state": "idle"}      # 2.0 /api/storage job
         _m._STORAGE_TASK = None
         _m._DB_BUSY_LOG_TS.clear()       # 2.0 503 handler's log throttle
+        _m._MAP_CFG_LOCK = None          # 2.3 PUT /api/map (rebound per loop)
     # 1.8 modules keep small process-global throttles; same isolation rule.
     _wp = sys.modules.get("app.widget_push")
     if _wp is not None:
@@ -125,6 +126,11 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _nw = sys.modules.get("app.nws_watch")
     if _nw is not None:
         _nw._reset_for_tests()
+    # 2.3 map beacon: the publish cadence and the mint/sign/post lock,
+    # which binds to the first loop that awaits it.
+    _mb = sys.modules.get("app.map_beacon")
+    if _mb is not None:
+        _mb._reset_for_tests()
     # Forecast snapshots now run on EVERY tick regardless of alert
     # transport (R7 R1) — without this stub, any tick-running test whose
     # device carries coords makes a REAL Open-Meteo call (15s timeout ×
@@ -196,6 +202,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # 2.1 maintenance lease (restore): a test that held or timed a
         # lease must not leave the gate closed or the counter off.
         _d._GATE_CLOSED = False
+        _d._GATE_HELD = None
         _d._GATE_EVENT = None
         _d._GATE_LOOP = None
         _d._ACTIVE_CONNECTIONS = 0

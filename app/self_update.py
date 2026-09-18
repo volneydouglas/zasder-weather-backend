@@ -213,8 +213,7 @@ async def snapshot_before_upgrade(tag: str) -> Path | None:
                         free // 2**20, need // 2**20)
             return None
         dest.unlink(missing_ok=True)
-        import aiosqlite
-        conn = await aiosqlite.connect(str(db_path))
+        conn = await db.open_connection(str(db_path))
         try:
             await conn.execute("VACUUM INTO ?", (str(dest),))
         finally:

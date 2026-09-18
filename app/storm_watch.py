@@ -19,6 +19,13 @@ alerts._check_storm_summaries:
 
 Every push is best-effort: a transport failure logs and waits for the
 next tick; nothing here may block or fail the summary pipeline.
+
+Switches (2.3): `storm_live_activity` turns the Live Activity off on its
+own, independent of the summary's channels (`storm_channels`), but it
+REQUIRES `storm_summary` on — the tracker whose episodes this module
+rides is the summary's, and turning the summary off stops the tracker
+and with it every card here. That is a documented consequence, not a
+separate gate (R23).
 """
 from __future__ import annotations
 
@@ -55,7 +62,10 @@ async def _content_state(mac: str, started_ms: int, now_ms: int,
 
 async def on_open_tick(cfg, device: dict, started_ms: int,
                        now_ms: int, field: str | None) -> None:
-    """Called each monitor tick for a device whose episode is open."""
+    """Called each monitor tick for a device whose episode is open.
+    `storm_summary` off means no tracker and no card (see the module
+    docstring); `storm_live_activity` off keeps the summary and drops
+    only the card."""
     if not cfg.storm_summary:
         return
     from . import apns
@@ -64,6 +74,8 @@ async def on_open_tick(cfg, device: dict, started_ms: int,
     la = await db.get_storm_watch_la(mac)
     try:
         if la is None or la["episode_started_ms"] != started_ms:
+            if not getattr(cfg, "storm_live_activity", True):
+                return          # 2.3: lock screen off; the summary still comes
             # New episode (or a restart lost nothing: the row persists) —
             # start the Activity exactly once per episode.
             state = await _content_state(mac, started_ms, now_ms, field, False)

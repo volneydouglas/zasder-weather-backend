@@ -417,7 +417,13 @@ def test_every_alert_preference_round_trips_through_backup(client):
         assert backup["alert_prefs"][k] == v, k
     assert backup["device_alert_prefs"]["AA:BB:CC:00:00:11"]["storm_summary"] is False
     assert backup["alert_rules"][0]["severity"] == "urgent"
-    # The allowlist and the database's stored column list agree.
+    # The allowlist IS the database's stored column list minus the
+    # deliberate exclusions (each named with a reason): a column added to
+    # db._ALERT_PREF_COLS fails here until the backup carries it (R22-06,
+    # then R23 with the three 2.3 switches).
+    assert set(config_backup._ALERT_PREF_KEYS) == (
+        set(db._ALERT_PREF_COLS) - set(config_backup.BACKUP_EXCLUDED_PREFS))
+    assert set(config_backup.BACKUP_EXCLUDED_PREFS) == {"smtp_password"}
     assert set(config_backup._ALERT_PREF_KEYS) >= set(changed)
 
     # Reset everything, then restore.
@@ -456,3 +462,85 @@ def test_a_version_one_backup_still_restores(client):
     assert client.post("/api/config/restore", headers=H, json=old).status_code == 200
     assert client.get("/api/alerts", headers=H).json()["email_scope"] == "device_down"
     assert [r["severity"] for r in client.get("/api/alerts/rules", headers=H).json()] == ["minor"]
+
+
+def test_the_2_3_switches_round_trip_through_backup(client):
+    """R23: `nws_push`, `nws_warnings_only` and `storm_live_activity` were
+    missing from the export allowlist, so a restore reset an owner's
+    NWS-off back to on."""
+    from app import config_backup
+    changed = {"nws_push": False, "nws_warnings_only": True,
+               "storm_live_activity": False}
+    assert client.put("/api/alerts", headers=H, json=changed).status_code == 200
+    backup = client.get("/api/config/backup", headers=H).json()
+    for k, v in changed.items():
+        assert backup["alert_prefs"][k] == v, k
+    reset = {"nws_push": True, "nws_warnings_only": False,
+             "storm_live_activity": True}
+    assert client.put("/api/alerts", headers=H, json=reset).status_code == 200
+    assert client.post("/api/config/restore", headers=H, json=backup).status_code == 200
+    got = client.get("/api/alerts", headers=H).json()
+    for k, v in changed.items():
+        assert got[k] == v, (k, got[k])
+    for k in changed:
+        assert config_backup._coerce_alert_pref(k, True) == 1
+        assert config_backup._coerce_alert_pref(k, "yes") is config_backup._INVALID
+
+
+def test_the_item_5_live_activity_prefs_round_trip_through_backup(client):
+    """2.3 item 5: the lightning / wind-ramp / freeze-night switches and
+    the two thresholds ride the backup like every other pref (the
+    derived-set test above fails the moment a column is left out)."""
+    from app import config_backup
+    changed = {"lightning_live_activity": False, "wind_live_activity": False,
+               "freeze_live_activity": False, "lightning_live_mi": 6.5,
+               "wind_live_mph": 42.0}
+    assert client.put("/api/alerts", headers=H, json=changed).status_code == 200
+    backup = client.get("/api/config/backup", headers=H).json()
+    for k, v in changed.items():
+        assert backup["alert_prefs"][k] == v, k
+    reset = {"lightning_live_activity": True, "wind_live_activity": True,
+             "freeze_live_activity": True, "lightning_live_mi": 10.0,
+             "wind_live_mph": 35.0}
+    assert client.put("/api/alerts", headers=H, json=reset).status_code == 200
+    assert client.post("/api/config/restore", headers=H, json=backup).status_code == 200
+    got = client.get("/api/alerts", headers=H).json()
+    for k, v in changed.items():
+        assert got[k] == v, (k, got[k])
+    for k in ("lightning_live_activity", "wind_live_activity",
+              "freeze_live_activity"):
+        assert config_backup._coerce_alert_pref(k, True) == 1
+        assert config_backup._coerce_alert_pref(k, "yes") is config_backup._INVALID
+    for k in ("lightning_live_mi", "wind_live_mph"):
+        assert config_backup._coerce_alert_pref(k, 12) == 12.0
+        for bad in (0, -3, "nan", "far"):
+            assert config_backup._coerce_alert_pref(k, bad) is config_backup._INVALID, bad
+
+
+def test_restore_refuses_a_threshold_the_api_would(client):
+    """The same bounds AlertPrefsIn puts on PUT /api/alerts (10..120 mph,
+    1..40 mi): a hand-edited backup with 5 mph or 400 mi is skipped, not
+    stored — a restore is not a way around the API's range check."""
+    from app import config_backup
+    assert config_backup._coerce_alert_pref("wind_live_mph", 5) is config_backup._INVALID
+    assert config_backup._coerce_alert_pref("wind_live_mph", 121) is config_backup._INVALID
+    assert config_backup._coerce_alert_pref("wind_live_mph", 10) == 10.0
+    assert config_backup._coerce_alert_pref("wind_live_mph", 120) == 120.0
+    assert config_backup._coerce_alert_pref("lightning_live_mi", 400) is config_backup._INVALID
+    assert config_backup._coerce_alert_pref("lightning_live_mi", 0.5) is config_backup._INVALID
+    assert config_backup._coerce_alert_pref("lightning_live_mi", 1) == 1.0
+    assert config_backup._coerce_alert_pref("lightning_live_mi", 40) == 40.0
+    # The API itself refuses the same values, so the two agree.
+    assert client.put("/api/alerts", headers=H, json={"wind_live_mph": 5}).status_code == 422
+    assert client.put("/api/alerts", headers=H, json={"lightning_live_mi": 400}).status_code == 422
+    # And through the whole restore: the bad pair is skipped, a good
+    # sibling in the same file lands.
+    backup = client.get("/api/config/backup", headers=H).json()
+    backup["alert_prefs"]["wind_live_mph"] = 5
+    backup["alert_prefs"]["lightning_live_mi"] = 400
+    backup["alert_prefs"]["heat_day_threshold_f"] = 101.0
+    r = client.post("/api/config/restore", headers=H, json=backup)
+    assert r.status_code == 200, r.text
+    got = client.get("/api/alerts", headers=H).json()
+    assert got["heat_day_threshold_f"] == 101.0
+    assert got["wind_live_mph"] != 5 and got["lightning_live_mi"] != 400

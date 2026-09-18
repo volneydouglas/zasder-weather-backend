@@ -61,7 +61,22 @@ _ALERT_PREF_KEYS = (
     # (2.2 release review R22-06: export dropped them, import ignored them).
     "outlook_hour", "outlook_minute", "outlook_source",
     "sky_notes", "sky_good_only",
+    # 2.3: the NWS relay's switch and filter, and the storm Live Activity
+    # switch (R23: a restore reset Doren's NWS-off back to on — R22-06
+    # again; the test now derives the expected set from db._ALERT_PREF_COLS
+    # so the next column fails the suite until it is carried).
+    "nws_push", "nws_warnings_only", "storm_live_activity",
+    # 2.3 item 5: the lightning / wind-ramp / freeze-night cards and
+    # their two thresholds.
+    "lightning_live_activity", "wind_live_activity", "freeze_live_activity",
+    "lightning_live_mi", "wind_live_mph",
 )
+# Columns set_alert_prefs stores that the backup deliberately leaves out,
+# each with its reason. test_config_backup checks _ALERT_PREF_KEYS is
+# exactly db._ALERT_PREF_COLS minus these.
+BACKUP_EXCLUDED_PREFS = {
+    "smtp_password": "a secret: never written to a file the owner may share",
+}
 RULE_SEVERITIES = ("minor", "standard", "major", "urgent")
 
 
@@ -75,7 +90,7 @@ async def export_config() -> dict[str, Any]:
         "device_alert_prefs": await db.get_device_alert_prefs(),
         "alert_rules": [
             {k: r.get(k) for k in ("target_mac", "field", "comparator",
-                                   "threshold", "enabled", "severity")}
+                                   "threshold", "enabled", "severity", "note")}
             for r in await db.list_alert_rules()
         ],
         "device_locations": await db.device_locations(),
@@ -105,7 +120,10 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
         return None
     if key in ("enabled", "smtp_tls", "smtp_ssl", "storm_summary",
                "sky_notes", "sky_good_only",
-               "rain_start", "heat_day"):
+               "rain_start", "heat_day",
+               "nws_push", "nws_warnings_only", "storm_live_activity",
+               "lightning_live_activity", "wind_live_activity",
+               "freeze_live_activity"):
         if isinstance(v, bool) or v in (0, 1):
             return 1 if v else 0
         return _INVALID
@@ -122,6 +140,17 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
         except (TypeError, ValueError):
             return _INVALID
         return f if math.isfinite(f) else _INVALID
+    if key in ("lightning_live_mi", "wind_live_mph"):
+        # A trigger distance or speed, within the same bounds AlertPrefsIn
+        # puts on PUT /api/alerts (1..40 mi, 10..120 mph), or skipped: a
+        # restore must not store a threshold the API would refuse.
+        lo, hi = {"lightning_live_mi": (1.0, 40.0),
+                  "wind_live_mph": (10.0, 120.0)}[key]
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return _INVALID
+        return f if math.isfinite(f) and lo <= f <= hi else _INVALID
     if key == "outlook_source":
         return v if v in ("open-meteo", "twc") else _INVALID
     if key in ("quiet_start_min", "quiet_end_min", "digest_hour",
@@ -265,8 +294,10 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
             severity = r.get("severity") or "minor"
             if severity not in RULE_SEVERITIES:
                 severity = "minor"        # a hand-edited file never invents a tier
+            from .alerts import clean_rule_note
             staged.append((target_mac, field, comparator, threshold,
-                           bool(r.get("enabled", True)), severity))
+                           bool(r.get("enabled", True)), severity,
+                           clean_rule_note(r.get("note"))))
         # An explicitly empty list is a legitimate "clear my rules". A list
         # with ANY rejected entry is applied not at all: replacing a working
         # set with a partial one, and reporting it as restored, was the
@@ -283,10 +314,11 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
             # replacement, all or nothing.
             summary["alert_rules"] = await db.replace_alert_rules(staged)
         else:
-            for target, field, comparator, threshold, enabled, severity in staged:
+            for target, field, comparator, threshold, enabled, severity, note in staged:
                 created = await db.create_alert_rule(target, field,
                                                      comparator, threshold,
-                                                     severity=severity)
+                                                     severity=severity,
+                                                     note=note)
                 if created and not enabled:
                     await db.set_alert_rule_enabled(int(created["id"]), False)
                 summary["alert_rules"] += 1

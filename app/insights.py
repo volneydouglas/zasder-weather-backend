@@ -23,11 +23,12 @@ from __future__ import annotations
 import logging
 import asyncio
 import math
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from .config import settings
+from . import day_rain as _day_rain
 from .day_rain import day_rain_in
 
 log = logging.getLogger("zasder.insights")
@@ -135,7 +136,7 @@ CREATE TABLE IF NOT EXISTS daily_rollups (
     feels_like_min REAL, feels_like_max REAL,
     uv_max REAL, solarradiation_max REAL,
     rain_total REAL,                    -- max(dailyrainin) seen that day
-    yearly_min REAL, yearly_max REAL,   -- fallback rain delta for SDR sources
+    yearly_min REAL, yearly_max REAL,   -- pre-2.2 reset signature: day_rain_in's last fallback until a rebuild fills yearly_rise
     lightning_max REAL,                 -- peak strikes/hr that day (1.6; ALTERed in)
     -- 2.2 (ALTERed in; db.init_db lists them in ROLLUP_LATE_COLUMNS):
     -- sums for the long-period means the MCP analyses asked for, and the
@@ -152,6 +153,19 @@ CREATE TABLE IF NOT EXISTS daily_rollups (
     -- lifetime counter is last - first (2.2, ref_rain_counters).
     yearly_first REAL, yearly_first_ms INTEGER,
     yearly_last REAL, yearly_last_ms INTEGER,
+    -- 2.3: the day's rain as the SUM OF RISES in the counter, which is the
+    -- only form that survives more than one reset in a day. last - first
+    -- above is right for a day with no reset and for a day with exactly
+    -- one; a gauge that resets twice, or resets and then rains again past
+    -- its restart, reads short. Every positive step is added and a drop
+    -- adds nothing, so the answer is the same whatever the counter did.
+    yearly_rise REAL,
+    -- 2.3 (F01): the first and last observation of the day, any field,
+    -- so a consumer can tell a day the station covered from one it saw
+    -- for a minute. The forecast scorecard scores only days whose span
+    -- reaches forecast_skill.MIN_COVER_HOURS; a row folded before these
+    -- existed reads NULL and is "coverage unknown", never "covered".
+    obs_first_ms INTEGER, obs_last_ms INTEGER,
     PRIMARY KEY (mac, day)
 );
 
@@ -208,6 +222,8 @@ ROLLUP_LATE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("tempinf_min", "REAL"), ("tempinf_max", "REAL"),
     ("yearly_first", "REAL"), ("yearly_first_ms", "INTEGER"),
     ("yearly_last", "REAL"), ("yearly_last_ms", "INTEGER"),
+    ("yearly_rise", "REAL"),
+    ("obs_first_ms", "INTEGER"), ("obs_last_ms", "INTEGER"),
 )
 
 # (column stem) -> the rollup_params key that feeds it, for the sum/n pairs.
@@ -247,7 +263,8 @@ INSERT INTO daily_rollups (mac, day,
     pm25_min, pm25_max, pm25_sum, pm25_n,
     co2_min, co2_max, co2_sum, co2_n,
     tempinf_min, tempinf_max,
-    yearly_first, yearly_first_ms, yearly_last, yearly_last_ms)
+    yearly_first, yearly_first_ms, yearly_last, yearly_last_ms,
+    yearly_rise, obs_first_ms, obs_last_ms)
 VALUES (:mac, :day,
     :tempf, :tempf, :tempf, :tempf_n,
     :humidity, :humidity, :windspeedmph, :windgustmph,
@@ -260,8 +277,35 @@ VALUES (:mac, :day,
     :co2, :co2, :co2, :co2_n,
     :tempinf, :tempinf,
     :yearlyrainin, CASE WHEN :yearlyrainin IS NULL THEN NULL ELSE :ts END,
-    :yearlyrainin, CASE WHEN :yearlyrainin IS NULL THEN NULL ELSE :ts END)
+    :yearlyrainin, CASE WHEN :yearlyrainin IS NULL THEN NULL ELSE :ts END,
+    -- The day's FIRST reading is not a rise from nothing, but it may be
+    -- a rise from the PREVIOUS day's last reading (F02): 23:59 at 10.00
+    -- and 00:01 at 10.20 is 0.20 in of rain that used to vanish from
+    -- both days. The step is credited to the day it ENDS on, under the
+    -- same rules as a step inside the day (positive, one-step ceiling,
+    -- rate gate), and only from the calendar day before: a gap of days
+    -- is a gap, not a rise. NULL when there is no counter at all: absent
+    -- is not zero, and a gauge-less station must not read as a dry day.
+    -- `FROM daily_rollups AS prev` is re-aimed at the staging twin by
+    -- _upsert_into, so the rebuild (which folds each station in time
+    -- order) sees the previous day it just folded.
+    CASE WHEN :yearlyrainin IS NULL THEN NULL ELSE COALESCE((
+        SELECT CASE
+            WHEN :yearlyrainin > prev.yearly_last
+                 AND (:yearlyrainin - prev.yearly_last) <= :rise_max
+                 AND (:yearlyrainin - prev.yearly_last) <= :rate_max
+                     * (MAX(:ts - prev.yearly_last_ms, 1000) / 3600000.0)
+                     + :rate_slack
+                THEN :yearlyrainin - prev.yearly_last
+            ELSE 0.0 END
+        FROM daily_rollups AS prev
+        WHERE prev.mac = :mac AND prev.day = :prev_day
+          AND prev.yearly_last IS NOT NULL AND prev.yearly_last_ms IS NOT NULL
+          AND prev.yearly_last_ms <= :ts), 0.0) END,
+    :ts, :ts)
 ON CONFLICT(mac, day) DO UPDATE SET
+    obs_first_ms = MIN(COALESCE(obs_first_ms, :ts), :ts),
+    obs_last_ms  = MAX(COALESCE(obs_last_ms, :ts), :ts),
     tempf_min = MIN(COALESCE(tempf_min, :tempf), COALESCE(:tempf, tempf_min)),
     tempf_max = MAX(COALESCE(tempf_max, :tempf), COALESCE(:tempf, tempf_max)),
     tempf_sum = COALESCE(tempf_sum, 0) + COALESCE(:tempf, 0),
@@ -311,8 +355,83 @@ ON CONFLICT(mac, day) DO UPDATE SET
                        ELSE yearly_last END,
     yearly_last_ms = CASE WHEN :yearlyrainin IS NULL THEN yearly_last_ms
                           WHEN yearly_last_ms IS NULL OR :ts >= yearly_last_ms THEN :ts
-                          ELSE yearly_last_ms END
+                          ELSE yearly_last_ms END,
+    -- Every positive step the counter took today, added up. SQL evaluates
+    -- every right-hand side against the row as it was BEFORE this UPDATE,
+    -- so `yearly_last` here is still the previous reading even though the
+    -- clause above is replacing it.
+    --
+    -- A DROP adds nothing. That is what makes this survive a reset: the
+    -- restarted counter's own climb is measured by the steps that follow,
+    -- so two resets in a day, or a reset followed by more rain, come out
+    -- right where last - first reads short.
+    --
+    -- Out-of-order rows (a history import, a resumed relay) add nothing
+    -- either: a reading that predates `yearly_last` did not happen after
+    -- it, so the gap between them is not a rise. The rebuild scans in
+    -- timestamp order per station and therefore sees every step.
+    --
+    -- A single step over RISE_MAX_IN is a corrupt counter, not weather —
+    -- more rain than anywhere on earth records between two readings — and
+    -- it is dropped rather than allowed to poison the day.
+    --
+    -- A step that does not fit the time it took (R23) is a manual counter
+    -- set, not weather: rate_max in/hr over the elapsed time since the
+    -- previous reading, plus rate_slack for tip jitter — ingest's own
+    -- spike-guard allowance, which ACCEPTS such a step as a level shift
+    -- once the next reading confirms it (a console set always confirms).
+    -- The Davis console went 0 -> 0.34 in one 60 s step on 2026-08-10.
+    -- Rejected either way, the step still advances yearly_last (the
+    -- clause above), so what follows is measured from the new level.
+    -- Changing THESE rules means bumping ROLLUP_FOLD_VERSION.
+    yearly_rise = CASE
+        -- No counter in this reading: nothing to add, nothing to spoil.
+        WHEN :yearlyrainin IS NULL THEN yearly_rise
+        -- This reading is OLDER than the last one folded, so the steps did
+        -- not arrive in order and the running sum has already missed some
+        -- of them. It cannot be repaired from here — the readings in
+        -- between are not in this row. Abandon it: day_rain_in then falls
+        -- back to last - first, which is ordered by reading time and right
+        -- for this day, and the next rebuild scans in order and fills the
+        -- column in properly.
+        WHEN yearly_last_ms IS NOT NULL AND :ts < yearly_last_ms THEN NULL
+        -- Already abandoned today. A later in-order row must not restart
+        -- the sum from zero, which would understate the day a second way
+        -- while looking authoritative.
+        WHEN yearly_rise IS NULL AND yearly_last IS NOT NULL THEN NULL
+        -- The day's first counter reading is a starting point, not a rise.
+        WHEN yearly_last IS NULL THEN 0.0
+        WHEN :yearlyrainin > yearly_last
+             AND (:yearlyrainin - yearly_last) <= :rise_max
+             AND (:yearlyrainin - yearly_last) <= :rate_max
+                 * (MAX(:ts - COALESCE(yearly_last_ms, :ts), 1000) / 3600000.0)
+                 + :rate_slack
+            THEN yearly_rise + (:yearlyrainin - yearly_last)
+        ELSE yearly_rise END
 """
+
+# The version of the fold RULES above (R23). Compared at boot with the
+# `rollups_fold_version` kv beside the late-column migration in
+# db.init_db: a database folded under an older rule is marked dirty once,
+# so the lifespan rebuild re-folds history under the current one. Bump it
+# whenever _UPSERT_DAILY's arithmetic changes in a way history must see.
+#   1: yearly_rise as the sum of rises (2.3)
+#   2: the rate gate on a rise (R23, the manual-counter-set finding)
+#   3: the first step of a day is measured from the previous day's last
+#      reading (F02), and the day's observation span is recorded
+ROLLUP_FOLD_VERSION = 3
+ROLLUP_FOLD_VERSION_KEY = "rollups_fold_version"
+
+
+def rain_rate_max_in_per_hr() -> float:
+    """Ingest's plausible rain rate, for the fold's gate. Ingest treats a
+    non-positive setting as "guard off"; the fold honours that the same
+    way so the two never disagree."""
+    try:
+        rate = float(settings.ingest_max_rain_rate_in_per_hr)
+    except (TypeError, ValueError, AttributeError):
+        rate = _day_rain.RATE_MAX_IN_PER_HR_DEFAULT
+    return rate if rate > 0 else float("inf")
 
 _UPSERT_HOUR = """
 INSERT INTO hour_rollups (mac, month, hour, tempf_sum, tempf_n, feels_sum, feels_n)
@@ -392,6 +511,8 @@ def rollup_params(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any] | None:
     return {
         "mac": row.get("_mac"),          # filled by caller
         "day": local.strftime("%Y-%m-%d"),
+        # The calendar day before, for the midnight step (F02).
+        "prev_day": (local.date() - timedelta(days=1)).isoformat(),
         "ts": int(ts),
         "_year": local.year,
         "_month": local.month,
@@ -418,6 +539,15 @@ def rollup_params(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any] | None:
         "solarradiation": num("solarradiation"),
         "dailyrainin": num("dailyrainin"),
         "yearlyrainin": num("yearlyrainin"),
+        # The ceiling on ONE step of the counter (see the yearly_rise
+        # clause). A parameter rather than a literal so the constant lives
+        # in day_rain.py beside the other rain limits.
+        "rise_max": _day_rain.RISE_MAX_IN,
+        # The rate gate (R23): the same allowance ingest's spike guard
+        # gives one step, so a step ingest would call a level shift is
+        # not credited as rain here either.
+        "rate_max": rain_rate_max_in_per_hr(),
+        "rate_slack": _day_rain.RATE_SLACK_IN,
         # Trailing-hour strike count; the day's MAX is "most strikes in an
         # hour that day", which is what the records screen quotes.
         "lightning": num("lightning_last_1hr"),
@@ -586,7 +716,11 @@ def _upsert_into(sql: str, table: str) -> str:
     head = f"\nINSERT INTO {table} ("
     if head not in sql:
         raise ValueError(f"upsert does not target {table}")
-    return sql.replace(head, f"\nINSERT INTO {staging_table(table)} (", 1)
+    out = sql.replace(head, f"\nINSERT INTO {staging_table(table)} (", 1)
+    # A self-referencing subquery (the previous day's row, F02) must read
+    # the staging twin too, or the rebuild would credit the midnight step
+    # from the LIVE ledger it is about to replace.
+    return out.replace(f"FROM {table} AS prev", f"FROM {staging_table(table)} AS prev")
 
 
 _UPSERT_DAILY_STAGING = _upsert_into(_UPSERT_DAILY, "daily_rollups")
@@ -934,7 +1068,10 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
     async with dbmod.connect() as db:
         cur = await db.execute(
             "SELECT day, tempf_min, tempf_max, tempf_sum, tempf_n, "
-            "rain_total, yearly_min, yearly_max FROM daily_rollups "
+            "rain_total, yearly_min, yearly_max, "
+            # 2.3: day_rain_in ranks these above the min/max signature.
+            # Positional indices below, so appending is the safe edit.
+            "yearly_first, yearly_last, yearly_rise FROM daily_rollups "
             "WHERE mac = ? ORDER BY day", (mac,))
         days = await cur.fetchall()
         cur = await db.execute(
@@ -957,7 +1094,9 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
         # streak, and a station with no gauge at all has no dry streak
         # rather than an ever-growing one (round-two review BE-N1).
         return day_rain_in({"day": d[0], "rain_total": d[5],
-                            "yearly_min": d[6], "yearly_max": d[7]})
+                            "yearly_min": d[6], "yearly_max": d[7],
+                            "yearly_first": d[8], "yearly_last": d[9],
+                            "yearly_rise": d[10]})
 
     # To-date anchor (2.0, story engine): the month-day that splits each
     # year into "the part comparable with the running year" and the rest.

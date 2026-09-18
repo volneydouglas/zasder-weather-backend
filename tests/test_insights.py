@@ -256,12 +256,13 @@ def test_same_batch_duplicate_timestamps_fold_once(insights_on, monkeypatch):
 
 def test_jan1_yearly_fallback_not_counted(insights_on):
     client = insights_on
-    # No dailyrainin; yearly counter resets on Jan 1 — the fallback delta
-    # must not book the reset day as rain. Anchored on the most recent Jan 1
-    # (see _recent_jan1: hardcoded dates go stale at the ingest horizon), and
-    # every post + the final shape is ASSERTED — the old version posted
-    # unchecked and guarded its only assertion with `if body["years"]`, so
-    # once the posts started failing it passed vacuously forever.
+    # No dailyrainin; yearly counter resets on Jan 1 — the fallback must
+    # not book the counter's whole old total as a day of rain. Anchored on
+    # the most recent Jan 1 (see _recent_jan1: hardcoded dates go stale at
+    # the ingest horizon), and every post + the final shape is ASSERTED —
+    # the old version posted unchecked and guarded its only assertion with
+    # `if body["years"]`, so once the posts started failing it passed
+    # vacuously forever.
     ts = _recent_jan1().replace(hour=10, minute=0)
     for minute, yearly in ((0, 20.0), (30, 0.0), (60, 0.05)):
         body = {"device": {"id": "AABBCCDDEEFF", "name": "Davis"},
@@ -275,9 +276,18 @@ def test_jan1_yearly_fallback_not_counted(insights_on):
     body = client.get("/api/insights?mac=" + MAC, headers=_H).json()
     assert body["day_count"] == 1
     assert len(body["years"]) == 1, "yearly rollups vanished"
-    # The only day is the reset day, which measures nothing: the year has
-    # no rain total rather than a zero one (round-three review BE-F11).
-    assert body["years"][0]["rain_total"] is None
+    # The thing this test exists to prevent: twenty inches booked because
+    # the counter happened to be holding twenty inches when it reset.
+    total = body["years"][0]["rain_total"]
+    assert total != 20.0 and (total is None or total < 1.0)
+    # Through 2.2 the answer here was None — the min/max signature could
+    # see a reset and refused to guess past it, which was the honest
+    # answer with the information it had. `yearly_rise` (2.3) has better
+    # information: it adds up the counter's RISES, so the 20 -> 0 drop
+    # contributes nothing and the 0 -> 0.05 climb after it contributes
+    # 0.05. Five hundredths of an inch really did fall on this day, and
+    # saying so is not the bug this test guards.
+    assert total == pytest.approx(0.05)
 
 
 def test_daily_series_endpoint(insights_on):

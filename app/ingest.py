@@ -44,6 +44,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from . import db
+from . import day_rain as _day_rain
 from . import device_probation
 from . import source_status
 from . import wu_upload
@@ -565,7 +566,8 @@ def _is_rain_glitch(jump_in: float, elapsed_h: float,
     resets / negative deltas are handled by the offset/clamp path)."""
     if max_rate_in_per_hr <= 0 or jump_in <= 0:
         return False
-    allowance = max_rate_in_per_hr * max(elapsed_h, 1.0 / 3600.0) + 0.25
+    allowance = (max_rate_in_per_hr * max(elapsed_h, 1.0 / 3600.0)
+                 + _day_rain.RATE_SLACK_IN)
     return jump_in > allowance
 
 
@@ -726,7 +728,11 @@ def _confirms_rejected_level(mac: str, value_in: float, ts_ms: float,
     if value_in < rej_val - 0.05:          # fell back — it WAS a glitch
         return False
     elapsed_h = max((ts_ms - rej_ts) / 3_600_000.0, 1.0 / 3600.0)
-    return (value_in - rej_val) <= max_rate_in_per_hr * elapsed_h + 0.25
+    # The same allowance the rollup fold gives one step (day_rain.py):
+    # a step accepted HERE as a level shift is one the fold refuses to
+    # credit as rain (R23, the manual-counter-set finding).
+    return (value_in - rej_val) <= (max_rate_in_per_hr * elapsed_h
+                                    + _day_rain.RATE_SLACK_IN)
 
 
 def _confirms_temp_level(key: str, value_f: float, ts_ms: float,
@@ -808,12 +814,32 @@ def _payload_coords(normalized: dict[str, Any]) -> dict[str, Any] | None:
     inner = raw.get("coords") if isinstance(raw.get("coords"), dict) else raw
     if not isinstance(inner, dict):
         return None
+    # A bool is not a coordinate: float(True) is 1.0, and {"lat": true,
+    # "lon": false} stored a place in the Gulf of Guinea.
+    if isinstance(inner.get("lat"), bool) or isinstance(inner.get("lon"), bool):
+        return None
     try:
         lat = float(inner["lat"])
         lon = float(inner["lon"])
     except (KeyError, TypeError, ValueError):
         return None
+    # R23: "nan", "inf" and 999 all parsed as floats and were stored, and
+    # every reader downstream (forecast, NWS, the map beacon) took them
+    # as a place. Not finite or off the globe is no location at all.
+    if not valid_coords(lat, lon):
+        return None
     return {"location": raw.get("location"), "coords": {"lat": lat, "lon": lon}}
+
+
+def valid_coords(lat: float, lon: float) -> bool:
+    """A real point on the globe: finite, |lat| <= 90, |lon| <= 180."""
+    if isinstance(lat, bool) or isinstance(lon, bool):
+        return False                    # float(True) is 1.0; a bool is not a place
+    try:
+        return (math.isfinite(lat) and math.isfinite(lon)
+                and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0)
+    except TypeError:
+        return False
 
 
 def _auto_device_name(normalized: dict[str, Any]) -> str:

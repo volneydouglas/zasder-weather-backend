@@ -19,6 +19,11 @@ aiosqlite==0.20.0
 python-multipart>=0.0.18,<0.1
 # APNs push: ES256-signed JWT (token auth) + HTTP/2 to api.push.apple.com.
 PyJWT[crypto]>=2.8,<3
+# Ed25519 for the map beacon (2.3, map_beacon.py) imports it directly; it
+# reached the image only as PyJWT[crypto]'s extra (R23). Pinned exactly,
+# like every other direct import here, so a PyJWT that drops the extra
+# cannot take it and the image matches the venv the suite ran against.
+cryptography==50.0.1
 h2>=4,<5
 # MQTT publishing (Home Assistant discovery). Only used when MQTT_HOST is set;
 # the publisher imports it lazily, so a stripped install still boots without it.

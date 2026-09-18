@@ -197,21 +197,21 @@ def headline(r: Report) -> str:
 
 
 # ── shared palette (the share cards' vocabulary, email-safe) ────────────
+# 2.3: the palette and the card shell live in email_card so the outlook
+# report and the storm summary wear the same dress. The aliases stay.
 
-_BG = "#0b0d12"
-_CARD = "#151922"
-_EDGE = "#262c38"
-_ACCENT = "#4fa6f2"
-_TEXT = "#e8ecf2"
-_DIM = "#8a93a3"
-_WARM = "#ff9a4d"
-_SEV = {"warning": "#ff5c47", "major": "#ff9a4d",
-        "watch": "#4fa6f2", "info": "#8a93a3"}
+from . import email_card as _ec
 
-_LABEL = ("font:800 9px -apple-system,'Segoe UI',Arial,sans-serif;"
-          "letter-spacing:1.2px;color:" + _DIM + ";")
-_TILE = ("background:" + _CARD + ";border:1px solid " + _EDGE + ";"
-         "border-radius:10px;padding:10px 12px;")
+_BG = _ec.BG
+_CARD = _ec.CARD
+_EDGE = _ec.EDGE
+_ACCENT = _ec.ACCENT
+_TEXT = _ec.TEXT
+_DIM = _ec.DIM
+_WARM = _ec.WARM
+_SEV = _ec.SEV
+_LABEL = _ec.LABEL
+_TILE = _ec.TILE
 
 
 def _fmt(v: float | None, spec: str, unit: str) -> str:

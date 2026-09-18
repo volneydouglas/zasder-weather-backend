@@ -73,16 +73,48 @@ def valid_route(route: str | None) -> str | None:
     return route if _ROUTE_RE.match(route) else None
 
 
+# Which server a push came from (2.3, Sites). The app can hold several
+# owned servers, each pushing through its own relay key to the same
+# phone; without a sender stamp a tapped report opened in whichever site
+# was in view. The value is `main.ensure_server_id()`'s UUID, read from
+# the same kv row here so this module never imports main. Shape-checked
+# like `route`: one token of safe characters, never interpolated into aps.
+SERVER_ID_KEY = "server_id"
+_SERVER_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,64}$")
+
+
+def valid_server_id(server_id: str | None) -> str | None:
+    """The server id to stamp, or None. Total, like valid_route: an odd
+    value degrades to a push that opens the app on the default site."""
+    if not server_id or not isinstance(server_id, str):
+        return None
+    return server_id if _SERVER_ID_RE.match(server_id) else None
+
+
+async def current_server_id() -> str | None:
+    """This server's identity as minted at boot, or None before the first
+    boot minted one (or when the database cannot answer): a push must
+    never fail for want of a stamp."""
+    try:
+        return valid_server_id(await db.get_kv(SERVER_ID_KEY))
+    except Exception:
+        log.warning("server_id lookup failed; pushing without a sender stamp",
+                    exc_info=True)
+        return None
+
+
 def build_payload(title: str, body: str,
                   interruption_level: str | None = None,
-                  route: str | None = None) -> dict:
+                  route: str | None = None,
+                  server_id: str | None = None) -> dict:
     """Standard alert aps payload. `interruption_level` is only stamped
     when it's a non-default level we know — an unknown string must not
     reach Apple, and omitting the key IS "active".
 
     `route` (2.1) rides ALONGSIDE aps, which is where APNs puts custom
     keys and where iOS hands them back as userInfo. Validated, never
-    interpolated into aps itself."""
+    interpolated into aps itself. `server_id` (2.3) rides the same way,
+    with or without a route: a plain alert still says which site sent it."""
     aps: dict = {"alert": {"title": title, "body": body}, "sound": "default"}
     if interruption_level in INTERRUPTION_LEVELS and \
             interruption_level != "active":
@@ -91,6 +123,9 @@ def build_payload(title: str, body: str,
     r = valid_route(route)
     if r:
         out["route"] = r
+    sid = valid_server_id(server_id)
+    if sid:
+        out["server_id"] = sid
     return out
 
 
@@ -229,7 +264,8 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
                           la_payload: dict | None = None,
                           push_type: str = "liveactivity",
                           interruption_level: str | None = None,
-                          route: str | None = None) -> dict:
+                          route: str | None = None,
+                          server_id: str | None = None) -> dict:
     """Send through a shared relay instead of signing locally. For self-hosters
     who don't run their own APNs key: the relay holds the key, fans out to
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
@@ -265,6 +301,12 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
         # payload lock stands. Omitted when there is no route so a pre-2.1
         # relay (extra=forbid) still sees a byte-identical body.
         payload["route"] = stamped_route
+    stamped_sid = valid_server_id(server_id)
+    if stamped_sid and la_payload is None:
+        # 2.3: the sender, same rules as `route`. The relay builds the
+        # payload from it; omitted when unknown so a pre-2.3 relay sees
+        # the body it knows.
+        payload["server_id"] = stamped_sid
     headers = {"authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -273,8 +315,8 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
             # (extra=forbid). Degrade rather than lose the push: an urgent
             # alert that arrives quietly, or a report push that opens the
             # app instead of the report, beats one that never arrives.
-            # Both extras go in one retry — a 1.8 relay rejects the pair.
-            extras = [k for k in ("interruption_level", "route")
+            # All extras go in one retry — a 1.8 relay rejects the lot.
+            extras = [k for k in ("interruption_level", "route", "server_id")
                       if k in payload]
             if r.status_code == 422 and extras:
                 log.warning("relay rejected %s (older relay?) — retrying as "
@@ -454,6 +496,9 @@ async def send_to_all(title: str, body: str,
     tokens = await db.list_push_tokens()
     if not tokens:
         return {"sent": 0, "pruned": 0, "total": 0}
+    # 2.3: stamp the sender so a phone holding several owned sites opens
+    # the tap in the one that pushed (Sites). Resolved once per batch.
+    server_id = await current_server_id()
     ios = [t for t in tokens if (t.get("platform") or "ios") != "android"]
     android = [t for t in tokens if t.get("platform") == "android"]
 
@@ -464,7 +509,8 @@ async def send_to_all(title: str, body: str,
     if ios and own:
         res = await _push_tokens(
             ios, title, body,
-            payload=build_payload(title, body, interruption_level, route))
+            payload=build_payload(title, body, interruption_level, route,
+                                  server_id))
         sent += res.get("sent", 0)
         failed += res.get("failed", 0)
         dead += res.get("dead", [])
@@ -489,7 +535,7 @@ async def send_to_all(title: str, body: str,
             res = await _push_via_relay([t["token"] for t in sendable], title,
                                         body, relay_url, relay_token,  # type: ignore[arg-type]
                                         interruption_level=interruption_level,
-                                        route=route)
+                                        route=route, server_id=server_id)
             sent += res.get("sent", 0)
             failed += res.get("failed", 0)
             # Prune only tokens whose env was their OWN stored value. For a

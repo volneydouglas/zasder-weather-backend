@@ -560,7 +560,12 @@ class StoryContext:
                     "SELECT day, tempf_min, tempf_max, windgustmph_max, "
                     "baromrelin_min, baromrelin_max, rain_total, "
                     "yearly_min, yearly_max, dew_point_min, dew_point_max, "
-                    "humidity_max, lightning_max FROM daily_rollups "
+                    "humidity_max, lightning_max, "
+                    # 2.3: day_rain_in ranks yearly_rise above the min/max
+                    # signature, and a SELECT that omits it silently drops
+                    # every rain story to the worst rule available.
+                    "yearly_first, yearly_last, yearly_rise "
+                    "FROM daily_rollups "
                     "WHERE mac = ? ORDER BY day", (self.mac,))).fetchall()
             self._daily = [dict(r) for r in rows]
         return self._daily

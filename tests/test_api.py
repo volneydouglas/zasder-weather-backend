@@ -990,6 +990,57 @@ def test_send_to_all_uses_db_relay(client, monkeypatch):
     assert res["sent"] == 1
 
 
+def test_send_to_all_stamps_this_servers_id(client, monkeypatch):
+    """2.3 Sites: every delivered alert names the server that sent it, on
+    the own-key path (in the payload) and the relay path (as the field
+    the relay builds from), route or no route. Before the first boot has
+    minted an id there is nothing to stamp and the push still goes."""
+    import asyncio
+    import app.apns as apns
+    import app.db as db
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/api/push/register", headers=H, json={"token": "d" * 64, "env": "production"})
+
+    # The lifespan minted the id when the client fixture booted the app.
+    sid = asyncio.run(db.get_kv("server_id"))
+    assert sid and apns.valid_server_id(sid) == sid
+
+    # Relay path: the id rides as its own field beside the route.
+    client.put("/api/push/relay", headers=H, json={
+        "relay_url": "https://weather.zasder.com/api/relay/push", "relay_token": "dbtok"})
+    seen = {}
+    async def fake_relay(tokens, title, body, url, token, **kw):
+        seen.update(kw)
+        return {"sent": len(tokens), "dead": [], "failed": 0}
+    monkeypatch.setattr(apns, "_push_via_relay", fake_relay)
+    assert asyncio.run(apns.send_to_all("T", "B"))["sent"] == 1
+    assert seen["server_id"] == sid and seen["route"] is None
+    seen.clear()
+    asyncio.run(apns.send_to_all("T", "B", route="report/7"))
+    assert seen["server_id"] == sid and seen["route"] == "report/7"
+
+    # Own-key path: the id is in the payload Apple receives.
+    monkeypatch.setattr(apns.settings, "apns_team_id", "TEAM")
+    monkeypatch.setattr(apns.settings, "apns_key_id", "KEY")
+    monkeypatch.setattr(apns.settings, "apns_key_p8", "p8")
+    monkeypatch.setattr(type(apns.settings), "apns_configured", property(lambda self: True))
+    got = {}
+    async def fake_tokens(tokens, title, body, payload=None, push_type="alert"):
+        got["payload"] = payload
+        return {"sent": len(tokens), "dead": [], "failed": 0}
+    monkeypatch.setattr(apns, "_push_tokens", fake_tokens)
+    asyncio.run(apns.send_to_all("T", "B"))
+    assert got["payload"]["server_id"] == sid and "route" not in got["payload"]
+    assert got["payload"]["aps"]["alert"] == {"title": "T", "body": "B"}
+    asyncio.run(apns.send_to_all("T", "B", route="report/7"))
+    assert got["payload"]["server_id"] == sid and got["payload"]["route"] == "report/7"
+
+    # No id minted yet: nothing to stamp, and the push still goes.
+    asyncio.run(db.set_kv("server_id", None))
+    asyncio.run(apns.send_to_all("T", "B"))
+    assert "server_id" not in got["payload"]
+
+
 def test_alert_rule_toggle_enabled(client):
     H = {"Authorization": "Bearer test-api-token"}
     rid = client.post("/api/alerts/rules", headers=H,
@@ -1133,6 +1184,50 @@ def test_wind_chatter_is_one_alert_until_sustained_calm(client, monkeypatch):
     tick(39, 12.0)                 # a genuinely new event
     assert len(fired) == 2
     assert "12" in fired[-1]
+
+
+def test_rain_starting_preset_fires_again_on_the_next_rain(client, monkeypatch):
+    """The "Rain starting" preset is Rain Rate above 0.00. The 0.02 in
+    rain deadband asked the rate to fall to -0.02 before re-arming, so
+    the rule fired ONCE, ever (Doren, 2026-09-13, "what do I set the
+    Value to?"). A dry gauge (rate 0.00) held for the dwell is the
+    all-clear; the next shower is a new alert."""
+    import asyncio
+    import app.alerts as alerts
+    from app.alerts import AlertMonitor, effective_config
+    from app import db
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/api/alerts/rules", headers=H,
+                json={"field": "hourlyrainin", "comparator": "above",
+                      "threshold": 0.0})
+    fired = []
+    async def fake_deliver(cfg, subj, body, *a, **kw):
+        fired.append(body)
+        return True
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    MIN = 60_000
+    def tick(minute: int, rate: float) -> None:
+        client.post("/ingest/custom",
+            headers={"Authorization": "Bearer test-ingest-token",
+                     "Content-Type": "application/json"},
+            json={"device": {"id": "AA:BB:CC:DD:EE:FF", "name": "Chaucer"},
+                  "timestamp_utc": f"2026-06-01T12:{minute:02d}:00Z",
+                  "rain": {"hourly_in": rate}})
+        async def one():
+            cfg = await effective_config()
+            devs = await db.list_devices()
+            await AlertMonitor()._check_threshold_rules(cfg, devs, minute * MIN)
+        asyncio.run(one())
+
+    tick(1, 0.01)                  # first tip of the day
+    assert len(fired) == 1
+    tick(2, 0.00)                  # gauge dry: the clock starts
+    tick(18, 0.00)                 # 16 min dry → re-armed at the floor
+    tick(19, 0.02)                 # the next shower
+    assert len(fired) == 2, ("a rule at the bottom of the scale must re-arm "
+                             "when the gauge reads zero; the deadband cannot "
+                             "ask for negative rain")
 
 
 # ───── per-device ingest tokens (1.7) ─────

@@ -335,3 +335,43 @@ def test_tokens_without_a_channel_is_a_noop_not_a_failure(client):
 
     res = asyncio.run(run())
     assert res == {"sent": 0, "dead": [], "failed": 0}, res
+
+
+def test_lock_screen_switch_gates_the_storm_watch_start(client, monkeypatch):
+    """2.3 (Volney, 09-14): the Storm Watch Live Activity only ever checked
+    the storm_summary master switch, so someone who chose email-only
+    summaries still got the lock-screen card. It has its own switch now.
+    Off: no start, and the summary path is untouched. An Activity that is
+    already up keeps updating (the switch gates the START only)."""
+    calls = _fake_apns(monkeypatch)
+    from app import storm_watch
+    dev = {"mac": "AA:BB:CC:00:00:02", "name": "Quiet Station"}
+    now = int(time.time() * 1000)
+    started = now - 600_000
+
+    async def run():
+        await storm_watch.on_open_tick(_cfg(storm_live_activity=False), dev,
+                                       started, now, "dailyrainin")
+        assert calls["start"] == [], "lock screen off must not start one"
+        await storm_watch.on_open_tick(_cfg(storm_live_activity=True), dev,
+                                       started, now + 60_000, "dailyrainin")
+        assert len(calls["start"]) == 1
+        # Switched off mid-storm: the running Activity still gets its beat.
+        await storm_watch.on_open_tick(_cfg(storm_live_activity=False), dev,
+                                       started, now + 10 * 60_000,
+                                       "dailyrainin")
+        assert len(calls["update"]) == 1
+    asyncio.run(run())
+
+
+def test_lock_screen_switch_round_trips_and_defaults_on(client):
+    r = client.get("/api/alerts", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["storm_live_activity"] is True, "NULL row means on"
+    r = client.put("/api/alerts", headers=AUTH,
+                   json={"storm_live_activity": False})
+    assert r.status_code == 200
+    assert client.get("/api/alerts", headers=AUTH).json()["storm_live_activity"] is False
+    # A PUT that leaves the field out does not touch it.
+    client.put("/api/alerts", headers=AUTH, json={"sky_notes": True})
+    assert client.get("/api/alerts", headers=AUTH).json()["storm_live_activity"] is False

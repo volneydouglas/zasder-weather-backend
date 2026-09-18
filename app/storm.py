@@ -207,3 +207,43 @@ def build_storm_message(device_name: str, s: StormSummary,
         lines.append(" | ".join(third))
 
     return title, "\n".join(lines)
+
+
+def build_storm_html(device_name: str, s: StormSummary, tz_name: str) -> str:
+    """The storm summary in the morning report's dress (2.3, Doren). The
+    same numbers as the text, as tiles; a line the text has no room for
+    says when it rained. Absent sensors get no tile, not a placeholder."""
+    from . import email_card as ec
+    import html as _h
+    name = _clean_name(device_name)
+    span = f"{_fmt_clock(s.started_ms, tz_name)} to {_fmt_clock(s.ended_ms, tz_name)}"
+    inner = ec.section_label(f"\u25cf {name.upper()}", padding="14px 0 6px")
+    inner += (f'<div style="font:400 14px {ec.FONT};color:{ec.TEXT};">'
+              f'Rain from {_h.escape(span)}, {s.duration_hours:.1f} hours.</div>')
+    tiles = [ec.tile("TOTAL", f"{s.total_in:.2f}&quot;", ec.ACCENT)]
+    if s.peak_rate_in_hr is not None:
+        tiles.append(ec.tile("MAX RATE", f"{s.peak_rate_in_hr:.2f}&quot;/h",
+                             ec.WARM if s.peak_rate_in_hr >= 1.0 else ec.TEXT))
+    if s.max_gust_mph is not None:
+        tiles.append(ec.tile("PEAK GUST", f"{s.max_gust_mph:.0f} mph",
+                             ec.WARM if s.max_gust_mph >= 30 else ec.TEXT))
+    if s.max_tempf is not None and s.min_tempf is not None:
+        tiles.append(ec.tile("HI / LO", f"{s.max_tempf:.0f}&deg; / {s.min_tempf:.0f}&deg;F"))
+    elif s.max_tempf is not None:
+        tiles.append(ec.tile("HIGH", f"{s.max_tempf:.0f}&deg;F", ec.WARM))
+    elif s.min_tempf is not None:
+        tiles.append(ec.tile("LOW", f"{s.min_tempf:.0f}&deg;F", ec.ACCENT))
+    inner += ec.tile_row(tiles, margin_top=10)
+    day = _local_day_label(s.ended_ms, tz_name)
+    return ec.shell(day, f"{name} Storm Summary", inner,
+                    "Measured in your backyard, one report per storm. "
+                    "Every storm lives in the app's Reports pane.")
+
+
+def _local_day_label(ms: int, tz_name: str) -> str:
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    dt = datetime.fromtimestamp(ms / 1000, tz)
+    return dt.strftime("%A, %B ") + str(dt.day)

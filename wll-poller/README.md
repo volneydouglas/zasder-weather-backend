@@ -35,8 +35,20 @@ over UDP). Same physical Davis VP2, ~6× lower latency, no key, no quotas.
 - Reads **one** ISS transmitter (a WLL supports 8). Blank `WLL_TXID` uses the
   lowest id reporting and warns if there are others; set it to pin one
 - POSTs to `${BACKEND_URL}/ingest/custom` with the ingest bearer token
-- Stateless — backend stores observations; the poller just translates +
-  forwards and keeps going on errors
+- Follows a gateway that moves. Every answer carries the gateway's own
+  hardware id (`data.did`), so the poller learns it while the address
+  works. If the address then goes quiet for `WLL_REDISCOVER_AFTER_S`
+  (default 600) it sweeps the rest of that /24, private ranges only, and
+  moves **only** to a box reporting the same id — your neighbour's
+  WeatherLink Live answers the same URL with the same shape, so an
+  address alone is never enough. Turn it off with `WLL_REDISCOVER=0`; the
+  learned id and the address it was last found at live in `WLL_STATE_FILE`
+  (default `/tmp/wll-poller-state.json`), and a restart begins at that
+  address rather than at `WLL_HOST`, so a container that comes back after
+  a move does not spend another quiet period on the dead one. Delete the
+  state file to start from `WLL_HOST` again.
+- Otherwise stateless — backend stores observations; the poller just
+  translates + forwards and keeps going on errors
 
 ## Requirements
 

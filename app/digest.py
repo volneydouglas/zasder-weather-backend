@@ -330,14 +330,18 @@ def _spread_block(sp: dict | None) -> str:
             f'is printed because no sensor read one.</div></div>')
 
 
-def build_html(r: Report) -> str:
-    """The whole email body. Single dark column, 480px, every style
-    inline, zero external requests."""
+def build_html(r: Report, theme: str = "dark") -> str:
+    """The whole email body. Single column, 480px, every style inline,
+    zero external requests.
+
+    Built dark and themed on the way out, like every other card here
+    (see email_card for why the theme is a substitution rather than a
+    palette threaded through every builder).
+    """
     stations = "".join(_station_block(s) for s in r.stations)
     stations += _spread_block(compute_spread(r.stations))
     outlook = _outlook_block(r.outlook) if r.outlook else ""
-    return f"""<!DOCTYPE html>
-<html><body style="margin:0;padding:0;background:{_BG};">
+    return _ec.document(f"""<body style="margin:0;padding:0;background:{_BG};">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
        style="background:{_BG};"><tr><td align="center" style="padding:24px 12px;">
 <table role="presentation" width="480" cellpadding="0" cellspacing="0"
@@ -358,7 +362,7 @@ def build_html(r: Report) -> str:
     Full history lives in the app&#8217;s Alerts tab.
   </div>
 </td></tr></table></td></tr></table>
-</body></html>"""
+</body>""", theme)
 
 
 def build_text(r: Report) -> str:

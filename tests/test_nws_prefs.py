@@ -12,7 +12,8 @@ DEV = [{"mac": "AA:BB:CC:00:00:66", "name": "Chaucer",
 
 def _cfg(**kw):
     base = dict(enabled=False, email_scope="device_down", recipients=[],
-                storm_summary=False, nws_push=True, nws_warnings_only=False)
+                storm_summary=False, nws_push=True, nws_warnings_only=False,
+                nws_muted_families=[])
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -22,8 +23,11 @@ def _run(batches, cfg, monkeypatch, gap_min=11):
     nw._reset_for_tests()
     delivered = []
 
+    tiers = []
+
     async def fake_deliver(cfg, subject, body, pt, pb, **kw):
         delivered.append(pt)
+        tiers.append(kw.get("severity"))
         return True
 
     calls = []
@@ -38,6 +42,7 @@ def _run(batches, cfg, monkeypatch, gap_min=11):
         for i in range(len(batches) or 1):
             await nw.check(cfg, DEV, now + i * gap_min * 60_000, fake_deliver)
     asyncio.run(run())
+    _run.tiers = tiers            # the last run's tiers, for item 1
     return delivered, len(calls)
 
 
@@ -231,3 +236,141 @@ def test_an_unchanged_extension_stays_silent_and_a_cancel_never_escalates(client
                             {"urn:u1"}, {})
     assert nw.escalates(_upd(2, 1, severity="Extreme"), {"urn:u1"}, {"urn:u1": [3, False]})
     assert not nw.escalates(_upd(2, 1, severity="Severe"), {"urn:u1"}, {"urn:u1": [3, False]})
+
+
+# ───────────── 2.4 item 1: families and levels ─────────────
+
+
+def test_family_prefs_round_trip_with_their_catalogue(client):
+    """The apps draw the family list from the server rather than each
+    keeping its own copy of the keys — that is how a family ends up
+    mutable on the phone and not on the Mac."""
+    g = client.get("/api/alerts", headers=H).json()
+    assert g["nws_families"] == []
+    cat = g["nws_family_catalogue"]
+    assert [c["key"] for c in cat][0] == "tornado"
+    assert [c["key"] for c in cat][-1] == "other"
+    assert all(c["label"].strip() for c in cat)
+
+    r = client.put("/api/alerts", headers=H,
+                   json={"nws_families": ["marine", "flood", "nonsense"]})
+    assert r.status_code == 200, r.text
+    # Cleaned on the way in: the key nobody knows is dropped rather than
+    # stored, and the order is the catalogue's.
+    assert client.get("/api/alerts", headers=H).json()["nws_families"] \
+        == ["flood", "marine"]
+    # An empty list is a real value — un-muting everything.
+    client.put("/api/alerts", headers=H, json={"nws_families": []})
+    assert client.get("/api/alerts", headers=H).json()["nws_families"] == []
+
+
+def test_a_muted_family_never_pushes(client, monkeypatch):
+    """Doren's Flood Watch. Muting Flood must stop it without touching
+    the tornado sitting beside it in the same batch."""
+    batch = [{"id": "urn:m1", "severity": "Severe", "event": "Flood Watch",
+              "headline": "w"},
+             {"id": "urn:m2", "severity": "Extreme", "event": "Tornado Warning",
+              "headline": "t"},
+             {"id": "urn:m3", "severity": "Severe", "event": "Small Craft Advisory",
+              "headline": "s"}]
+    delivered, _ = _run([batch], _cfg(nws_muted_families=["flood", "marine"]),
+                        monkeypatch)
+    assert delivered == ["Chaucer: Tornado Warning"]
+    # The muted ones are SEEN, so un-muting later does not replay a week
+    # of held alerts — and a later poll does not raise them again.
+    import json
+
+    from app import db
+    from app import nws_watch as nw
+    seen = json.loads(asyncio.run(db.get_kv(nw._SEEN_KEY)))
+    assert set(seen) >= {"urn:m1", "urn:m2", "urn:m3"}
+
+
+def test_the_product_class_sets_how_loud_it_is(client, monkeypatch):
+    """Until 2.4 every relayed alert rode the `warning` tier — time
+    sensitive, through quiet hours — so a Frost Advisory punched through
+    Focus exactly as a Tornado Warning did."""
+    batch = [{"id": "urn:t1", "severity": "Extreme", "event": "Tornado Warning",
+              "headline": "t"},
+             {"id": "urn:t2", "severity": "Severe", "event": "Flood Watch",
+              "headline": "w"},
+             {"id": "urn:t3", "severity": "Severe", "event": "Wind Advisory",
+              "headline": "a"}]
+    delivered, _ = _run([batch], _cfg(), monkeypatch)
+    assert delivered == ["Chaucer: Tornado Warning", "Chaucer: Flood Watch",
+                         "Chaucer: Wind Advisory"]
+    assert _run.tiers == ["warning", "major", "watch"]
+
+
+def test_no_muted_families_is_the_pre_24_behaviour(client, monkeypatch):
+    batch = [{"id": "urn:d1", "severity": "Severe", "event": "Flood Watch",
+              "headline": "w"}]
+    delivered, _ = _run([batch], _cfg(), monkeypatch)
+    assert delivered == ["Chaucer: Flood Watch"]
+
+
+def test_a_malformed_event_stays_loud_and_still_says_something(client,
+                                                               monkeypatch):
+    """CodeRabbit, PR #40: the display fallback "Weather alert" ends in
+    "alert", so for one commit a malformed event classified as an
+    ADVISORY — quiet tier, and dropped entirely under warnings-only.
+    An unidentifiable product gets the loud side, and the title still
+    reads as words."""
+    batch = [{"id": "urn:x1", "severity": "Extreme", "event": None,
+              "headline": "something is very wrong"}]
+    delivered, _ = _run([batch], _cfg(nws_warnings_only=True), monkeypatch)
+    assert delivered == ["Chaucer: Weather alert"]
+    assert _run.tiers == ["warning"]
+
+
+def test_an_advisory_is_held_through_quiet_hours_and_sent_after(client, monkeypatch):
+    """2.4 review: the tiers made an Advisory an ordinary push and a
+    Statement an after-the-fact line, and both sit below the quiet-hours
+    floor. `deliver` then attempts nothing at night, reports the alert
+    HANDLED, and nws_watch recorded it pushed for good — a Frost Advisory
+    issued at 22:30 never reached the phone at all. Held is not handled:
+    the id stays unseen until quiet hours end, then goes once. Through the
+    REAL deliver, because the stub in _run is exactly what hid this."""
+    from app import alerts, nws_watch as nw
+    nw._reset_for_tests()
+    sent = []
+
+    async def fake_push_configured():
+        return True
+
+    async def fake_send_to_all(title, body, **kw):
+        sent.append((title, kw.get("tier")))
+        return {"sent": 1, "total": 1}
+    monkeypatch.setattr(alerts.apns, "push_configured", fake_push_configured)
+    monkeypatch.setattr(alerts.apns, "send_to_all", fake_send_to_all)
+
+    quiet = {"on": True}
+    monkeypatch.setattr(alerts, "in_quiet_hours",
+                        lambda now_ms, tz, s, e: quiet["on"] and s is not None)
+    batch = [{"id": "urn:q1", "severity": "Severe", "event": "Frost Advisory",
+              "headline": "Frost tonight"},
+             {"id": "urn:q2", "severity": "Extreme", "event": "Tornado Warning",
+              "headline": "Take cover"}]
+    batches = [list(batch), list(batch), list(batch)]
+
+    async def fake_fetch(lat, lon):
+        return batches.pop(0) if batches else []
+    monkeypatch.setattr(nw, "_fetch_active", fake_fetch)
+    cfg = _cfg(quiet_start_min=22 * 60, quiet_end_min=7 * 60,
+               recipients=[], smtp_host=None)
+    now = int(time.time() * 1000)
+
+    async def run():
+        # 1. Night: the warning goes, the advisory is held.
+        await nw.check(cfg, DEV, now, alerts._deliver)
+        assert sent == [("Chaucer: Tornado Warning", "warning")]
+        # 2. Still night, next poll: held again, not re-sent, not marked.
+        await nw.check(cfg, DEV, now + 11 * 60_000, alerts._deliver)
+        assert len(sent) == 1
+        # 3. Morning: the advisory goes exactly once.
+        quiet["on"] = False
+        await nw.check(cfg, DEV, now + 22 * 60_000, alerts._deliver)
+        assert sent[1:] == [("Chaucer: Frost Advisory", "watch")]
+        await nw.check(cfg, DEV, now + 33 * 60_000, alerts._deliver)
+        assert len(sent) == 2
+    asyncio.run(run())

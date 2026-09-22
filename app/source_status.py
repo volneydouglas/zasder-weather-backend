@@ -38,6 +38,10 @@ class SourceState:
     # run is its own kind of failure: the credentials work and the API answers,
     # but nothing new is arriving.
     last_rows: int | None = None
+    # When a tick last STORED something (or the first success, for a
+    # source that never sends a count). The health record measures a
+    # quiet station from here, not from a single empty tick.
+    last_rows_ms: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -138,6 +142,8 @@ def record_success(name: str, rows: int | None = None) -> None:
         st.failing_since_ms = None
         if rows is not None:
             st.last_rows = rows
+        if rows is None or rows > 0 or st.last_rows_ms is None:
+            st.last_rows_ms = st.last_success_ms
 
 
 # Upstream errors routinely embed the request URL, and AmbientWeather takes
@@ -198,6 +204,7 @@ def _health(st: SourceState, now: int) -> dict[str, Any]:
         "failing_since_ms": st.failing_since_ms,
         "consecutive_failures": st.consecutive_failures,
         "last_rows": st.last_rows,
+        "last_rows_ms": st.last_rows_ms,
     }
 
 

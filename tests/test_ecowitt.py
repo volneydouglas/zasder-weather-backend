@@ -334,3 +334,27 @@ def test_metric_conversion_never_invents_readings():
     n = normalize(form)
     assert n["rain"]["hourly_in"] is None
     assert n["rain"]["daily_in"] is None
+
+
+def test_soil_channels_five_to_eight_are_reachable(client):
+    """2.4 item 5: a WH51 gateway takes eight probes and a WN34 eight
+    more. Until now the mapping stopped at four, so the second half of
+    somebody's garden was unreachable from every path."""
+    from app import ecowitt
+    for i in range(1, 9):
+        assert ecowitt._CHANNEL_MAP[f"soilmoisture{i}"] == f"soilhum{i}"
+        assert ecowitt._CHANNEL_MAP[f"tf_ch{i}"] == f"soiltemp{i}f"
+    from app import db
+    for i in range(1, 9):
+        assert f"soilhum{i}" in db.QUERYABLE_FIELDS
+        assert f"soiltemp{i}f" in db.QUERYABLE_FIELDS
+
+
+def test_every_soil_temperature_channel_has_a_battery_key():
+    """Eight tf_ch probes since 2.4 item 5, so eight tf_batt keys: the
+    map stopped at four and channels five to eight could never report
+    a low cell."""
+    from app import ecowitt
+    for i in range(1, 9):
+        assert f"tf_batt{i}" in ecowitt._BATT_VOLTS
+        assert f"soilbatt{i}" in ecowitt._BATT_VOLTS

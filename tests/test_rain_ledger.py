@@ -381,3 +381,32 @@ def test_records_never_read_a_reset_lifetime_counter_as_a_wettest_day(ledger):
         assert dr is None or dr["max"] is None, (pname, dr)
     # The ledger itself knows the day was 0.70, for the screens that read it.
     assert periods(db, mac)["daily_in"] == pytest.approx(0.70)
+
+
+def test_a_daily_counter_station_reads_the_ledger_too(client, monkeypatch):
+    """2.4 item 12: tier 3 (a Tempest, whose only counter is the day's)
+    used to re-scan roughly half a million index rows per /current. The
+    ledger already has a per-day figure and tier 1 has read it since
+    2.3, so this one does too — with the scan kept as the fallback for
+    everything the ledger cannot answer."""
+    import asyncio
+
+    from app import db
+
+    asked = {"ledger": 0}
+    real = db._rain_ledger_periods
+
+    async def counting(mac, tz, start_of_today, boundaries):
+        asked["ledger"] += 1
+        return await real(mac, tz, start_of_today, boundaries)
+
+    monkeypatch.setattr(db, "_rain_ledger_periods", counting)
+
+    async def run():
+        db._DAILY_ROLLUP_CACHE.clear()
+        await db._rollups_from_daily("AA:BB:CC:00:00:99",
+                                     __import__("zoneinfo").ZoneInfo("UTC"))
+    asyncio.run(run())
+    # It ASKS, whatever the answer: a station with no ledger falls
+    # through to the scan, which is the point of keeping both.
+    assert asked["ledger"] == 1

@@ -24,6 +24,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from typing import Any
 
 # No baked-in default host: the old default was one developer's LAN IP,
 # which on anyone else's network either fails slowly or polls a stranger's
@@ -39,6 +40,26 @@ except ValueError:
                      f"got {_POLL_ENV!r}")
 if WLL_POLL_SECONDS <= 0:
     raise SystemExit(f"WLL_POLL_SECONDS must be positive, got {WLL_POLL_SECONDS}")
+# Rediscovery after a gateway swap (2.4, item 2). Doren replaced a
+# WeatherLink Live and the poller kept asking the old address forever,
+# because the address is the only thing it was ever told. The gateway
+# reports its OWN hardware id in every answer (`data.did`, the Davis
+# serial), so the poller remembers that while the typed address works and
+# can go and find it again if the address stops answering. Set
+# WLL_REDISCOVER=0 to switch the whole thing off.
+WLL_REDISCOVER    = os.environ.get("WLL_REDISCOVER", "1").strip() not in ("0", "false", "no")
+# How long the address has to be silent before the poller goes looking. A
+# gateway rebooting, or a router handing out leases after a power cut, is
+# back inside a couple of minutes; a sweep before that is noise on
+# somebody's network for nothing.
+_QUIET_ENV        = os.environ.get("WLL_REDISCOVER_AFTER_S", "").strip() or "600"
+try:
+    WLL_REDISCOVER_AFTER_S = int(_QUIET_ENV)
+except ValueError:
+    raise SystemExit(f"WLL_REDISCOVER_AFTER_S must be a whole number of "
+                     f"seconds, got {_QUIET_ENV!r}")
+# Where the learned id is kept, so a restart does not forget it.
+WLL_STATE_FILE    = os.environ.get("WLL_STATE_FILE", "/tmp/wll-poller-state.json")
 BACKEND_URL       = os.environ.get("BACKEND_URL", "").rstrip("/")
 INGEST_TOKEN      = os.environ.get("INGEST_TOKEN", "")
 # Synthetic MAC the backend stores under. If you also run the WeatherLink
@@ -312,6 +333,157 @@ def post_observation(obs: dict, *, backend: str = BACKEND_URL,
         r.read()
 
 
+# ── finding a gateway that moved (2.4, item 2) ────────────────────────
+#
+# The rule, and the reason for each half of it.
+#
+# The gateway is identified by `data.did`, which it reports itself, so
+# there is no ARP table to read and nothing to run as root. A poller that
+# moved on an address alone would happily start reading the NEIGHBOUR's
+# WeatherLink Live, which is worse than not reading anything.
+#
+# The sweep is the /24 around the address that was working, private
+# ranges only, and it runs at most once per cooldown after a long
+# silence. A subnet scan is a small rudeness on somebody's network; this
+# one is bounded, rare, and only ever a plain GET of a documented local
+# API.
+
+_PRIVATE_PREFIXES = ("10.", "192.168.", "169.254.")
+
+
+def _is_private_v4(ip: str) -> bool:
+    """RFC 1918 and link local. A public address is never swept: those are
+    not ours to knock on, and a WLL is not on one anyway."""
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        octets = [int(p) for p in parts]
+    except ValueError:
+        return False
+    if any(o < 0 or o > 255 for o in octets):
+        return False
+    if ip.startswith(_PRIVATE_PREFIXES):
+        return True
+    return octets[0] == 172 and 16 <= octets[1] <= 31
+
+
+def subnet_candidates(host: str) -> list[str]:
+    """Every other address on `host`'s /24, nearest first.
+
+    Nearest first because a gateway that got a new lease usually got a
+    neighbouring one, so the common case finishes in a few probes instead
+    of two hundred. .0 and .255 are skipped, and so is the address we
+    already know does not answer."""
+    if not _is_private_v4(host):
+        return []
+    a, b, c, d = host.split(".")
+    try:
+        base = int(d)
+    except ValueError:
+        return []
+    order = sorted(range(1, 255), key=lambda n: (abs(n - base), n))
+    return [f"{a}.{b}.{c}.{n}" for n in order if n != base]
+
+
+def device_id(snapshot: Any) -> str:
+    """The gateway's own hardware id, upper cased. Empty when absent.
+
+    Anything on the LAN can answer the probe URL with anything (a list,
+    a string, a number): that is "not a gateway", never a crash."""
+    if not isinstance(snapshot, dict):
+        return ""
+    did = (snapshot.get("data") or {}).get("did")
+    return did.strip().upper() if isinstance(did, str) else ""
+
+
+def _read_state(path: str = "") -> dict:
+    try:
+        with open(path or WLL_STATE_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_state(state: dict, path: str = "") -> None:
+    try:
+        with open(path or WLL_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
+def starting_host(env_host: str, state: dict) -> str:
+    """Where to poll first after a (re)start.
+
+    The state file remembers where the gateway was LAST FOUND. Starting
+    from the env address instead meant a restarted container polled the
+    dead address for another WLL_REDISCOVER_AFTER_S before sweeping
+    again. Only a stored host that belongs to a learned id is trusted;
+    an empty or half-written file falls back to the env."""
+    host = state.get("host") if isinstance(state, dict) else None
+    did = state.get("did") if isinstance(state, dict) else None
+    if isinstance(host, str) and host.strip() and isinstance(did, str) and did:
+        return host.strip()
+    return env_host
+
+
+def remember_device(host: str, snapshot: dict, path: str = "") -> str:
+    """Learn the id of whatever answered, while the address works."""
+    did = device_id(snapshot)
+    if not did:
+        return ""
+    state = _read_state(path)
+    if state.get("did") != did or state.get("host") != host:
+        _write_state({"did": did, "host": host}, path)
+    return did
+
+
+def find_gateway(did: str, from_host: str, *, fetch=None,
+                 timeout: float = 0.6, log_every: int = 64) -> str | None:
+    """Sweep `from_host`'s /24 for the gateway with this id.
+
+    Returns the address it answered on, or None. `fetch` is injectable so
+    the test suite can sweep a pretend network."""
+    if not did:
+        return None
+    probe = fetch or (lambda h: fetch_wll(h, timeout=timeout))
+    candidates = subnet_candidates(from_host)
+    if not candidates:
+        log.info("not sweeping %s — only private addresses are swept", from_host)
+        return None
+    log.warning("looking for gateway %s on %d addresses near %s",
+                did, len(candidates), from_host)
+    for i, host in enumerate(candidates, 1):
+        # Before the probe, not after it: a silent address `continue`s
+        # past anything below, and a whole /24 of silence is exactly the
+        # sweep that takes longest.
+        if log_every and i % log_every == 0:
+            log.info("swept %d of %d", i, len(candidates))
+            # A full /24 at 0.6 s a probe is over two minutes of not
+            # looping, which is longer than the Docker healthcheck waits.
+            # Sweeping is alive.
+            _touch_heartbeat()
+        try:
+            snap = probe(host)
+        except Exception:
+            continue
+        found = device_id(snap)
+        if found and found == did:
+            log.warning("gateway %s answered at %s after %d probes",
+                        did, host, i)
+            return host
+        if found:
+            # Somebody else's WeatherLink Live. This is exactly why the id
+            # is checked and the address alone is never enough.
+            log.info("%s is a different gateway (%s), leaving it alone",
+                     host, found)
+    log.warning("swept %d addresses near %s and found no gateway %s",
+                len(candidates), from_host, did)
+    return None
+
+
 # Liveness heartbeat for the Docker HEALTHCHECK: touched once per loop
 # iteration (even on error ticks — "alive but failing" is still alive and
 # still logging; a WEDGED process is what the healthcheck must catch).
@@ -337,12 +509,27 @@ def main() -> int:
         return 2
     log.info("polling http://%s every %ds → %s",
              WLL_HOST, WLL_POLL_SECONDS, BACKEND_URL)
+    # The id of the gateway this address last answered for, learned on the
+    # first good poll and kept across restarts (2.4, item 2), and the
+    # address it was last found at, so a restart after a move does not
+    # begin by polling the dead one.
+    state = _read_state()
+    known_did = state.get("did", "")
+    host = starting_host(WLL_HOST, state)
+    if host != WLL_HOST:
+        log.warning("starting at %s, where gateway %s was last found "
+                    "(WLL_HOST is %s)", host, known_did, WLL_HOST)
+    last_good = time.monotonic()
+    last_sweep = 0.0
     while True:
         # Monotonic clock for cadence: an NTP step backward would stall the
         # wall-clock version (huge sleep), a step forward would compress it.
         t0 = time.monotonic()
         try:
-            obs = to_observation(fetch_wll())
+            snapshot = fetch_wll(host)
+            last_good = time.monotonic()
+            known_did = remember_device(host, snapshot) or known_did
+            obs = to_observation(snapshot)
             if obs:
                 try:
                     post_observation(obs)
@@ -364,6 +551,30 @@ def main() -> int:
             log.warning("network error: %s", e)
         except Exception:
             log.exception("unexpected error in poll loop")
+        # The address has been silent long enough to be worth looking for
+        # the gateway elsewhere (2.4, item 2). Only with an id to match,
+        # only after the quiet period, and at most once per quiet period
+        # after that, so a gateway that is simply off does not turn into a
+        # sweep every ten minutes forever.
+        quiet = time.monotonic() - last_good
+        if (WLL_REDISCOVER and known_did and quiet >= WLL_REDISCOVER_AFTER_S
+                and time.monotonic() - last_sweep >= WLL_REDISCOVER_AFTER_S):
+            last_sweep = time.monotonic()
+            log.warning("no answer from %s for %d minutes", host, quiet // 60)
+            # Inside its own guard: the sweep talks to 253 strangers, and
+            # one of them answering with something surprising must not
+            # end the process (the R6 lesson, for the sweep).
+            try:
+                moved = find_gateway(known_did, host)
+            except Exception:
+                log.exception("unexpected error while sweeping for the gateway")
+                moved = None
+            if moved:
+                log.warning("gateway moved from %s to %s, polling there now",
+                            host, moved)
+                host = moved
+                _write_state({"did": known_did, "host": host})
+                last_good = time.monotonic()
         _touch_heartbeat()
         # steady cadence — sleep remainder of the window
         time.sleep(max(0.0, WLL_POLL_SECONDS - (time.monotonic() - t0)))

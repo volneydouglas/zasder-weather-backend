@@ -172,7 +172,7 @@ def test_phone_half_sends_live_activity_and_push_once(client, monkeypatch):
         return {"sent": 1, "dead": [], "failed": 0}
 
     async def fake_push(title, body, interruption_level=None,
-                            route=None):
+                            route=None, **kw):
         pushes.append((title, body))
         return {"sent": 1}
 
@@ -445,7 +445,7 @@ def test_quiet_day_stamps_both_halves_and_sends_nothing(client, monkeypatch):
         lambda *a, **kw: sent.append(a))
 
     async def fake_push(title, body, interruption_level=None,
-                            route=None):
+                            route=None, **kw):
         pushes.append(title)
         return {"sent": 1}
     monkeypatch.setattr(apns, "send_to_all", fake_push)
@@ -487,7 +487,7 @@ def test_email_send_failure_retries_next_tick(client, monkeypatch):
         return True
 
     async def fake_push(title, body, interruption_level=None,
-                            route=None):
+                            route=None, **kw):
         return {"sent": 1}
     monkeypatch.setattr(apns, "send_live_activity_start", fake_la)
     monkeypatch.setattr(apns, "send_to_all", fake_push)
@@ -592,7 +592,7 @@ def test_alerts_only_day_still_pushes_without_a_card(client, monkeypatch):
         return {"sent": 1, "dead": [], "failed": 0}
 
     async def fake_push(title, body, interruption_level=None,
-                            route=None):
+                            route=None, **kw):
         pushes.append((title, body))
         return {"sent": 1}
 
@@ -675,7 +675,7 @@ def test_partial_delivery_stamps_and_forfeits_the_failed_half(
         return {"sent": 1, "dead": [], "failed": 0}
 
     async def bad_push(title, body, interruption_level=None,
-                       route=None):
+                       route=None, **kw):
         push_calls.append(title)
         raise OSError("apns down")
 
@@ -731,7 +731,7 @@ def test_the_report_waits_for_the_minute_not_just_the_hour(client, monkeypatch):
         return {"sent": 1, "dead": [], "failed": 0}
 
     async def fake_push(title, body, interruption_level=None,
-                            route=None):
+                            route=None, **kw):
         return {"sent": 1}
 
     async def configured():
@@ -845,3 +845,22 @@ def test_feels_like_below_the_air_still_counts():
                   stations=[_station(tmax_f=34.0, tmin_f=18.0,
                                      feels_max_f=22.0)])
     assert "feeling like 22" in dg.headline(r)
+
+
+def test_every_html_email_declares_its_colour_scheme():
+    """2.4 (D7), Doren 2026-09-20: his 10 PM outlook arrived re-coloured
+    light over a dark card while that morning's report stayed dark —
+    neither shell had a <head>, so Apple Mail decided the scheme message
+    by message. Both shells now say what they are painted in."""
+    from app import email_card as ec
+
+    r = dg.Report(date_label="Sunday, September 20", stations=[_station()])
+    card = ec.shell("Sunday", "Storm Summary", "<div>inner</div>", "footer")
+    for html_body in (dg.build_html(r), card):
+        assert "<head>" in html_body
+        assert '<meta name="color-scheme" content="dark">' in html_body
+        assert ('<meta name="supported-color-schemes" content="dark">'
+                in html_body)
+        # The head goes BEFORE the body it describes, or it describes
+        # nothing.
+        assert html_body.index("<head>") < html_body.index("<body")

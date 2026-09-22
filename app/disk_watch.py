@@ -16,14 +16,29 @@ slowing down. Two jobs here:
 De-escalation is hysteretic: a volume hovering at exactly 85.0% must
 drop a couple of points before the tier clears, or every tick near the
 boundary would flap alert/recover forever.
+
+2.4 (D2) adds two rules about WHEN the number may be believed, after
+Doren's box warned at 88% for two minutes while his nightly backup's own
+`VACUUM INTO` copy sat on the volume:
+
+- a tick is skipped entirely while a whole-database copy is registered in
+  `copy_jobs` — the disk is genuinely fuller, and genuinely about to not
+  be, and a watchdog that shouts about a file it can see being written is
+  noise;
+- a RISE must be seen on two consecutive believed ticks before it is
+  acted on. Falls are acted on at once: nobody was ever hurt by an early
+  all-clear, and the rise it would have to undo can no longer fire.
 """
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 
-from . import db
+from . import copy_jobs, db
 from .config import settings
+
+log = logging.getLogger("api")
 
 _SERVER_MAC = "server"          # sentinel: no station wears this mac
 _KIND = "disk_low"
@@ -32,6 +47,19 @@ WARN_PCT = 85.0
 URGENT_PCT = 95.0
 # Must drop this far below a tier's threshold to leave the tier.
 CLEAR_MARGIN_PCT = 2.0
+# Consecutive believed ticks a RISE needs before it alerts.
+CONFIRM_TICKS = 2
+
+# The rise being confirmed: (tier, ticks seen). Process-global like the
+# other watch state and reset per test in conftest — it must NOT go in
+# the smart-alert table, where `triggered` means "this tier has been
+# announced" and a half-confirmed rise has not.
+_PENDING: tuple[int, int] | None = None
+
+
+def _reset_for_tests() -> None:
+    global _PENDING
+    _PENDING = None
 
 
 def snapshot() -> dict | None:
@@ -109,6 +137,19 @@ def build_message(tier: int, used_pct: float, free_bytes: int,
 
 
 async def check(cfg, now_ms: int, deliver) -> None:
+    global _PENDING
+    # A whole-database copy is on the disk right now (D2): the number is
+    # real and temporary, and the job that made it will take it away.
+    # The pending rise is left alone rather than cleared — the ticks on
+    # either side of a backup are genuine readings of a genuine volume.
+    # Only a copy landing on the DATABASE's filesystem: the backup
+    # destination can be the tempdir, which on a Fly machine is the root
+    # filesystem, and a copy over there is no reason to stop watching the
+    # volume (CodeRabbit, PR #40).
+    busy = copy_jobs.in_flight(settings.database_path)
+    if busy:
+        log.debug("disk watch: skipping a tick while %s is in flight", busy)
+        return
     stats = snapshot()
     if stats is None:
         return
@@ -116,8 +157,16 @@ async def check(cfg, now_ms: int, deliver) -> None:
     prev = states.get((_SERVER_MAC, _KIND), 0)
     tier = tier_for(stats["used_pct"], prev)
     if tier == prev:
+        _PENDING = None
         return
     if tier > prev:
+        # Two consecutive believed ticks. A different tier than the one
+        # being confirmed starts the count over, so 1 → 2 → 1 within the
+        # window announces nothing.
+        seen = _PENDING[1] + 1 if _PENDING and _PENDING[0] == tier else 1
+        _PENDING = (tier, seen)
+        if seen < CONFIRM_TICKS:
+            return
         title, body = build_message(tier, stats["used_pct"],
                                     stats["free_bytes"], stats["total_bytes"])
         # Urgent tier is a warning: quiet hours don't apply to a disk
@@ -129,7 +178,12 @@ async def check(cfg, now_ms: int, deliver) -> None:
                          kind=_KIND, mac=None,
                          severity="warning" if tier >= 2 else None):
             await db.upsert_smart_alert_state(_SERVER_MAC, _KIND, tier, now_ms)
+            _PENDING = None
+        # A failed delivery keeps the confirmed count: the tier is proven
+        # and the next tick retries at once, it does not re-serve its
+        # apprenticeship (the state table is the same way about this).
         return
+    _PENDING = None
     if tier == 0:
         title, body = build_message(0, stats["used_pct"],
                                     stats["free_bytes"], stats["total_bytes"])

@@ -478,3 +478,140 @@ class R6TimestampAndTypeGuards(unittest.TestCase):
         # R6 finding 4: a JSON list crashed on .get instead of the
         # documented None.
         self.assertIsNone(poller.to_observation([1, 2, 3]))
+
+
+# ── finding a gateway that moved (2.4, item 2) ───────────────────────────
+
+
+def _snapshot(did="001D0A700123"):
+    return {"data": {"did": did, "ts": 1789000000, "conditions": []}}
+
+
+def test_the_gateway_is_identified_by_what_it_reports():
+    """Not by ARP, not by a table needing root. The WeatherLink Live puts
+    its own hardware id in every answer."""
+    assert poller.device_id(_snapshot()) == "001D0A700123"
+    assert poller.device_id(_snapshot("001d0a700123")) == "001D0A700123"
+    assert poller.device_id({"data": {}}) == ""
+    assert poller.device_id({}) == ""
+    assert poller.device_id({"data": {"did": 12345}}) == ""
+
+
+def test_only_private_subnets_are_ever_swept():
+    """A sweep is a small rudeness on somebody's network. A public
+    address is not ours to knock on, and a gateway is never on one."""
+    assert poller.subnet_candidates("8.8.8.8") == []
+    assert poller.subnet_candidates("not an address") == []
+    assert poller.subnet_candidates("172.32.0.5") == []      # outside 172.16/12
+    assert poller.subnet_candidates("172.16.0.5") != []
+    assert poller.subnet_candidates("10.0.0.5") != []
+
+
+def test_the_sweep_starts_next_door_and_skips_the_edges():
+    hosts = poller.subnet_candidates("192.168.1.42")
+    # The address we know is silent is not probed again.
+    assert "192.168.1.42" not in hosts
+    # Nearest first: a new lease is usually a neighbouring one.
+    assert hosts[:4] == ["192.168.1.41", "192.168.1.43",
+                         "192.168.1.40", "192.168.1.44"]
+    # Network and broadcast are not hosts.
+    assert "192.168.1.0" not in hosts and "192.168.1.255" not in hosts
+    assert len(hosts) == 253
+
+
+def test_a_moved_gateway_is_found_by_its_id():
+    """Doren's gateway swap. The address stops answering, the same box is
+    somewhere else on the same subnet, and the poller finds it."""
+    def fake(host):
+        if host == "192.168.1.57":
+            return _snapshot()
+        raise OSError("no answer")
+
+    assert poller.find_gateway("001D0A700123", "192.168.1.42",
+                               fetch=fake) == "192.168.1.57"
+
+
+def test_a_neighbours_gateway_is_left_alone():
+    """THE reason the id is checked. An address that answers the same API
+    is not the same box, and moving onto it would quietly start reporting
+    somebody else's weather as this station's."""
+    def fake(host):
+        if host == "192.168.1.43":
+            return _snapshot("001D0A7099999")      # the neighbour's
+        raise OSError("no answer")
+
+    assert poller.find_gateway("001D0A700123", "192.168.1.42",
+                               fetch=fake) is None
+
+
+def test_no_id_means_no_sweep():
+    """An install that has never had a good poll has nothing to match, so
+    it stays put rather than guessing."""
+    def boom(host):                       # pragma: no cover
+        raise AssertionError("swept with no id to match")
+
+    assert poller.find_gateway("", "192.168.1.42", fetch=boom) is None
+
+
+def test_the_learned_id_survives_a_restart(tmp_path):
+    state = str(tmp_path / "state.json")
+    assert poller.remember_device("192.168.1.42", _snapshot(), state) \
+        == "001D0A700123"
+    assert poller._read_state(state) == {"did": "001D0A700123",
+                                         "host": "192.168.1.42"}
+    # A snapshot with no id leaves what was learned alone.
+    assert poller.remember_device("192.168.1.42", {"data": {}}, state) == ""
+    assert poller._read_state(state)["did"] == "001D0A700123"
+    # And a corrupt file reads as "nothing learned yet" rather than dying.
+    with open(state, "w") as f:
+        f.write("{not json")
+    assert poller._read_state(state) == {}
+
+
+def test_a_stranger_answering_with_a_list_does_not_end_the_sweep():
+    """A LAN device that answers the probe URL with JSON that is not an
+    object (a list, a string) used to raise out of the sweep, and the
+    sweep ran outside the poll loop's guard, so one such neighbour ended
+    the whole poller. Not a gateway, keep going."""
+    def fake(host):
+        if host == "192.168.1.41":
+            return []                            # somebody's JSON list
+        if host == "192.168.1.43":
+            return "not even json-shaped"
+        if host == "192.168.1.57":
+            return _snapshot()
+        raise OSError("no answer")
+
+    assert poller.device_id([]) == ""
+    assert poller.device_id("x") == ""
+    assert poller.device_id(None) == ""
+    assert poller.find_gateway("001D0A700123", "192.168.1.42",
+                               fetch=fake) == "192.168.1.57"
+
+
+def test_a_restart_begins_where_the_gateway_was_last_found():
+    """After a move the state file holds the new address. Starting from
+    WLL_HOST again meant polling the dead address for another quiet
+    period before sweeping a second time."""
+    env = "192.168.1.42"
+    assert poller.starting_host(env, {}) == env
+    assert poller.starting_host(env, {"did": "001D0A700123",
+                                      "host": "192.168.1.57"}) == "192.168.1.57"
+    # A host with no learned id behind it is not trusted.
+    assert poller.starting_host(env, {"host": "192.168.1.57"}) == env
+    assert poller.starting_host(env, {"did": "001D0A700123", "host": ""}) == env
+    assert poller.starting_host(env, "garbage") == env
+
+
+def test_the_sweep_keeps_the_heartbeat_alive(tmp_path, monkeypatch):
+    """A /24 at 0.6 s a probe is longer than the Docker healthcheck
+    waits. The sweep touches the heartbeat as it goes."""
+    beat = tmp_path / "beat"
+    monkeypatch.setattr(poller, "HEARTBEAT_FILE", str(beat))
+
+    def never(host):
+        raise OSError("no answer")
+
+    assert poller.find_gateway("001D0A700123", "192.168.1.42",
+                               fetch=never, log_every=10) is None
+    assert beat.exists()

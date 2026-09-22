@@ -388,7 +388,7 @@ def test_the_morning_report_it_sent_is_the_report_you_can_open(client,
         la_sends.append((activity, payload))
         return {"sent": 1, "dead": [], "failed": 0}
 
-    async def fake_push(title, body, interruption_level=None, route=None):
+    async def fake_push(title, body, interruption_level=None, route=None, **kw):
         pushes.append({"title": title, "route": route})
         return {"sent": 1}
 
@@ -469,7 +469,7 @@ def test_a_server_that_cannot_store_still_sends_the_report(client,
 
     pushes = []
 
-    async def fake_push(title, body, interruption_level=None, route=None):
+    async def fake_push(title, body, interruption_level=None, route=None, **kw):
         pushes.append(route)
         return {"sent": 1}
 

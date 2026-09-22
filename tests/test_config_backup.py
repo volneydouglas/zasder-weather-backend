@@ -544,3 +544,53 @@ def test_restore_refuses_a_threshold_the_api_would(client):
     got = client.get("/api/alerts", headers=H).json()
     assert got["heat_day_threshold_f"] == 101.0
     assert got["wind_live_mph"] != 5 and got["lightning_live_mi"] != 400
+
+
+def test_muted_alert_families_survive_a_restore(client):
+    """2.4 item 1, and the R22-06 shape one more time: a restore that
+    reset a preference back to its default is how Doren's NWS-off came
+    back on."""
+    H = {"Authorization": "Bearer test-api-token"}
+    client.put("/api/alerts", headers=H,
+               json={"nws_families": ["flood", "marine"]})
+    export = client.get("/api/config/backup", headers=H).json()
+    client.put("/api/alerts", headers=H, json={"nws_families": []})
+    assert client.get("/api/alerts", headers=H).json()["nws_families"] == []
+    r = client.post("/api/config/restore", headers=H, json=export)
+    assert r.status_code == 200, r.text
+    assert client.get("/api/alerts", headers=H).json()["nws_families"] \
+        == ["flood", "marine"]
+
+
+def test_sensor_calibrations_round_trip_through_backup(client):
+    """2.4 review: item 7's corrections are operator-typed, non-secret and
+    live on the device row, the same shape as names and locations, and
+    the export left them out — a restore onto a replacement box put every
+    offset back to zero and stored uncorrected readings from then on."""
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCCDDEE07"},
+                      "timestamp_utc": "2026-08-09T12:00:00Z",
+                      "outdoor": {"tempf": 70, "humidity": 50},
+                      "wind": {}, "rain": {}, "pressure": {}, "source": "t"})
+    mac = "AA:BB:CC:DD:EE:07"
+    empty = client.get("/api/config/backup", headers=H).json()
+    assert empty.get("device_calibrations") == {}
+    r = client.put(f"/api/devices/{mac}/calibration", headers=H,
+                   json={"calibration": {"tempf": -1.5, "humidity": 3}})
+    assert r.status_code == 200, r.text
+    backup = client.get("/api/config/backup", headers=H).json()
+    assert backup["device_calibrations"] == {mac: {"tempf": -1.5, "humidity": 3.0}}
+
+    # Change it first: restoring on top of the identical value would pass
+    # even if the restore silently skipped the write.
+    client.put(f"/api/devices/{mac}/calibration", headers=H,
+               json={"calibration": {"tempf": 2.0}})
+    # An unknown station in the file is skipped, not an error.
+    backup["device_calibrations"]["AA:BB:CC:DD:EE:99"] = {"tempf": 1.0}
+    r = client.post("/api/config/restore", headers=H, json=backup)
+    assert r.status_code == 200, r.text
+    assert r.json()["restored"]["device_calibrations"] == 1
+    got = client.get(f"/api/devices/{mac}/calibration", headers=H).json()
+    assert got["calibration"] == {"tempf": -1.5, "humidity": 3.0}

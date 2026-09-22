@@ -209,7 +209,8 @@ def build_storm_message(device_name: str, s: StormSummary,
     return title, "\n".join(lines)
 
 
-def build_storm_html(device_name: str, s: StormSummary, tz_name: str) -> str:
+def build_storm_html(device_name: str, s: StormSummary, tz_name: str,
+                     theme: str = "dark") -> str:
     """The storm summary in the morning report's dress (2.3, Doren). The
     same numbers as the text, as tiles; a line the text has no room for
     says when it rained. Absent sensors get no tile, not a placeholder."""
@@ -237,7 +238,8 @@ def build_storm_html(device_name: str, s: StormSummary, tz_name: str) -> str:
     day = _local_day_label(s.ended_ms, tz_name)
     return ec.shell(day, f"{name} Storm Summary", inner,
                     "Measured in your backyard, one report per storm. "
-                    "Every storm lives in the app's Reports pane.")
+                    "Every storm lives in the app's Reports pane.",
+                    theme=theme)
 
 
 def _local_day_label(ms: int, tz_name: str) -> str:

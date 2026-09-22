@@ -8,6 +8,155 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.4.0] — 2026-09-22
+
+### Added
+- **A day of health for every source, and a verdict about whose fault it
+  was.** A station that stops updating looks identical whatever the
+  cause, so the server now keeps a rolling 24 hours per source and says
+  which leg of the chain broke: the service not answering, the station
+  having nothing new while the service answers fine, or trouble on this
+  server. It rides on `/api/devices` and `/api/sources` as one character
+  an hour, the apps draw it as a strip under the source line, and an
+  hour nobody was watching is drawn as absent rather than as healthy.
+  The not-reporting email now says what the day looked like, and the
+  recovery email says how long it was out.
+- **Severe weather alerts, one family at a time.** The National Weather
+  Service relay was all-or-nothing: a Flood Watch reached you exactly as
+  loudly as a Tornado Warning, and the only control was a switch that
+  turned every alert off. Eleven families — tornado, thunderstorm, flood,
+  tropical, winter, heat and cold, wind and dust, fire weather, air
+  quality, marine and coastal, and everything else — can now be muted
+  one at a time on `PUT /api/alerts` (`nws_families`, the muted set), and
+  the same setting is what the apps read, so a family muted once is muted
+  on the phone, the widget, the Mac and the watch. `GET /api/alerts`
+  hands back the catalogue so the apps never keep their own copy of it.
+- **A warning and a watch no longer sound the same.** The app carries two
+  tones of its own, a rising pair said twice for the urgent tier and a
+  softer falling pair, mixed quieter, for a watch or an advisory. The
+  quietest tier keeps the system sound. A phone whose app predates them
+  falls back to the sound it has always played.
+- **A watch is quieter than a warning.** Every relayed alert used to
+  arrive time-sensitive and through quiet hours. Now the product class
+  decides: a Warning still breaks through, a Watch wakes you without
+  punching through Focus, an Advisory is an ordinary notification, and a
+  Statement waits for the morning.
+- **A station whose only rain counter is the day's now reads the
+  ledger too.** That tier (a Tempest) re-scanned about half a million
+  index rows on every `/current`, which on a small box measured between
+  half a second and three seconds cold. The per-day ledger the live fold
+  already keeps answers the same question in one primary-key range read;
+  the scan stays as the fallback for anything the ledger cannot answer.
+- **Report emails in a theme you choose.** Dark as before, light, follow
+  the sky (dark after sunset at your station, light after sunrise), or
+  follow your device. One setting under Quiet hours and reports, applied
+  to the morning report, the outlook and storm summaries alike. Follow
+  your device sends the light card with a request to darken it, which
+  Apple Mail honours and Gmail's web client ignores; the setting says so
+  rather than promising what the wire cannot deliver.
+- **Three more networks to share with**: Met Office WOW, AWEKAS and
+  OpenWeatherMap, beside the four that were already there. Each one gets
+  its own units at the boundary (WOW imperial, AWEKAS metric,
+  OpenWeatherMap SI) and each one's own published rate floor, because
+  sending faster than a network asks is how a station gets blocked.
+- **Per sensor calibration.** `GET/PUT /api/devices/{mac}/calibration`
+  corrects a station's readings the way every other weather system does:
+  an offset for a thermometer that sits warm, a scale for a rain gauge
+  that under-collects. Applied wherever a reading is stored, the cloud
+  pollers included, so the rollups, records, alerts and exports all
+  agree with the number on the screen; a dew point or feels-like the
+  console computed from the raw reading is derived again from the
+  corrected one, and what was applied rides in the row so any reading
+  can be turned back into what the sensor actually said. Corrections
+  change the future, not the past, and the route says so. The tables
+  ride the config backup with the rest of the station's preferences.
+- **Nine more derived numbers**, on `GET /api/devices/{mac}/derived`.
+  Vapour pressure deficit, humidex, Steadman's apparent temperature (the
+  one with wind in it, so it answers on the spring days heat index and
+  wind chill both ignore), the convective cloud base, and an EPA AQI
+  from PM2.5 that names its own window instead of implying the 24 hour
+  one. Plus four that add the day up rather than reading it: wind run,
+  sunshine hours against a clear-sky envelope, Utah-model chill hours
+  (which can go down on a warm afternoon, and should), and reference
+  evapotranspiration by FAO-56 Penman-Monteith for the stations whose
+  console does not compute its own. Each is omitted, never zeroed, when
+  the sensor it needs is absent.
+- **Soil, where you can see it.** Moisture and temperature probes
+  (Ecowitt WH51 and WN34) have been stored since 1.9 and shown nowhere.
+  The dashboard now draws a card for the channels that actually
+  reported, with a bar and a plain word beside the number, and the range
+  runs to all eight channels instead of stopping at four. A station with
+  no probes draws nothing at all.
+- **Bring your history with you.** `POST /api/import/weewx` takes a
+  `weewx.sdb` uploaded as the request body and imports the `archive`
+  table, converting every row from its own `usUnits` so a database that
+  changed unit system part way through its life still lands correctly.
+  `POST /api/import/csv` does the same for anything else that exports
+  one, with a column mapping you supply, because there is no standard.
+  Both are paced and cancellable, both re-run for free, and a reading
+  the file does not have stays missing rather than importing as zero.
+  `GET /api/import/csv/fields` hands the apps the mapping catalogue so
+  they never keep their own copy, and interval rain from a WeeWX
+  archive is summed per local day into the day counter the station
+  would have posted, so an imported rainy day has its total.
+- **When the weather changed, not just what it did.** `GET
+  /api/devices/{mac}/changes` reads the station's own rows and returns
+  the moments it turned: rain starting and stopping, a wind shift, the
+  barometer changing direction, the window's high and low, clearing and
+  clouding over. Rain comes from the day counter moving rather than the
+  trailing hour total, so "stopped" is not fifty minutes late, and a
+  counter that falls is midnight rather than negative rain. A wind shift
+  is a vector mean against the previous half hour, because a scalar mean
+  of 350 and 10 degrees is 180, which is the opposite way. Sun
+  transitions need coordinates and a sustained crossing, so one cloud
+  writes nothing. Each entry carries the instant, a sentence, and where
+  there is a number, the value with the unit it is in, so an app can say
+  it in whatever units its reader uses. Also an MCP tool
+  (`weather_changes`), and it answers on a server with insights off
+  because it reads raw observations.
+- **The weather watches can be switched on.** Lightning proximity with
+  an all clear thirty minutes after the last strike, frost and heat
+  warnings, a rapid pressure drop, the season's first frost, and low
+  batteries or a sensor gone quiet have all been in the server since
+  1.8. Every one of them sat behind `SMART_ALERTS`, which defaults to
+  off and which no app could set, so on most servers they had never
+  fired at all. `PUT /api/alerts` now takes `smart_alerts`, the apps
+  draw a switch for it under Rain and heat, and `GET /api/alerts`
+  reports the effective value. A server whose owner set the environment
+  variable keeps exactly what it was told; the switch simply overrides
+  it once somebody touches it. It rides the config backup like every
+  other preference, because a restore that quietly turned these back
+  off would be the worst version of an old bug here.
+- **A test push.** `POST /api/push/test` sends a one-off notification to
+  the devices registered with this server, the way `POST /api/alerts/test`
+  has always sent a test email — the only way to prove push before this
+  was to invent a threshold rule the weather would cross and wait.
+  `{"kind": "live_activity"}` starts a short-lived test Live Activity
+  instead, which exercises the separate push-to-start token. Owner token
+  only, one attempt per minute, and it says how many devices it reached.
+
+### Changed
+- **A WeatherLink Live that moves is followed.** The poller and the Mac
+  app learn the gateway's own hardware id from its answers while the
+  address works, and if that address goes quiet for ten minutes they
+  sweep the rest of the /24 and move only to the box reporting the same
+  id. A neighbour's gateway answers the same URL with the same shape, so
+  an address alone is never enough to move on. Off with
+  `WLL_REDISCOVER=0`; the wait is `WLL_REDISCOVER_AFTER_S`.
+- **A database backup no longer sets off the disk alarm.** The
+  watchdog skips its tick while a backup, a restore or a pre-upgrade
+  snapshot is copying the database, a rise has to be seen on two
+  consecutive ticks before it alerts, and a backup that would push the
+  volume past the warn line goes to the temporary directory instead when
+  there is room there. A falling reading still clears at once.
+
+### Fixed
+- **Report and summary emails no longer arrive in the wrong colours.**
+  The HTML emails carried no `<head>`, so Apple Mail decided the colour
+  scheme message by message and could paint a light background under a
+  card drawn for dark. Both shells now declare the scheme they are
+  painted in.
+
 ## [2.3.0] — 2026-09-18
 
 ### Added

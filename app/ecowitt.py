@@ -52,8 +52,8 @@ _BATT_LEVEL = ("wh57batt", "pm25batt1", "pm25batt2",
 # 1.2) — unmapped before R11, so their sensors could die silently.
 _BATT_VOLTS = {"wh68batt": 2.4, "wh80batt": 2.4, "wh90batt": 2.4,
                "wh40batt": 1.2,
-               **{f"soilbatt{i}": 1.2 for i in range(1, 5)},
-               **{f"tf_batt{i}": 1.2 for i in range(1, 5)}}
+               **{f"soilbatt{i}": 1.2 for i in range(1, 9)},
+               **{f"tf_batt{i}": 1.2 for i in range(1, 9)}}
 
 
 def _f(v: Any) -> float | None:
@@ -126,12 +126,12 @@ def _batteries(form: dict[str, Any]) -> dict[str, float]:
 _CHANNEL_MAP = {
     **{f"temp{i}f": f"temp{i}f" for i in range(1, 5)},
     **{f"humidity{i}": f"humidity{i}" for i in range(1, 5)},
-    **{f"soilmoisture{i}": f"soilhum{i}" for i in range(1, 5)},
+    **{f"soilmoisture{i}": f"soilhum{i}" for i in range(1, 9)},
     # WN34 soil/water temperature probes report as tf_chN — without this
     # mapping the soiltemp1f-4f columns were unreachable from every 1.9
-    # source and the readings vanished entirely (R11 V14). Channels 5-8
-    # have no columns; they stay unmapped rather than silently aliased.
-    **{f"tf_ch{i}": f"soiltemp{i}f" for i in range(1, 5)},
+    # source and the readings vanished entirely (R11 V14). 2.4 item 5
+    # added the columns for channels 5 to 8, so the whole range maps now.
+    **{f"tf_ch{i}": f"soiltemp{i}f" for i in range(1, 9)},
     **{f"leak_ch{i}": f"leak{i}" for i in range(1, 5)},
     **{f"leafwetness_ch{i}": f"leafwetness{i}" for i in range(1, 3)},
 }
@@ -190,7 +190,7 @@ def _rain(form: dict[str, Any]) -> dict[str, Any]:
 _METRIC_C_TO_F = {
     "tempc": "tempf", "tempinc": "tempinf",
     **{f"temp{i}c": f"temp{i}f" for i in range(1, 5)},
-    **{f"tf_ch{i}c": f"tf_ch{i}" for i in range(1, 5)},
+    **{f"tf_ch{i}c": f"tf_ch{i}" for i in range(1, 9)},
 }
 _METRIC_KMH_TO_MPH = {"windspeedkmh": "windspeedmph",
                       "windgustkmh": "windgustmph",

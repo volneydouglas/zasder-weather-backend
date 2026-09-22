@@ -210,7 +210,7 @@ def _clip_narrative(text: str, limit: int = PUSH_NARRATIVE_MAX) -> str:
     return text[:cut + 1] if cut > limit // 2 else text[:limit].rstrip() + "…"
 
 
-def build_html(r: OutlookReport) -> str:
+def build_html(r: OutlookReport, theme: str = "dark") -> str:
     """The outlook email in the morning report's dress (2.3): the day and
     its sky as the headline, the four numbers as tiles, sun times, the
     provider's own prose, and the credit. The plain text stays the
@@ -252,7 +252,8 @@ def build_html(r: OutlookReport) -> str:
               f'padding-top:10px;">Forecast by {_h.escape(src)}.</div>')
     return ec.shell(title(r), f"{when}, {r.date_label}", inner,
                     "The outlook at the hour you chose. "
-                    "Every report lives in the app's Reports pane.")
+                    "Every report lives in the app's Reports pane.",
+                    theme=theme)
 
 
 async def fetch_daily(lat: float, lon: float, *, source: str, wu_key: str | None,

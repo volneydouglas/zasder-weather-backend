@@ -548,7 +548,7 @@ def test_urgent_rule_breaks_quiet_hours_minor_does_not(client, monkeypatch):
     pushes = []
     async def fake_push_configured():
         return True
-    async def fake_send_to_all(title, body, interruption_level=None):
+    async def fake_send_to_all(title, body, interruption_level=None, **kw):
         pushes.append(title)
         return {"sent": 1}
     monkeypatch.setattr(apns, "push_configured", fake_push_configured)
@@ -809,7 +809,7 @@ def test_quiet_hours_tier_ladder(client, monkeypatch):
     monkeypatch.setattr(al, "in_quiet_hours", lambda *a: True)
     calls: list = []
 
-    async def fake_send(title, body, interruption_level=None):
+    async def fake_send(title, body, interruption_level=None, **kw):
         calls.append(interruption_level)
         return {"sent": 1}
 
@@ -842,7 +842,7 @@ def test_outside_quiet_hours_only_warning_is_time_sensitive(client, monkeypatch)
     monkeypatch.setattr(al, "in_quiet_hours", lambda *a: False)
     calls: list = []
 
-    async def fake_send(title, body, interruption_level=None):
+    async def fake_send(title, body, interruption_level=None, **kw):
         calls.append(interruption_level)
         return {"sent": 1}
 

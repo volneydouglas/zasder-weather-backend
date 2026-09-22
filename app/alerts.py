@@ -9,13 +9,14 @@ Off unless `alert_email_to` and `smtp_host` are configured (see Settings).
 """
 import asyncio
 import functools
+import json
 import logging
 import math
 from typing import Any
 import smtplib
 import ssl
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from zoneinfo import ZoneInfo
@@ -781,6 +782,12 @@ class EffectiveAlertConfig:
     # phone-local. NULL in the row keeps the 1.8 behaviour (on).
     nws_push: bool = True
     nws_warnings_only: bool = False
+    # 2.4 item 1 (Doren, 09-19: a Flood Watch lit the widget's triangle
+    # and pushed like a tornado): the families that are muted. Empty is
+    # the pre-2.4 behaviour — every family reaches every surface.
+    nws_muted_families: list[str] = field(default_factory=list)
+    # 2.4 item 11: light | dark | sky | device for the report emails.
+    report_theme: str = "dark"
     # 2.3 (Volney, 09-14): the Storm Watch Live Activity gets its own
     # switch, separate from the summary's CHANNELS (storm_channels) but
     # not from the summary itself: the Live Activity rides the storm
@@ -797,6 +804,14 @@ class EffectiveAlertConfig:
     freeze_live_activity: bool = True
     lightning_live_mi: float = 10.0
     wind_live_mph: float = 35.0
+    # 2.4: the derived-alert pillar's master switch (lightning proximity
+    # and its 30 minute all clear, frost, heat, rapid pressure drop,
+    # first frost of the season, battery and sensor-quiet). It was env
+    # only until now, the env defaults to off, and nothing in any app
+    # could set it — so none of that had ever fired for anyone. NULL in
+    # the row still means "whatever SMART_ALERTS says", so an operator
+    # who set the env keeps what they configured.
+    smart_alerts: bool = False
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -877,7 +892,72 @@ async def effective_config() -> EffectiveAlertConfig:
                               or bool(p.get("freeze_live_activity"))),
         lightning_live_mi=_float_or(p.get("lightning_live_mi"), 10.0),
         wind_live_mph=_float_or(p.get("wind_live_mph"), 35.0),
-        nws_warnings_only=bool(p.get("nws_warnings_only")))
+        nws_warnings_only=bool(p.get("nws_warnings_only")),
+        nws_muted_families=_muted_families(p.get("nws_families")),
+        report_theme=_report_theme(p.get("report_theme")),
+        smart_alerts=(bool(p["smart_alerts"]) if p.get("smart_alerts") is not None
+                      else settings.smart_alerts))
+
+
+async def report_theme_now(cfg, devices: list[dict[str, Any]] | None = None
+                           ) -> str:
+    """The palette to send in, right now (2.4 item 11).
+
+    "Follow the sky" is resolved HERE, at send time, against the
+    station's own sunset rather than the server's clock or the reader's:
+    the whole idea is that the email matches the sky the station is
+    under. Without coordinates it stays dark, which is what these emails
+    have always been.
+    """
+    from . import email_card
+    theme = getattr(cfg, "report_theme", "dark")
+    if theme != "sky":
+        return email_card.resolve_theme(theme, after_dark=None)
+    after_dark = None
+    try:
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo
+        from . import almanac
+        from .config import settings as _settings
+        rows = devices if devices is not None else await db.list_devices()
+        coords = None
+        for d in rows:
+            c = (((d.get("info") or {}).get("coords") or {}).get("coords")
+                 or {})
+            if c.get("lat") is not None and c.get("lon") is not None:
+                coords = (float(c["lat"]), float(c["lon"]))
+                break
+        if coords is not None:
+            tz = ZoneInfo(_settings.timezone)
+            now_local = _dt.now(tz)
+            sunrise = almanac.sun_event_local(coords[0], coords[1],
+                                              now_local.date(), rising=True,
+                                              tz=tz)
+            sunset = almanac.sun_event_local(coords[0], coords[1],
+                                             now_local.date(), rising=False,
+                                             tz=tz)
+            if sunrise is not None and sunset is not None:
+                after_dark = now_local < sunrise or now_local >= sunset
+    except Exception:
+        log.exception("report theme: could not read the station's sky")
+    return email_card.resolve_theme("sky", after_dark=after_dark)
+
+
+def _report_theme(raw: Any) -> str:
+    from . import email_card
+    return raw if raw in email_card.THEMES else "dark"
+
+
+def _muted_families(raw: Any) -> list[str]:
+    """The stored JSON list, cleaned through nws_families.normalise_muted
+    so a hand-edited row cannot silence a family the UI cannot show."""
+    from . import nws_families
+    if not raw:
+        return []
+    try:
+        return nws_families.normalise_muted(json.loads(raw))
+    except (ValueError, TypeError):
+        return []
 
 
 def _float_or(v, default: float) -> float:
@@ -1002,8 +1082,14 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
             # `route` only when there is one: the 2.1 callers and their
             # test doubles never saw the kwarg.
             extra = {"route": route} if route else {}
+            # 2.4 item 1: the tier also picks WHICH of the app's two tones
+            # plays, so a warning and a watch are told apart before the
+            # phone leaves a pocket. Always passed, unlike `route`: every
+            # delivery has a tier, and a double that cannot take it is a
+            # double that has stopped describing this call.
             res = await apns.send_to_all(push_title, push_body,
-                                         interruption_level=level, **extra)
+                                         interruption_level=level,
+                                         tier=eff_severity, **extra)
             if res.get("sent"):
                 delivered = True
             elif res.get("failed"):
@@ -1227,7 +1313,10 @@ class AlertMonitor:
         # ── threshold rules: fire when a device's latest reading crosses a rule
         await self._check_threshold_rules(cfg, devices, now_ms)
         # ── smart (derived) alerts: frost / heat / rapid pressure drop
-        if settings.smart_alerts:
+        #
+        # cfg, not settings: 2.4 gave this an app switch. The env is
+        # still the fallback for a box whose owner set it there.
+        if cfg.smart_alerts:
             await self._check_smart_alerts(cfg, devices, now_ms)
             # 1.8 seasonal one-shots (first frost of the season).
             await self._check_seasonal_events(cfg, devices, now_ms)
@@ -1246,6 +1335,15 @@ class AlertMonitor:
                 await health_watch.check(cfg, devices, now_ms, _deliver)
             except Exception:
                 log.exception("health watch failed")
+        else:
+            # A fired edge must not outlive the switch. Off, nothing
+            # records a clearance, so a triggered row would still be
+            # there at re-enable and the next crossing would read as
+            # already fired until the condition cleared and crossed
+            # again. Rebaselined while off, the switch coming back sees
+            # the yard as it is (CodeRabbit, PR #40).
+            if await db.get_smart_alert_states():
+                await db.clear_smart_alert_states()
         # 2.2 source watchdog: a cloud poller failing for an hour is an
         # outage, so it runs whether or not the smart alerts are on.
         from . import health_watch as _hw
@@ -1517,7 +1615,8 @@ class AlertMonitor:
                                       email_ok=email_ok, push_ok=push_ok,
                                       kind="storm", mac=mac,
                                       html=storm.build_storm_html(
-                                          dname, summary, settings.timezone),
+                                          dname, summary, settings.timezone,
+                                          await report_theme_now(cfg)),
                                       route=(f"report/{report_id}"
                                              if report_id else None)):
                         await db.upsert_storm_state(mac, None, None, field,
@@ -1690,10 +1789,11 @@ class AlertMonitor:
                    + (f" · {len(rows)} alert{'s' if len(rows) != 1 else ''}"
                       if rows else ""))
         try:
+            theme = await report_theme_now(cfg, devices)
             await asyncio.to_thread(_send_sync, subject,
                                     dg.build_text(report),
                                     cfg.recipients, cfg,
-                                    dg.build_html(report))
+                                    dg.build_html(report, theme))
             await db.set_kv("alerts.digest.last_ms", str(now_ms))
             log.info("morning report sent: %d station(s), %d alert(s)",
                      len(stations), len(rows))
@@ -1779,9 +1879,10 @@ class AlertMonitor:
             if cfg.enabled and cfg.recipients:
                 had_targets = True
                 try:
+                    theme = await report_theme_now(cfg, devices)
                     await asyncio.to_thread(_send_sync, "[Zasder Weather] " + title,
                                             ol.text(report), cfg.recipients, cfg,
-                                            ol.build_html(report))
+                                            ol.build_html(report, theme))
                     sent_any = True
                 except Exception:
                     log.exception("outlook email failed; will retry next tick")

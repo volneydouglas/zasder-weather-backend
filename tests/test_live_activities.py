@@ -375,3 +375,165 @@ def test_lock_screen_switch_round_trips_and_defaults_on(client):
     # A PUT that leaves the field out does not touch it.
     client.put("/api/alerts", headers=AUTH, json={"sky_notes": True})
     assert client.get("/api/alerts", headers=AUTH).json()["storm_live_activity"] is False
+
+
+# ───────── 2.4 (D6): a test push, so push can be proven like email ─────────
+
+TEST_PUSH_H = {"Authorization": "Bearer test-api-token"}
+
+
+def _push_channel(monkeypatch, sent=1):
+    """A configured push channel that records what it was asked to send."""
+    from app import apns
+    calls = {"alert": [], "start": []}
+
+    async def configured():
+        return True
+
+    async def fake_all(title, body, **kw):
+        calls["alert"].append((title, body, kw))
+        return {"sent": sent, "pruned": 0, "total": 1, "dead": [], "failed": 0}
+
+    async def fake_start(payload, title, body, **kw):
+        calls["start"].append((payload, title, body))
+        return {"sent": sent, "dead": [], "failed": 0}
+
+    monkeypatch.setattr(apns, "push_configured", configured)
+    monkeypatch.setattr(apns, "send_to_all", fake_all)
+    monkeypatch.setattr(apns, "send_live_activity_start", fake_start)
+    return calls
+
+
+def _reset_push_throttle():
+    """conftest clears it per test; these cases send more than once."""
+    from app import main as M
+    M._TEST_PUSH_TS = None
+
+
+def test_push_test_needs_a_channel_and_a_device(client, monkeypatch):
+    """Both refusals are 400s that say what to do, never a 500 and never
+    a silent ok: Doren could not tell a broken channel from quiet
+    weather, which is the whole reason this route exists."""
+    from app import apns
+    _reset_push_throttle()
+
+    async def unconfigured():
+        return False
+
+    monkeypatch.setattr(apns, "push_configured", unconfigured)
+    r = client.post("/api/push/test", headers=TEST_PUSH_H, json={})
+    assert r.status_code == 400 and "push channel" in r.json()["detail"]
+
+    _push_channel(monkeypatch)                      # channel, but no tokens
+    r = client.post("/api/push/test", headers=TEST_PUSH_H, json={})
+    assert r.status_code == 400 and "registered" in r.json()["detail"]
+
+
+def test_push_test_sends_and_then_throttles(client, monkeypatch):
+    _reset_push_throttle()
+    calls = _push_channel(monkeypatch)
+    client.post("/api/push/register", headers=TEST_PUSH_H,
+                json={"token": "d" * 64, "env": "production"})
+    r = client.post("/api/push/test", headers=TEST_PUSH_H, json={})
+    assert r.status_code == 200
+    b = r.json()
+    assert b["ok"] is True and b["sent"] == 1 and b["registered"] == 1
+    assert b["kind"] == "alert"
+    title, body, _ = calls["alert"][0]
+    assert "Test" in title and "working" in body
+    # Throttled like /api/alerts/test — one attempt per process per minute.
+    assert client.post("/api/push/test", headers=TEST_PUSH_H,
+                       json={}).status_code == 429
+    assert len(calls["alert"]) == 1
+
+
+def test_push_test_live_activity_starts_its_own_card(client, monkeypatch):
+    """The push-to-start path fails on its own and silently, so it gets
+    its own test — and its own attributes type: a test that started a
+    rain card would be a test that says rain is coming."""
+    from app import main as M
+    _reset_push_throttle()
+    calls = _push_channel(monkeypatch)
+    client.post("/api/push/live-activity-token", headers=TEST_PUSH_H,
+                json={"token": "s" * 40, "kind": "start",
+                      "env": "production"})
+    r = client.post("/api/push/test", headers=TEST_PUSH_H,
+                    json={"kind": "live_activity"})
+    assert r.status_code == 200 and r.json()["sent"] == 1
+    payload, title, _ = calls["start"][0]
+    aps = payload["aps"]
+    assert aps["attributes-type"] == M.PUSH_TEST_ACTIVITY
+    assert aps["event"] == "start"
+    assert aps["content-state"]["sentMs"] > 0
+    assert aps["attributes"]["stationName"]
+    # It clears itself: stale within minutes, dismissed shortly after.
+    assert 0 < aps["stale-date"] - aps["timestamp"] <= 300
+    assert aps["stale-date"] < aps["dismissal-date"]
+    assert not calls["alert"]                    # no plain push tagged along
+
+
+def test_push_test_without_live_activity_tokens_is_a_400(client, monkeypatch):
+    _reset_push_throttle()
+    _push_channel(monkeypatch)
+    client.post("/api/push/register", headers=TEST_PUSH_H,
+                json={"token": "d" * 64, "env": "production"})
+    r = client.post("/api/push/test", headers=TEST_PUSH_H,
+                    json={"kind": "live_activity"})
+    assert r.status_code == 400 and "Live Activities" in r.json()["detail"]
+
+
+def test_push_test_rejects_a_bad_kind(client, monkeypatch):
+    _reset_push_throttle()
+    _push_channel(monkeypatch)
+    r = client.post("/api/push/test", headers=TEST_PUSH_H,
+                    json={"kind": "telegram"})
+    assert r.status_code == 400
+
+
+def test_push_test_reports_a_delivered_nothing_without_failing(client,
+                                                               monkeypatch):
+    """Every token refused is not a server error — it is the answer the
+    operator needs, in words."""
+    _reset_push_throttle()
+    _push_channel(monkeypatch, sent=0)
+    client.post("/api/push/register", headers=TEST_PUSH_H,
+                json={"token": "d" * 64, "env": "production"})
+    r = client.post("/api/push/test", headers=TEST_PUSH_H, json={})
+    assert r.status_code == 200
+    b = r.json()
+    assert b["ok"] is False and b["sent"] == 0 and "detail" in b
+
+# A guest or reviewer token reaching /api/push/test is covered
+# mechanically by the write-route sweep in test_security_invariants.py —
+# the route is WRITE-gated, so it is in that parametrisation by
+# construction rather than by anyone remembering to add it.
+
+
+def test_push_test_can_play_either_tone(client, monkeypatch):
+    """2.4 item 1: the button that proves push also lets someone hear
+    what a warning sounds like beside a watch, without waiting for
+    weather to do it for them."""
+    _reset_push_throttle()
+    calls = _push_channel(monkeypatch)
+    client.post("/api/push/register", headers=TEST_PUSH_H,
+                json={"token": "d" * 64, "env": "production"})
+    r = client.post("/api/push/test", headers=TEST_PUSH_H,
+                    json={"tier": "warning"})
+    assert r.status_code == 200 and r.json()["sound"] == "zw-warning.caf"
+    title, _, kw = calls["alert"][0]
+    assert kw.get("tier") == "warning" and "warning" in title
+
+    _reset_push_throttle()
+    r = client.post("/api/push/test", headers=TEST_PUSH_H,
+                    json={"tier": "watch"})
+    assert r.json()["sound"] == "zw-watch.caf"
+
+    # Unasked, a test push sounds like any other notification.
+    _reset_push_throttle()
+    r = client.post("/api/push/test", headers=TEST_PUSH_H, json={})
+    assert r.json()["sound"] == "default"
+
+    # A tier nobody ships is a 400, not a silent default.
+    _reset_push_throttle()
+    assert client.post("/api/push/test", headers=TEST_PUSH_H,
+                       json={"tier": "info"}).status_code == 400

@@ -54,13 +54,22 @@ def _safe_err(e: Exception) -> str:
     msg = _URL_RE.sub("<url>", str(e)) or type(e).__name__
     return f"{type(e).__name__}: {msg}"[:200]
 
-TARGETS = ("pwsweather", "windy", "weathercloud", "cwop")
+TARGETS = ("pwsweather", "windy", "weathercloud", "cwop",
+           # 2.4 item 8. Three more, chosen because each one is a
+           # network a real person asked to be on rather than a logo:
+           # WOW is the UK Met Office's own citizen network, AWEKAS is
+           # the European club, and OpenWeatherMap is where a developer
+           # wants their own station to appear.
+           "wow", "awekas", "openweathermap")
 
 _INTERVALS_MS = {
     "pwsweather": 5 * 60_000,
     "windy": 5 * 60_000,
     "weathercloud": 10 * 60_000,
     "cwop": 10 * 60_000,
+    "wow": 10 * 60_000,
+    "awekas": 10 * 60_000,
+    "openweathermap": 15 * 60_000,
 }
 # The operator can send more often (Doren, 2026-09-06: WeatherCat posts
 # PWSWeather every 5 s and WeatherCloud every minute), down to each
@@ -68,7 +77,13 @@ _INTERVALS_MS = {
 # free plan one per 10 min, CWOP asks for 5 min or slower, PWSWeather
 # has no published floor (1 min is plenty). `interval_min` in the target's
 # config; absent means the defaults above.
-MIN_INTERVAL_MIN = {"pwsweather": 1, "windy": 5, "weathercloud": 10, "cwop": 5}
+# Each network's own published floor, never ours. Sending faster than a
+# network asks for is how a station gets blocked, and the number here is
+# the one THEY state: WOW asks for no more than one every 5 minutes,
+# AWEKAS free accounts are rate limited to one every 5, OpenWeatherMap
+# takes one per station per 10 minutes on the free tier.
+MIN_INTERVAL_MIN = {"pwsweather": 1, "windy": 5, "weathercloud": 10,
+                    "cwop": 5, "wow": 5, "awekas": 5, "openweathermap": 10}
 MAX_INTERVAL_MIN = 60
 
 
@@ -522,8 +537,194 @@ async def _with_hour_rain(station: dict[str, Any], now_ms: int) -> dict[str, Any
     return obs
 
 
+# ── 2.4 item 8 ────────────────────────────────────────────────────────
+
+
+WOW_UPDATE = "https://wow.metoffice.gov.uk/automaticreading"
+
+
+def wow_params(cfg: dict, obs: dict, now_utc: _dt.datetime) -> dict:
+    """Met Office WOW.
+
+    The same Weather Underground style field names the other networks
+    use, with two of their own: `siteid` is a GUID from the WOW site
+    page and `siteAuthenticationKey` is the six digit PIN, which WOW
+    calls a PIN precisely because it is not a password.
+
+    The date goes as `dateutc` in their documented format, which is the
+    only one of these that wants the URL-encoded literal rather than a
+    space; httpx encodes it for us.
+    """
+    p: dict[str, Any] = {
+        "siteid": str(cfg.get("station_id", "")).strip(),
+        "siteAuthenticationKey": str(cfg.get("api_key", "")).strip(),
+        "dateutc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "softwaretype": f"ZasderWeather-{__version__}",
+    }
+    for src, dst in (("tempf", "tempf"), ("humidity", "humidity"),
+                     ("dewPoint", "dewptf"), ("winddir", "winddir"),
+                     ("windspeedmph", "windspeedmph"),
+                     ("windgustmph", "windgustmph"),
+                     ("baromrelin", "baromin"), (RAIN_LAST_HOUR, "rainin"),
+                     ("dailyrainin", "dailyrainin"),
+                     ("solarradiation", "solarradiation")):
+        v = _f(obs.get(src))
+        if v is not None:
+            p[dst] = v
+    return p
+
+
+async def _send_wow(cfg, obs, now_ms) -> str | None:
+    params = wow_params(cfg, obs, _reading_time(obs, now_ms))
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(WOW_UPDATE, params=params)
+    # WOW answers 200 with an empty body on success and 429 when a
+    # reading arrives inside its own floor, which is not a failure worth
+    # waking anybody about.
+    if r.status_code in (200, 429):
+        return None
+    return f"HTTP {r.status_code}"
+
+
+AWEKAS_UPDATE = "https://data.awekas.at/eingabe_pruefung.php"
+
+
+def awekas_params(cfg: dict, obs: dict, now_utc: _dt.datetime,
+                  coords: tuple[float, float] | None = None) -> dict:
+    """AWEKAS.
+
+    Metric, which is the whole reason this one needs its own builder:
+    °C, km/h, mm and hPa. The conversion happens HERE, at the boundary,
+    exactly like every other unit conversion in this project.
+
+    ONE query parameter, `val`, a semicolon-joined list in a fixed order
+    with an empty slot for anything the station does not have. That is
+    the whole API; named parameters are ignored and the upload rejected,
+    which is what the first cut of this did (2.4 review). The order is
+    the one WeeWX's uploader sends, which is the documentation everybody
+    actually reads.
+
+    The password goes as an MD5 hex digest, which is what their API
+    documents. That is their choice and not a security claim of ours; it
+    is sent over HTTPS either way.
+    """
+    import hashlib
+
+    def num(field: str, factor: float = 1.0, offset: float = 0.0,
+            digits: int | None = 1) -> str:
+        v = _f(obs.get(field))
+        if v is None:
+            return ""
+        v = (v + offset) * factor
+        return str(round(v)) if digits is None else str(round(v, digits))
+
+    slots = [
+        str(cfg.get("station_id", "")).strip(),                    # 0 user
+        hashlib.md5(str(cfg.get("api_key", "")).encode("utf-8")).hexdigest(),
+        now_utc.strftime("%d.%m.%Y"),                              # 2 date
+        now_utc.strftime("%H:%M"),                                 # 3 time
+        num("tempf", 5 / 9, -32),                                  # 4 °C
+        num("humidity", digits=None),                              # 5 %
+        num("baromrelin", 33.8639),                                # 6 hPa
+        num("dailyrainin", 25.4),                                  # 7 mm today
+        num("windspeedmph", 1.609344),                             # 8 km/h
+        num("winddir", digits=None),                               # 9 degrees
+        "",                                                        # 10 weather condition
+        "",                                                        # 11 warning text
+        "",                                                        # 12 snow height
+        "en",                                                      # 13 language
+        "",                                                        # 14 tendency
+        num("windgustmph", 1.609344),                              # 15 km/h
+        num("solarradiation"),                                     # 16 W/m²
+        num("uv"),                                                 # 17 index
+        "",                                                        # 18 brightness
+        "",                                                        # 19 sunshine hours
+        "",                                                        # 20 soil temperature
+        num(RAIN_LAST_HOUR, 25.4),                                 # 21 mm/h
+        f"ZasderWeather-{__version__}",                            # 22 software
+        "" if not coords else str(round(coords[1], 5)),            # 23 lon
+        "" if not coords else str(round(coords[0], 5)),            # 24 lat
+    ]
+    return {"val": ";".join(slots)}
+
+
+async def _send_awekas(cfg, obs, now_ms, coords=None) -> str | None:
+    params = awekas_params(cfg, obs, _reading_time(obs, now_ms), coords)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(AWEKAS_UPDATE, params=params)
+    if r.status_code != 200:
+        return f"HTTP {r.status_code}"
+    # AWEKAS answers 200 with a body that says what it thought of the
+    # reading, so a rejected upload looks exactly like a good one at the
+    # status code. Carry their word for it, bounded.
+    body = (r.text or "").strip()
+    lowered = body.lower()
+    if lowered.startswith("ok") or not body:
+        return None
+    return f"AWEKAS said: {body[:120]}"
+
+
+OWM_UPDATE = "https://api.openweathermap.org/data/3.0/stations"
+OWM_MEASUREMENTS = "https://api.openweathermap.org/data/3.0/measurements"
+
+
+def owm_measurement(cfg: dict, obs: dict, now_utc: _dt.datetime) -> dict:
+    """OpenWeatherMap's station measurement.
+
+    JSON rather than query parameters, SI units, and an epoch in
+    seconds. `station_id` here is the id OWM issues when a station is
+    registered, not a name somebody picked.
+    """
+    m: dict[str, Any] = {
+        "station_id": str(cfg.get("station_id", "")).strip(),
+        "dt": int(now_utc.timestamp()),
+    }
+    temp_f = _f(obs.get("tempf"))
+    if temp_f is not None:
+        m["temperature"] = round((temp_f - 32) * 5 / 9, 2)
+    hum = _f(obs.get("humidity"))
+    if hum is not None:
+        m["humidity"] = round(hum)
+    slp = _f(obs.get("baromrelin"))
+    if slp is not None:
+        # OWM wants hPa, and their field is the station's own pressure.
+        m["pressure"] = round(slp * 33.8639, 1)
+    wind = _f(obs.get("windspeedmph"))
+    if wind is not None:
+        m["wind_speed"] = round(wind * 0.44704, 2)
+    gust = _f(obs.get("windgustmph"))
+    if gust is not None:
+        m["wind_gust"] = round(gust * 0.44704, 2)
+    direction = _f(obs.get("winddir"))
+    if direction is not None:
+        m["wind_deg"] = round(direction)
+    hourly = _f(obs.get(RAIN_LAST_HOUR))
+    if hourly is not None:
+        m["rain_1h"] = round(hourly * 25.4, 2)
+    dew = _f(obs.get("dewPoint"))
+    if dew is not None:
+        m["dew_point"] = round((dew - 32) * 5 / 9, 2)
+    return m
+
+
+async def _send_openweathermap(cfg, obs, now_ms, coords=None) -> str | None:
+    measurement = owm_measurement(cfg, obs, _reading_time(obs, now_ms))
+    if not measurement.get("station_id"):
+        return "no station id"
+    key = str(cfg.get("api_key", "")).strip()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(OWM_MEASUREMENTS, params={"appid": key},
+                              json=[measurement])
+    # 204 is their documented success for a measurement upload.
+    if r.status_code in (200, 201, 204):
+        return None
+    return f"HTTP {r.status_code}"
+
+
 SENDERS = {"pwsweather": "_send_pwsweather", "windy": "_send_windy",
-           "weathercloud": "_send_weathercloud", "cwop": "_send_cwop"}
+           "weathercloud": "_send_weathercloud", "cwop": "_send_cwop",
+           "wow": "_send_wow", "awekas": "_send_awekas",
+           "openweathermap": "_send_openweathermap"}
 
 
 async def send_once(target: str, devices: list[dict[str, Any]],
@@ -549,7 +750,9 @@ async def send_once(target: str, devices: list[dict[str, Any]],
         return {"ok": False, "error": err, "station": station.get("mac")}
     try:
         sender = globals()[SENDERS[target]]
-        if target == "cwop":
+        # The same senders take the station's coordinates here as in
+        # the tick, so Save and verify sends what the tick will send.
+        if target in ("cwop", "awekas"):
             err = await sender(cfg, obs, now_ms, _coords(station))
         else:
             err = await sender(cfg, obs, now_ms)
@@ -577,6 +780,13 @@ async def check(devices: list[dict[str, Any]], now_ms: int) -> None:
                 err = await _send_windy(cfg, obs, now_ms)
             elif target == "weathercloud":
                 err = await _send_weathercloud(cfg, obs, now_ms)
+            elif target == "wow":
+                err = await _send_wow(cfg, obs, now_ms)
+            elif target == "awekas":
+                err = await _send_awekas(cfg, obs, now_ms, _coords(station))
+            elif target == "openweathermap":
+                err = await _send_openweathermap(cfg, obs, now_ms,
+                                                 _coords(station))
             else:
                 err = await _send_cwop(cfg, obs, now_ms, _coords(station))
         except Exception as e:

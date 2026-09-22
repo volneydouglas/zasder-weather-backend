@@ -22,6 +22,7 @@ an SMTP username, which is why the warning still exists, just a milder one.
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -66,10 +67,21 @@ _ALERT_PREF_KEYS = (
     # again; the test now derives the expected set from db._ALERT_PREF_COLS
     # so the next column fails the suite until it is carried).
     "nws_push", "nws_warnings_only", "storm_live_activity",
+    # 2.4 item 1: the muted alert families. Carried like every other
+    # pref — a restore that reset Doren's NWS-off back to on is the
+    # R22-06 shape this list exists to stop.
+    "nws_families",
+    # 2.4 item 11: the report emails' palette.
+    "report_theme",
     # 2.3 item 5: the lightning / wind-ramp / freeze-night cards and
     # their two thresholds.
     "lightning_live_activity", "wind_live_activity", "freeze_live_activity",
     "lightning_live_mi", "wind_live_mph",
+    # 2.4: the weather-watches master switch. It decides whether the
+    # whole derived-alert pillar runs, so a restore that dropped it
+    # would silently switch lightning, frost, heat and the battery
+    # alerts back off — the R22-06 shape in its loudest form yet.
+    "smart_alerts",
 )
 # Columns set_alert_prefs stores that the backup deliberately leaves out,
 # each with its reason. test_config_backup checks _ALERT_PREF_KEYS is
@@ -99,6 +111,11 @@ async def export_config() -> dict[str, Any]:
         # override lives on the device row the station creates on its
         # first post.
         "device_names": await db.device_display_names(),
+        # 2.4 item 7 corrections: operator-typed, non-secret, on the
+        # device row like names and locations, and a restore onto a
+        # replacement box without them stores uncorrected readings from
+        # then on (2.4 review). Optional on restore, like the names.
+        "device_calibrations": await db.all_calibrations(),
         # Recorded so a restore can say what it couldn't put back.
         "smtp_password_included": False,
     }
@@ -123,7 +140,7 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
                "rain_start", "heat_day",
                "nws_push", "nws_warnings_only", "storm_live_activity",
                "lightning_live_activity", "wind_live_activity",
-               "freeze_live_activity"):
+               "freeze_live_activity", "smart_alerts"):
         if isinstance(v, bool) or v in (0, 1):
             return 1 if v else 0
         return _INVALID
@@ -151,6 +168,24 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
         except (TypeError, ValueError):
             return _INVALID
         return f if math.isfinite(f) and lo <= f <= hi else _INVALID
+    if key == "nws_families":
+        # Stored as JSON text. Accept the list the export writes (and a
+        # JSON string, which is what the column holds), clean it through
+        # the catalogue, and store the cleaned JSON — never a key the UI
+        # cannot show.
+        from . import nws_families as _nf
+        raw = v
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return _INVALID
+        if not isinstance(raw, list):
+            return _INVALID
+        return json.dumps(_nf.normalise_muted(raw))
+    if key == "report_theme":
+        from . import email_card as _ec
+        return v if v in _ec.THEMES else _INVALID
     if key == "outlook_source":
         return v if v in ("open-meteo", "twc") else _INVALID
     if key in ("quiet_start_min", "quiet_end_min", "digest_hour",
@@ -207,6 +242,7 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
     summary: dict[str, Any] = {"alert_prefs": 0, "device_alert_prefs": 0,
                                "alert_rules": 0, "device_locations": 0,
                                "device_names": 0,
+                               "device_calibrations": 0,
                                "smtp_password_restored": False}
 
     prefs = payload.get("alert_prefs")
@@ -359,6 +395,23 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
                 continue
             if await db.set_device_display_name(mac, clean):
                 summary["device_names"] += 1
+
+    calibrations = payload.get("device_calibrations")
+    if isinstance(calibrations, dict):
+        from . import calibration
+        for mac, table in calibrations.items():
+            if not isinstance(mac, str) or not isinstance(table, dict):
+                continue
+            # The same cleaner the PUT route and the ingest path use: a
+            # hand-edited offset out of bounds is dropped, not stored.
+            try:
+                clean_table = calibration.clean(table)
+            except ValueError:
+                continue
+            if not clean_table:
+                continue
+            if await db.set_calibration(mac, clean_table):
+                summary["device_calibrations"] += 1
 
     if sum(v for v in summary.values() if isinstance(v, int)) == 0:
         if summary.get("alert_rules_error"):

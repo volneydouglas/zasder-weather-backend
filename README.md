@@ -970,6 +970,11 @@ already approved, the API token) is typed on the consent page.
 | GET/POST/PATCH/DELETE | `/api/alerts/rules` | Threshold alert rules (e.g. tempf above 100), evaluated server-side; PATCH toggles `enabled` |
 | POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
 | POST | `/api/push/register` | Register a push token (iOS APNs or Android FCM — `platform` field) |
+| GET/PUT | `/api/devices/{mac}/calibration` | Per-sensor offsets and scales, applied at ingest (temperature, humidity, pressure, wind, solar, UV, rain, soil) |
+| POST | `/api/import/weewx?mac=` | Import a `weewx.sdb` uploaded as the raw body. Converts each row from its own `usUnits`; paced, cancellable |
+| POST | `/api/import/csv` | Import a CSV with a caller-supplied column mapping (`mapping`, `time_column`, `time_format`, `units`); up to 16 MiB in the body, a column mapped to `intervalRainIn` is summed into the day counter. Bigger histories go through the WeeWX door |
+| GET | `/api/import/archive/status` | Progress of the running WeeWX or CSV import |
+| POST | `/api/push/test` | Send a test notification to the registered devices (owner token, one per minute). `{"kind": "live_activity"}` starts a short-lived test Live Activity instead |
 | GET/PUT | `/api/push/relay` | App-managed relay config (URL + token); token write-only, never returned. PUT enforces `https://` + rejects private/loopback hosts |
 | GET | `/api/storage` | Where the database's bytes live: per-table sizes, the data_json split, thinning state |
 | POST | `/api/update/check` | Run the daily release check right now (the background check is once a day) |

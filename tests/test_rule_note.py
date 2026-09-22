@@ -65,7 +65,7 @@ def test_a_firing_rule_pushes_its_note_and_its_route(client, monkeypatch):
     async def fake_configured():
         return True
 
-    async def fake_send_to_all(title, body, interruption_level=None, route=None):
+    async def fake_send_to_all(title, body, interruption_level=None, route=None, **kw):
         pushes.append((title, body, interruption_level, route))
         return {"sent": 1, "total": 1}
     monkeypatch.setattr(apns, "push_configured", fake_configured)

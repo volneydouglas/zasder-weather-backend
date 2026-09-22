@@ -344,6 +344,9 @@ def test_the_body_limit_middleware_exempts_exactly_the_restore_path(client, temp
     else."""
     from app import limits
     assert limits.EXEMPT_PATHS == frozenset({"/api/backup/database/restore"})
+    # The two archive doors have their own bounded caps (R24-02, 2.4
+    # release review); nothing else is lifted above the default.
+    assert set(limits.PATH_LIMITS) == {"/api/import/csv", "/api/import/weewx"}
     _seed(client, 2)
     snap = Path(temp_env).parent / "saved.db"
     _snapshot_of(temp_env, snap)
@@ -520,3 +523,55 @@ def test_a_second_restore_is_refused_and_the_challenge_is_not_burned(client, tem
         release.set()
     st = _wait_done(client)
     assert st["state"] == "done", st
+
+
+def test_a_chunked_upload_past_its_limit_is_refused_even_when_its_prefix_is_valid(client, tmp_path, monkeypatch):
+    """The middleware used to turn overflow into EOF, so a chunked body
+    whose first chunk was a complete, valid weewx.sdb was written and
+    ACCEPTED, the bytes past the limit simply dropped. A body that
+    crosses its path limit is a 413 now and no import starts
+    (CodeRabbit, PR #40). The limit is lowered for the test; the
+    middleware reads it per request."""
+    from app import limits
+    from tests.test_archive_import import _weewx_db, _make_device
+    H = {"Authorization": "Bearer test-api-token"}
+    _make_device(client, "AABBCC000077")
+    path = tmp_path / "weewx.sdb"
+    _weewx_db(path, [(1_700_100_000 + i * 300, 1, 70.0 + i, 5.0, 29.9, 0.0, 50.0)
+                     for i in range(20)])
+    good = path.read_bytes()
+    monkeypatch.setitem(limits.PATH_LIMITS, "/api/import/weewx", len(good) + 1024)
+
+    def chunks():
+        yield good
+        yield b"\x00" * 4096          # past the limit, after a valid prefix
+    r = client.post("/api/import/weewx?mac=AA:BB:CC:00:00:77", headers=H,
+                    content=chunks())
+    assert r.status_code == 413, r.text
+    assert "mid-stream" in r.json()["detail"]
+    # The job dict is process-global and an earlier test's finished job
+    # may still sit in it; what matters is that no job started for THIS
+    # station.
+    s = client.get("/api/import/archive/status", headers=H).json()
+    assert s.get("mac") != "AA:BB:CC:00:00:77", s
+
+
+def test_an_unknown_length_weewx_upload_reserves_the_whole_limit(client, monkeypatch):
+    """No Content-Length reserved only the slack, while the middleware
+    still let 512 MiB through; a write-token holder could fill the
+    temporary filesystem (CodeRabbit, PR #40)."""
+    import shutil
+    from collections import namedtuple
+    Usage = namedtuple("Usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: Usage(1, 0, 200 * 2**20))
+    H = {"Authorization": "Bearer test-api-token"}
+    client.post("/ingest/custom", headers={"Authorization": "Bearer test-ingest-token"},
+                json={"device": {"id": "AABBCC000078", "model": "T"},
+                      "timestamp_utc": "2026-05-14T06:00:00Z",
+                      "outdoor": {"tempf": 70.0}, "source": "test"})
+
+    def chunks():
+        yield b"SQLite format 3\x00" + b"\x00" * 1024
+    r = client.post("/api/import/weewx?mac=AA:BB:CC:00:00:78", headers=H,
+                    content=chunks())
+    assert r.status_code == 507, r.text

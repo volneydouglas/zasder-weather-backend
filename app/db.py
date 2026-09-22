@@ -126,7 +126,12 @@ CREATE TABLE IF NOT EXISTS devices (
     -- (GW3000B)"); this is the override the operator typed, NULL when they
     -- never did. Every reader goes through effective_device_name() so the
     -- two can't leak differently per surface.
-    display_name TEXT
+    display_name TEXT,
+    -- 2.4 item 7: per sensor calibration, a JSON object of field →
+    -- offset or scale. NULL for a station nobody has corrected, which is
+    -- almost all of them. Applied at ingest (see app/calibration.py for
+    -- why there and not on read).
+    calibration_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS observations (
@@ -186,6 +191,11 @@ CREATE TABLE IF NOT EXISTS observations (
     humidity1 REAL, humidity2 REAL, humidity3 REAL, humidity4 REAL,
     soilhum1 REAL, soilhum2 REAL, soilhum3 REAL, soilhum4 REAL,
     soiltemp1f REAL, soiltemp2f REAL, soiltemp3f REAL, soiltemp4f REAL,
+    -- 2.4 item 5: channels 5 to 8. A WH51 gateway takes eight probes and
+    -- a WN34 eight more, and a garden with four beds has four probes in
+    -- it, so the second half of the range is not exotic.
+    soilhum5 REAL, soilhum6 REAL, soilhum7 REAL, soilhum8 REAL,
+    soiltemp5f REAL, soiltemp6f REAL, soiltemp7f REAL, soiltemp8f REAL,
     leafwetness1 REAL, leafwetness2 REAL,
     lightning_last_3hr     INTEGER,
     lightning_last_strike_ms INTEGER,
@@ -313,7 +323,10 @@ CREATE TABLE IF NOT EXISTS alert_prefs (
     -- 1.7: 'push' | 'email' | 'both' — which channels carry STORM SUMMARIES
     -- specifically. NULL = legacy behavior (push always, email iff
     -- email_scope='all'), so nobody's delivery changes until they pick.
-    storm_channels        TEXT
+    storm_channels        TEXT,
+    -- 2.4: the smart-alert master switch. NULL = the env SMART_ALERTS,
+    -- which is the only thing that decided this before now.
+    smart_alerts          INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS device_alert_prefs (
@@ -927,6 +940,11 @@ _FIELD_MAP: dict[str, str] = {
         "leafwetness1", "leafwetness2",
         "lightning_last_3hr", "lightning_last_strike_ms",
     )},
+    # 2.4 item 5: the rest of the soil channels.
+    **{c: c for c in (
+        "soilhum5", "soilhum6", "soilhum7", "soilhum8",
+        "soiltemp5f", "soiltemp6f", "soiltemp7f", "soiltemp8f",
+    )},
 }
 _COLUMNS = list(_FIELD_MAP.keys())
 
@@ -947,6 +965,16 @@ _EXTRA_1_9_COLS: dict[str, str] = {
         "soiltemp1f", "soiltemp2f", "soiltemp3f", "soiltemp4f",
         "leafwetness1", "leafwetness2")},
 }
+# 2.4 item 5: soil channels 5 to 8, their own list rather than added to
+# the 1.9 dict above, because that dict also drives a chunked BACKFILL of
+# data_json and these have never ridden data_json under any other name.
+# There is nothing to backfill; the column is simply new.
+_SOIL_5_8_COLS: dict[str, str] = {
+    **{c: "REAL" for c in (
+        "soilhum5", "soilhum6", "soilhum7", "soilhum8",
+        "soiltemp5f", "soiltemp6f", "soiltemp7f", "soiltemp8f")},
+}
+
 # Numeric columns that can be queried via /summary (use the API field name).
 QUERYABLE_FIELDS = set(_FIELD_MAP.values())
 
@@ -1037,6 +1065,15 @@ async def init_db(path: str | None = None) -> None:
                     await db.execute(
                         f"ALTER TABLE observations ADD COLUMN {col} {decl}")
                     added_extra = True
+            # 2.4 item 5. Added on a LIVE database as well as a fresh
+            # one: a new index in SCHEMA that only works on an empty
+            # database is how the map directory crash-looped on boot
+            # ([[map directory outage]]), and a column is the same shape
+            # of mistake.
+            for col, decl in _SOIL_5_8_COLS.items():
+                if col not in existing:
+                    await db.execute(
+                        f"ALTER TABLE observations ADD COLUMN {col} {decl}")
         await db.executescript(SCHEMA)
         # Insights rollup tables (see app/insights.py). Created even when
         # the INSIGHTS flag is off — empty tables cost nothing and let the
@@ -1171,6 +1208,16 @@ async def init_db(path: str | None = None) -> None:
             # 2.3 NWS relay switch (NULL = on, the pre-2.3 behaviour) and
             # the warnings-only filter (NULL = every Severe/Extreme alert).
             ("nws_push", "INTEGER"), ("nws_warnings_only", "INTEGER"),
+            # 2.4 item 1: the alert FAMILIES the owner has muted, a JSON
+            # list of nws_families keys (NULL/absent = nothing muted, the
+            # pre-2.4 behaviour). Stored as the muted set rather than the
+            # allowed one so a family added in a later release arrives
+            # switched ON, which is the safe side for a weather alert.
+            ("nws_families", "TEXT"),
+            # 2.4 item 11 (Doren's idea, Volney decided): which palette
+            # the report emails wear. NULL = dark, which is what every
+            # one of them has always been.
+            ("report_theme", "TEXT"),
             # 2.3 storm watch on the lock screen (NULL = on): the Live
             # Activity only ever checked the storm_summary master switch.
             ("storm_live_activity", "INTEGER"),
@@ -1181,6 +1228,15 @@ async def init_db(path: str | None = None) -> None:
             ("wind_live_activity", "INTEGER"),
             ("freeze_live_activity", "INTEGER"),
             ("lightning_live_mi", "REAL"), ("wind_live_mph", "REAL"),
+            # 2.4: the smart-alert master switch, finally reachable from
+            # the app. NULL falls back to the env SMART_ALERTS, which is
+            # how every box behaved until now — and since that env
+            # defaults to off, the whole 1.8 derived-alert pillar
+            # (lightning proximity and its all clear, frost, heat, rapid
+            # pressure drop, first frost, battery and sensor-quiet) had
+            # never fired for anybody (Doren, 2026-09-21, asking for a
+            # feature he already owned).
+            ("smart_alerts", "INTEGER"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
@@ -1192,6 +1248,10 @@ async def init_db(path: str | None = None) -> None:
         existing = {r[1] for r in await cur.fetchall()}
         if "display_name" not in existing:
             await db.execute("ALTER TABLE devices ADD COLUMN display_name TEXT")
+        # 2.4 item 7, on a live database as well as a fresh one.
+        if "calibration_json" not in existing:
+            await db.execute(
+                "ALTER TABLE devices ADD COLUMN calibration_json TEXT")
         # 1.8: update-token discriminator, after the table shipped in 1.7.
         cur = await db.execute("PRAGMA table_info(live_activity_tokens)")
         existing = {r[1] for r in await cur.fetchall()}
@@ -1816,6 +1876,56 @@ def effective_device_name(row: Any) -> str | None:
         return override
     name = row["name"]
     return name if name else None
+
+
+async def get_calibration(mac: str) -> dict[str, float]:
+    """One station's correction table (2.4 item 7), cleaned on the way
+    out as well as in: a row hand-edited into something out of bounds
+    must not reach the ingest path."""
+    from . import calibration
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT calibration_json FROM devices WHERE mac = ?",
+            (mac,))).fetchone()
+    if not row or not row[0]:
+        return {}
+    try:
+        return calibration.clean(json.loads(row[0]))
+    except ValueError:
+        return {}
+
+
+async def set_calibration(mac: str, table: dict[str, float]) -> bool:
+    """Replace a station's corrections. An empty table clears the column
+    rather than storing an empty object. False when the MAC is unknown,
+    for the same reason set_device_display_name returns it: there is
+    nothing to attach a correction to until the station has posted."""
+    from . import calibration
+    cleaned = calibration.clean(table)
+    async with connect() as db:
+        cur = await db.execute(
+            "UPDATE devices SET calibration_json = ? WHERE mac = ?",
+            (json.dumps(cleaned) if cleaned else None, mac))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def all_calibrations() -> dict[str, dict[str, float]]:
+    """Every station's corrections, for the ingest path's cache."""
+    from . import calibration
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, calibration_json FROM devices "
+            "WHERE calibration_json IS NOT NULL")).fetchall()
+    out: dict[str, dict[str, float]] = {}
+    for mac, raw in rows:
+        try:
+            table = calibration.clean(json.loads(raw))
+        except ValueError:
+            continue
+        if table:
+            out[mac] = table
+    return out
 
 
 async def set_device_display_name(mac: str, name: str | None) -> bool:
@@ -2629,10 +2739,12 @@ _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipie
                     "quiet_start_min", "quiet_end_min", "digest_hour",
                     "digest_minute", "outlook_hour", "outlook_minute",
                     "outlook_source", "sky_notes", "sky_good_only",
-                    "nws_push", "nws_warnings_only", "storm_live_activity",
+                    "nws_push", "nws_warnings_only", "nws_families",
+                    "report_theme",
+                    "storm_live_activity",
                     "lightning_live_activity", "wind_live_activity",
                     "freeze_live_activity", "lightning_live_mi",
-                    "wind_live_mph")
+                    "wind_live_mph", "smart_alerts")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -2944,6 +3056,17 @@ async def upsert_smart_alert_state(mac: str, kind: str, triggered: int,
             (mac, kind, triggered, changed_ms),
         )
         await db.commit()
+
+
+async def clear_smart_alert_states() -> int:
+    """Forget every smart-alert edge. Read by the monitor while the
+    switch is OFF (2.4): nothing records a clearance then, so a
+    triggered row would outlive the switch and the next crossing after
+    re-enable would read as already fired."""
+    async with connect() as db:
+        cur = await db.execute("DELETE FROM smart_alert_state")
+        await db.commit()
+        return cur.rowcount or 0
 
 
 _REPORT_MAX_ROWS = 900          # see reports.MAX_ROWS; kept here so
@@ -3464,6 +3587,32 @@ async def observation_rows(mac: str, start_ms: int, end_ms: int,
             "ORDER BY dateutc_ms LIMIT ?",
             (mac, start_ms, end_ms, limit))).fetchall()
     return [dict(r) for r in rows]
+
+
+async def observation_window(mac: str, start_ms: int, end_ms: int, *,
+                             max_rows: int = 250_000) -> list[dict[str, Any]]:
+    """Every raw row in a window, ascending, paged to the END.
+
+    `observation_rows` is one batch and its callers used to take that one
+    batch as the window: a station posting every two seconds had the
+    newest hours of a twelve-hour window missing while the timeline
+    claimed the window's full end (R24-04, 2.4 release review). This
+    pages until the window is exhausted. `max_rows` is a memory bound,
+    not a silent cap: tripping it is logged, because a value computed
+    over part of a window must never look complete."""
+    rows: list[dict[str, Any]] = []
+    cursor = start_ms
+    while True:
+        batch = await observation_rows(mac, cursor, end_ms, limit=5000)
+        rows.extend(batch)
+        if len(batch) < 5000:
+            return rows
+        if len(rows) >= max_rows:
+            log.warning("observation_window %s: %d rows hit max_rows, the "
+                        "window from %d to %d is INCOMPLETE",
+                        mac, len(rows), start_ms, end_ms)
+            return rows
+        cursor = int(batch[-1]["dateutc_ms"]) + 1
 
 
 _HEALTH_FIELDS = {"humidity", "windgustmph", "windspeedmph", "tempf",
@@ -4653,6 +4802,29 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
                                     "weekly_in": None, "monthly_in": None,
                                     "yearly_in": None}
     day_ms = 86_400_000
+
+    # 2.4 item 12: ask the LEDGER first. `daily_rollups` already holds a
+    # per-day figure for this station, kept current by the live fold, and
+    # tier 1 has read it since 2.3. Reading it here too turns a scan of
+    # roughly half a million index rows into one primary-key range read
+    # — which on the 256 MB box where this was measured at 0.5 to 3.0
+    # seconds cold is the difference between a slow /current and a fast
+    # one. The scan below stays as the fallback for everything the
+    # ledger cannot answer: INSIGHTS off, a dirty or frozen ledger, a
+    # zone that is not the fold's, or a period it does not reach back to.
+    #
+    # hourly_in and daily_in stay None on this tier either way: a source
+    # here posts both itself and its own revisable value is the truth.
+    ledger = await _rain_ledger_periods(
+        mac, tz, start_of_today,
+        {"weekly_in": start_of_week, "monthly_in": start_of_month,
+         "yearly_in": start_of_year})
+    if len(ledger) == 3:
+        for name, value in ledger.items():
+            out[name] = round(max(0.0, value), 3)
+        _rollup_cache_store(cache_key, out, now_mono)
+        return out
+
     async with connect() as db:
         # Same cumulative-counter judgment records() makes: a REAL per-day
         # counter touches ~0 at some reset; a lifetime counter stored in

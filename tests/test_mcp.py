@@ -166,7 +166,8 @@ def test_tools_list_is_well_formed_and_read_only(client):
     names = [t["name"] for t in res["tools"]]
     assert names == ["list_stations", "current_conditions", "history",
                      "daily_summary", "records", "insights", "stories",
-                     "reports", "report", "storm_history", "noaa_report"]
+                     "weather_changes", "reports", "report", "storm_history",
+                     "noaa_report"]
     for t in res["tools"]:
         assert t["description"]
         schema = t["inputSchema"]

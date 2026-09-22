@@ -235,6 +235,73 @@ def _source_key(name: str) -> str:
     return f"source:{name}"
 
 
+def _spell_duration(ms: int) -> str:
+    """"3 hours", "45 minutes", "1.5 days". Round numbers on purpose:
+    nobody wants 2.317 hours in a sentence, and "60 minutes" is an hour
+    said the long way."""
+    minutes = max(1, int(round(ms / 60_000)))
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    hours = minutes / 60
+    if hours < 36:
+        # Nearest half hour, so 90 minutes is not rounded away to "2
+        # hours" and 3 hours does not arrive as "3.0".
+        halves = round(hours * 2) / 2
+        if halves == int(halves):
+            n = int(halves)
+            return f"{n} hour{'s' if n != 1 else ''}"
+        return f"{halves} hours"
+    days = hours / 24
+    if abs(days - round(days)) < 0.25:
+        n = int(round(days))
+        return f"{n} day{'s' if n != 1 else ''}"
+    return f"{days:.1f} days"
+
+
+def _outage_ms(runs: list, now_ms: int) -> int:
+    """How long the most recent unhealthy stretch lasted, reading back
+    from the end of the record. Stops at the first healthy run, so a
+    source that failed, recovered and failed again reports THIS outage
+    and not the sum of both."""
+    total = 0
+    for r in reversed(runs):
+        if r["verdict"] in ("ok", "unknown"):
+            if total:
+                break
+            continue
+        total += max(0, int(r["until_ms"]) - int(r["from_ms"]))
+    return total
+
+
+def day_summary_line(label: str, summary: dict) -> str:
+    """One sentence about the last 24 hours, for the not-reporting mail.
+
+    Never a percentage of a day the server did not see: `covered_ms` is
+    the honest denominator, and when it is small the sentence says so
+    rather than dressing up an hour of data as a day."""
+    from . import source_history as _sh
+    covered = int(summary.get("covered_ms") or 0)
+    if covered < 3_600_000:
+        return (f"There is less than an hour of health history for "
+                f"{label}, so there is nothing useful to say about the "
+                f"last day yet.")
+    totals = summary.get("totals_ms") or {}
+    ok = int(totals.get(_sh.OK) or 0)
+    bits = []
+    for verdict, phrase in ((_sh.VENDOR, "the service not answering"),
+                            (_sh.DEVICE, "the station reporting nothing"),
+                            (_sh.OURS, "trouble on this server")):
+        span = int(totals.get(verdict) or 0)
+        if span >= 60_000:
+            bits.append(f"{_spell_duration(span)} of {phrase}")
+    window = _spell_duration(covered)
+    if not bits:
+        return f"Over the last {window} of records, {label} was fine until now."
+    tail = bits[0] if len(bits) == 1 else ", ".join(bits[:-1]) + " and " + bits[-1]
+    return (f"Over the last {window} of records, {label} was working for "
+            f"{_spell_duration(ok)} of it, with {tail}.")
+
+
 def source_down_copy(label: str, kind: str, hours: float,
                      last_error: str | None) -> tuple[str, str]:
     """Title and body for a failing source, honest about whose problem it is."""
@@ -261,8 +328,22 @@ def source_down_copy(label: str, kind: str, hours: float,
 
 async def check_sources(cfg, now_ms: int, deliver,
                         quiet_minutes: float | None = None) -> None:
-    from . import source_status
+    from . import source_history, source_status
     from .config import settings
+
+    # 2.4 item 3: before anything is decided, this tick's verdict per
+    # source goes into the rolling 24 hour record. It is written even
+    # when the watchdog itself is switched off (`source_alert_minutes`
+    # zero), because the record is what answers "what happened
+    # overnight" afterwards, and a record with holes in it where somebody
+    # had alerts off is worse than useless.
+    try:
+        for src in source_status.snapshot():
+            if src.get("configured") and src.get("label") is not None:
+                await source_history.record(
+                    src["name"], source_history.verdict_for(now_ms, src), now_ms)
+    except Exception:
+        log.exception("source health record failed")
 
     minutes = settings.source_alert_minutes if quiet_minutes is None else quiet_minutes
     if not minutes or minutes <= 0:
@@ -282,6 +363,16 @@ async def check_sources(cfg, now_ms: int, deliver,
             hours = (now_ms - int(since)) / 3_600_000
             kind = src.get("last_error_kind") or "ours"
             title, body = source_down_copy(label, kind, hours, src.get("last_error"))
+            # 2.4 item 3: say what the last day looked like, because "it
+            # has been down for two hours" and "it has been flapping all
+            # day" are different problems and the first sentence should
+            # not have to be asked for twice.
+            try:
+                runs = await source_history.history(name, now_ms)
+                body += "\n\n" + day_summary_line(
+                    label, source_history.summarise(runs, now_ms))
+            except Exception:
+                log.exception("source day summary failed")
             # Same channel rule as device-down: an outage is the one thing a
             # device_down email scope exists for.
             if await deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
@@ -290,6 +381,15 @@ async def check_sources(cfg, now_ms: int, deliver,
         elif prev and not failing and src["last_success_ms"] is not None:
             title = f"{label} is answering again"
             body = f"{label}'s readings are arriving again."
+            # And how long it was out, which is the first thing anyone
+            # wants from a recovery notice.
+            try:
+                runs = await source_history.history(name, now_ms)
+                gone = _outage_ms(runs, now_ms)
+                if gone:
+                    body += f" It was out for {_spell_duration(gone)}."
+            except Exception:
+                log.exception("source recovery duration failed")
             if await deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
                              email_ok=True, kind="source_recovered", mac=None):
                 await db.upsert_smart_alert_state(key, _SOURCE_KIND, 0, now_ms)

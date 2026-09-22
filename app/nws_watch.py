@@ -36,7 +36,7 @@ from typing import Any
 
 import httpx
 
-from . import db
+from . import db, nws_families
 from .version import __version__
 
 log = logging.getLogger("nws")
@@ -70,10 +70,15 @@ def _reset_for_tests() -> None:
     _last_poll_ms.clear()
 
 
-def is_warning(event: str) -> bool:
+def is_warning(event) -> bool:
     """NWS event names end in the product's class: "Tornado Warning",
-    "Flood Watch", "Wind Advisory", "Special Weather Statement"."""
-    return event.strip().lower().endswith("warning")
+    "Flood Watch", "Wind Advisory", "Special Weather Statement".
+
+    Takes whatever the feed held, like nws_families.event_name: this is
+    reached from `pushed_as` AFTER a delivery, so a non-string here would
+    raise between the push and the ledger write and re-push the alert
+    next tick (CodeRabbit, PR #40)."""
+    return nws_families.event_name(event).lower().endswith("warning")
 
 
 def severity_rank(severity: Any) -> int:
@@ -248,6 +253,19 @@ async def _load_seen(devices: list[dict[str, Any]]) -> list[str]:
     return merged
 
 
+def _held_by_quiet_hours(cfg, event: str | None, now_ms: int) -> bool:
+    """Whether this product's tier would be silenced by quiet hours right
+    now. The same floor `deliver` applies (`_QUIET_HOURS_EXEMPT`), asked
+    up front so the caller can leave the id unseen rather than spent."""
+    from . import alerts                 # alerts imports this module
+    from .config import settings
+    if nws_families.tier(event) in alerts._QUIET_HOURS_EXEMPT:
+        return False
+    return alerts.in_quiet_hours(now_ms, settings.timezone,
+                                 getattr(cfg, "quiet_start_min", None),
+                                 getattr(cfg, "quiet_end_min", None))
+
+
 async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
                 deliver) -> None:
     """One monitor-tick entry point; per-station poll cadence, ONE global
@@ -257,6 +275,11 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
         # the switch back on during a long-lived alert pushes it once.
         return
     warnings_only = bool(getattr(cfg, "nws_warnings_only", False))
+    # 2.4 item 1: the muted families, and the same `allows` rule the
+    # app's banner and the widget's triangle ask — one set of toggles,
+    # honoured everywhere, or the owner has to mute the same family
+    # twice and still hears it from the third place.
+    muted = list(getattr(cfg, "nws_muted_families", ()) or ())
     seen: list[str] | None = None      # loaded lazily on the first due poll
     seen_set: set[str] = set()
     pushed: list[str] = []
@@ -308,11 +331,19 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
             aid = a.get("id")
             if not aid or aid in seen_set:
                 continue
-            event = a.get("event") or "Weather alert"
+            # The normalised name is what gets CLASSIFIED; the fallback
+            # is only ever a title (CodeRabbit, PR #40). They were the
+            # same string for one commit, and "Weather alert" ends in
+            # "alert" — so a malformed event read as an ADVISORY and
+            # warnings-only silently dropped it, which is the opposite of
+            # the loud-side rule an unidentifiable product is meant to
+            # get.
+            event = nws_families.event_name(a.get("event"))
+            title_event = event or "Weather alert"
             reissue = (is_reissue(a, pushed_set)
                        and not escalates(a, pushed_set, pushed_meta))
             if (a.get("severity") not in _PUSH_SEVERITIES
-                    or (warnings_only and not is_warning(event))
+                    or not nws_families.allows(event, muted, warnings_only)
                     or reissue):
                 # Non-push severities, filtered events and reissues are
                 # recorded immediately — there is nothing to retry.
@@ -327,23 +358,41 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
                     pushed.append(aid)
                     pushed_changed = True
                 continue
+            # 2.4 review: held is not handled. An Advisory (tier watch)
+            # or a Statement (tier info) sits below the quiet-hours floor,
+            # and `deliver` at night attempts nothing, reports the alert
+            # handled, and this loop then recorded it pushed for good — a
+            # Frost Advisory issued at 22:30 never reached the phone. So
+            # the floor is asked HERE, before delivery: a held id stays
+            # unseen and goes on the first tick after quiet hours end, if
+            # the product is still active then. A warning or a watch
+            # rides through the night exactly as before.
+            if _held_by_quiet_hours(cfg, event, now_ms):
+                log.debug("NWS %s held through quiet hours", title_event)
+                continue
             headline = (a.get("headline") or a.get("description")
                         or "")[:180]
-            title = f"{name}: {event}"
+            title = f"{name}: {title_event}"
             body = headline or "See the app for details."
             # Persist-after-deliver: a failed push leaves the id unseen so
             # the next tick retries; a handled one is done for good.
+            # 2.4 item 1: the product class sets the tier. Until now every
+            # relayed alert rode `warning` — time-sensitive, through quiet
+            # hours — so a Frost Advisory punched through Focus exactly as
+            # a Tornado Warning did. A Watch now wakes without punching,
+            # an Advisory is an ordinary push.
             if await deliver(cfg, f"[Zasder Weather] {title}", body,
                              title, body,
                              email_ok=cfg.email_scope == "all",
-                             kind="nws", mac=mac):
+                             kind="nws", mac=mac,
+                             severity=nws_families.tier(event)):
                 seen_set.add(aid)
                 seen.append(aid)
                 pushed_set.add(aid)
                 pushed.append(aid)
                 pushed_meta[aid] = pushed_as(a)
                 changed = pushed_changed = True
-                log.info("NWS %s pushed (surfaced by %s)", event, name)
+                log.info("NWS %s pushed (surfaced by %s)", title_event, name)
     # Pushed first: see the load-time merge above for why the order matters.
     if pushed_changed:
         kept = pushed[-_SEEN_CAP:]

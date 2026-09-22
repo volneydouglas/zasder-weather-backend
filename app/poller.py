@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Any
 
-from . import db
+from . import calibration, db
 from .ambient_client import AmbientWeatherClient
 from . import source_status
 from .config import settings
@@ -42,6 +42,11 @@ class Poller:
             await db.upsert_device(mac, d)
             try:
                 rows = await self.client.device_history(mac, limit=288)
+                # The operator's corrections, the same as a live tick
+                # (2.4 item 7): a backfilled row is still a stored row.
+                table = await db.get_calibration(mac)
+                for r in rows:
+                    calibration.correct_with(r, table)
                 added = await db.insert_observations(mac, rows)
                 log.info("bootstrap %s: added %d historical rows", mac, added)
             except Exception as e:
@@ -94,6 +99,11 @@ class Poller:
                 elif ts < now_ms - _PAST_HORIZON_MS:
                     log.warning("%s dateutc too far past — dropping row", mac)
                     last = None
+            if last:
+                # Corrected BEFORE the device row is written, so the live
+                # view and the stored row agree (2.4 item 7).
+                if await calibration.correct(mac, last):
+                    d = dict(d, lastData=last)
             await db.upsert_device(mac, d)
             if last:
                 added = await db.insert_observations(mac, [last])

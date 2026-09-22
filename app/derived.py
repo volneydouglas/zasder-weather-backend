@@ -239,6 +239,285 @@ _ZAMBRETTI_TEXT = {
 }
 
 
+# ── 2.4 item 6 ────────────────────────────────────────────────────────
+#
+# Sources, same rule as above: each formula keeps its own paper's units
+# and converts at the boundary, and missing input is None rather than a
+# fabricated zero.
+#
+# - Vapour pressure deficit: Buck 1981 saturation vapour pressure, kPa.
+#   The number greenhouse and vineyard people actually steer by.
+# - Humidex: Masterton & Richardson 1979, Environment Canada. Reported
+#   as a °C-scaled index, never as a temperature, which is why it has no
+#   unit suffix in their own publications.
+# - Apparent temperature: Steadman 1984 as used by the Australian BoM —
+#   the one that takes WIND as well as humidity, so it reads below air
+#   temperature in a breeze where heat index simply stops existing.
+# - Cloud base: the standard 1000 ft per 4.4 °F spread rule for
+#   convective cumulus. A rule of thumb with a real pedigree, and wrong
+#   for every other cloud type, which the wording has to carry.
+# - Wind run: distance the air moved past the station, which is what an
+#   anemometer measures and what evaporation and spray drift care about.
+# - Sunshine hours: the WMO threshold is 120 W/m² of DIRECT beam; a
+#   pyranometer sees global radiation, so the common proxy compares
+#   against a fraction of the clear-sky maximum for the sun's angle.
+# - EPA AQI: the 2024 PM2.5 breakpoints (the reform that moved the
+#   annual standard to 9 µg/m³ kept these 24 h breakpoints).
+# - Chill hours: the Utah model's weighted bands, which unlike a simple
+#   hours-below-45 count can go DOWN on a hot afternoon.
+
+
+def vapour_pressure_deficit_kpa(temp_f, humidity) -> float | None:
+    """How thirsty the air is, in kPa. Zero means saturated."""
+    t, rh = _f(temp_f), _f(humidity)
+    if t is None or rh is None or not (0 <= rh <= 100):
+        return None
+    tc = _f2c(t)
+    # Buck 1981, over water, kPa.
+    svp = 0.61121 * math.exp((18.678 - tc / 234.5) * (tc / (257.14 + tc)))
+    return max(0.0, svp * (1.0 - rh / 100.0))
+
+
+def humidex(temp_f, humidity) -> float | None:
+    """Environment Canada's humidex. An INDEX on the Celsius scale, not
+    a temperature: 40 is "great discomfort", not 40 degrees of
+    anything."""
+    t, rh = _f(temp_f), _f(humidity)
+    if t is None or rh is None or not (0 <= rh <= 100):
+        return None
+    dew = dew_point_f(t, rh)
+    if dew is None:
+        return None
+    dew_k = _f2c(dew) + 273.15
+    if dew_k <= 0:
+        return None
+    vapour = 6.11 * math.exp(5417.7530 * (1 / 273.16 - 1 / dew_k))
+    return _f2c(t) + 0.5555 * (vapour - 10.0)
+
+
+def apparent_temperature_f(temp_f, humidity, wind_mph) -> float | None:
+    """Steadman's apparent temperature, the one with wind in it.
+
+    Heat index gives up below about 80 °F and wind chill above about
+    50 °F, which leaves the middle of the year with no answer at all.
+    This one is continuous, and it reads BELOW the air temperature in a
+    breeze, which is the honest answer on a dry windy day.
+    """
+    t, rh, wind = _f(temp_f), _f(humidity), _f(wind_mph)
+    if t is None or rh is None or not (0 <= rh <= 100):
+        return None
+    wind = 0.0 if wind is None or wind < 0 else wind
+    tc = _f2c(t)
+    ws = wind * 0.44704                      # m/s
+    e = rh / 100.0 * 6.105 * math.exp(17.27 * tc / (237.7 + tc))
+    return _c2f(tc + 0.33 * e - 0.70 * ws - 4.00)
+
+
+def cloud_base_ft(temp_f, dew_point_f_val) -> float | None:
+    """Height of the convective cumulus base above the STATION.
+
+    The 1000 ft per 4.4 °F spread rule. It describes fair weather cumulus
+    and nothing else, so anywhere it is shown has to say so.
+    """
+    t, dew = _f(temp_f), _f(dew_point_f_val)
+    if t is None or dew is None:
+        return None
+    spread = t - dew
+    if spread < 0:
+        return 0.0
+    return spread / 4.4 * 1000.0
+
+
+def wind_run_mi(readings: list[tuple[int, float]]) -> float | None:
+    """Miles of air past the station, from (epoch ms, mph) samples.
+
+    Trapezoidal over the gaps actually present, so a poller that missed
+    an hour reports the miles it can account for rather than inventing
+    the hour. A gap longer than an hour is NOT bridged: at that point
+    the average is a guess and a day's wind run that silently includes
+    guesses is worse than one that says it is short.
+    """
+    if not readings or len(readings) < 2:
+        return None
+    ordered = sorted(readings, key=lambda r: r[0])
+    total = 0.0
+    for (t0, v0), (t1, v1) in zip(ordered, ordered[1:]):
+        gap_h = (t1 - t0) / 3_600_000
+        if gap_h <= 0 or gap_h > 1.0:
+            continue
+        total += (v0 + v1) / 2.0 * gap_h
+    return total
+
+
+# The share of the clear-sky maximum that counts as sunshine. The WMO
+# threshold is 120 W/m² of direct beam; a pyranometer sees global, so
+# the hobbyist convention (Cumulus, WeeWX) compares against a fraction
+# of the theoretical clear-sky value for the sun's elevation.
+SUNSHINE_FRACTION = 0.75
+SUNSHINE_FLOOR_WM2 = 120.0
+
+
+def is_sunshine(solar_wm2, clear_sky_wm2) -> bool | None:
+    """Whether this instant counts as sunshine."""
+    s, clear = _f(solar_wm2), _f(clear_sky_wm2)
+    if s is None or clear is None or clear <= 0:
+        return None
+    return s >= max(SUNSHINE_FLOOR_WM2, clear * SUNSHINE_FRACTION)
+
+
+# EPA AQI breakpoints for PM2.5, µg/m³, 24 hour average (the 2024
+# reform kept these). (low, high, aqi_low, aqi_high, category).
+_PM25_BANDS = (
+    (0.0, 9.0, 0, 50, "Good"),
+    (9.1, 35.4, 51, 100, "Moderate"),
+    (35.5, 55.4, 101, 150, "Unhealthy for sensitive groups"),
+    (55.5, 125.4, 151, 200, "Unhealthy"),
+    (125.5, 225.4, 201, 300, "Very unhealthy"),
+    (225.5, 325.4, 301, 500, "Hazardous"),
+)
+
+
+def aqi_pm25(pm25) -> tuple[int, str] | None:
+    """US EPA AQI and its category from a PM2.5 concentration.
+
+    The breakpoints are defined on a 24 HOUR average. Handing this an
+    instantaneous reading gives an instantaneous AQI, which is what
+    every consumer monitor shows and is not what the EPA publishes, so
+    whatever displays it has to be honest about the window.
+    """
+    v = _f(pm25)
+    if v is None or v < 0:
+        return None
+    v = math.floor(v * 10) / 10          # EPA truncates to 0.1 µg/m³
+    for lo, hi, alo, ahi, label in _PM25_BANDS:
+        if v <= hi:
+            aqi = (ahi - alo) / (hi - lo) * (v - lo) + alo
+            return int(round(aqi)), label
+    return 500, "Hazardous"
+
+
+def chill_hours_utah(temp_f) -> float | None:
+    """One hour's contribution under the Utah model.
+
+    Unlike a plain hours-below-45 count this one can go NEGATIVE, which
+    is the whole reason fruit growers use it: a warm winter afternoon
+    genuinely undoes chill the night before accumulated.
+    """
+    t = _f(temp_f)
+    if t is None:
+        return None
+    if t <= 34.0:
+        return 0.0
+    if t <= 36.0:
+        return 0.5
+    if t <= 48.0:
+        return 1.0
+    if t <= 54.0:
+        return 0.5
+    if t <= 60.0:
+        return 0.0
+    if t <= 65.0:
+        return -0.5
+    return -1.0
+
+
+def evapotranspiration_in(temp_f, humidity, wind_mph, solar_wm2,
+                          pressure_inhg, hours: float = 1.0) -> float | None:
+    """Reference evapotranspiration, inches, FAO-56 Penman-Monteith.
+
+    The number irrigation scheduling runs on. A Davis console computes
+    its own ET and that one is preferred where it exists; this is for
+    every station that does not, which is most of them.
+
+    Hourly form, with the standard reference crop (0.12 m grass,
+    albedo 0.23). Soil heat flux is taken as zero, which is the FAO's
+    own daytime simplification and is close enough at an hour.
+    """
+    t, rh = _f(temp_f), _f(humidity)
+    wind, solar, press = _f(wind_mph), _f(solar_wm2), _f(pressure_inhg)
+    if None in (t, rh, wind, solar, press) or not (0 <= rh <= 100):
+        return None
+    if hours <= 0:
+        return None
+    tc = _f2c(t)
+    u2 = max(0.0, wind) * 0.44704                    # m/s at 2 m
+    p_kpa = press * 3.386389
+    # W/m² → MJ/m² per HOUR. A rate, like every other term in the
+    # numerator; the one `* hours` at the end integrates the step. Scaling
+    # this one by the step as well squared it, so the finer a station
+    # posted the less its sun counted (2.4 review).
+    rs_mj = max(0.0, solar) * 0.0036
+    svp = 0.6108 * math.exp(17.27 * tc / (tc + 237.3))
+    avp = svp * rh / 100.0
+    delta = 4098 * svp / ((tc + 237.3) ** 2)
+    gamma = 0.000665 * p_kpa
+    rn = 0.77 * rs_mj                                # net radiation, albedo 0.23
+    numerator = (0.408 * delta * rn
+                 + gamma * (37.0 / (tc + 273.0)) * u2 * (svp - avp))
+    denominator = delta + gamma * (1 + 0.34 * u2)
+    if denominator <= 0:
+        return None
+    et_mm = numerator / denominator * hours
+    return max(0.0, et_mm) / 25.4
+
+
+def solar_elevation_deg(ts_ms: int, lat: float, lon: float) -> float | None:
+    """How high the sun is, in degrees above the horizon.
+
+    The standard NOAA short form: declination and the equation of time
+    from the day angle, then the hour angle from apparent solar time.
+    Good to a fraction of a degree, which is far more than a clear-sky
+    envelope needs, and it keeps this module free of a dependency for
+    one sine.
+
+    Negative below the horizon on purpose, so a caller can tell night
+    from an overcast noon.
+    """
+    try:
+        lat = float(lat)
+        lon = float(lon)
+        ts = float(ts_ms) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    import datetime as _dt
+    when = _dt.datetime.fromtimestamp(ts, _dt.timezone.utc)
+    day_of_year = when.timetuple().tm_yday
+    gamma = 2 * math.pi / 365.0 * (day_of_year - 1 + (when.hour - 12) / 24.0)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(gamma)
+                       - 0.032077 * math.sin(gamma)
+                       - 0.014615 * math.cos(2 * gamma)
+                       - 0.040849 * math.sin(2 * gamma))
+    decl = (0.006918 - 0.399912 * math.cos(gamma) + 0.070257 * math.sin(gamma)
+            - 0.006758 * math.cos(2 * gamma) + 0.000907 * math.sin(2 * gamma)
+            - 0.002697 * math.cos(3 * gamma) + 0.00148 * math.sin(3 * gamma))
+    minutes = when.hour * 60 + when.minute + when.second / 60.0
+    true_solar = (minutes + eqtime + 4 * lon) % 1440
+    hour_angle = math.radians(true_solar / 4.0 - 180.0)
+    phi = math.radians(lat)
+    cos_zenith = (math.sin(phi) * math.sin(decl)
+                  + math.cos(phi) * math.cos(decl) * math.cos(hour_angle))
+    cos_zenith = max(-1.0, min(1.0, cos_zenith))
+    return 90.0 - math.degrees(math.acos(cos_zenith))
+
+
+def clear_sky_wm2(ts_ms: int, lat: float, lon: float) -> float:
+    """Clear-sky global radiation for this instant, W/m².
+
+    The elevation model the hobbyist sunshine proxies use. Zero below
+    the horizon, which is what makes a night of zero solar read as "no
+    sunshine to measure" rather than as an overcast day.
+    """
+    elevation = solar_elevation_deg(ts_ms, lat, lon)
+    if elevation is None or elevation <= 0:
+        return 0.0
+    sin_h = math.sin(math.radians(elevation))
+    if sin_h <= 0:
+        return 0.0
+    return 1098.0 * sin_h * math.exp(-0.057 / sin_h)
+
+
 def zambretti(slp_hpa, trend: str) -> str | None:
     """The Negretti & Zambra slide rule, canonical algorithmic form:
     falling Z = 127 − 0.12·P (clamped 1–9), steady Z = 144 − 0.13·P

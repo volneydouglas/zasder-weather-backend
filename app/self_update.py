@@ -213,11 +213,15 @@ async def snapshot_before_upgrade(tag: str) -> Path | None:
                         free // 2**20, need // 2**20)
             return None
         dest.unlink(missing_ok=True)
-        conn = await db.open_connection(str(db_path))
-        try:
-            await conn.execute("VACUUM INTO ?", (str(dest),))
-        finally:
-            await conn.close()
+        # Registered like the backup route's copy (2.4, D2): a second copy
+        # of the database beside the first is not the volume filling up.
+        from . import copy_jobs
+        with copy_jobs.running("pre-upgrade snapshot", dest):
+            conn = await db.open_connection(str(db_path))
+            try:
+                await conn.execute("VACUUM INTO ?", (str(dest),))
+            finally:
+                await conn.close()
         # Only now, with the new net in place, let the previous one go: a
         # snapshot that could not be written must not cost the one that was.
         for old in db_path.parent.glob(f"{db_path.name}{PRE_UPGRADE_SNAPSHOT_SUFFIX}-*.db"):

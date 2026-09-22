@@ -350,6 +350,26 @@ async def _stories(args: dict, role: str) -> dict:
     return {"mac": mac, **out}
 
 
+def _changes_max() -> int:
+    from . import changes as ch
+    return ch.WINDOW_HOURS_MAX
+
+
+async def _changes(args: dict, role: str) -> dict:
+    """The weather-change timeline (2.4). Not an insights tool: it reads
+    the station's raw observations, so it answers on a server with
+    insights switched off and on a station with no history to rank
+    against."""
+    from . import changes as ch
+    mac = await _known_mac(args.get("mac"))
+    hours = _int_arg(args, "hours", ch.WINDOW_HOURS_DEFAULT, 1,
+                     ch.WINDOW_HOURS_MAX)
+    out = await ch.assemble(mac, hours)
+    for c in out["changes"]:
+        c["at_iso"] = _iso(c.get("at_ms"))
+    return out
+
+
 async def _reports(args: dict, role: str) -> dict:
     from . import db, reports as rp
     kind = args.get("kind")
@@ -509,6 +529,24 @@ TOOLS: list[tuple[dict[str, Any], Handler]] = [
         }, ["mac"]),
         "annotations": _READ_ONLY,
     }, _stories),
+    ({
+        "name": "weather_changes",
+        "title": "What changed",
+        "description": "When the weather TURNED at one station over the "
+                       "last day or three, from its own readings: rain "
+                       "starting and stopping, wind shifts, the barometer "
+                       "changing direction, the window's high and low, "
+                       "clearing and clouding over. Each entry carries the "
+                       "instant it happened and, where there is a number, "
+                       "the value and the unit it is in. " + _UNITS,
+        "inputSchema": _schema({
+            "mac": _MAC_PROP,
+            "hours": {"type": "integer", "minimum": 1,
+                      "maximum": _changes_max(),
+                      "description": "Window, default 24"},
+        }, ["mac"]),
+        "annotations": _READ_ONLY,
+    }, _changes),
     ({
         "name": "reports",
         "title": "Stored reports",

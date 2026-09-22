@@ -37,7 +37,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from . import db, ecowitt, ingest, source_status
+from . import calibration, db, ecowitt, ingest, source_status
 from .ecowitt_cloud_client import EcowittCloudClient, native, to_float
 
 
@@ -490,12 +490,17 @@ class EcowittCloudPoller:
                 mac, start.astimezone(zone), end.astimezone(zone))
             payloads = history_payloads(mac, data, self._label(mac), meta)
             rows: list[dict[str, Any]] = []
+            # The operator's corrections (2.4 item 7), read once for the
+            # day: these rows skip _do_ingest and would otherwise skip
+            # the calibration a live tick gets.
+            table = await db.get_calibration(mac)
             for p in payloads:
                 flat = ingest._flatten(p)  # type: ignore[attr-defined]
                 if not flat:
                     continue
                 flat.pop("_raw_dateutc", None)
                 flat.pop("_feels_derived", None)
+                calibration.correct_with(flat, table)
                 rows.append(flat)
             if rows:
                 # Same info shape _do_ingest hands upsert_device, minus

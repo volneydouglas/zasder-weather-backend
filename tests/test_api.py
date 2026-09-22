@@ -5,6 +5,7 @@ Covers the security boundaries the reviewer flagged: token auth on read +
 write, capture endpoint gate, status-page HTML escaping."""
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -309,14 +310,17 @@ def test_oversize_streamed_body_bounded(client):
                  "Content-Type": "application/json"},
         content=_chunks(),
     )
-    # 400 specifically, not `in (400, 413)`: 413 is the Content-Length fast
-    # path, so accepting it would let this test pass while the streaming
-    # branch stayed unexercised — which is exactly what it did before.
-    # Verified: chunked -> 400, fixed Content-Length -> 413.
-    assert r.status_code == 400, (
-        f"expected the streaming counter to truncate the body (400), got "
-        f"{r.status_code} — a 413 means the Content-Length fast path ran "
-        f"instead and this test is not covering what it claims")
+    # The streaming counter used to truncate the body to EOF and the route
+    # answered 400 to the short JSON; since CodeRabbit on PR #40 it raises
+    # inside the receive channel and the middleware answers 413 with a
+    # detail that names the mid-stream branch. The detail is asserted, not
+    # only the code: the Content-Length fast path is a 413 too, and a
+    # `content=<bytes>` body would trip it without ever running the
+    # streaming counter this test is named for.
+    assert r.status_code == 413, r.text
+    assert "mid-stream" in r.json()["detail"], (
+        f"a plain 413 means the Content-Length fast path ran instead and "
+        f"this test is not covering what it claims: {r.text}")
 
 
 # ─────────────────── discoveries (long-tail RF survey) ───────────────────
@@ -734,7 +738,7 @@ def test_deliver_email_scope_gates_email_not_push(client, monkeypatch):
     pushed = []
     monkeypatch.setattr(alerts_mod, "_send_sync",
                         lambda *a, **k: sent_emails.append(a))
-    async def fake_push(title, body, interruption_level=None):
+    async def fake_push(title, body, interruption_level=None, **kw):
         pushed.append(title)
         return {"sent": 1, "pruned": 0, "total": 1}
     from app import apns
@@ -3699,6 +3703,67 @@ def test_db_backup_dest_space_handling(client, monkeypatch):
     assert "MB" in ei.value.detail
 
 
+def test_db_backup_dest_avoids_tripping_the_disk_watchdog(client, monkeypatch):
+    """2.4 (D2): the volume has ROOM for the copy but not room to spare —
+    landing it there puts the volume past the watchdog's warn line and
+    the operator's phone says the server is running out of disk (Doren,
+    2026-09-20). The tempdir gets it. When nowhere is comfortable, bare
+    room decides and the snapshot still happens."""
+    import collections
+    import tempfile as T
+    from app import main as M
+
+    Usage = collections.namedtuple("usage", "total used free")
+    db_parent = str(M.Path(M.settings.database_path).parent)
+    need = M.Path(M.settings.database_path).stat().st_size
+    need = int(need * 1.02) + 32 * 1024 * 1024
+    GB = 1024**3
+
+    # Volume: the copy fits, and lands it at ~90% used. Tempdir: roomy.
+    def tight(d):
+        if str(d) == db_parent:
+            return Usage(10 * GB, 8 * GB, need + GB)
+        return Usage(10**12, 0, 10**11)
+
+    monkeypatch.setattr(M.shutil, "disk_usage", tight)
+    assert str(M._db_backup_dest()).startswith(str(M.Path(T.gettempdir())))
+
+    # Neither is comfortable: the volume still takes it rather than 507.
+    def both_tight(d):
+        return Usage(10 * GB, 8 * GB, need + GB)
+
+    monkeypatch.setattr(M.shutil, "disk_usage", both_tight)
+    assert str(M._db_backup_dest()).startswith(db_parent)
+
+
+def test_db_backup_registers_while_it_copies(client, monkeypatch):
+    """The disk watchdog must be able to see that the second copy of the
+    database on the volume is ours (D2)."""
+    import app.copy_jobs as cj
+    from app import main as M
+
+    seen: list[str | None] = []
+
+    class FakeConn:
+        async def execute(self, *a, **kw):
+            seen.append(cj.in_flight())
+
+        async def close(self):
+            pass
+
+    async def fake_open(path):
+        return FakeConn()
+
+    monkeypatch.setattr(M.db, "open_connection", fake_open)
+    dest = M.Path(M.settings.database_path).parent / ".dbbackup-probe.db"
+    dest.write_bytes(b"x")
+    job: dict = {"state": "running"}
+    asyncio.run(M._run_db_backup(job, dest))
+    assert seen == ["backup"]
+    assert cj.in_flight() is None
+    dest.unlink(missing_ok=True)
+
+
 def test_storm_summary_channels_and_per_device(client):
     """1.7 storm-summary controls (Volney: own settings section, per-device
     selection, push/email/both). Channel choice validates and round-trips;
@@ -4191,7 +4256,7 @@ def test_warning_kind_fallback_is_time_sensitive(client, monkeypatch):
     monkeypatch.setattr(al, "in_quiet_hours", lambda *a: False)
     calls = []
 
-    async def fake_send(title, body, interruption_level=None):
+    async def fake_send(title, body, interruption_level=None, **kw):
         calls.append(interruption_level)
         return {"sent": 1}
 

@@ -116,6 +116,11 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._STORAGE_TASK = None
         _m._DB_BUSY_LOG_TS.clear()       # 2.0 503 handler's log throttle
         _m._MAP_CFG_LOCK = None          # 2.3 PUT /api/map (rebound per loop)
+        # 2.4 (D6): the test-push throttle. One test's send must not 429
+        # the next one's — and the test-EMAIL throttle beside it has the
+        # same shape, so it goes too.
+        _m._TEST_PUSH_TS = None
+        _m._TEST_ALERT_TS = None
     # 1.8 modules keep small process-global throttles; same isolation rule.
     _wp = sys.modules.get("app.widget_push")
     if _wp is not None:
@@ -152,6 +157,13 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _dw.snapshot = lambda: {"total_bytes": 8 * 1024**3,
                             "free_bytes": 4 * 1024**3,
                             "used_pct": 50.0}
+    # 2.4 (D2): the half-confirmed rise and the in-flight copy table are
+    # process-global too — one test's pending tier must not confirm the
+    # next test's first tick, and a wrapped copy that died mid-test must
+    # not silence every later disk tick.
+    _dw._reset_for_tests()
+    import app.copy_jobs as _cj
+    _cj._reset_for_tests()
     _hw = sys.modules.get("app.health_watch")
     if _hw is not None:
         _hw._reset_for_tests()

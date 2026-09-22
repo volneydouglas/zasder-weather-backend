@@ -43,7 +43,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
 
-from . import db
+from . import calibration, db
 from . import day_rain as _day_rain
 from . import device_probation
 from . import source_status
@@ -125,8 +125,8 @@ def _battery_flag(v: Any) -> int | None:
 _PASSTHROUGH_FAMILY = frozenset(
     [f"temp{i}f" for i in range(1, 5)]
     + [f"humidity{i}" for i in range(1, 5)]
-    + [f"soilhum{i}" for i in range(1, 5)]
-    + [f"soiltemp{i}f" for i in range(1, 5)]
+    + [f"soilhum{i}" for i in range(1, 9)]
+    + [f"soiltemp{i}f" for i in range(1, 9)]
     + [f"leak{i}" for i in range(1, 5)]
     + [f"leafwetness{i}" for i in range(1, 3)]
     + [f"batt{i}" for i in range(1, 9)]
@@ -1247,6 +1247,20 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
         if slp is not None:
             flat["baromabsin"] = flat["baromrelin"]
             flat["baromrelin"] = slp
+
+    # The operator's own corrections first (2.4 item 7), because
+    # everything below this line — the plausibility bands, the relative
+    # guards, the derivations — should be judging the number the station
+    # is understood to be reporting, not the one it happens to print.
+    # What was applied rides in data_json, so a row can always be turned
+    # back into what the sensor actually said.
+    applied = await calibration.correct(mac, flat)
+    if "feelsLike" in calibration.rederived(applied):
+        # The console's feels-like was just replaced by OUR derivation,
+        # so the band rule below must treat it as ours: a derivation
+        # whose input the bands then null is never stored, whoever
+        # first computed it (CodeRabbit, PR #40).
+        flat["_feels_derived"] = True
 
     # Physical plausibility bands next (records QC): decode garbage — values
     # beyond world-record extremes — is nulled field-by-field before it can

@@ -4023,6 +4023,60 @@ def test_embed_reports_its_height(client, monkeypatch):
     assert "window.parent === window" in body   # no-op when not framed
 
 
+def test_embed_height_follows_content_not_the_frame(client):
+    """The reporter must measure the CONTENT, not the frame (Doren,
+    2026-09-23: a tall empty band under the cards in Safari and Chrome).
+    Inside an iframe documentElement.scrollHeight is never smaller than the
+    frame itself, so the old reporter echoed the embedding page's fallback
+    height (1750px) back at it and a frame could grow but never shrink.
+    Runs the real script under node against a fake DOM whose frame is
+    taller than its content; the posted height must be the content's."""
+    import json, shutil, subprocess
+    import pytest
+    from app.main import _EMBED_HEIGHT_SCRIPT
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not installed")
+    harness = """
+    var posts = [];
+    var CONTENT = 1028, FRAME = 1750;
+    var resizeCallback = null, observedTarget = null;
+    var body = { getBoundingClientRect: function () { return { height: CONTENT }; } };
+    // Delivers a resize only to an observer watching the BODY: the
+    // documentElement resizes with the frame, not with the cards.
+    var ResizeObserver = function (callback) {
+      resizeCallback = callback;
+      return { observe: function (target) { observedTarget = target; } };
+    };
+    global.ResizeObserver = ResizeObserver;
+    global.document = {
+      body: body,
+      documentElement: { get scrollHeight() { return Math.max(CONTENT, FRAME); } },
+    };
+    global.getComputedStyle = function () { return { marginTop: "0px", marginBottom: "0px" }; };
+    global.window = { parent: { postMessage: function (m) { posts.push(m); } },
+                      addEventListener: function () {},
+                      ResizeObserver: ResizeObserver };
+    global.setInterval = function () { return 0; };
+    global.clearInterval = function () {};
+    with (global) {
+    """ + _EMBED_HEIGHT_SCRIPT + """
+    }
+    // The records strip arrives on a later rebuild: the content grows and
+    // the reporter must say so at once, not a minute later on the timer.
+    CONTENT = 1200;
+    if (observedTarget === body && resizeCallback) resizeCallback();
+    console.log(JSON.stringify(posts));
+    """
+    out = subprocess.run([node, "-e", harness], capture_output=True,
+                         text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    posts = json.loads(out.stdout)
+    assert posts, "the reporter posted nothing"
+    assert posts[0] == {"type": "zasder-embed-height", "height": 1028}
+    assert posts[-1] == {"type": "zasder-embed-height", "height": 1200}
+
+
 def test_rule_patch_edits_threshold_and_target(client):
     """1.7 rule editing: PATCH takes threshold and target_mac ("" = back to
     all devices), a threshold/scope change clears the rule's trigger state

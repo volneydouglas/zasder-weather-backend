@@ -894,14 +894,27 @@ _EMBED_HEIGHT_SCRIPT = """
 (function () {
   if (window.parent === window) return;
   var last = 0;
+  /* Measure the CONTENT, never the frame (2026-09-23): inside an iframe
+     documentElement.scrollHeight is at least the frame's own height, so
+     it echoed the embedding page's fallback (1750px) straight back and a
+     frame could grow but never shrink, leaving a tall empty band under
+     the cards. The body's box is its content plus padding, whatever the
+     frame's size; the corner spinner is position:fixed and adds nothing. */
+  function contentHeight() {
+    var b = document.body;
+    var cs = getComputedStyle(b);
+    return Math.ceil(b.getBoundingClientRect().height +
+                     (parseFloat(cs.marginTop) || 0) +
+                     (parseFloat(cs.marginBottom) || 0));
+  }
   function post() {
-    var h = document.documentElement.scrollHeight;
+    var h = contentHeight();
     if (Math.abs(h - last) < 2) return;
     last = h;
     window.parent.postMessage({ type: "zasder-embed-height", height: h }, "*");
   }
   if (window.ResizeObserver) {
-    new ResizeObserver(post).observe(document.documentElement);
+    new ResizeObserver(post).observe(document.body);
   }
   window.addEventListener("load", post);
   post();

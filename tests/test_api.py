@@ -4066,6 +4066,10 @@ def test_embed_height_follows_content_not_the_frame(client):
     // the reporter must say so at once, not a minute later on the timer.
     CONTENT = 1200;
     if (observedTarget === body && resizeCallback) resizeCallback();
+    // ...and shrinks again (the strip drops out of a cold rebuild): the
+    // whole point of the fix is that the frame follows it DOWN too.
+    CONTENT = 900;
+    if (observedTarget === body && resizeCallback) resizeCallback();
     console.log(JSON.stringify(posts));
     """
     out = subprocess.run([node, "-e", harness], capture_output=True,
@@ -4074,7 +4078,8 @@ def test_embed_height_follows_content_not_the_frame(client):
     posts = json.loads(out.stdout)
     assert posts, "the reporter posted nothing"
     assert posts[0] == {"type": "zasder-embed-height", "height": 1028}
-    assert posts[-1] == {"type": "zasder-embed-height", "height": 1200}
+    assert posts[-2] == {"type": "zasder-embed-height", "height": 1200}
+    assert posts[-1] == {"type": "zasder-embed-height", "height": 900}
 
 
 def test_rule_patch_edits_threshold_and_target(client):

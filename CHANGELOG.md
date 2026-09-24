@@ -8,6 +8,19 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.4.1] — 2026-09-23
+
+### Fixed
+- **An embedded dashboard fits its frame again, and can shrink.** The
+  `/embed` page tells the site that frames it how tall to be, and it was
+  measuring the frame instead of the cards: inside an iframe the page's
+  scroll height is never smaller than the frame itself, so it reported
+  the embedding page's fallback height straight back. A frame could grow
+  but never shrink, which left a tall empty band under the cards
+  whenever the content got shorter (a narrow moment, or the records
+  strip absent from a cold rebuild). It now measures the content and
+  follows it both ways. Nothing to change on the embedding page.
+
 ## [2.4.0] — 2026-09-22
 
 ### Added

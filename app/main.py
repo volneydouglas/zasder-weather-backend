@@ -2425,6 +2425,11 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
     # network round-trip (up to 10s), and a token-less instance — the
     # default for one-tap users mid-repair — was paying it just to receive
     # the 409 this cheap local check produces instantly.
+    # Off Fly first (2.4.2, mirror issue #5): a Docker or bare install has
+    # no machine to rewrite, so the token recipe below cannot help it.
+    if not self_update._on_fly():
+        raise HTTPException(status_code=409,
+                            detail=self_update.OFF_FLY_DETAIL)
     if not self_update._fly_token():
         raise HTTPException(
             status_code=409,

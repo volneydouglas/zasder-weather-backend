@@ -71,6 +71,24 @@ def _fly_token() -> str | None:
     return os.environ.get("FLY_API_TOKEN", "").strip() or None
 
 
+def _on_fly() -> bool:
+    """Fly sets both on every machine; a Docker or bare install has
+    neither. Self-update rewrites THIS machine's image through the
+    Machines API, so without them there is nothing to update (mirror
+    issue #5: a self-hoster was sent to mint a Fly token)."""
+    return bool(os.environ.get("FLY_APP_NAME", "").strip()
+                and os.environ.get("FLY_MACHINE_ID", "").strip())
+
+
+# What the apps show when Update is pressed off Fly. Must never contain
+# "deploy token" or FLY_API_TOKEN: the apps match those to offer the Fly
+# token repair rows, a dead end on a box that is not a Fly machine.
+OFF_FLY_DETAIL = ("one-tap update works only on a Fly.io server, and this "
+                  "one runs elsewhere. Update it where it runs: "
+                  "./bin/upgrade.sh in the folder you installed from, or "
+                  "git pull && docker compose pull && docker compose up -d")
+
+
 # Deploy tokens (`fly tokens create deploy`) are macaroons — 'fm2_...' or a
 # comma-joined discharge set — and Fly's API takes those under the FlyV1
 # scheme, not Bearer; flyctl makes exactly this split. Setup scripts store
@@ -293,6 +311,11 @@ class SelfUpdater:
 
     def start(self) -> None:
         if not _enabled():
+            return
+        if not _on_fly():
+            log.warning("AUTO_UPDATE=1 but this server is not a Fly.io "
+                        "machine — self-update stays inert; update with "
+                        "./bin/upgrade.sh or docker compose pull")
             return
         if not _fly_token():
             log.warning("AUTO_UPDATE=1 but FLY_API_TOKEN is not set — "

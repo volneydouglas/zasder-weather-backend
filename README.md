@@ -841,6 +841,12 @@ The backend checks GitHub once a day and shows an **"update available"** banner
 on the status page (and at `GET /api/version`) when a newer release exists.
 Disable with `UPDATE_CHECK=0`. See [CHANGELOG.md](CHANGELOG.md) for what changed.
 
+The check works on every install, but acting on it from inside the apps
+(the **Update backend** button, and automatic updates below) is **Fly.io
+only**: it swaps the Fly machine's own image through the Machines API. On a
+Docker or bare install the button says so and names the upgrade that works
+there, `./bin/upgrade.sh` or the Docker commands below.
+
 ### Automatic updates (Fly.io, optional)
 
 If you said yes during setup, your instance updates **itself**: about two days

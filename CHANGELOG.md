@@ -8,6 +8,19 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.4.2] — 2026-09-25
+
+### Fixed
+- **The Update button tells a self-hoster how to update.** One-tap update
+  swaps a Fly.io machine's own image, so on a Docker or bare install it can
+  never work, yet pressing it said to create a Fly deploy token, which
+  cannot help a server that is not on Fly (and the apps then offered to
+  store one). Off Fly the server now answers that one-tap is Fly-only and
+  names the upgrade that works there: `./bin/upgrade.sh`, or
+  `git pull && docker compose pull && docker compose up -d`. `AUTO_UPDATE=1`
+  off Fly logs the same at boot instead of asking for a token. The README
+  says so too. Thanks to adam8833 for the report (issue #5).
+
 ## [2.4.1] — 2026-09-23
 
 ### Fixed

@@ -138,7 +138,8 @@ def _async_capture(sink):
 def test_update_apply_endpoint_guards(client, monkeypatch):
     """POST /api/update/apply is the push-button sibling of AUTO_UPDATE.
     Guards, in order: no update -> 409; major bump -> 409 (manual steps);
-    no deploy token -> 409 with the recipe; unpublished image -> 409; and
+    not a Fly machine -> 409 naming the self-hosted upgrade; no deploy
+    token -> 409 with the recipe; unpublished image -> 409; and
     only then does the machine update fire. Write-gated like every other
     mutating route (covered by the invariants suite)."""
     from app import main, self_update
@@ -151,7 +152,14 @@ def test_update_apply_endpoint_guards(client, monkeypatch):
     # fetch is a network round-trip, and a token-less instance shouldn't
     # pay it for a foregone 409 — so a major bump WITHOUT a token reads
     # "deploy token", not "major".
+    # 2.4.2: off Fly entirely (conftest blanks the Fly trio) the answer is
+    # the self-hosted upgrade path, never the Fly token recipe.
     main.app.state.update_info = {"latest": NEWER, "update_available": True}
+    r = client.post("/api/update/apply", headers=H)
+    assert r.status_code == 409 and "upgrade.sh" in r.json()["detail"]
+
+    monkeypatch.setenv("FLY_APP_NAME", "zw-test")
+    monkeypatch.setenv("FLY_MACHINE_ID", "d891234")
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "deploy token" in r.json()["detail"]
 
@@ -414,7 +422,7 @@ def test_update_apply_major_gate_honors_the_vouch(client, monkeypatch):
     round-trip for a foregone 409."""
     from app import main, self_update
     H = {"Authorization": "Bearer test-api-token"}
-    monkeypatch.setenv("FLY_API_TOKEN", "x" * 20)
+    _fly_env(monkeypatch)
     main.app.state.update_info = {"latest": NEXT_MAJOR, "update_available": True}
 
     async def no_vouch(latest, current):
@@ -433,6 +441,26 @@ def test_update_apply_major_gate_honors_the_vouch(client, monkeypatch):
     monkeypatch.setattr(self_update, "image_exists", no_image)
     r = client.post("/api/update/apply", headers=H)
     assert r.status_code == 409 and "no published image" in r.json()["detail"]
+
+
+def test_update_apply_off_fly_never_sends_a_self_hoster_to_fly(client, monkeypatch):
+    """Issue #5 on the mirror: a Docker or bare install pressed Update and
+    was told to mint a Fly deploy token, which cannot help a box that is
+    not a Fly machine. Off Fly the 409 names the upgrade that works there,
+    and it must not carry the words the apps match to offer the Fly token
+    repair rows ("deploy token", FLY_API_TOKEN). A token alone, without
+    the machine identity, is still not Fly."""
+    from app import main
+    H = {"Authorization": "Bearer test-api-token"}
+    main.app.state.update_info = {"latest": NEWER, "update_available": True}
+    for token in ("", "x" * 20):
+        monkeypatch.setenv("FLY_API_TOKEN", token)
+        r = client.post("/api/update/apply", headers=H)
+        assert r.status_code == 409
+        detail = r.json()["detail"]
+        assert "upgrade.sh" in detail and "docker compose pull" in detail
+        assert "deploy token" not in detail.lower()
+        assert "FLY_API_TOKEN" not in detail
 
 
 def test_auto_update_still_never_crosses_majors(wired):

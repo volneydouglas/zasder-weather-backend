@@ -1256,8 +1256,13 @@ async def api_version() -> JSONResponse:
     # runs short. Same openness class as the version itself — how full a
     # disk is says nothing about the weather data on it. Computed per
     # request (one statvfs); null when the path can't be statted.
-    from . import disk_watch
-    return JSONResponse({**info, "disk": disk_watch.snapshot()})
+    from . import disk_watch, self_update
+    # 2.5 (mirror issue #5): how the Update button can act on this box, and
+    # a request still waiting on the operator's updater, so the apps can
+    # show the button, the manual command, or "requested" honestly.
+    return JSONResponse({**info, "disk": disk_watch.snapshot(),
+                         "one_tap": self_update.one_tap_mode(),
+                         "update_request": self_update.pending_request(__version__)})
 
 
 # ── 2.1 server recommendations: more disk / memory, one tap ──────────
@@ -2426,11 +2431,15 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
     # default for one-tap users mid-repair — was paying it just to receive
     # the 409 this cheap local check produces instantly.
     # Off Fly first (2.4.2, mirror issue #5): a Docker or bare install has
-    # no machine to rewrite, so the token recipe below cannot help it.
-    if not self_update._on_fly():
-        raise HTTPException(status_code=409,
-                            detail=self_update.OFF_FLY_DETAIL)
-    if not self_update._fly_token():
+    # no machine to rewrite, so the token recipe below cannot help it. With
+    # UPDATE_REQUEST_FILE set it hands the vetted tag to the operator's own
+    # updater instead, through every gate the Fly path uses.
+    on_fly = self_update._on_fly()
+    if not on_fly:
+        if self_update.one_tap_mode() != "request_file":
+            raise HTTPException(status_code=409,
+                                detail=self_update.OFF_FLY_DETAIL)
+    elif not self_update._fly_token():
         raise HTTPException(
             status_code=409,
             detail="no deploy token on this instance — create one with "
@@ -2452,6 +2461,32 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
             status_code=409,
             detail=f"release v{latest} has no published image yet — "
                    "try again in a few minutes")
+    if not on_fly:
+        # The same safety net apply_update() lays before a Fly swap: the
+        # host's updater runs the migrations the moment it acts, and a
+        # vouched major may carry some. Best effort, like on Fly: no room
+        # or a failed copy is logged and the request still goes.
+        await self_update.snapshot_before_upgrade(latest)
+        try:
+            path = self_update.write_update_request(latest)
+        except ValueError:
+            raise HTTPException(
+                status_code=409,
+                detail="the release check returned a version this server "
+                       "will not hand to an updater; nothing was requested"
+            ) from None
+        except OSError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"could not write UPDATE_REQUEST_FILE "
+                       f"({e.strerror or e}); check the path exists and "
+                       "this server can write to its folder") from e
+        # 202: accepted, and the operator's updater does the rest. The apps
+        # treat any 2xx as "applying" and poll /api/version for the change.
+        return JSONResponse(status_code=202, content={
+            "ok": True, "requested": latest, "path": str(path),
+            "note": "update requested; this server's own updater installs "
+                    "it, then re-check /api/version"})
     ok = await self_update.apply_update(latest)
     if not ok:
         raise HTTPException(status_code=502,

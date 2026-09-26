@@ -37,10 +37,13 @@ it, that is what a release process is for.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import shutil
+import tempfile
 from pathlib import Path
 import time
 from typing import Any
@@ -86,7 +89,88 @@ def _on_fly() -> bool:
 OFF_FLY_DETAIL = ("one-tap update works only on a Fly.io server, and this "
                   "one runs elsewhere. Update it where it runs: "
                   "./bin/upgrade.sh in the folder you installed from, or "
-                  "git pull && docker compose pull && docker compose up -d")
+                  "git pull && docker compose pull && docker compose up -d. "
+                  "To make this button work here, set UPDATE_REQUEST_FILE "
+                  "(an absolute path) and point your own updater at it; "
+                  "see the README")
+
+
+# ── Update request file (off Fly, opt-in) ─────────────────────────────
+# Off Fly there is no machine to rewrite, so with UPDATE_REQUEST_FILE set
+# the button writes the release tag the server vetted to that one file and
+# nothing else; a watcher the operator runs on the host (systemd .path,
+# launchd WatchPaths, cron) decides what to do with it. The web process
+# never runs a command. The tag is strict X.Y.Z because a watcher may
+# interpolate the file into a shell line (mirror issue #5, adam8833).
+
+_TAG_RE = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")
+
+
+def _request_file() -> Path | None:
+    """The configured path, or None. Relative paths are refused: the
+    server's cwd is not something an operator reasons about."""
+    raw = os.environ.get("UPDATE_REQUEST_FILE", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.is_absolute() else None
+
+
+def one_tap_mode() -> str | None:
+    """How the Update button can act here: "fly" (rewrite this machine),
+    "request_file" (hand the tag to the operator's updater), or None (it
+    cannot; the apps should show the manual upgrade instead)."""
+    if _on_fly():
+        return "fly"
+    if _request_file() is not None:
+        return "request_file"
+    return None
+
+
+def write_update_request(tag: str) -> Path:
+    """Write `v<tag>` to the request file, whole: a temp file in the same
+    directory renamed over it, so a watcher never reads half a line.
+    Readable by others because the watcher is usually another user.
+    ValueError on a tag that is not X.Y.Z; OSError when the path cannot
+    be written."""
+    if not _TAG_RE.fullmatch(tag):
+        raise ValueError(f"refusing to request an odd version {tag!r}")
+    path = _request_file()
+    if path is None:
+        raise OSError("UPDATE_REQUEST_FILE is not set to an absolute path")
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write(f"v{tag}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    log.warning("update requested: v%s written to %s", tag, path)
+    return path
+
+
+def pending_request(current: str) -> dict[str, Any] | None:
+    """The request still waiting on the operator's updater: a well-formed
+    tag newer than the running version. Anything else (no file, garbage,
+    a tag already installed, a Fly box) is not pending."""
+    if one_tap_mode() != "request_file":
+        return None
+    path = _request_file()
+    try:
+        with open(path, encoding="ascii", errors="replace") as f:
+            text = f.read(64)
+        requested_ms = int(os.stat(path).st_mtime * 1000)
+    except OSError:
+        return None
+    tag = text.strip().removeprefix("v")
+    if not _TAG_RE.fullmatch(tag) or not is_newer(tag, current):
+        return None
+    return {"tag": tag, "requested_ms": requested_ms}
 
 
 # Deploy tokens (`fly tokens create deploy`) are macaroons — 'fm2_...' or a

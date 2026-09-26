@@ -841,11 +841,13 @@ The backend checks GitHub once a day and shows an **"update available"** banner
 on the status page (and at `GET /api/version`) when a newer release exists.
 Disable with `UPDATE_CHECK=0`. See [CHANGELOG.md](CHANGELOG.md) for what changed.
 
-The check works on every install, but acting on it from inside the apps
-(the **Update backend** button, and automatic updates below) is **Fly.io
-only**: it swaps the Fly machine's own image through the Machines API. On a
-Docker or bare install the button says so and names the upgrade that works
-there, `./bin/upgrade.sh` or the Docker commands below.
+The check works on every install. Acting on it from inside the apps (the
+**Update backend** button) swaps the machine's own image on Fly.io; on a
+Docker or bare install the button works once you opt in to an
+[update request file](#update-request-file-docker-and-bare-installs-optional),
+and otherwise says so and names the upgrade that works there,
+`./bin/upgrade.sh` or the Docker commands below. Automatic updates are
+Fly.io only.
 
 ### Automatic updates (Fly.io, optional)
 
@@ -877,6 +879,84 @@ the oldest version it installs onto hands-free), and the one-tap path then
 works across the boundary too. Unvouched majors keep the classic
 follow-the-release-notes flow, and automatic updates never cross a major
 either way.
+
+### Update request file (Docker and bare installs, optional)
+
+Off Fly there is no machine for the Update button to rewrite, and the
+server will not run commands on your host. Set `UPDATE_REQUEST_FILE` to an
+absolute path and the button instead **writes the release tag it vetted**
+(one line, for example `v2.5.0`) to that file and answers "update
+requested". It passes the same checks as on Fly first: a newer release,
+same major unless the release vouches for the jump, and a published image.
+The file is replaced whole (temp file, then rename), so a watcher never
+reads half a line. `GET /api/version` reports `"one_tap": "request_file"`
+and, until the running version catches up, the pending
+`"update_request": {"tag": ..., "requested_ms": ...}`.
+
+What acts on the file is yours: a systemd path unit, a launchd
+`WatchPaths` job, a cron line, or nothing. The apps wait about 90 seconds
+for the new version to answer, so a watcher that fires on the change
+fits; a nightly timer still works, the app just stops waiting first.
+
+Docker Compose on Linux, with systemd. The path is inside the container,
+so put it on a bind mount the host can see and that the server's user
+(uid 1000) can write:
+
+```yaml
+# docker-compose.override.yml, beside docker-compose.yml
+services:
+  zasder-weather:
+    environment:
+      UPDATE_REQUEST_FILE: /update/request
+    volumes:
+      - ./update:/update
+```
+
+```sh
+mkdir -p update && sudo chown 1000:1000 update
+docker compose up -d
+```
+
+```ini
+# /etc/systemd/system/zasder-update.path
+[Unit]
+Description=Zasder Weather update request
+
+[Path]
+PathChanged=/opt/zasder-weather/update/request
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```ini
+# /etc/systemd/system/zasder-update.service
+[Unit]
+Description=Upgrade Zasder Weather
+
+[Service]
+Type=oneshot
+# The user that owns the checkout and is in the docker group.
+User=youruser
+WorkingDirectory=/opt/zasder-weather
+ExecStart=/opt/zasder-weather/bin/upgrade.sh --docker --request /opt/zasder-weather/update/request
+```
+
+```sh
+sudo systemctl daemon-reload && sudo systemctl enable --now zasder-update.path
+```
+
+`--request` installs **exactly the release the server vetted**: it reads
+the file, refuses anything that is not a plain `vX.Y.Z`, and pulls that
+tag's image (compose reads it as `ZASDER_IMAGE_TAG`) rather than whatever
+`:latest` points at by then. `--docker` matters too: `upgrade.sh`
+otherwise picks the Fly path whenever `fly.toml` is present and `fly` is
+installed. Before writing the file the server takes the same pre-upgrade
+snapshot of the database the Fly path takes (`weather.db.pre-upgrade-<tag>.db`
+beside it, when the volume has room), so a migration that goes wrong has a
+way back. On macOS the same idea is a LaunchAgent whose `WatchPaths` names
+the file and whose program is your own upgrade script; have it read the
+tag from the file and check it the same way.
 
 To upgrade, from the repo directory:
 

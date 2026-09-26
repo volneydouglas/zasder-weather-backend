@@ -81,6 +81,9 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
                 # that exports them — deploy.sh does — made every "off Fly"
                 # test depend on the shell (round two, I4).
                 "FLY_API_TOKEN", "FLY_APP_NAME", "FLY_MACHINE_ID",
+                # 2.5: the off-Fly update request file. A developer shell
+                # that sets it would have every update test write there.
+                "UPDATE_REQUEST_FILE",
                 # Found by tests/test_env_sweep.py the day it was written:
                 # the WU key powers the TWC forecast fetch and the WU import,
                 # and the two passwords ride transports whose hosts are

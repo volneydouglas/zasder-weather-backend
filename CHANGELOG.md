@@ -8,6 +8,20 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.5.0] — Unreleased
+
+### Added
+- **The Update button works off Fly.io, if you opt in.** Set
+  `UPDATE_REQUEST_FILE` to an absolute path and, on a Docker or bare
+  install, the button writes the release tag it vetted (for example
+  `v2.5.0`) to that one file instead of refusing. The server runs no
+  command: a watcher you run on the host (a systemd path unit, a launchd
+  `WatchPaths` job, cron) does the upgrade. The same gates as on Fly apply
+  first, the tag is strictly `vX.Y.Z`, and the file is replaced whole.
+  `/api/version` now reports `one_tap` (`fly`, `request_file` or null) and
+  any `update_request` still waiting. The README has a Docker Compose and
+  systemd example. Proposed by adam8833 (issue #5).
+
 ## [2.4.2] — 2026-09-25
 
 ### Fixed

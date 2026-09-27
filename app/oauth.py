@@ -61,6 +61,8 @@ from urllib.parse import urlencode, urlparse, urlsplit, urlunsplit
 from fastapi import APIRouter, Form, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from .envfile import env_value
+
 log = logging.getLogger("api")
 
 router = APIRouter()
@@ -194,7 +196,7 @@ def _fly_host() -> str | None:
 
 
 def _allowed_hosts() -> list[str]:
-    raw = (os.environ.get("ALLOWED_HOSTS") or "*").strip()
+    raw = (env_value("ALLOWED_HOSTS") or "*").strip()
     return [h.strip().lower() for h in raw.split(",") if h.strip()]
 
 

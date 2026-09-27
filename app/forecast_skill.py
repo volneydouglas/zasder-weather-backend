@@ -289,3 +289,33 @@ async def _coords_station() -> str | None:
     from .forecast_snapshots import coords_device
     d = coords_device(await db.list_devices())
     return None if d is None else (d.get("name") or d.get("mac"))
+
+
+# ── Backyard correction (2.5, C1) ────────────────────────────────────────
+# The scorecard says how far the forecast tends to miss THIS yard, per
+# lead. The correction is that bias turned around: forecast minus bias is
+# what the station has tended to measure. Shown BESIDE the forecast, never
+# instead of it (the forecast is somebody's model; this is what your yard
+# has done to it). A lead gets a correction only with MIN_DAYS scored days
+# and a bias of at least MIN_OFFSET_F; below that, a nudge is noise.
+
+CORRECTION_DAYS = 45
+MIN_OFFSET_F = 1.0
+
+
+def corrections_from(card: dict[str, Any]) -> list[dict[str, Any]]:
+    """Pure: the scorecard's leads → the offsets to ADD to a forecast."""
+    out = []
+    for lead in card.get("leads") or []:
+        if not lead.get("enough"):
+            continue
+        hi = (lead.get("high") or {}).get("bias_f")
+        lo = (lead.get("low") or {}).get("bias_f")
+        row: dict[str, Any] = {"lead_days": lead["lead_days"], "n": lead["n"]}
+        row["high_offset_f"] = (round(-hi, 1) if isinstance(hi, (int, float))
+                                and abs(hi) >= MIN_OFFSET_F else None)
+        row["low_offset_f"] = (round(-lo, 1) if isinstance(lo, (int, float))
+                               and abs(lo) >= MIN_OFFSET_F else None)
+        if row["high_offset_f"] is not None or row["low_offset_f"] is not None:
+            out.append(row)
+    return out

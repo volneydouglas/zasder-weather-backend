@@ -102,3 +102,36 @@ def test_copy_names_who_must_act():
     t, b = health_watch.source_down_copy("Govee", "ours", 0.5, "KeyError")
     assert t == "Readings from Govee are not being stored" and "30 min" in b
     assert "on the server" in b
+
+
+async def test_smart_alerts_off_does_not_erase_the_watchdogs_memory(client, monkeypatch):
+    """2.5, found building C2: with smart alerts OFF (the default on a new
+    install) the tick cleared EVERY smart_alert_state row before the source
+    watchdog ran, so a poller down for an hour re-announced its outage on
+    every tick. Only the smart family's own edges may be forgotten."""
+    from app import alerts, apns, db, source_status
+    health_watch, _ = _mods()
+    sent = []
+
+    async def fake_deliver(cfg, subject, body, title, push_body, **kw):
+        sent.append(kw.get("kind"))
+        return True
+    monkeypatch.setattr(alerts, "_deliver", fake_deliver)
+
+    async def yes():
+        return True
+    monkeypatch.setattr(apns, "push_configured", yes)
+    t0 = 1_788_800_000_000
+    source_status.declare("airgradient", True)
+    monkeypatch.setattr(source_status, "_now_ms", lambda: t0)
+    source_status.record_success("airgradient", rows=2)
+    _fail("airgradient", "ReadTimeout", t0 + 60_000, monkeypatch)
+    now = [t0 + 65 * 60_000]
+    monkeypatch.setattr(alerts.time, "time", lambda: now[0] / 1000)
+    cfg = await alerts.effective_config()
+    assert not cfg.smart_alerts, "this test needs the switch OFF"
+    mon = alerts.AlertMonitor()
+    await mon._tick()
+    now[0] += 60_000
+    await mon._tick()
+    assert sent.count("source_down") == 1

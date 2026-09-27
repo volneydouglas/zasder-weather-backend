@@ -34,6 +34,7 @@ import csv as _csv
 import io
 import logging
 import math
+import os
 import sqlite3
 import time
 from typing import Any, Iterable, Iterator
@@ -190,6 +191,138 @@ def csv_rows(text: str, mapping: dict[str, str], *, system: int = US,
             yield row
 
 
+def csv_file_rows(path: str, mapping: dict[str, str], *, system: int = US,
+                  time_column: str = "", time_format: str = "") -> Iterator[dict]:
+    """csv_rows, read from a file a row at a time (2.5): the file door
+    never holds the CSV in memory. A UTF-8 BOM on the header is dropped,
+    as a spreadsheet export often carries one."""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for raw in _csv.DictReader(f):
+            row = csv_row(raw, mapping, system=system, time_column=time_column,
+                          time_format=time_format)
+            if row is not None:
+                yield row
+
+
+def csv_file_header(path: str) -> list[str]:
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        return next(_csv.reader(f), [])
+
+
+# The sort must leave this much free on the disk it spills to; a file
+# that would take the disk below it is refused mid-sort instead (Greptile,
+# PR #48: the upload's own room check cannot see the sort's second copy).
+SORT_MIN_FREE_BYTES = 64 * 1024 * 1024
+# An (ts, seq) index entry: two varints, the rowid and cell and page
+# overhead. Measured about 20 bytes a row; 32 leaves room.
+INDEX_BYTES_PER_ROW = 32
+
+
+class SortSpaceError(OSError):
+    """The spill would have taken the disk below SORT_MIN_FREE_BYTES."""
+
+
+def _free_bytes(path: str) -> int:
+    import shutil
+    return shutil.disk_usage(path).free
+
+
+def spill_sorted(rows: Iterable[dict], workdir: str, chunk: int = 5000,
+                 cancelled: Any = None) -> str:
+    """Spill rows into a throwaway SQLite file beside the upload, indexed by
+    time, and return its path (2.5). Blocking on purpose: run_import calls
+    it through asyncio.to_thread, because reading and indexing a 512 MiB
+    file before the first row comes back held the event loop (and live
+    ingest with it) for the whole sort (Greptile, PR #48). The free-space
+    floor is checked every chunk; SortSpaceError removes the file."""
+    import json as _json
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix=".csvsort-", suffix=".db", dir=workdir)
+    os.close(fd)
+    try:
+        con = sqlite3.connect(path)
+        try:
+            con.execute("CREATE TABLE r (ts INTEGER, seq INTEGER, row TEXT)")
+            batch = []
+
+            def put() -> None:
+                con.executemany("INSERT INTO r VALUES (?, ?, ?)", batch)
+                batch.clear()
+                if _free_bytes(workdir) < SORT_MIN_FREE_BYTES:
+                    raise SortSpaceError(
+                        "not enough free disk to sort the file: sorting keeps a "
+                        "second copy of the readings beside the upload, and "
+                        f"{workdir} fell below {SORT_MIN_FREE_BYTES // 2**20} MB free")
+            for seq, row in enumerate(rows):
+                batch.append((int(row.get("dateutc") or 0), seq,
+                              _json.dumps(row, separators=(",", ":"))))
+                if len(batch) >= chunk:
+                    put()
+                    if cancelled is not None and cancelled():
+                        break
+            if batch:
+                put()
+            con.commit()
+            # The index is the phase the per-batch floor cannot see
+            # (CodeRabbit, PR #48): two integers and a rowid per row,
+            # about INDEX_BYTES_PER_ROW with B-tree overhead, checked
+            # against the floor before it is built.
+            n = con.execute("SELECT COUNT(*) FROM r").fetchone()[0]
+            if _free_bytes(workdir) - n * INDEX_BYTES_PER_ROW < SORT_MIN_FREE_BYTES:
+                raise SortSpaceError(
+                    "not enough free disk to sort the file: its index needs about "
+                    f"{n * INDEX_BYTES_PER_ROW // 2**20} MB more and {workdir} would "
+                    f"fall below {SORT_MIN_FREE_BYTES // 2**20} MB free")
+            con.execute("CREATE INDEX r_ts ON r (ts, seq)")
+            con.commit()
+        finally:
+            con.close()
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _remove_spill(fut: "asyncio.Future[str]") -> None:
+    if fut.cancelled() or fut.exception() is not None:
+        return
+    try:
+        os.unlink(fut.result())
+    except OSError:
+        pass
+
+
+def read_spilled(path: str) -> Iterator[dict]:
+    """The spilled rows in ascending time, file order within a tie; the
+    file is removed when the reader finishes or is closed."""
+    import json as _json
+    try:
+        con = sqlite3.connect(path)
+        try:
+            for (text,) in con.execute("SELECT row FROM r ORDER BY ts, seq"):
+                yield _json.loads(text)
+        finally:
+            con.close()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def sorted_on_disk(rows: Iterable[dict], workdir: str,
+                   chunk: int = 5000) -> Iterator[dict]:
+    """Rows in ascending time without holding them all (2.5): spilled into
+    a throwaway SQLite file beside the upload and read back ORDER BY time.
+    A CSV can come in any order its author left it, and the interval-rain
+    day counter only means something in order. Synchronous; run_import
+    spills through a thread instead."""
+    yield from read_spilled(spill_sorted(rows, workdir, chunk))
+
+
 def csv_row(raw: dict[str, Any], mapping: dict[str, str], *, system: int = US,
             time_column: str = "", time_format: str = "") -> dict | None:
     ts_ms = _parse_time(raw.get(time_column), time_format)
@@ -310,6 +443,28 @@ JOB: dict[str, Any] = {"state": "idle"}
 _TASK: asyncio.Task | None = None
 
 
+# Held from the moment a door accepts an import until run_import ends
+# (CodeRabbit, PR #48): status() is only a copy of JOB, and the file doors
+# await a whole upload between checking it and starting the task, so two
+# uploads could both pass the check and share one JOB.
+_RESERVED = False
+
+
+def reserve() -> bool:
+    """Take the one import slot, or False when it is held or running. No
+    await between the test and the set, so it is atomic on the loop."""
+    global _RESERVED
+    if _RESERVED or JOB.get("state") == "running":
+        return False
+    _RESERVED = True
+    return True
+
+
+def release() -> None:
+    global _RESERVED
+    _RESERVED = False
+
+
 def status() -> dict[str, Any]:
     return dict(JOB)
 
@@ -366,7 +521,8 @@ class _DayCounter:
 
 
 def day_counter_from_intervals(rows: Iterable[dict], *,
-                               ordered: bool = True) -> Iterator[dict]:
+                               ordered: bool = True,
+                               spill_dir: str | None = None) -> Iterator[dict]:
     """Rows in ascending time with `dailyrainin` synthesised from
     `intervalRainIn`. A running sum only means something in order:
     WeeWX rows arrive ORDER BY dateTime from a generator and are taken
@@ -375,7 +531,10 @@ def day_counter_from_intervals(rows: Iterable[dict], *,
     its door passes `ordered=False` and the rows are sorted here."""
     counter = _DayCounter()
     if not ordered:
-        rows = sorted(rows, key=lambda r: int(r.get("dateutc") or 0))
+        # 2.5: the file door sorts on disk; the in-memory JSON door (whose
+        # rows are already in memory, 16 MiB at most) sorts in memory.
+        rows = (sorted_on_disk(rows, spill_dir) if spill_dir
+                else sorted(rows, key=lambda r: int(r.get("dateutc") or 0)))
     for row in rows:
         counter.apply(row)
         yield row
@@ -383,7 +542,8 @@ def day_counter_from_intervals(rows: Iterable[dict], *,
 
 async def run_import(mac: str, rows: Iterable[dict], *, kind: str,
                      dry_run: bool = False,
-                     ordered: bool = True) -> dict[str, Any]:
+                     ordered: bool = True,
+                     spill_dir: str | None = None) -> dict[str, Any]:
     """Insert an archive, paced, with the job dict carrying progress.
 
     Paced on purpose. A decade of five minute archives is about a million
@@ -395,8 +555,29 @@ async def run_import(mac: str, rows: Iterable[dict], *, kind: str,
     JOB.update(state="running", kind=kind, mac=mac, read=0, inserted=0,
                started_ms=_now_ms(), dry_run=bool(dry_run))
     batch: list[dict] = []
+    spilled: str | None = None
     try:
-        for row in day_counter_from_intervals(rows, ordered=ordered):
+        if not ordered and spill_dir:
+            # Off the event loop: parsing and indexing the whole file happens
+            # before the first row can come back (Greptile, PR #48).
+            # Shielded: a cancelled import (a shutdown) cannot stop the
+            # worker thread, so the thread is told to stop and its file is
+            # removed whenever it does finish (CodeRabbit, PR #48).
+            work = asyncio.ensure_future(asyncio.to_thread(
+                spill_sorted, rows, spill_dir,
+                cancelled=lambda: bool(JOB.get("cancel"))))
+            try:
+                spilled = await asyncio.shield(work)
+            except asyncio.CancelledError:
+                JOB["cancel"] = True
+                work.add_done_callback(_remove_spill)
+                raise
+            if JOB.get("cancel"):
+                JOB.update(state="cancelled", finished_ms=_now_ms())
+                return status()
+            rows, ordered = read_spilled(spilled), True
+        for row in day_counter_from_intervals(rows, ordered=ordered,
+                                              spill_dir=spill_dir):
             if JOB.get("cancel"):
                 JOB.update(state="cancelled", finished_ms=_now_ms())
                 return status()
@@ -410,7 +591,22 @@ async def run_import(mac: str, rows: Iterable[dict], *, kind: str,
         if batch and not dry_run:
             JOB["inserted"] += await db.insert_observations(mac, batch)
         JOB.update(state="done", finished_ms=_now_ms())
+    except asyncio.CancelledError:
+        # Not an Exception: without this the job read "running" until a
+        # restart and every later import was refused as already running.
+        JOB.update(state="cancelled", finished_ms=_now_ms())
+        raise
+    except SortSpaceError as e:
+        log.warning("%s import stopped: %s", kind, e)
+        JOB.update(state="error", error=str(e), finished_ms=_now_ms())
     except Exception as e:
         log.exception("%s import failed", kind)
         JOB.update(state="error", error=str(e), finished_ms=_now_ms())
+    finally:
+        if spilled is not None:
+            try:
+                os.unlink(spilled)
+            except OSError:
+                pass
+        release()
     return status()

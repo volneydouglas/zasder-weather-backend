@@ -395,6 +395,15 @@ def validate_beacon(b: dict[str, Any], now_ms: int) -> None:
     prec = b.get("precision")
     if prec is not None and prec not in ("exact", "area", "city"):
         raise HTTPException(status_code=400, detail="bad precision")
+    # 2.5 (C14): the town a "city" pin stands for ("Chandler, AZ"), and
+    # whether the owner placed the pin themselves. Both optional; an
+    # older server sends neither.
+    place = b.get("place")
+    if place is not None and (not isinstance(place, str) or not (1 <= len(place) <= 64)):
+        raise HTTPException(status_code=400, detail="bad place")
+    placed = b.get("placed_by")
+    if placed is not None and placed != "owner":
+        raise HTTPException(status_code=400, detail="bad placed_by")
     name = b.get("name")
     if name is not None and (not isinstance(name, str) or len(name) > 48):
         raise HTTPException(status_code=400, detail="bad name")
@@ -652,7 +661,7 @@ def _feature(b: dict[str, Any], received_ms: int,
              public_id: str | None = None) -> dict[str, Any]:
     props = {k: b.get(k) for k in ("station_id", "name", "sensor", "tz",
                                     "observed_ms", "sent_ms", "expires_ms", "fuzzed",
-                                    "precision", "software")}
+                                    "precision", "software", "place", "placed_by")}
     # NEVER copied straight out of the body: `visit_url` is whatever the
     # server signed, and in `id` mode the map must not see it.
     mode = link_mode_of(b)

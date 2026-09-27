@@ -8,6 +8,119 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.5.0] — 2026-09-27
+
+### Added
+- **Every station gets its own 24 hours.** `/api/devices` now carries
+  `arrival_24h` for every station: its day drawn from when its readings
+  actually arrived, on a five minute grid. A station fed from your own
+  network (a relay board, the WeatherLink Live bridge, a local Ecowitt
+  push, your own script) has no poller and so had no health strip at all;
+  it has one now. A polled station gets its own too, with its source's
+  outages laid over the quiet hours, so an hour the vendor was down reads
+  as the vendor's and an hour the device alone went quiet reads as the
+  device's. A gap only counts against a station while this server was
+  demonstrably running. The apps draw it as the footer of the Today card.
+- **Nearby Weather Underground stations, on demand.** With a WU key,
+  `GET /api/neighbors` finds the stations within 25 km and
+  `GET /api/neighbors/{id}/history` fetches their recent days, kept in
+  their own tables so they never raise an alert, a record or a share
+  upload. Nothing polls: the apps fetch only when you open the Compare
+  card's nearby row, and draw up to three as dashed lines. WU's own
+  quality flags are honoured and your own WU station is never offered
+  back to you.
+- **A sensor that runs away from the street says so.**
+  `GET /api/neighbors/check` compares the last day's hourly means against
+  the median of the neighbours that passed WU's quality check, and flags
+  a field only when the gap is large and keeps one sign for hours: a
+  radiation shield in the sun, an aging hygrometer, a barometer never
+  calibrated.
+- **One storm, every station.** `GET /api/storms/compare` measures a
+  storm's window at every weather station by the storm summary's own
+  rules, so a Davis and a Tempest a few feet apart can be read side by
+  side. A station with no rain counter in the window has no total rather
+  than 0.00.
+- **Leak detectors alert.** Ecowitt WH55 leak channels have been stored
+  since 1.9 with nothing watching them. A wet channel now sends a `leak`
+  alert (warning tier, it breaks quiet hours) and a `leak_cleared` when it
+  dries. It is not behind the smart-alerts switch: a leak detector is a
+  sensor bought to be told.
+- **Rules that duplicate a built-in watch say so.**
+  `GET /api/alerts/rules/overlaps` finds enabled rules the alert history
+  shows firing beside a matching built-in watch (a temperature-below-33
+  rule and the frost watch, a gust rule and the wind ramp), at least twice
+  in 90 days, and the apps offer to turn the rule off.
+- **Sensor checks.** Readings the plausibility bands refused (a 255 mph
+  gust is a faulting anemometer) used to be logged and forgotten.
+  They are now counted per station, day and field, and
+  `GET /api/devices/{mac}/sensor-health` pairs them with what was stored
+  over 30 days. Ingest gains no write per reading.
+- **"Next few hours here."** `GET /api/nowcast` serves what the rain
+  nowcast currently expects, and the apps compose it with the station's
+  own last hour and the forecast into one line under the hero: "Rain
+  expected around 7:40 PM, cooling about 4° an hour, pressure falling."
+- **Which years you already have.** `GET /api/devices/{mac}/coverage`
+  answers per year and month from the daily rollups and the import
+  ledger, and the import page draws it, so the next import can be aimed
+  at the gap.
+- **The watering call.** `GET /api/devices/{mac}/watering` weighs a week
+  of your own rain against reference evapotranspiration (FAO-56
+  Hargreaves, from the day's high, low and your latitude, so it needs no
+  solar sensor) and says water, go light, or skip. Every morning at 05:00
+  local the call goes to your webhooks as a `watering` event, for an
+  irrigation controller or a mower schedule. Days the station did not
+  measure are left out, never counted dry.
+- **The forecast, corrected by your yard.**
+  `GET /api/devices/{mac}/forecast-correction` turns the forecast
+  scorecard's measured bias per lead into an offset for the high and the
+  low, learned over 45 days and only where the bias is at least a degree.
+  The apps keep the forecast's own numbers and add a YARD line beside
+  them.
+- **Map location: "City" is your real town, and you can place the pin
+  yourself.** City is now the centre of the nearest town of 15,000 or
+  more from a bundled GeoNames gazetteer (no geocoding call leaves your
+  box), and the beacon carries its name ("Chandler, AZ"). A new "a place
+  you choose" puts the pin where you tap, at most 100 miles from the
+  station.
+- **The Update button works off Fly.io, if you opt in.** Set
+  `UPDATE_REQUEST_FILE` to an absolute path and, on a Docker or bare
+  install, the button writes the release tag it vetted (for example
+  `v2.5.0`) to that one file instead of refusing. The server runs no
+  command: a watcher you run on the host (a systemd path unit, a launchd
+  `WatchPaths` job, cron) does the upgrade. The same gates as on Fly apply
+  first, the tag is strictly `vX.Y.Z`, and the file is replaced whole.
+  `/api/version` now reports `one_tap` (`fly`, `request_file` or null) and
+  any `update_request` still waiting. The README has a Docker Compose and
+  systemd example and a native macOS launchd one. Proposed, tested and
+  the macOS example contributed by adam8833 (issue #5).
+
+### Changed
+- **CSV imports stream to disk.** `POST /api/import/csv/file` takes the
+  file itself as the body (up to 512 MiB, the WeeWX door's limit) and
+  sorts an out-of-order file through a throwaway SQLite file beside it,
+  so a decade of readings never sits in memory. The JSON door and its
+  16 MiB limit stay for older apps.
+- **`/api/sources` says how many stations each source feeds**, so the
+  apps can show a source whose keys were wrong from its first poll and
+  never made a station.
+- **`/api/update/check` answers in `/api/version`'s shape.**
+
+### Fixed
+- **A failing poller stopped re-announcing its outage.** With smart
+  alerts off (the default), every tick cleared the watchdog's memory of
+  what it had already said, so a poller down for an hour re-sent its
+  alert on every tick.
+- **The 24 hour source record is written on a box with no alert
+  channels.** It was written after the alert tick's channel check, so a
+  box with no email, push or webhook never kept one.
+- **Options in `.env` work on a bare install.** A handful of options were
+  read straight from the process environment, which Docker fills from
+  `.env` and a bare `uvicorn` does not: `UPDATE_REQUEST_FILE`,
+  `AUTO_UPDATE`, `ALLOWED_HOSTS`, `DEBUG`, `LOG_FILE`, `MAX_REQUEST_BYTES`
+  and `CAPTURE_TOKEN` set only in `.env` were silently ignored outside
+  Docker. They now read the environment first and `.env` second, like
+  every other setting. Found by adam8833 (issue #5).
+
 ## [2.4.2] — 2026-09-25
 
 ### Fixed

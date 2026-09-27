@@ -373,12 +373,15 @@ def test_a_withdrawal_the_directory_missed_is_retried_from_the_tick(client, monk
 
 def test_precision_is_a_three_way_choice_and_the_old_flag_still_reads(client):
     from app import map_beacon as mb
-    lat, lon = 33.3062, -111.8413            # not a grid centre
+    lat, lon = 33.2941, -111.9202            # a house, not a grid centre
     exact = mb.place(lat, lon, "exact")
     area = mb.place(lat, lon, "area")
     city = mb.place(lat, lon, "city")
-    assert exact == (33.3062, -111.8413)
-    assert area == mb.fuzz(lat, lon, 0.5) and city == mb.fuzz(lat, lon, 10.0)
+    assert exact == (33.2941, -111.9202)
+    # 2.5 (C14): city is the centre of the nearest real town from the
+    # bundled gazetteer, not a 10 km grid cell (which read as "near my
+    # house"); the grid is only the fallback for a point no town is near.
+    assert area == mb.fuzz(lat, lon, 0.5) and city == (33.3062, -111.8413)
     # City is coarser than area: the snapped point sits farther away.
     d = lambda p: abs(p[0] - lat) + abs(p[1] - lon)
     assert d(city) > d(area) > 0

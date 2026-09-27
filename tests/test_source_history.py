@@ -317,3 +317,19 @@ def test_a_run_does_not_bridge_six_unobserved_hours(client):
         assert len(steady) == 1
         assert steady[0]["until_ms"] == NOW + 20 * 60_000
     asyncio.run(run())
+
+
+def test_a_source_that_never_made_a_station_is_still_visible(client):
+    """A poller failing from its first tick has no device row, so no
+    station carries its health; /api/sources says how many it feeds so
+    the app can list the orphan itself (2.4 review follow-up)."""
+    from app import db, source_status
+    source_status.declare("govee", True)
+    source_status.declare("tempest", True)
+
+    async def seed():
+        await db.upsert_device("AA:BB:CC:00:00:A1", {"name": "T", "info": {"source": "tempest"}})
+    asyncio.run(seed())
+    rows = {r["name"]: r for r in client.get("/api/sources", headers=H).json()["sources"]}
+    assert rows["tempest"]["stations"] == 1
+    assert rows["govee"]["stations"] == 0

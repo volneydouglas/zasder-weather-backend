@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo as _ZoneInfo
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .envfile import ENV_FILE as _ENV_FILE
+
 _log = _logging.getLogger("config")
 
 
@@ -85,7 +87,7 @@ def _normalize_mac_map(v) -> dict[str, float]:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, extra="ignore")
 
     # Optional — only required for AmbientWeather ingest. AcuRite-only
     # deploys can leave both unset; the poller stays asleep and only the

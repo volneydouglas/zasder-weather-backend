@@ -1272,6 +1272,8 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
         if dropped:
             log.warning("implausible values dropped for %s: %s",
                         mac, ", ".join(dropped))
+            # 2.5 (C4): counted, not just logged, for the sensor checks card.
+            db.note_rejections(mac, dropped)
             # A feels-like the backend derived from an input the bands just
             # nulled is garbage that happened to land in-band (tempf=85 with
             # humidity=-5 → a plausible-looking 92.9 °F) — never store a

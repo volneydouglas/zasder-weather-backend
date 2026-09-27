@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .envfile import env_value
 from .limits import BodySizeLimitMiddleware
 from .updates import UpdateChecker
 from .version import __version__
@@ -74,7 +75,8 @@ def attach_file_log(db_path: str) -> str | None:
     rolled off). LOG_FILE overrides the path; LOG_FILE="" disables."""
     import os
     from logging.handlers import RotatingFileHandler
-    path = os.environ.get("LOG_FILE")
+    from .envfile import env_value
+    path = env_value("LOG_FILE", None)
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(db_path)),
                             "logs", "zasder.log")
@@ -714,7 +716,7 @@ async def _retention_daily() -> None:
 # CDN scripts (Swagger UI), which exacerbates the missing CSP. Disable
 # in production; set DEBUG=1 (or any truthy value) to re-enable for
 # local development.
-_DEBUG = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes")
+_DEBUG = env_value("DEBUG").strip().lower() in ("1", "true", "yes")
 app = FastAPI(
     title="zasder weather",
     lifespan=lifespan,
@@ -814,7 +816,7 @@ app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), na
 #      public HTML status page; documents loading CDN scripts (Swagger UI
 #      in DEBUG mode) need a CSP that allows them.
 
-_allowed_raw = os.environ.get("ALLOWED_HOSTS", "*").strip()
+_allowed_raw = (env_value("ALLOWED_HOSTS") or "*").strip()
 _ALLOWED_HOSTS = [h.strip() for h in _allowed_raw.split(",") if h.strip()] or ["*"]
 if _ALLOWED_HOSTS != ["*"]:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
@@ -1256,8 +1258,21 @@ async def api_version() -> JSONResponse:
     # runs short. Same openness class as the version itself — how full a
     # disk is says nothing about the weather data on it. Computed per
     # request (one statvfs); null when the path can't be statted.
-    from . import disk_watch
-    return JSONResponse({**info, "disk": disk_watch.snapshot()})
+    return JSONResponse(_version_payload(info))
+
+
+def _version_payload(info: dict[str, Any]) -> dict[str, Any]:
+    """The /api/version body, shared with /api/update/check: the apps
+    REPLACE their version info with the check's answer, so a field only
+    one of them carries reads as absent after "Check for updates now".
+    2.5 (mirror issue #5): `one_tap` says how the Update button can act on
+    this box and `update_request` is a request still waiting on the
+    operator's updater, so the apps can show the button, the manual
+    command, or "requested" honestly."""
+    from . import disk_watch, self_update
+    return {**info, "disk": disk_watch.snapshot(),
+            "one_tap": self_update.one_tap_mode(),
+            "update_request": self_update.pending_request(__version__)}
 
 
 # ── 2.1 server recommendations: more disk / memory, one tap ──────────
@@ -2426,11 +2441,15 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
     # default for one-tap users mid-repair — was paying it just to receive
     # the 409 this cheap local check produces instantly.
     # Off Fly first (2.4.2, mirror issue #5): a Docker or bare install has
-    # no machine to rewrite, so the token recipe below cannot help it.
-    if not self_update._on_fly():
-        raise HTTPException(status_code=409,
-                            detail=self_update.OFF_FLY_DETAIL)
-    if not self_update._fly_token():
+    # no machine to rewrite, so the token recipe below cannot help it. With
+    # UPDATE_REQUEST_FILE set it hands the vetted tag to the operator's own
+    # updater instead, through every gate the Fly path uses.
+    on_fly = self_update._on_fly()
+    if not on_fly:
+        if self_update.one_tap_mode() != "request_file":
+            raise HTTPException(status_code=409,
+                                detail=self_update.OFF_FLY_DETAIL)
+    elif not self_update._fly_token():
         raise HTTPException(
             status_code=409,
             detail="no deploy token on this instance — create one with "
@@ -2452,6 +2471,32 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
             status_code=409,
             detail=f"release v{latest} has no published image yet — "
                    "try again in a few minutes")
+    if not on_fly:
+        # The same safety net apply_update() lays before a Fly swap: the
+        # host's updater runs the migrations the moment it acts, and a
+        # vouched major may carry some. Best effort, like on Fly: no room
+        # or a failed copy is logged and the request still goes.
+        await self_update.snapshot_before_upgrade(latest)
+        try:
+            path = self_update.write_update_request(latest)
+        except ValueError:
+            raise HTTPException(
+                status_code=409,
+                detail="the release check returned a version this server "
+                       "will not hand to an updater; nothing was requested"
+            ) from None
+        except OSError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"could not write UPDATE_REQUEST_FILE "
+                       f"({e.strerror or e}); check the path exists and "
+                       "this server can write to its folder") from e
+        # 202: accepted, and the operator's updater does the rest. The apps
+        # treat any 2xx as "applying" and poll /api/version for the change.
+        return JSONResponse(status_code=202, content={
+            "ok": True, "requested": latest, "path": str(path),
+            "note": "update requested; this server's own updater installs "
+                    "it, then re-check /api/version"})
     ok = await self_update.apply_update(latest)
     if not ok:
         raise HTTPException(status_code=502,
@@ -2693,9 +2738,7 @@ async def api_update_check() -> JSONResponse:
         raise HTTPException(status_code=502,
                             detail="couldn't reach GitHub to check — "
                                    "try again in a minute")
-    from . import disk_watch
-    return JSONResponse({**app.state.update_info,
-                         "disk": disk_watch.snapshot()})
+    return JSONResponse(_version_payload(app.state.update_info))
 
 
 # ── Cloud-source integrations (Settings → Integrations) ──────────────────
@@ -2823,6 +2866,17 @@ async def api_sources() -> dict[str, Any]:
     from . import source_history
     now_ms = int(time.time() * 1000)
     sources = source_status.snapshot()
+    # 2.5 (a 2.4 review follow-up): how many stations each source feeds.
+    # A poller whose credentials were wrong from its first tick never made
+    # a device row, so no station could carry its health line and the app
+    # showed nothing at all; with this count it can list the source itself.
+    feeds: dict[str, int] = {}
+    for d in await db.list_devices():
+        name = source_status.DEVICE_SOURCES.get((d.get("info") or {}).get("source") or "")
+        if name:
+            feeds[name] = feeds.get(name, 0) + 1
+    for row in sources:
+        row["stations"] = feeds.get(row["name"], 0)
     for row in sources:
         if not row.get("configured") or row.get("label") is None:
             continue
@@ -2903,7 +2957,55 @@ async def get_devices(
                 cache[name] = {}
         if cache[name]:
             health["health_24h"] = cache[name]
+    # 2.5 (C13): every station's own day, from when its readings arrived.
+    # Pushed stations have no record above; polled ones have the poller's,
+    # which stays green while one of its stations goes quiet (09-26), so
+    # theirs carries the source's outages over the device verdict.
+    watch: list[dict[str, Any]] | None = None
+    for d in devices:
+        if d.get("source_health") is None \
+                and source_status.DEVICE_SOURCES.get((d.get("info") or {}).get("source") or ""):
+            continue    # a polled source that has not declared this boot
+        try:
+            if watch is None:
+                watch = await source_history.history(
+                    source_history.SERVER_WATCH, now_ms)
+            health = d.get("source_health")
+            if health:
+                runs = await source_history.history(health["name"], now_ms)
+                d["arrival_24h"] = await _arrival_day(
+                    d["mac"], watch, now_ms,
+                    outages=[r for r in runs if r["verdict"] in (source_history.VENDOR,
+                                                                  source_history.OURS)],
+                    kind="polled")
+            else:
+                d["arrival_24h"] = await _arrival_day(d["mac"], watch, now_ms)
+        except Exception:
+            log.exception("arrival day failed for %s", d.get("mac"))
     return JSONResponse(devices)
+
+
+# One minute per station: /api/devices is the app's most-polled route and
+# a day on a five minute grid does not move faster than that.
+_ARRIVAL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_ARRIVAL_TTL_S = 60.0
+
+
+async def _arrival_day(mac: str, watch: list[dict[str, Any]],
+                       now_ms: int, outages: list[dict[str, Any]] | None = None,
+                       kind: str = "push") -> dict[str, Any]:
+    from . import source_history
+    hit = _ARRIVAL_CACHE.get(mac)
+    now = time.monotonic()
+    if hit and now - hit[0] < _ARRIVAL_TTL_S:
+        return hit[1]
+    # One extra quiet window before the day, so its first slots know
+    # whether the station was already silent.
+    since = now_ms - source_history.WINDOW_MS - source_history.DEVICE_QUIET_MS
+    slots = await db.arrival_slots(mac, since, source_history.ARRIVAL_SLOT_MS)
+    day = source_history.arrival_day(slots, watch, now_ms, outages=outages, kind=kind)
+    _ARRIVAL_CACHE[mac] = (now, day)
+    return day
 
 
 # ───────────────────────── alert preferences (app-managed) ─────────────────────────
@@ -3710,6 +3812,28 @@ async def get_climate(mac: str,
     return JSONResponse(await climate.year_summary(_format_mac(mac), year))
 
 
+@app.get("/api/devices/{mac}/forecast-correction",
+         dependencies=[Depends(require_token)])
+async def get_forecast_correction(
+    mac: str,
+    provider: str = Query("open-meteo", pattern="^[a-z0-9-]{1,32}$"),
+) -> JSONResponse:
+    """What this yard has done to the forecast (2.5, C1): per lead, the
+    offset to add to the forecast high and low, learned from the last
+    CORRECTION_DAYS of the scorecard. Shown beside the forecast in the
+    apps, never in place of it. Empty when there is not enough to learn
+    from (a new server, Insights off)."""
+    from .ingest import _format_mac
+    if not settings.insights:
+        return JSONResponse({"provider": provider, "leads": []})
+    card = await forecast_skill.scorecard(_format_mac(mac), provider=provider,
+                                          days=forecast_skill.CORRECTION_DAYS)
+    leads = forecast_skill.corrections_from(card) if card.get("available") else []
+    return JSONResponse({"provider": provider,
+                         "window_days": forecast_skill.CORRECTION_DAYS,
+                         "leads": leads})
+
+
 @app.get("/api/devices/{mac}/forecast-accuracy",
          dependencies=[Depends(require_token)])
 async def get_forecast_accuracy(
@@ -3745,6 +3869,264 @@ async def get_storms(mac: str,
     from .ingest import _format_mac
     return JSONResponse({"storms": await db.list_storms(_format_mac(mac),
                                                         limit)})
+
+
+@app.get("/api/nowcast", dependencies=[Depends(require_token)])
+async def get_nowcast() -> JSONResponse:
+    """The rain the nowcast expects, if any (2.5, C12): the dashboard's
+    "next few hours" line reads it beside the station's own trend. `rain`
+    is null when nothing is expected or the nowcast is off."""
+    from . import nowcast
+    return JSONResponse({"rain": await nowcast.upcoming(int(time.time() * 1000))})
+
+
+# ── The watering call (2.5, C6) ─────────────────────────────────────────
+
+@app.get("/api/devices/{mac}/watering", dependencies=[Depends(require_token)])
+async def get_watering(mac: str) -> JSONResponse:
+    """Seven days of rain against estimated evapotranspiration, and the
+    verdict: water, light, or skip (app/watering.py)."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    from . import watering
+    from .ingest import _format_mac
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = timezone.utc
+    m = _format_mac(mac)
+    coords = await _device_coords(m)
+    return JSONResponse(await watering.for_station(
+        m, _dt.now(tz).date(), coords[0] if coords else None))
+
+
+# ── Archive coverage (2.5, C10) ─────────────────────────────────────────
+# "Which years do I have?" After a WU import (or a CSV / WeeWX one) the
+# only way to know what the archive holds was to scroll the charts. Per
+# year: days with data, days per month, and how many came from each
+# importer, from the daily rollups (one row per station per local day) and
+# the import ledger. No scan of the raw observations.
+
+@app.get("/api/devices/{mac}/coverage", dependencies=[Depends(require_token)])
+async def get_coverage(mac: str) -> JSONResponse:
+    import calendar
+    from .ingest import _format_mac
+    days, imported = await db.coverage_days(_format_mac(mac))
+    by_year: dict[int, dict[str, Any]] = {}
+
+    def year(y: int) -> dict[str, Any]:
+        if y not in by_year:
+            by_year[y] = {"year": y, "days": 0,
+                          "days_in_year": 366 if calendar.isleap(y) else 365,
+                          "months": [0] * 12, "imported": {}}
+        return by_year[y]
+
+    for d in days:
+        try:
+            y, m = int(d[:4]), int(d[5:7])
+        except (ValueError, IndexError):
+            continue
+        row = year(y)
+        row["days"] += 1
+        row["months"][m - 1] += 1
+    for src, ds in imported.items():
+        for d in ds:
+            try:
+                y = int(d[:4])
+            except ValueError:
+                continue
+            row = year(y)
+            row["imported"][src] = row["imported"].get(src, 0) + 1
+    years = [by_year[y] for y in sorted(by_year, reverse=True)]
+    return JSONResponse({"first_day": days[0] if days else None,
+                         "last_day": days[-1] if days else None,
+                         "years": years})
+
+
+# ── Sensor checks (2.5, C4) ─────────────────────────────────────────────
+# Per field over the last N days: how many readings were stored and how
+# many the plausibility bands refused. Refusals used to exist only as a
+# log line; a gust sensor sending 255 mph all week looked, in the app,
+# like a quiet week.
+
+_SENSOR_HEALTH_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+_SENSOR_HEALTH_TTL_S = 3600.0
+
+
+@app.get("/api/devices/{mac}/sensor-health", dependencies=[Depends(require_token)])
+async def get_sensor_health(mac: str,
+                            days: int = Query(30, ge=1, le=90)) -> JSONResponse:
+    from .alerts import _FIELD_LABELS
+    from .ingest import _PLAUSIBLE_BANDS, _format_mac
+    m = _format_mac(mac)
+    key = (m, days)
+    hit = _SENSOR_HEALTH_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _SENSOR_HEALTH_TTL_S:
+        body = dict(hit[1])
+    else:
+        now_ms = int(time.time() * 1000)
+        since_ms = now_ms - days * 86_400_000
+        fields = list(_PLAUSIBLE_BANDS)
+        accepted = await db.accepted_counts(m, since_ms, fields)
+        body = {"days": days, "accepted": accepted}
+        _SENSOR_HEALTH_CACHE[key] = (time.monotonic(), body)
+        body = dict(body)
+    # Refusals are cheap and must be current (a flush a minute ago counts).
+    since_day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+    rejected = await db.sensor_rejections(m, since_day)
+    rows = []
+    for f in sorted(set(body["accepted"]) | set(rejected)):
+        a, r = body["accepted"].get(f, 0), rejected.get(f, 0)
+        if a == 0 and r == 0:
+            continue
+        rows.append({"field": f, "label": _FIELD_LABELS.get(f, f),
+                     "accepted": a, "rejected": r,
+                     "rejected_pct": round(100.0 * r / (a + r), 2) if a + r else 0.0})
+    rows.sort(key=lambda x: (-x["rejected"], x["field"]))
+    return JSONResponse({"days": body["days"], "fields": rows})
+
+
+# ── Storm compare (2.5, Doren's 2b) ─────────────────────────────────────
+# One storm, recorded at one station, measured at every other station over
+# the same window: did the Tempest get what the Davis got? Each station is
+# measured by the storm summary's own rules (storm_window_stats with that
+# station's own counter; the close capture), so the numbers are the ones
+# its own summary would have printed. A station that was not reporting in
+# the window says so rather than reading as a dry one.
+
+STORM_COMPARE_MAX_MS = 3 * 86_400_000
+
+
+@app.get("/api/storms/compare", dependencies=[Depends(require_token)])
+async def get_storm_compare(mac: str, started_ms: int = Query(..., ge=0),
+                            ended_ms: int = Query(..., ge=0)) -> JSONResponse:
+    from . import storm
+    from .ingest import _format_mac
+    home = _format_mac(mac)
+    if ended_ms < started_ms:
+        raise HTTPException(status_code=400, detail="the storm ends before it starts")
+    if ended_ms - started_ms > STORM_COMPARE_MAX_MS:
+        raise HTTPException(status_code=400, detail="a storm window is at most three days")
+    now_ms = int(time.time() * 1000)
+    out = []
+    for d in await db.list_devices():
+        if db.is_air_monitor_device(d):
+            continue
+        m = d["mac"]
+        # The counter this station actually kept IN THE WINDOW, in the storm
+        # module's own preference order (yearly first: it survives
+        # midnight). The latest reading is not a safe guide: a source can
+        # change which counters it sends.
+        field, counted = "yearlyrainin", 0
+        for f in storm._COUNTER_FIELDS:
+            n = await db.count_non_null_between(m, f, started_ms, ended_ms)
+            if n:
+                field, counted = f, n
+                break
+        stats = await db.storm_window_stats(m, started_ms, ended_ms, field)
+        count = await db.count_observations_between(m, started_ms, ended_ms)
+        capture = await db.storm_close_capture(m, started_ms, ended_ms, now_ms)
+        out.append({
+            "mac": m,
+            "name": d.get("name") or m,
+            "is_home": m == home,
+            "readings": count,
+            # Absent is not zero: no counter readings in the window is "this
+            # station was not measuring rain", not a dry 0.00.
+            "total_in": round(stats["total_in"], 2) if counted else None,
+            "peak_rate_in_hr": stats.get("peak_rate_in_hr"),
+            "max_gust_mph": stats.get("max_gust_mph"),
+            "min_tempf": stats.get("min_tempf"),
+            "max_tempf": stats.get("max_tempf"),
+            **capture,
+        })
+    out.sort(key=lambda r: (not r["is_home"], r["name"].lower()))
+    return JSONResponse({"started_ms": started_ms, "ended_ms": ended_ms,
+                         "stations": out})
+
+
+# ── Neighbour stations (2.5, Doren's 2a) ────────────────────────────────
+# Nearby Weather Underground stations for the Charts comparison. Fetched
+# lazily (when Compare opens), with the owner's WU key; see app/neighbors.py
+# for the design rules. A failure is an answer the apps can say out loud,
+# never a 500: the comparison still draws your own stations.
+
+async def _device_coords(mac: str) -> tuple[float, float] | None:
+    for d in await db.list_devices():
+        if d.get("mac") != mac:
+            continue
+        c = (((d.get("info") or {}).get("coords") or {}).get("coords") or {})
+        lat, lon = c.get("lat"), c.get("lon")
+        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) \
+                and math.isfinite(lat) and math.isfinite(lon):
+            return float(lat), float(lon)
+    return None
+
+
+@app.get("/api/neighbors", dependencies=[Depends(require_token)])
+async def get_neighbors(mac: str,
+                        refresh: bool = Query(False)) -> JSONResponse:
+    """The WU stations near one of yours, nearest first."""
+    from . import neighbors
+    from .ingest import _format_mac
+    coords = await _device_coords(_format_mac(mac))
+    body: dict[str, Any] = {"configured": bool(await neighbors.api_key()),
+                            "stations": [], "error": None}
+    if coords is None:
+        body["error"] = "This station has no location, so there is nothing to be near."
+        return JSONResponse(body)
+    try:
+        body["stations"] = await neighbors.stations_near(*coords, refresh=refresh)
+    except neighbors.NotConfigured:
+        body["error"] = ("Nearby stations come from Weather Underground and need "
+                         "your WU API key (Settings, Weather Underground).")
+    except neighbors.UpstreamError as e:
+        body["error"] = str(e)
+    return JSONResponse(body)
+
+
+@app.get("/api/neighbors/check", dependencies=[Depends(require_token)])
+async def get_neighbor_check(mac: str) -> JSONResponse:
+    """Does one of this station's sensors run away from the nearby ones
+    (2.5, C3)? Only neighbour readings already stored count; nothing is
+    fetched here."""
+    from . import neighbors
+    from .ingest import _format_mac
+    m = _format_mac(mac)
+    return JSONResponse(await neighbors.drift(m, await _device_coords(m)))
+
+
+@app.get("/api/neighbors/{station_id}/history",
+         dependencies=[Depends(require_token)])
+async def get_neighbor_history(station_id: str,
+                               start_ms: int = Query(...),
+                               end_ms: int | None = Query(None)) -> JSONResponse:
+    """One neighbour's readings in a window (at most the last week), as
+    Observation-shaped rows. Only a station a near search found can be
+    fetched: this is not a general WU proxy."""
+    from . import neighbors
+    sid = station_id.upper()
+    if not neighbors.valid_station_id(sid):
+        raise HTTPException(status_code=400, detail="not a station id")
+    st = await neighbors.known_station(sid)
+    if st is None:
+        raise HTTPException(status_code=404, detail="not a known neighbour")
+    now_ms = int(time.time() * 1000)
+    end = min(end_ms or now_ms, now_ms)
+    body: dict[str, Any] = {"id": sid, "name": st["name"], "rows": [],
+                            "error": None}
+    if st["qc_status"] == neighbors.QC_FAILED:
+        body["error"] = "This station failed Weather Underground's quality checks."
+        return JSONResponse(body)
+    try:
+        await neighbors.refresh(sid, start_ms, now_ms)
+    except neighbors.NotConfigured:
+        body["error"] = "No Weather Underground API key on this server."
+    except neighbors.UpstreamError as e:
+        # Serve what is stored; say why it may be short.
+        body["error"] = str(e)
+    body["rows"] = await neighbors.history(sid, start_ms, end)
+    return JSONResponse(body)
 
 
 @app.get("/api/devices/{mac}/changes", dependencies=[Depends(require_token)])
@@ -4182,28 +4564,38 @@ async def start_csv_import(body: ArchiveImportIn) -> JSONResponse:
     mac = _format_mac(body.mac)
     if not any(d["mac"] == mac for d in await db.list_devices()):
         raise HTTPException(status_code=404, detail=f"unknown device {mac}")
-    if archive_import.status().get("state") == "running":
+    if not archive_import.reserve():
         raise HTTPException(status_code=409, detail="an import is already running")
-    if not body.time_column:
-        raise HTTPException(status_code=400,
-                            detail="time_column names the column holding the "
-                                   "timestamp")
-    unknown = sorted(f for f in body.mapping.values()
-                     if f not in archive_import.FIELD_KINDS)
-    if unknown:
-        raise HTTPException(
-            status_code=400,
-            detail=("these fields are not readings this server stores: "
-                    + ", ".join(unknown)))
-    rows = archive_import.csv_rows(
-        body.csv, body.mapping,
-        system=archive_import.UNIT_SYSTEMS[body.units],
-        time_column=body.time_column, time_format=body.time_format)
+    try:
+        if not body.time_column:
+            raise HTTPException(status_code=400,
+                                detail="time_column names the column holding the "
+                                       "timestamp")
+        unknown = sorted(f for f in body.mapping.values()
+                         if f not in archive_import.FIELD_KINDS)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=("these fields are not readings this server stores: "
+                        + ", ".join(unknown)))
+        rows = archive_import.csv_rows(
+            body.csv, body.mapping,
+            system=archive_import.UNIT_SYSTEMS[body.units],
+            time_column=body.time_column, time_format=body.time_format)
+    except BaseException:
+        # Refused or failed before the task took the slot over.
+        archive_import.release()
+        raise
     _ARCHIVE_IMPORT_TASK = asyncio.create_task(
         archive_import.run_import(mac, rows, kind="csv",
                                   dry_run=body.dry_run, ordered=False))
     return JSONResponse({"ok": True, "mac": mac, "kind": "csv",
                          "dry_run": body.dry_run})
+
+
+def _limits_weewx_max() -> int:
+    from .limits import WEEWX_IMPORT_MAX
+    return WEEWX_IMPORT_MAX
 
 
 @app.get("/api/import/csv/fields", dependencies=[Depends(require_token)])
@@ -4217,11 +4609,150 @@ async def csv_import_fields() -> JSONResponse:
         "fields": [{"field": f, "kind": k}
                    for f, k in sorted(archive_import.FIELD_KINDS.items())],
         "units": sorted(archive_import.UNIT_SYSTEMS),
+        # 2.5: POST /api/import/csv/file takes the file itself, streamed,
+        # up to this many bytes; the JSON door stays for older apps.
+        "file_door_max_bytes": _limits_weewx_max(),
         "note": ("Map each column to one reading, or leave it out. The time "
                  "column is separate; an epoch needs no format, anything "
                  "else needs a strptime pattern and is read in the "
                  "server's zone."),
     })
+
+
+async def _stream_upload_to_temp(request: Request, *, suffix: str, prefix: str,
+                                 sort_copies: int = 0) -> "Path":
+    """An archive upload, streamed to a temp file rather than held in
+    memory (the WeeWX door's since 2.4, shared with the CSV file door in
+    2.5). Room for it is checked before a byte lands (R24-02); an empty
+    body is a 400; a failure removes the partial file. `sort_copies`
+    reserves room for that many more copies of the upload: the CSV door
+    sorts through a second file beside it (Greptile, PR #48), and the sort
+    itself still stops at archive_import.SORT_MIN_FREE_BYTES."""
+    import shutil as _shutil
+    import tempfile
+    from pathlib import Path as _Path
+    from .limits import WEEWX_IMPORT_MAX as _MAX
+    tmp = _Path(tempfile.gettempdir()) / f"{prefix}{secrets.token_hex(8)}{suffix}"
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    # No usable length (chunked, or a malformed header) reserves the whole
+    # limit: the middleware still lets that much through (CodeRabbit, PR #40).
+    need = ((min(declared, _MAX) if declared > 0 else _MAX) * (1 + sort_copies)
+            + 64 * 1024 * 1024)
+    try:
+        free = _shutil.disk_usage(tmp.parent).free
+    except OSError as e:
+        raise HTTPException(status_code=507, detail=f"cannot measure free disk: {e}")
+    if free < need:
+        raise HTTPException(
+            status_code=507,
+            detail=f"not enough free disk for the upload: it needs about "
+                   f"{need // 2**20} MB and {tmp.parent} has {free // 2**20} MB free")
+    total = 0
+    try:
+        with open(tmp, "wb") as f:
+            # Written from a worker thread a megabyte at a time: a slow
+            # volume must not stall ingest behind a 512 MiB upload
+            # (CodeRabbit, PR #48).
+            pending: list[bytes] = []
+            size = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                if declared > 0 and total > declared:
+                    # The room above was reserved from the declared length;
+                    # a body longer than it declared is refused rather than
+                    # trusted to fit (CodeRabbit, PR #48). Reserving the
+                    # whole limit for every upload instead would ask a
+                    # 1 KB CSV for 1.6 GB free.
+                    raise HTTPException(
+                        status_code=400,
+                        detail="the upload is longer than its Content-Length")
+                pending.append(chunk)
+                size += len(chunk)
+                if size >= 1 << 20:
+                    await asyncio.to_thread(f.write, b"".join(pending))
+                    pending, size = [], 0
+            if pending:
+                await asyncio.to_thread(f.write, b"".join(pending))
+        if total == 0:
+            raise HTTPException(status_code=400, detail="no file was uploaded")
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+@app.post("/api/import/csv/file", dependencies=[Depends(require_write_token)])
+async def start_csv_file_import(
+    mac: str,
+    request: Request,
+    time_column: str,
+    mapping: str,
+    time_format: str = "",
+    units: str = "us",
+    dry_run: bool = False,
+) -> JSONResponse:
+    """A CSV import from the raw request body, streamed to disk (2.5, a 2.4
+    review follow-up). The JSON door holds up to 16 MiB of text in memory
+    and sorts it there; this one takes up to limits.WEEWX_IMPORT_MAX, reads
+    it a row at a time and sorts it through a throwaway SQLite file beside
+    it, so a decade of spreadsheet never sits in memory. `mapping` is the
+    column → field object as JSON, the same shape the JSON door takes."""
+    from . import archive_import
+    from .ingest import _format_mac
+    global _ARCHIVE_IMPORT_TASK
+    formatted = _format_mac(mac)
+    if not any(d["mac"] == formatted for d in await db.list_devices()):
+        raise HTTPException(status_code=404, detail=f"unknown device {formatted}")
+    if not archive_import.reserve():
+        raise HTTPException(status_code=409, detail="an import is already running")
+    try:
+        try:
+            cols = json.loads(mapping)
+            assert isinstance(cols, dict) and all(
+                isinstance(k, str) and isinstance(v, str) for k, v in cols.items())
+        except Exception:
+            raise HTTPException(status_code=400, detail="mapping must be a JSON object of column to field")
+        unknown = sorted(f for f in cols.values() if f not in archive_import.FIELD_KINDS)
+        if unknown:
+            raise HTTPException(status_code=400,
+                                detail="these fields are not readings this server stores: "
+                                       + ", ".join(unknown))
+        if units not in archive_import.UNIT_SYSTEMS:
+            raise HTTPException(status_code=400, detail="unknown units")
+        # The sort's copy is compact JSON per row, about twice the CSV's bytes.
+        tmp = await _stream_upload_to_temp(request, suffix=".csv", prefix=".csv-",
+                                           sort_copies=2)
+        try:
+            header = archive_import.csv_file_header(str(tmp))
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="that does not read as a UTF-8 CSV")
+        if time_column not in header:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=400,
+                                detail=f"the file has no column named {time_column!r}")
+
+        async def _run() -> None:
+            try:
+                rows = archive_import.csv_file_rows(
+                    str(tmp), cols, system=archive_import.UNIT_SYSTEMS[units],
+                    time_column=time_column, time_format=time_format)
+                await archive_import.run_import(formatted, rows, kind="csv",
+                                                dry_run=dry_run, ordered=False,
+                                                spill_dir=str(tmp.parent))
+            finally:
+                tmp.unlink(missing_ok=True)
+
+    except BaseException:
+        # Refused or failed before the task took the slot over.
+        archive_import.release()
+        raise
+    _ARCHIVE_IMPORT_TASK = asyncio.create_task(_run())
+    return JSONResponse({"ok": True, "mac": formatted, "kind": "csv",
+                         "dry_run": dry_run, "columns": len(header)})
 
 
 @app.post("/api/import/weewx", dependencies=[Depends(require_write_token)])
@@ -4237,66 +4768,39 @@ async def start_weewx_import(
     of hundreds of megabytes. Bounded at limits.WEEWX_IMPORT_MAX by the
     ASGI layer and by free disk here (R24-02).
     """
-    import tempfile
-    from pathlib import Path as _Path
     from . import archive_import
     from .ingest import _format_mac
     global _ARCHIVE_IMPORT_TASK
     formatted = _format_mac(mac)
     if not any(d["mac"] == formatted for d in await db.list_devices()):
         raise HTTPException(status_code=404, detail=f"unknown device {formatted}")
-    if archive_import.status().get("state") == "running":
+    if not archive_import.reserve():
         raise HTTPException(status_code=409, detail="an import is already running")
-    tmp = _Path(tempfile.gettempdir()) / f".weewx-{secrets.token_hex(8)}.sdb"
-    # Room for the upload before a byte of it lands (R24-02): the restore
-    # door asks the same question for the same reason.
-    import shutil as _shutil
-    from .limits import WEEWX_IMPORT_MAX as _WEEWX_MAX
     try:
-        declared = int(request.headers.get("content-length") or 0)
-    except ValueError:
-        declared = 0
-    # No usable length (chunked, or a malformed header) reserves the whole
-    # limit: the middleware still lets that much through, and a route
-    # that reserved 64 MiB for it could fill the temporary filesystem
-    # (CodeRabbit, PR #40).
-    need = (min(declared, _WEEWX_MAX) if declared > 0 else _WEEWX_MAX) \
-        + 64 * 1024 * 1024
-    try:
-        free = _shutil.disk_usage(tmp.parent).free
-    except OSError as e:
-        raise HTTPException(status_code=507, detail=f"cannot measure free disk: {e}")
-    if free < need:
-        raise HTTPException(
-            status_code=507,
-            detail=f"not enough free disk for the upload: it needs about "
-                   f"{need // 2**20} MB and {tmp.parent} has {free // 2**20} MB free")
-    total = 0
-    try:
-        with open(tmp, "wb") as f:
-            async for chunk in request.stream():
-                total += len(chunk)
-                f.write(chunk)
-        if total == 0:
-            raise HTTPException(status_code=400, detail="no file was uploaded")
+        tmp = await _stream_upload_to_temp(request, suffix=".sdb", prefix=".weewx-")
         try:
-            summary = archive_import.weewx_summary(str(tmp))
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"that does not look like a weewx.sdb ({e})")
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-    async def _run() -> None:
-        try:
-            await archive_import.run_import(
-                formatted, archive_import.read_weewx(str(tmp)),
-                kind="weewx", dry_run=dry_run)
-        finally:
+            try:
+                summary = archive_import.weewx_summary(str(tmp))
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"that does not look like a weewx.sdb ({e})")
+        except BaseException:
             tmp.unlink(missing_ok=True)
+            raise
 
+        async def _run() -> None:
+            try:
+                await archive_import.run_import(
+                    formatted, archive_import.read_weewx(str(tmp)),
+                    kind="weewx", dry_run=dry_run)
+            finally:
+                tmp.unlink(missing_ok=True)
+
+    except BaseException:
+        # Refused or failed before the task took the slot over.
+        archive_import.release()
+        raise
     _ARCHIVE_IMPORT_TASK = asyncio.create_task(_run())
     return JSONResponse({"ok": True, "mac": formatted, "kind": "weewx",
                          "dry_run": dry_run, **summary})
@@ -4993,6 +5497,15 @@ class AlertRulePatch(BaseModel):
     note: str | None = Field(default=None, max_length=400)   # "" clears (2.3)
 
 
+@app.get("/api/alerts/rules/overlaps", dependencies=[Depends(require_token)])
+async def get_rule_overlaps() -> JSONResponse:
+    """Rules the alert history shows firing alongside a matching built-in
+    watch (2.5, C5), so the apps can offer to retire them. Suggests only;
+    turning a rule off is the ordinary PATCH."""
+    from . import rule_overlap
+    return JSONResponse({"overlaps": await rule_overlap.find(int(time.time() * 1000))})
+
+
 @app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_shared_write)])
 async def patch_rule(rule_id: int, body: AlertRulePatch) -> JSONResponse:
     import math
@@ -5474,6 +5987,10 @@ class MapSharePut(BaseModel):
     visit_public_page: bool | None = None
     # direct | id | none — how the map may reach this server from its pin.
     link_mode: str | None = None
+    # 2.5 (C14): the owner's own point for "custom", within 100 miles of
+    # the station's true one. Both or neither.
+    custom_lat: float | None = None
+    custom_lon: float | None = None
 
 
 @app.get("/api/map", dependencies=[Depends(require_write_token)])
@@ -5499,6 +6016,13 @@ async def get_map_share() -> JSONResponse:
         "name_visible": bool(cfg.get("name_visible")),
         "location_precision": mb.precision_of(cfg),
         "precisions": list(mb.PRECISIONS),
+        # 2.5 (C14): the owner's placed point, when one is set, and the
+        # city the gazetteer names for the shared station.
+        "custom_lat": cfg.get("custom_lat"),
+        "custom_lon": cfg.get("custom_lon"),
+        "custom_max_km": mb.CUSTOM_MAX_KM,
+        "city_label": (preview or {}).get("place") if mb.precision_of(cfg) == "city"
+                      else _city_label(station),
         # The public page: whether it is on, its address if the server
         # can know it, and whether the owner chose to link it. The app
         # shows the link switch only when the page is on AND addressable.
@@ -5531,6 +6055,16 @@ async def get_map_share() -> JSONResponse:
         "pending_withdraw": [p["mac"] for p in await mb.pending_withdrawals()
                              if isinstance(p.get("mac"), str)],
     })
+
+
+def _city_label(station: dict[str, Any] | None) -> str | None:
+    """The gazetteer's name for where a station is, for the picker's
+    "City (Chandler, AZ)" row whatever precision is chosen."""
+    from . import map_beacon as mb
+    from .share_targets import _coords
+    c = _coords(station) if station else None
+    hit = mb.nearest_place(c[0], c[1]) if c else None
+    return hit["label"] if hit else None
 
 
 # Serializes PUT /api/map (R23): the handler reads the config, awaits
@@ -5571,9 +6105,28 @@ async def _put_map_share_locked(body: MapSharePut) -> JSONResponse:
     if body.location_precision is not None:
         if body.location_precision not in mb.PRECISIONS:
             raise HTTPException(status_code=400,
-                                detail="location_precision must be exact, area or city")
+                                detail="location_precision must be exact, area, city or custom")
         cfg["location_precision"] = body.location_precision
         cfg.pop("exact_location", None)
+    if (body.custom_lat is None) != (body.custom_lon is None):
+        raise HTTPException(status_code=400,
+                            detail="custom_lat and custom_lon go together")
+    if body.custom_lat is not None:
+        from .share_targets import _coords
+        station = next((d for d in devices
+                        if d.get("mac") == mb.effective_mac(cfg, devices)), None)
+        true = _coords(station) if station else None
+        if true is None:
+            raise HTTPException(status_code=400,
+                                detail="the shared station has no location to measure from")
+        if not (-90 <= body.custom_lat <= 90 and -180 <= body.custom_lon <= 180):
+            raise HTTPException(status_code=400, detail="not a point on Earth")
+        if mb._km(true[0], true[1], body.custom_lat, body.custom_lon) > mb.CUSTOM_MAX_KM:
+            raise HTTPException(status_code=400,
+                                detail="a placed pin must stay within 100 miles of the station")
+        cfg["custom_lat"] = round(body.custom_lat, 4)
+        cfg["custom_lon"] = round(body.custom_lon, 4)
+        cfg["custom_mac"] = station["mac"]
     if body.visit_public_page is not None:
         cfg["visit_public_page"] = bool(body.visit_public_page)
     if body.link_mode is not None:

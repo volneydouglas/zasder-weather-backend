@@ -326,24 +326,32 @@ def source_down_copy(label: str, kind: str, hours: float,
             f"readings for {h}{err}. This one is on the server.")
 
 
-async def check_sources(cfg, now_ms: int, deliver,
-                        quiet_minutes: float | None = None) -> None:
-    from . import source_history, source_status
-    from .config import settings
+async def record_sources(now_ms: int) -> None:
+    """This tick's verdict per source into the rolling 24 hour record
+    (2.4 item 3), plus the server's own watch (2.5, C13) that a pushed
+    station's day is read against.
 
-    # 2.4 item 3: before anything is decided, this tick's verdict per
-    # source goes into the rolling 24 hour record. It is written even
-    # when the watchdog itself is switched off (`source_alert_minutes`
-    # zero), because the record is what answers "what happened
-    # overnight" afterwards, and a record with holes in it where somebody
-    # had alerts off is worse than useless.
+    Called from the alert tick BEFORE its channel gate: the record is what
+    answers "what happened overnight", and it used to be written inside
+    the source watchdog, which a box with no email, push or webhook never
+    reached. A record with holes wherever somebody had alerts off is
+    worse than useless."""
+    from . import source_history, source_status
     try:
+        await source_history.record(source_history.SERVER_WATCH,
+                                    source_history.OK, now_ms)
         for src in source_status.snapshot():
             if src.get("configured") and src.get("label") is not None:
                 await source_history.record(
                     src["name"], source_history.verdict_for(now_ms, src), now_ms)
     except Exception:
         log.exception("source health record failed")
+
+
+async def check_sources(cfg, now_ms: int, deliver,
+                        quiet_minutes: float | None = None) -> None:
+    from . import source_status
+    from .config import settings
 
     minutes = settings.source_alert_minutes if quiet_minutes is None else quiet_minutes
     if not minutes or minutes <= 0:

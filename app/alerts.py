@@ -339,6 +339,9 @@ def build_threshold_message(device_name: str, field: str, value: float,
 # alerts should have to EARN silence, not legibility.
 ALERT_SEVERITY: dict[str, str] = {
     "lightning": "warning",
+    # 2.5 (C2): water on the floor does not wait for morning.
+    "leak": "warning",
+    "leak_cleared": "info",
     "outflow": "warning",
     "pipe_freeze": "warning",
     "nws": "warning",
@@ -1209,6 +1212,11 @@ class AlertMonitor:
             await db.flush_write_audit()
         except Exception as e:
             log.warning("write-audit flush failed: %s", e)
+        # 2.5 (C4): the plausibility bands' refusal counts.
+        try:
+            await db.flush_qc_rejections()
+        except Exception as e:
+            log.warning("sensor-check flush failed: %s", e)
         cfg = await effective_config()
         now_ms = int(time.time() * 1000)
         devices = await db.list_devices()
@@ -1217,6 +1225,10 @@ class AlertMonitor:
         # racing a test's monkeypatch found the widened window).
         alerts_open = (cfg.enabled or await apns.push_configured()
                        or bool(await db.list_webhooks(enabled_only=True)))
+        # The 24 hour health record and the server watch are a record,
+        # not a delivery: written whether or not any channel is open.
+        from . import health_watch as _hw_rec
+        await _hw_rec.record_sources(now_ms)
         # ── Pillar B egress + widget nudges run FIRST, independent of the
         # alert-transport gate below (R7 R1): community uploads, forecast
         # snapshots and widget refreshes are their own delivery surfaces —
@@ -1247,6 +1259,12 @@ class AlertMonitor:
             await share_targets.check(devices, now_ms)
         except Exception:
             log.exception("share fan-out failed")
+        # 2.5 (C6): the morning watering call, to webhooks only.
+        from . import watering
+        try:
+            await watering.send_if_due(devices, now_ms)
+        except Exception:
+            log.exception("watering call failed")
         # 2.3 shared station map: the opt-in beacon, on the same best-
         # effort footing as the network uploads.
         from . import map_beacon
@@ -1344,6 +1362,13 @@ class AlertMonitor:
             # the yard as it is (CodeRabbit, PR #40).
             if await db.get_smart_alert_states():
                 await db.clear_smart_alert_states()
+        # 2.5 (C2) leak detectors: a sensor bought to be told, so not
+        # behind the smart-alerts switch (see app/leak_watch.py).
+        from . import leak_watch
+        try:
+            await leak_watch.check(cfg, devices, now_ms, _deliver)
+        except Exception:
+            log.exception("leak watch failed")
         # 2.2 source watchdog: a cloud poller failing for an hour is an
         # outage, so it runs whether or not the smart alerts are on.
         from . import health_watch as _hw

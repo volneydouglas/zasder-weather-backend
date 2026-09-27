@@ -30,6 +30,8 @@ still costs no memory: FastAPI answers 401 without touching the stream.
 
 import os
 
+from .envfile import env_value
+
 _DEFAULT_MAX = 1 * 1024 * 1024  # 1 MiB
 # Exact paths whose routes bound their own body, after authentication.
 EXEMPT_PATHS = frozenset({"/api/backup/database/restore"})
@@ -47,12 +49,15 @@ WEEWX_IMPORT_MAX = 512 * 1024 * 1024
 PATH_LIMITS: dict[str, int] = {
     "/api/import/csv": CSV_IMPORT_MAX,
     "/api/import/weewx": WEEWX_IMPORT_MAX,
+    # 2.5: the CSV file door streams to disk like the WeeWX one, so the
+    # same disk-bound cap.
+    "/api/import/csv/file": WEEWX_IMPORT_MAX,
 }
 
 
 def _max_bytes() -> int:
     try:
-        v = int((os.environ.get("MAX_REQUEST_BYTES") or "").strip())
+        v = int((env_value("MAX_REQUEST_BYTES") or "").strip())
         return v if v > 0 else _DEFAULT_MAX
     except ValueError:
         return _DEFAULT_MAX

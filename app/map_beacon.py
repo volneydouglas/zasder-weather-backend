@@ -29,6 +29,7 @@ import logging
 import math
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -66,8 +67,20 @@ TTL_MS = 3 * 3_600_000            # a beacon nobody renews is gone in three hour
 # Location precision (Volney 09-14, "a drop down: exact, approximate,
 # city"): the grid the true point is snapped to before anything leaves.
 FUZZ_KM = 0.5                     # "area": within about half a kilometre
-CITY_KM = 10.0                    # "city": within about ten kilometres
-PRECISIONS = ("exact", "area", "city")
+# "city" (2.5, C14): the centre of the nearest populated place of 15,000+
+# people, from a bundled GeoNames gazetteer (app/places.tsv, CC BY 4.0).
+# No geocoding call leaves the box. Every station in a city shares one
+# point, so the pin says "Chandler", not "about seven km from my house".
+# CITY_KM stays as the fallback grid for a point the gazetteer cannot
+# place (a remote station more than CITY_MAX_KM from any town).
+CITY_KM = 10.0
+CITY_MAX_KM = 80.0
+# "custom" (2.5, C14): a point the owner places, at most CUSTOM_MAX_KM
+# (100 miles) from the station's true one. It travels as precision
+# "area" plus `placed_by: "owner"`, which every deployed directory
+# accepts (an older one ignores the extra key and shows "approximate").
+CUSTOM_MAX_KM = 160.934
+PRECISIONS = ("exact", "area", "city", "custom")
 DEFAULT_PRECISION = "area"
 # The outdoor set a stranger sees. Indoor, CO2, PM2.5, lightning and the
 # rain counters that reveal a day's habits stay home.
@@ -272,7 +285,77 @@ def precision_of(cfg: dict[str, Any]) -> str:
 def place(lat: float, lon: float, precision: str) -> tuple[float, float]:
     if precision == "exact":
         return round(lat, 5), round(lon, 5)
+    if precision == "city":
+        hit = nearest_place(lat, lon)
+        if hit is not None:
+            return hit["lat"], hit["lon"]
     return fuzz(lat, lon, CITY_KM if precision == "city" else FUZZ_KM)
+
+
+_PLACES: list[tuple[float, float, str, str]] | None = None
+
+
+def _places() -> list[tuple[float, float, str, str]]:
+    global _PLACES
+    if _PLACES is None:
+        out = []
+        path = Path(__file__).with_name("places.tsv")
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                name, region, la, lo = line.rstrip("\n").split("\t")
+                out.append((float(la), float(lo), name, region))
+        _PLACES = out
+    return _PLACES
+
+
+def _km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2)
+         * math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+_NEAREST_CACHE: dict[tuple[float, float], dict[str, Any] | None] = {}
+
+
+def nearest_place(lat: float, lon: float) -> dict[str, Any] | None:
+    """The nearest populated place within CITY_MAX_KM: its centre and its
+    label ("Chandler, AZ"). Cached per 0.01° cell; the gazetteer is read
+    once per process."""
+    key = (round(lat, 2), round(lon, 2))
+    if key in _NEAREST_CACHE:
+        return _NEAREST_CACHE[key]
+    best = None
+    best_km = CITY_MAX_KM
+    # A cheap box first: a degree of latitude is 111 km.
+    span = CITY_MAX_KM / 111.0
+    for la, lo, name, region in _places():
+        if abs(la - lat) > span:
+            continue
+        d = _km(lat, lon, la, lo)
+        if d < best_km:
+            best_km, best = d, (la, lo, name, region)
+    hit = None if best is None else {
+        "lat": round(best[0], 4), "lon": round(best[1], 4),
+        "label": f"{best[2]}, {best[3]}", "km": round(best_km, 1)}
+    _NEAREST_CACHE[key] = hit
+    return hit
+
+
+def custom_point(cfg: dict[str, Any], mac: str, lat: float, lon: float
+                 ) -> tuple[float, float] | None:
+    """The owner's point for this station, if it still stands: set for
+    THIS station and within CUSTOM_MAX_KM of where the station is now."""
+    c_lat, c_lon = _num(cfg.get("custom_lat")), _num(cfg.get("custom_lon"))
+    if c_lat is None or c_lon is None:
+        return None
+    if str(cfg.get("custom_mac") or "").upper() != mac.upper():
+        return None
+    if _km(lat, lon, c_lat, c_lon) > CUSTOM_MAX_KM:
+        return None
+    return round(c_lat, 4), round(c_lon, 4)
 
 
 def public_page_url() -> str | None:
@@ -374,7 +457,24 @@ def build(*, server_id: str, station: dict[str, Any], cfg: dict[str, Any],
     if coords is None or not obs:
         return None
     precision = precision_of(cfg)
-    lat, lon = place(coords[0], coords[1], precision)
+    extra: dict[str, Any] = {}
+    custom = (custom_point(cfg, str(station.get("mac") or ""), coords[0], coords[1])
+              if precision == "custom" else None)
+    if precision == "custom" and custom is None:
+        # Moved, re-assigned, or never placed: the city is the honest
+        # fallback, never the true point.
+        precision = "city"
+    if custom is not None:
+        lat, lon = custom
+        # Travels as "area" so every deployed directory accepts it.
+        precision = "area"
+        extra["placed_by"] = "owner"
+    else:
+        lat, lon = place(coords[0], coords[1], precision)
+        if precision == "city":
+            hit = nearest_place(coords[0], coords[1])
+            if hit is not None:
+                extra["place"] = hit["label"]
     observed = obs.get("dateutc")
     observed_ms = int(observed) if isinstance(observed, (int, float)) else now_ms
     beacon: dict[str, Any] = {
@@ -390,6 +490,7 @@ def build(*, server_id: str, station: dict[str, Any], cfg: dict[str, Any],
         "expires_ms": now_ms + TTL_MS,
         "conditions": conditions(obs),
         "software": f"zasder-weather-backend/{__version__}",
+        **extra,
     }
     if cfg.get("name_visible"):
         name = str(station.get("name") or "").strip()[:48]

@@ -120,7 +120,10 @@
     const c = p.conditions || {};
     const name = p.name ? esc(p.name) : 'A shared station';
     let html = '<div class="card"><h3>' + name + '</h3>';
-    const where = p.precision === 'city' ? 'Somewhere in the area · ' : (p.fuzzed ? 'Approximate location · ' : '');
+    // 2.5 (C14): a city pin names its town; a pin the owner placed says so.
+    const where = p.placed_by === 'owner' ? 'Location set by the owner · '
+      : p.precision === 'city' ? (p.place ? 'In ' + esc(p.place) + ' · ' : 'Somewhere in the area · ')
+      : (p.fuzzed ? 'Approximate location · ' : '');
     html += '<div class="muted">' + where + esc(age(p.observed_ms || p.sent_ms)) + '</div>';
     html += '<table>';
     const n = k => reading(c, k);

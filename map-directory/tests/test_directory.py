@@ -965,3 +965,26 @@ def test_epoch_fields_are_bounded_to_what_a_reader_can_hold(client):
     assert r.status_code == 200
     geo = client.get("/v1/beacons").json()
     assert geo["features"][0]["properties"]["observed_ms"] == now - 60_000
+
+
+def test_a_city_pin_names_its_town_and_an_owner_pin_says_so(client):
+    """2.5 (C14): `place` and `placed_by` ride through to the map; anything
+    else in them is refused."""
+    key = _key()
+    r = client.post("/v1/beacons", json=_env(key, _beacon(
+        precision="city", place="Chandler, AZ")))
+    assert r.status_code == 200, r.text
+    props = client.get("/v1/beacons").json()["features"][0]["properties"]
+    assert props["place"] == "Chandler, AZ" and "placed_by" not in props
+    r = client.post("/v1/beacons", json=_env(_key(), _beacon(
+        server="srv-b", station="st-2", precision="area", placed_by="owner")))
+    assert r.status_code == 200, r.text
+    got = {f["properties"]["station_id"]: f["properties"]
+           for f in client.get("/v1/beacons").json()["features"]}
+    assert got["st-2"]["placed_by"] == "owner"
+    bad = client.post("/v1/beacons", json=_env(_key(), _beacon(
+        server="srv-c", station="st-3", placed_by="someone")))
+    assert bad.status_code == 400
+    long = client.post("/v1/beacons", json=_env(_key(), _beacon(
+        server="srv-d", station="st-4", place="x" * 65)))
+    assert long.status_code == 400

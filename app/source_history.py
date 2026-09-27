@@ -209,6 +209,89 @@ def buckets(runs: list[dict[str, Any]], now_ms: int, count: int = 24) -> str:
     return "".join(out)
 
 
+# The server's own watch (2.5, C13): stamped OK on every alert tick, so a
+# pushed station's silence can be told apart from the server's. Not a
+# source name any poller uses (they are vendor names, no underscore).
+SERVER_WATCH = "_server"
+# Arrival days are built on this grid. Five minutes keeps the query to at
+# most 288 grouped rows per station on the app's most-polled route.
+ARRIVAL_SLOT_MS = 5 * 60_000
+
+
+def arrival_day(stamps_ms: list[int], watched: list[dict[str, Any]],
+                now_ms: int, outages: list[dict[str, Any]] | None = None,
+                kind: str = "push") -> dict[str, Any]:
+    """The last 24 hours of ONE station, in the shape `summarise` gives a
+    polled source, from when its readings arrived (2.5, C13).
+
+    Since 09-26 every station gets one, polled ones too: the per-source
+    record stays green while one of two monitors on a poller goes quiet,
+    because the poller still brought rows for the other (the outdoor
+    AirGradient's twelve quiet minutes never showed on any strip). For a
+    polled station `outages` is its source's own record, and a quiet slot
+    inside a vendor or ours run takes THAT verdict: a station cannot
+    deliver through a service that was not answering.
+
+    A station fed from the owner's own network has no poller to blame or
+    absolve, so there are only three answers per slot: readings arrived
+    (a reading also proves the server was up), the station was quiet for
+    longer than DEVICE_QUIET_MS while the server watch covered the slot
+    (`device`), or nobody was watching (`unknown`, drawn as absent). The
+    same 15 minute rule as a polled source: a station on a ten minute
+    cadence is never "quiet".
+    """
+    start = now_ms - WINDOW_MS
+    slot = ARRIVAL_SLOT_MS
+    count = WINDOW_MS // slot
+    have = sorted({int(t) for t in stamps_ms if start - WINDOW_MS <= int(t) <= now_ms})
+    spans = [(int(r["from_ms"]), int(r["until_ms"]))
+             for r in watched if r.get("verdict") in VERDICTS]
+    # The newest run's end moves only every KEEPALIVE_MS, so a run that
+    # ends within one bridge of now is still being watched up to now.
+    if spans and now_ms - spans[-1][1] <= MAX_BRIDGE_MS:
+        spans[-1] = (spans[-1][0], now_ms)
+
+    def watched_at(t: int) -> bool:
+        return any(a <= t < b for a, b in spans)
+
+    runs: list[dict[str, Any]] = []
+    i = 0
+    last_seen: int | None = None
+    # The newest reading before the window, so the first slots know
+    # whether the station was already quiet.
+    while i < len(have) and have[i] < start:
+        last_seen = have[i]
+        i += 1
+    for k in range(count):
+        a = start + k * slot
+        b = min(a + slot, now_ms)
+        got = False
+        while i < len(have) and have[i] < b:
+            last_seen = have[i]
+            got = True
+            i += 1
+        if got or (last_seen is not None and b - last_seen <= DEVICE_QUIET_MS):
+            verdict = OK      # this slot, or inside the normal cadence
+        elif watched_at(a):
+            verdict = next((o["verdict"] for o in outages or []
+                            if o.get("verdict") in (VENDOR, OURS)
+                            and int(o["from_ms"]) <= a < int(o["until_ms"])), DEVICE)
+        else:
+            verdict = UNKNOWN
+        if verdict == UNKNOWN:
+            continue      # gaps between runs ARE unknown to summarise
+        if runs and runs[-1]["verdict"] == verdict and runs[-1]["until_ms"] == a:
+            runs[-1]["until_ms"] = b
+        else:
+            runs.append({"from_ms": a, "until_ms": b, "verdict": verdict})
+    out = summarise(runs, now_ms)
+    if runs and runs[-1]["until_ms"] < now_ms - slot:
+        out["current"] = UNKNOWN
+        out["current_since_ms"] = runs[-1]["until_ms"]
+    out["kind"] = kind
+    return out
+
+
 async def _load(name: str) -> list[dict[str, Any]]:
     raw = await db.get_kv(_KEY_PREFIX + name)
     if not raw:

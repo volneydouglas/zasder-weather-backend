@@ -154,6 +154,17 @@ async def dispatch_alert(kind: str, mac: str | None, title: str,
     await asyncio.gather(*(_send(h, payload) for h in hooks))
 
 
+async def dispatch_event(event: str, data: dict[str, Any]) -> None:
+    """A non-alert event (2.5: the morning `watering` call) to every
+    enabled webhook, signed and delivered like an alert."""
+    hooks = await db.list_webhooks(enabled_only=True)
+    if not hooks:
+        return
+    payload = json.dumps({"event": event, **data},
+                         separators=(",", ":")).encode()
+    await asyncio.gather(*(_send(h, payload) for h in hooks))
+
+
 async def _send(hook: dict[str, Any], payload: bytes) -> None:
     headers = {
         "Content-Type": "application/json",

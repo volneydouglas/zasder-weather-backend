@@ -17,11 +17,11 @@ affects serving.
 
 import asyncio
 import logging
-import os
 import time
 
 import httpx
 
+from .envfile import env_value
 from .version import __version__
 
 log = logging.getLogger("updates")
@@ -32,12 +32,12 @@ _RETRY_ON_FAIL_S = 3600
 
 
 def _enabled() -> bool:
-    return (os.environ.get("UPDATE_CHECK", "1").strip().lower()
+    return (env_value("UPDATE_CHECK", "1").strip().lower()
             not in ("0", "false", "off", "no"))
 
 
 def _repo() -> str:
-    return os.environ.get("UPDATE_CHECK_REPO", "").strip() or _DEFAULT_REPO
+    return env_value("UPDATE_CHECK_REPO").strip() or _DEFAULT_REPO
 
 
 def parse_version(v: str) -> tuple[int, ...]:

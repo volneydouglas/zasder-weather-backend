@@ -27,6 +27,8 @@ from typing import Any
 import httpx
 import jwt
 
+from .envfile import env_value
+
 log = logging.getLogger("fcm")
 
 _TOKEN_URI_DEFAULT = "https://oauth2.googleapis.com/token"
@@ -45,8 +47,8 @@ _sa_cache: tuple[tuple, dict | None] | None = None
 
 def _service_account() -> dict | None:
     global _sa_cache
-    raw_env = os.environ.get("FCM_SERVICE_ACCOUNT_JSON", "").strip()
-    path = "" if raw_env else os.environ.get("FCM_SERVICE_ACCOUNT_FILE", "").strip()
+    raw_env = env_value("FCM_SERVICE_ACCOUNT_JSON").strip()
+    path = "" if raw_env else env_value("FCM_SERVICE_ACCOUNT_FILE").strip()
     mtime: int | None = None
     if path:
         try:

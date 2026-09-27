@@ -1,0 +1,8 @@
+{
+  "files": [
+    {
+      "path": "../AGENTS.md",
+      "description": "How the backend is built, configured and deployed; the environment reference."
+    }
+  ]
+}

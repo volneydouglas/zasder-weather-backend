@@ -25,6 +25,7 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
 from .config import tokens_match
+from .envfile import env_value
 
 router = APIRouter()
 
@@ -35,7 +36,7 @@ MAX_BODY_BYTES = 64 * 1024
 # JSON-lines log lives next to the SQLite db on the persistent volume so we
 # don't lose captures across redeploys. One file per slug; appended forever.
 def _log_path(slug: str) -> Path:
-    base = Path(os.environ.get("DATABASE_PATH", "./data/weather.db")).parent
+    base = Path(env_value("DATABASE_PATH") or "./data/weather.db").parent
     base = base / "captures"
     base.mkdir(parents=True, exist_ok=True)
     safe = "".join(c for c in slug if c.isalnum() or c in "-_") or "unknown"
@@ -43,7 +44,7 @@ def _log_path(slug: str) -> Path:
 
 
 def _require_capture_token(authorization: str | None, query_token: str | None) -> None:
-    expected = os.environ.get("CAPTURE_TOKEN", "").strip()
+    expected = env_value("CAPTURE_TOKEN").strip()
     if not expected:
         # Endpoint disabled entirely when no token is configured. We return
         # 404 (not 401) so a port scan can't tell the route exists.

@@ -190,6 +190,20 @@ async def _get_state() -> dict[str, Any]:
         return {}
 
 
+async def upcoming(now_ms: int) -> dict[str, Any] | None:
+    """The rain the nowcast currently expects, for the dashboard's "next
+    few hours" line (2.5, C12): the start and the expected total, while
+    the start is still ahead or under an hour past. None otherwise,
+    including when the nowcast is switched off (it then never writes)."""
+    state = await _get_state()
+    start = int(state.get("start_ms") or 0)
+    if not start or state.get("ended_ms") or now_ms > start + ACTIVITY_LIFETIME_MS:
+        return None
+    total = state.get("total_in")
+    return {"start_ms": start,
+            "total_in": float(total) if isinstance(total, (int, float)) else None}
+
+
 async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
                 deliver) -> None:
     """One monitor-tick entry point. `deliver` is alerts._deliver, passed in

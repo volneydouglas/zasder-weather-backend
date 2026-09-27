@@ -530,6 +530,48 @@ CREATE TABLE IF NOT EXISTS push_relay (
 -- slimmed down, and to stop burning WU API quota re-fetching archives we
 -- already hold. `source` names the importer ("wu"); force re-imports
 -- delete the rows first.
+-- Neighbour stations (2.5): nearby Weather Underground stations drawn
+-- beside yours in the Charts comparison. NEVER devices rows (decided
+-- 2026-09-21): somebody else's station has no alerts, rollups, records
+-- or share uploads. app/neighbors.py owns both tables; rows are WU's
+-- five-minute AVERAGES, stored API-native.
+CREATE TABLE IF NOT EXISTS neighbor_stations (
+    station_id  TEXT PRIMARY KEY,
+    name        TEXT,
+    lat         REAL NOT NULL,
+    lon         REAL NOT NULL,
+    qc_status   INTEGER,           -- WU: 1 passed, 0 failed, -1 unchecked
+    seen_ms     INTEGER NOT NULL,  -- last time a near search listed it
+    fetched_ms  INTEGER            -- last recent-day fetch
+);
+CREATE TABLE IF NOT EXISTS neighbor_observations (
+    station_id   TEXT NOT NULL,
+    ts_ms        INTEGER NOT NULL,
+    tempf        REAL,
+    humidity     REAL,
+    dew_point    REAL,
+    feels_like   REAL,
+    windspeedmph REAL,
+    windgustmph  REAL,
+    winddir      REAL,
+    baromrelin   REAL,
+    dailyrainin  REAL,
+    PRIMARY KEY (station_id, ts_ms)
+) WITHOUT ROWID;
+
+-- Sensor checks (2.5, C4): readings the plausibility bands refused, per
+-- station, UTC day and field. Written from an in-memory buffer the alert
+-- tick flushes (a faulting anemometer can post every few seconds, and
+-- ingest must not grow a write per reading). Accepted counts are read
+-- from observations when asked; only the refusals need remembering.
+CREATE TABLE IF NOT EXISTS sensor_qc_daily (
+    mac      TEXT NOT NULL,
+    day      TEXT NOT NULL,       -- YYYY-MM-DD, UTC
+    field    TEXT NOT NULL,
+    rejected INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (mac, day, field)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS imported_days (
     mac         TEXT NOT NULL,
     day         TEXT NOT NULL,        -- YYYY-MM-DD
@@ -1757,6 +1799,77 @@ def touch_ingest_token(token: str) -> None:
     _INGEST_LAST_USED[token] = int(time.time() * 1000)
 
 
+# 2.5 (C4): refusals waiting for the next flush, (mac, day, field) → n.
+_QC_PENDING: dict[tuple[str, str, str], int] = {}
+
+
+def note_rejections(mac: str, dropped: list[str], now_ms: int | None = None) -> None:
+    """Count what the plausibility bands refused. `dropped` is the band
+    filter's own list ("windgustmph=255", "windspeedmph=40(anemometer)")."""
+    if not dropped:
+        return
+    day = time.strftime("%Y-%m-%d", time.gmtime((now_ms or time.time() * 1000) / 1000))
+    for d in dropped:
+        field = d.split("=", 1)[0]
+        key = (mac, day, field)
+        _QC_PENDING[key] = _QC_PENDING.get(key, 0) + 1
+
+
+async def flush_qc_rejections() -> None:
+    """Same snapshot contract as the stamp flushes: counts that arrive
+    mid-flush wait for the next one. A flush that fails puts its counts
+    back, added to any that arrived meanwhile, so the next tick writes them
+    (Greptile, PR #48: they were dropped, and sensor checks undercounted)."""
+    if not _QC_PENDING:
+        return
+    pending = list(_QC_PENDING.items())
+    for k, _ in pending:
+        _QC_PENDING.pop(k, None)
+    try:
+        async with connect() as db:
+            for (mac, day, field), n in pending:
+                await db.execute(
+                    "INSERT INTO sensor_qc_daily (mac, day, field, rejected) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(mac, day, field) "
+                    "DO UPDATE SET rejected = rejected + excluded.rejected",
+                    (mac, day, field, n))
+            await db.execute(
+                "DELETE FROM sensor_qc_daily WHERE day < ?",
+                (time.strftime("%Y-%m-%d", time.gmtime(time.time() - 120 * 86400)),))
+            await db.commit()
+    except BaseException:
+        for k, n in pending:
+            _QC_PENDING[k] = _QC_PENDING.get(k, 0) + n
+        raise
+
+
+async def sensor_rejections(mac: str, since_day: str) -> dict[str, int]:
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT field, SUM(rejected) FROM sensor_qc_daily "
+            "WHERE mac = ? AND day >= ? GROUP BY field", (mac, since_day))).fetchall()
+    out = {r[0]: int(r[1] or 0) for r in rows}
+    # Not yet flushed counts are real too.
+    for (m, day, field), n in _QC_PENDING.items():
+        if m == mac and day >= since_day:
+            out[field] = out.get(field, 0) + n
+    return out
+
+
+async def accepted_counts(mac: str, since_ms: int, fields: list[str]) -> dict[str, int]:
+    """Stored (non-null) readings per field since `since_ms`. Field names
+    are whitelisted through _FIELD_MAP before they reach the SQL."""
+    cols = [(f, _FIELD_MAP[f]) for f in fields if f in _FIELD_MAP]
+    if not cols:
+        return {}
+    sel = ", ".join(f"COUNT({c})" for _, c in cols)
+    async with connect() as db:
+        row = await (await db.execute(
+            f"SELECT {sel} FROM observations WHERE mac = ? AND dateutc_ms >= ?",
+            (mac, since_ms))).fetchone()
+    return {f: int(row[i] or 0) for i, (f, _) in enumerate(cols)}
+
+
 async def flush_ingest_last_used() -> None:
     """Same atomic-snapshot contract as flush_guest_last_used: stamps that
     arrive mid-flush survive for the next one."""
@@ -2441,6 +2554,20 @@ async def set_device_location(mac: str, lat: float, lon: float,
         await db.commit()
 
 
+async def arrival_slots(mac: str, since_ms: int, slot_ms: int) -> list[int]:
+    """The start of every `slot_ms` slot since `since_ms` that holds at
+    least one reading for `mac` (2.5, C13: a pushed station's day). A
+    range scan on the (mac, dateutc_ms) primary key, grouped, so a day
+    of one-second readings still returns at most a slot's worth of rows."""
+    step = max(1, int(slot_ms))
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT (dateutc_ms / ?) * ? FROM observations "
+            "WHERE mac = ? AND dateutc_ms >= ? GROUP BY dateutc_ms / ?",
+            (step, step, mac, int(since_ms), step))).fetchall()
+    return [int(r[0]) for r in rows]
+
+
 async def get_kv(key: str) -> str | None:
     async with connect() as db:
         row = await (await db.execute(
@@ -3062,9 +3189,17 @@ async def clear_smart_alert_states() -> int:
     """Forget every smart-alert edge. Read by the monitor while the
     switch is OFF (2.4): nothing records a clearance then, so a
     triggered row would outlive the switch and the next crossing after
-    re-enable would read as already fired."""
+    re-enable would read as already fired.
+
+    Only the SMART family's edges. The source watchdog (`source:<name>`
+    rows) and the leak watch (`leak:<channel>`) share this table and run
+    whatever the switch says; clearing them every tick made a poller's
+    outage re-announce itself every minute on any box with smart alerts
+    off, the default (2.5, found building C2)."""
     async with connect() as db:
-        cur = await db.execute("DELETE FROM smart_alert_state")
+        cur = await db.execute(
+            "DELETE FROM smart_alert_state "
+            "WHERE mac NOT LIKE 'source:%' AND kind NOT LIKE 'leak:%'")
         await db.commit()
         return cur.rowcount or 0
 
@@ -3383,6 +3518,30 @@ async def storm_window_stats(mac: str, start_ms: int, end_ms: int,
         "max_tempf": _as_float(row["max_t"]) if row else None,
         "max_gust_mph": _as_float(row["max_gust"]) if row else None,
     }
+
+
+async def count_observations_between(mac: str, start_ms: int, end_ms: int) -> int:
+    """How many readings a station stored in a window (storm compare)."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT COUNT(*) FROM observations WHERE mac = ? "
+            "AND dateutc_ms BETWEEN ? AND ?", (mac, start_ms, end_ms))).fetchone()
+    return int(row[0] or 0)
+
+
+async def count_non_null_between(mac: str, field: str, start_ms: int,
+                                 end_ms: int) -> int:
+    """Readings in a window that carry `field` (an API field name,
+    whitelisted through _FIELD_MAP before it reaches the SQL)."""
+    if field not in _FIELD_MAP:
+        raise ValueError(f"refusing to interpolate unknown column {field!r}")
+    col = _FIELD_MAP[field]
+    async with connect() as db:
+        row = await (await db.execute(
+            f"SELECT COUNT(*) FROM observations WHERE mac = ? "
+            f"AND dateutc_ms BETWEEN ? AND ? AND {col} IS NOT NULL",
+            (mac, start_ms, end_ms))).fetchone()
+    return int(row[0] or 0)
 
 
 async def value_at_or_before(mac: str, field: str, cutoff_ms: int,
@@ -5259,6 +5418,21 @@ async def _rollup_period_fields(db, mac: str, fields: list[str],
 
 
 # ── historical-import ledger (1.9) ──────────────────────────────────────
+
+async def coverage_days(mac: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Every local day this station has a rollup for, and the imported
+    days per importer (2.5, C10: "which years do I have")."""
+    async with connect() as db:
+        days = [r[0] for r in await (await db.execute(
+            "SELECT day FROM daily_rollups WHERE mac = ? ORDER BY day",
+            (mac,))).fetchall()]
+        imported: dict[str, list[str]] = {}
+        for src, day in await (await db.execute(
+                "SELECT source, day FROM imported_days WHERE mac = ?",
+                (mac,))).fetchall():
+            imported.setdefault(src, []).append(day)
+    return days, imported
+
 
 async def imported_days(mac: str, source: str) -> set[str]:
     """Days (YYYY-MM-DD) this importer has fully processed for a station."""

@@ -391,3 +391,236 @@ def test_the_csv_field_catalogue_is_served_not_copied(client):
     assert set(body["units"]) == set(ai.UNIT_SYSTEMS)
     assert "time" in body["note"]
     assert client.get("/api/import/csv/fields").status_code == 401
+
+
+# ── the CSV file door (2.5, a 2.4 review follow-up) ──────────────────────
+
+def _wait_import():
+    import time as _t
+    for _ in range(400):
+        if ai.status().get("state") != "running":
+            break
+        _t.sleep(0.05)
+    return ai.status()
+
+
+def test_the_file_door_streams_sorts_on_disk_and_sums_interval_rain(client, monkeypatch):
+    """The same out-of-order file as the JSON door's test, sent as the file
+    itself: rows are read one at a time and sorted through a SQLite file
+    beside the upload, and the day counter comes out the same."""
+    import json as _json
+    from app import db
+    from app.day_rain import day_rain_in
+    monkeypatch.setattr(db.settings, "insights", True)
+    _make_device(client, "AABBCC000049")
+    mac = "AA:BB:CC:00:00:49"
+    text = ("﻿when,rain,temp\n"      # a spreadsheet's BOM
+            "1789993200,0.02,71\n"
+            "1789992600,0.03,72\n"
+            "1789992000,0.05,73\n")
+    r = client.post("/api/import/csv/file", headers=H, content=text.encode(),
+                    params={"mac": mac, "time_column": "when",
+                            "mapping": _json.dumps({"rain": "intervalRainIn",
+                                                    "temp": "tempf"})})
+    assert r.status_code == 200, r.text
+    assert r.json()["columns"] == 3
+    st = _wait_import()
+    assert st["state"] == "done" and st["inserted"] == 3
+
+    async def ledger():
+        async with db.connect() as conn:
+            row = dict(await (await conn.execute(
+                "SELECT * FROM daily_rollups WHERE mac=? AND day='2026-09-21'",
+                (mac,))).fetchone())
+            stored = await (await conn.execute(
+                "SELECT dailyrainin, tempf FROM observations WHERE mac=? "
+                "ORDER BY dateutc_ms", (mac,))).fetchall()
+        return day_rain_in(row), [tuple(s) for s in stored]
+    total, rows = asyncio.run(ledger())
+    assert total == pytest.approx(0.10)
+    assert [c for c, _ in rows[-3:]] == pytest.approx([0.05, 0.08, 0.10])
+    assert [t for _, t in rows[-3:]] == [73, 72, 71]
+    # Nothing left behind: the upload and the sort file are both gone.
+    import glob, tempfile
+    assert not glob.glob(os.path.join(tempfile.gettempdir(), ".csvsort-*"))
+
+
+def test_the_file_door_refuses_what_it_cannot_read(client):
+    import json as _json
+    _make_device(client, "AABBCC000050")
+    mac = "AA:BB:CC:00:00:50"
+    no_time = client.post("/api/import/csv/file", headers=H, content=b"a,b\n1,2\n",
+                          params={"mac": mac, "time_column": "when",
+                                  "mapping": _json.dumps({"a": "tempf"})})
+    assert no_time.status_code == 400 and "when" in no_time.json()["detail"]
+    bad_field = client.post("/api/import/csv/file", headers=H, content=b"when,a\n1,2\n",
+                            params={"mac": mac, "time_column": "when",
+                                    "mapping": _json.dumps({"a": "rain_total"})})
+    assert bad_field.status_code == 400
+    bad_json = client.post("/api/import/csv/file", headers=H, content=b"when\n1\n",
+                           params={"mac": mac, "time_column": "when", "mapping": "[1]"})
+    assert bad_json.status_code == 400
+    empty = client.post("/api/import/csv/file", headers=H, content=b"",
+                        params={"mac": mac, "time_column": "when", "mapping": "{}"})
+    assert empty.status_code == 400
+    assert client.post("/api/import/csv/file", content=b"when\n1\n",
+                       params={"mac": mac, "time_column": "when",
+                               "mapping": "{}"}).status_code == 401
+
+
+def test_the_on_disk_sort_keeps_a_file_order_tie_stable(tmp_path):
+    rows = [{"dateutc": 2, "n": "b"}, {"dateutc": 1, "n": "a"}, {"dateutc": 2, "n": "c"}]
+    out = list(ai.sorted_on_disk(iter(rows), str(tmp_path), chunk=2))
+    assert [r["n"] for r in out] == ["a", "b", "c"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_catalogue_names_the_file_doors_limit(client):
+    body = client.get("/api/import/csv/fields", headers=H).json()
+    from app.limits import WEEWX_IMPORT_MAX
+    assert body["file_door_max_bytes"] == WEEWX_IMPORT_MAX
+
+
+def test_the_sort_runs_off_the_event_loop(client, tmp_path):
+    """Greptile, PR #48: the first row out of an on-disk sort needs the
+    whole file parsed and indexed, and that ran on the event loop, so a
+    512 MiB CSV held live ingest for the whole sort. The rows are now
+    consumed by the spill in a worker thread."""
+    import threading
+    _make_device(client, "AABBCC000051")
+    seen: set[int] = set()
+
+    def rows():
+        for t in (3, 1, 2):
+            seen.add(threading.get_ident())
+            yield {"dateutc": 1789990000000 + t * 60_000, "tempf": 70 + t}
+
+    async def go():
+        loop_thread = threading.get_ident()
+        st = await ai.run_import("AA:BB:CC:00:00:51", rows(), kind="csv",
+                                 ordered=False, spill_dir=str(tmp_path))
+        return loop_thread, st
+    loop_thread, st = asyncio.run(go())
+    assert st["state"] == "done" and st["inserted"] == 3
+    assert seen and loop_thread not in seen
+    assert not list(tmp_path.iterdir()), "the sort file is removed"
+
+
+def test_a_sort_that_would_fill_the_disk_stops_and_cleans_up(client, tmp_path, monkeypatch):
+    """Greptile, PR #48: the upload's room check could not see the sort's
+    second copy. The spill checks the floor as it goes, stops with a
+    readable error and leaves nothing behind."""
+    _make_device(client, "AABBCC000052")
+    monkeypatch.setattr(ai, "_free_bytes", lambda _p: ai.SORT_MIN_FREE_BYTES - 1)
+    rows = ({"dateutc": 1789990000000 + k * 60_000, "tempf": 70} for k in range(10))
+    st = asyncio.run(ai.run_import("AA:BB:CC:00:00:52", rows, kind="csv",
+                                   ordered=False, spill_dir=str(tmp_path)))
+    assert st["state"] == "error" and "free disk" in st["error"]
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_file_door_reserves_room_for_the_sort(client, monkeypatch):
+    """An upload with room for itself but not for the sort's copy is
+    refused before a byte lands."""
+    import json as _json
+    import shutil
+    from collections import namedtuple
+    _make_device(client, "AABBCC000053")
+    body = b"when,temp\n" + b"1789990000,71\n" * 1000
+    Usage = namedtuple("Usage", "total used free")
+    room = len(body) * 2 + 64 * 1024 * 1024       # the upload twice, not three times
+    monkeypatch.setattr(shutil, "disk_usage", lambda _p: Usage(0, 0, room))
+    r = client.post("/api/import/csv/file", headers=H, content=body,
+                    params={"mac": "AA:BB:CC:00:00:53", "time_column": "when",
+                            "mapping": _json.dumps({"temp": "tempf"})})
+    assert r.status_code == 507, r.text
+
+
+def test_one_import_slot_is_taken_before_the_upload_is_awaited(client):
+    """CodeRabbit, PR #48: status() is a copy of JOB, and the file doors
+    await the whole upload between checking it and starting the task, so
+    two uploads could both pass. The slot is reserved first; a refused
+    request gives it back."""
+    import json as _json
+    _make_device(client, "AABBCC000054")
+    mac = "AA:BB:CC:00:00:54"
+    assert ai.reserve() is True
+    assert ai.reserve() is False, "a second taker is refused"
+    busy = client.post("/api/import/csv/file", headers=H, content=b"when,temp\n1789990000,71\n",
+                       params={"mac": mac, "time_column": "when",
+                               "mapping": _json.dumps({"temp": "tempf"})})
+    assert busy.status_code == 409
+    ai.release()
+    bad = client.post("/api/import/csv/file", headers=H, content=b"a\n1\n",
+                      params={"mac": mac, "time_column": "when",
+                              "mapping": _json.dumps({"a": "tempf"})})
+    assert bad.status_code == 400
+    assert ai.reserve() is True, "the refused request released the slot"
+    ai.release()
+
+
+def test_the_index_build_is_checked_against_the_floor(tmp_path, monkeypatch):
+    """CodeRabbit, PR #48: the per-batch floor could not see the index,
+    built after the last batch. Room for every batch but not the index is
+    refused before CREATE INDEX, and the file is removed."""
+    monkeypatch.setattr(ai, "_free_bytes",
+                        lambda _p: ai.SORT_MIN_FREE_BYTES + 5 * ai.INDEX_BYTES_PER_ROW)
+    rows = ({"dateutc": k, "tempf": 70} for k in range(10))
+    with pytest.raises(ai.SortSpaceError, match="index"):
+        ai.spill_sorted(rows, str(tmp_path))
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_cancelled_import_still_removes_the_sort_file(client, tmp_path):
+    """CodeRabbit, PR #48: cancelling the import task cannot stop the
+    spill's worker thread; whatever it writes is removed when it ends."""
+    import threading
+    import time as _t
+    started, finish = threading.Event(), threading.Event()
+
+    def rows():
+        yield {"dateutc": 2, "tempf": 70}
+        started.set()
+        finish.wait(5)
+        yield {"dateutc": 1, "tempf": 71}
+
+    async def go():
+        task = asyncio.ensure_future(ai.run_import(
+            "AA:BB:CC:00:00:55", rows(), kind="csv", ordered=False,
+            spill_dir=str(tmp_path)))
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        finish.set()
+        assert ai.status()["state"] == "cancelled", "not left reading running"
+        assert ai.reserve() is True, "the slot is free again"
+        ai.release()
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if not list(tmp_path.iterdir()):
+                break
+    asyncio.run(go())
+    assert not list(tmp_path.iterdir())
+
+
+def test_an_upload_longer_than_it_declared_is_refused_and_removed(tmp_path, monkeypatch):
+    """CodeRabbit, PR #48: disk room is reserved from Content-Length, so a
+    body that sends more than it declared must not be written past it."""
+    import tempfile
+    from fastapi import HTTPException
+    from app import main
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+    class Req:
+        headers = {"content-length": "10"}
+
+        async def stream(self):
+            yield b"0123456789"
+            yield b"more than declared"
+
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(main._stream_upload_to_temp(Req(), suffix=".csv", prefix=".csv-"))
+    assert e.value.status_code == 400
+    assert not list(tmp_path.iterdir()), "the partial file is removed"

@@ -344,9 +344,12 @@ def test_the_body_limit_middleware_exempts_exactly_the_restore_path(client, temp
     else."""
     from app import limits
     assert limits.EXEMPT_PATHS == frozenset({"/api/backup/database/restore"})
-    # The two archive doors have their own bounded caps (R24-02, 2.4
-    # release review); nothing else is lifted above the default.
-    assert set(limits.PATH_LIMITS) == {"/api/import/csv", "/api/import/weewx"}
+    # The archive doors have their own bounded caps (R24-02, 2.4 release
+    # review; the CSV file door, 2.5, streams to disk like the WeeWX one);
+    # nothing else is lifted above the default.
+    assert set(limits.PATH_LIMITS) == {"/api/import/csv", "/api/import/weewx",
+                                       "/api/import/csv/file"}
+    assert limits.PATH_LIMITS["/api/import/csv/file"] == limits.WEEWX_IMPORT_MAX
     _seed(client, 2)
     snap = Path(temp_env).parent / "saved.db"
     _snapshot_of(temp_env, snap)

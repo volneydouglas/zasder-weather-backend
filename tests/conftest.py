@@ -81,6 +81,9 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
                 # that exports them — deploy.sh does — made every "off Fly"
                 # test depend on the shell (round two, I4).
                 "FLY_API_TOKEN", "FLY_APP_NAME", "FLY_MACHINE_ID",
+                # 2.5: the off-Fly update request file. A developer shell
+                # that sets it would have every update test write there.
+                "UPDATE_REQUEST_FILE",
                 # Found by tests/test_env_sweep.py the day it was written:
                 # the WU key powers the TWC forecast fetch and the WU import,
                 # and the two passwords ride transports whose hosts are
@@ -109,6 +112,8 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._HEALTHZ_LOCK = None
         _m._SHARE_TEST_LAST.clear()
         _m._RECORDS_CACHE.clear()
+        _m._ARRIVAL_CACHE.clear()
+        _m._SENSOR_HEALTH_CACHE.clear()
         _m._RECORDS_LOCKS.clear()
         _m._DB_BACKUP_JOB = {"state": "idle"}
         _m._DB_BACKUP_TASK = None
@@ -121,6 +126,10 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # same shape, so it goes too.
         _m._TEST_PUSH_TS = None
         _m._TEST_ALERT_TS = None
+    # 2.5 neighbour fetch locks: an asyncio.Lock binds to its first loop.
+    _nb = sys.modules.get("app.neighbors")
+    if _nb is not None:
+        _nb._LOCKS.clear()
     # 1.8 modules keep small process-global throttles; same isolation rule.
     _wp = sys.modules.get("app.widget_push")
     if _wp is not None:
@@ -170,6 +179,12 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     # 2.1 modules with process-global job/cache state (2.1 pre-release
     # review BE-10): a restore left "swapping" by one test must not make
     # the next test's restore refuse, and cached advice must not leak.
+    # 2.5: the archive import slot. A task a test's shutdown reaped before
+    # it ran never reaches run_import's release, and the next test's
+    # import would be refused as "already running".
+    _ai = sys.modules.get("app.archive_import")
+    if _ai is not None:
+        _ai.release()
     _rs = sys.modules.get("app.restore")
     if _rs is not None:
         _rs.JOB.clear()
@@ -197,6 +212,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     if _d is not None:
         _d._GUEST_LAST_USED.clear()
         _d._INGEST_LAST_USED.clear()
+        _d._QC_PENDING.clear()
         # R5-33 rollup cache: a value computed against one test's DB must
         # not answer for the next test's — same isolation rule as above.
         _d._DAILY_ROLLUP_CACHE.clear()

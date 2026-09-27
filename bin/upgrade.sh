@@ -10,13 +10,52 @@
 # Usage:  bin/upgrade.sh            # auto-detect
 #         bin/upgrade.sh --fly      # force Fly.io path
 #         bin/upgrade.sh --docker   # force Docker path
+#         bin/upgrade.sh --docker --request FILE
+#             install exactly the release the server wrote to its
+#             UPDATE_REQUEST_FILE (a watcher's command; see the README)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 info() { printf '\033[1;34m›\033[0m %s\n' "$*"; }
 err()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; }
 
-MODE="${1:-auto}"
+MODE=auto
+REQUEST=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fly)     MODE=--fly ;;
+    --docker)  MODE=--docker ;;
+    --request)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        err "--request needs the path of the update request file."
+        exit 2
+      fi
+      REQUEST="$2"; shift ;;
+    auto)      MODE=auto ;;
+    *)         err "Unknown option: $1 (see the usage at the top of this script)"; exit 2 ;;
+  esac
+  shift
+done
+
+# --request: the server vetted one release and wrote its tag (one line,
+# "v2.5.0") to UPDATE_REQUEST_FILE. Install THAT tag, not whatever :latest
+# points at by the time the watcher runs, and refuse anything that is not
+# a plain vX.Y.Z before touching git or docker: the file is the only input
+# here that another process wrote.
+TAG=""
+if [ -n "$REQUEST" ]; then
+  if [ ! -r "$REQUEST" ]; then
+    err "Can't read the update request at $REQUEST."
+    exit 1
+  fi
+  line="$(head -c 64 "$REQUEST" | head -n 1 | tr -d '\r')"
+  if ! printf '%s\n' "$line" | grep -Eq '^v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$'; then
+    err "The update request at $REQUEST doesn't hold a release tag like v2.5.0."
+    err "Not upgrading."
+    exit 1
+  fi
+  TAG="${line#v}"
+fi
 # fly and flyctl are the same CLI under two names — which one is on PATH
 # depends on how it was installed. setup-fly.sh and doctor.sh use `fly`,
 # and this script used to hard-require `flyctl`, so the exact command the
@@ -33,6 +72,16 @@ case "$MODE" in
   --docker) MODE=docker ;;
   auto|"")  MODE="$(detect)" ;;
 esac
+if [ -n "$TAG" ] && [ "$MODE" != docker ]; then
+  err "--request is for Docker installs (run with --docker). A Fly.io server"
+  err "updates its own machine from the app's Update button."
+  exit 2
+fi
+if [ -n "$TAG" ] && ! grep -qE '^\s*image:\s*ghcr\.io' docker-compose.yml; then
+  err "--request installs a published release image, and this"
+  err "docker-compose.yml builds from source. Point it back at the ghcr.io image."
+  exit 1
+fi
 
 # Show what's running vs latest (best-effort; needs the app reachable/curl+jq not required).
 info "Pulling the latest source…"
@@ -101,7 +150,15 @@ case "$MODE" in
   docker)
     # If docker-compose pins a published image, pull it; otherwise rebuild.
     if grep -qE '^\s*image:\s*ghcr\.io' docker-compose.yml; then
-      info "Pulling the published image…"
+      if [ -n "$TAG" ]; then
+        # docker-compose.yml reads the tag as ${ZASDER_IMAGE_TAG:-latest}.
+        # Exported for this run only: a later plain `docker compose up -d`
+        # goes back to :latest, which is never older than a vetted request.
+        export ZASDER_IMAGE_TAG="$TAG"
+        info "Pulling the requested release image v${TAG}…"
+      else
+        info "Pulling the published image…"
+      fi
       docker compose pull
     else
       info "Rebuilding the image from source…"

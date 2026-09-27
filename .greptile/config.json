@@ -1,0 +1,94 @@
+{
+  "strictness": 2,
+  "commentTypes": [
+    "logic",
+    "syntax"
+  ],
+  "autoReview": [
+    "open",
+    "push"
+  ],
+  "triggerOnDrafts": false,
+  "statusCheck": false,
+  "shouldUpdateDescription": false,
+  "summarySection": {
+    "included": true,
+    "collapsible": true,
+    "defaultOpen": false
+  },
+  "issuesTableSection": {
+    "included": true,
+    "collapsible": false,
+    "defaultOpen": true
+  },
+  "confidenceScoreSection": {
+    "included": true,
+    "collapsible": true,
+    "defaultOpen": false
+  },
+  "sequenceDiagramSection": {
+    "included": false,
+    "collapsible": true,
+    "defaultOpen": false
+  },
+  "ignorePatterns": "# The reviewer-notes documents never ship in this mirror, but the exclusion\n# travels with the config so a stray copy could never be reviewed either.\ndocs/APP_REVIEW.md\ndocs/APP_REVIEW_MAC.md\n**/*.png\n**/*.jpg\n**/*.jpeg\n**/*.gif\n**/*.pdf\nlilygo-relay/.pio/**\nlilygo-relay/**/root_ca.h\n**/.venv/**\n**/*.lock\napp/places.tsv",
+  "instructions": "Zasder Weather's self-hosted backend (FastAPI + aiosqlite) with its LilyGO firmware and WeatherLink Live poller. This repository is generated from a private monorepo; review the code, but fixes land upstream. Report substantive defects, not style preferences.",
+  "rules": [
+    {
+      "id": "backend",
+      "scope": [
+        "app/**/*.py"
+      ],
+      "severity": "high",
+      "rule": "FastAPI + aiosqlite backend, self-hosted by third parties from this public repo \u2014 assume the reader is deploying it, not just reading it. Prioritise: (1) SQL correctness, especially f-string interpolation into SQL \u2014 flag any value that is NOT from an internal whitelist; (2) timezone / local period-boundary handling in rain rollups and records; (3) async issues \u2014 blocking calls on the event loop, fire-and-forget tasks whose exceptions vanish, unbounded caches; (4) secrets reaching logs (credentials are passed as query params to some upstream APIs, and exception messages can embed the full URL); (5) auth gaps on new endpoints \u2014 note that /, /healthz, /status, /api/version and /metrics are intentionally open, as is, since 2.1, the OAuth surface for the MCP server (the two /.well-known/oauth-* documents, POST /oauth/register, GET+POST /oauth/authorize, POST /oauth/token, POST /oauth/revoke: open per the MCP authorization spec, rate-limited, granting nothing without a connect code minted in the app, or the API token, on the consent page); POST /mcp takes the bearer or an OAuth access token; every other /api/* route is token-gated, and /ingest/custom is gated by a separate INGEST_TOKEN."
+    },
+    {
+      "id": "units",
+      "scope": [
+        "app/**/*.py"
+      ],
+      "severity": "high",
+      "rule": "Units are stored API-native (degrees F, mph, inHg, inches) and converted only for display. Flag any threshold or constant compared against a display-unit value."
+    },
+    {
+      "id": "absent-not-zero",
+      "scope": [
+        "app/**/*.py"
+      ],
+      "severity": "medium",
+      "rule": "A missing reading is not zero. Flag `or 0` and similar defaults that turn an absent sensor value into a real-looking 0."
+    },
+    {
+      "id": "tests",
+      "scope": [
+        "tests/**"
+      ],
+      "severity": "medium",
+      "rule": "pytest with asyncio_mode=auto. Flag tests that mutate shared state (env vars, the on-disk SQLite file, module-level singletons) without restoring it, and any test that would still pass if the behaviour it names regressed."
+    },
+    {
+      "id": "wll-poller",
+      "scope": [
+        "wll-poller/**/*.py"
+      ],
+      "severity": "medium",
+      "rule": "Pure-stdlib Python service polling a Davis WeatherLink Live gateway on the LAN and forwarding to /ingest/custom. It must stay dependency-free \u2014 flag any new third-party import. Prioritise unit conversions, resilience to malformed/partial gateway JSON, and retry/backoff behaviour when the gateway or backend is unreachable."
+    },
+    {
+      "id": "firmware",
+      "scope": [
+        "lilygo-relay/**"
+      ],
+      "severity": "medium",
+      "rule": "ESP32 (Arduino) firmware for SDR weather-sensor capture. Prioritise memory safety, blocking work in loop(), watchdog interaction, and the provisioning/auth surface on its local HTTP server."
+    },
+    {
+      "id": "scripts",
+      "scope": [
+        "bin/*.sh"
+      ],
+      "severity": "high",
+      "rule": "Setup and operations scripts that self-hosters run on their own machines, often by copy-paste and sometimes as root. Prioritise: unquoted expansions, missing `set -euo pipefail`, destructive commands (rm -rf, docker volume prune) whose target could be empty or unset, and any command that would echo a token to the terminal or into a world-readable file."
+    }
+  ]
+}

@@ -364,8 +364,16 @@ def test_api_storage_failed_job_reports_error_once_then_retries(
     err = _wait_for(client, "error")
     assert err["error"] == "disk on fire" and isinstance(err["db_bytes"], int)
     assert M._STORAGE_JOB == {"state": "idle"} and M._STORAGE_TASK is None
+    # Counted from here, not from zero: the scan function is patched at
+    # module level, so a scan another test left on the worker thread can
+    # land in `calls` too. The merge CI of 2.5 saw [1, 1, 1] against an
+    # exact 2 on a slow runner; the claim is only that this GET starts one.
+    before = len(calls)
     assert client.get("/api/storage", headers=H).json()["state"] == "measuring"
-    assert _wait_calls(calls, 2), calls
+    deadline = time.time() + 5.0
+    while len(calls) <= before and time.time() < deadline:
+        time.sleep(0.02)
+    assert len(calls) > before, calls
     _wait_for(client, "error")                  # drain the second job
 
 

@@ -107,14 +107,47 @@ OFF_FLY_DETAIL = ("one-tap update works only on a Fly.io server, and this "
 _TAG_RE = re.compile(r"\d{1,4}\.\d{1,4}\.\d{1,4}")
 
 
-def _request_file() -> Path | None:
-    """The configured path, or None. Relative paths are refused: the
-    server's cwd is not something an operator reasons about."""
+def _configured_request_file() -> Path | None:
     raw = env_value("UPDATE_REQUEST_FILE").strip()
-    if not raw:
+    return Path(raw) if raw else None
+
+
+def request_file_problem() -> str | None:
+    """Why the configured UPDATE_REQUEST_FILE cannot be written, or None
+    (R25-01, the 2.5 detailed review). The write is an os.replace, so a
+    path that named the database, one of its sidecars, a pre-upgrade
+    snapshot or .env would have swapped that file for one line and
+    crash-looped the server. Relative paths stay refused: the server's
+    cwd is not something an operator reasons about."""
+    path = _configured_request_file()
+    if path is None:
         return None
-    path = Path(raw)
-    return path if path.is_absolute() else None
+    if not path.is_absolute():
+        return "UPDATE_REQUEST_FILE must be an absolute path"
+    if path.is_symlink():
+        return "UPDATE_REQUEST_FILE must not be a symbolic link"
+    if path.exists() and not path.is_file():
+        return "UPDATE_REQUEST_FILE names something that is not a file"
+    from .config import settings
+    target = path.resolve()
+    db_path = Path(settings.database_path).resolve()
+    if path.name == ".env" or target.name == ".env":
+        return "UPDATE_REQUEST_FILE must not be the .env file"
+    if target.parent == db_path.parent and (
+            target.name == db_path.name
+            or target.name in {db_path.name + s for s in ("-wal", "-shm", "-journal")}
+            or target.name.startswith(db_path.name + PRE_UPGRADE_SNAPSHOT_SUFFIX)):
+        return ("UPDATE_REQUEST_FILE must not be the database, its -wal/-shm/"
+                "-journal files or a pre-upgrade snapshot")
+    return None
+
+
+def _request_file() -> Path | None:
+    """The configured path when it is safe to write, else None, so a bad
+    path never advertises one-tap (request_file_problem says why)."""
+    if request_file_problem() is not None:
+        return None
+    return _configured_request_file()
 
 
 def one_tap_mode() -> str | None:

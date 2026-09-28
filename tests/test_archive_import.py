@@ -624,3 +624,82 @@ def test_an_upload_longer_than_it_declared_is_refused_and_removed(tmp_path, monk
         asyncio.run(main._stream_upload_to_temp(Req(), suffix=".csv", prefix=".csv-"))
     assert e.value.status_code == 400
     assert not list(tmp_path.iterdir()), "the partial file is removed"
+
+
+@pytest.mark.parametrize("mapping, needle", [
+    ({}, "at least one"),
+    ({"Temprature": "tempf"}, "Temprature"),
+    ({"when": "tempf"}, "time column"),
+])
+def test_a_mapping_that_imports_nothing_is_refused_by_both_doors(client, mapping, needle):
+    """R25-02 (the 2.5 detailed review): an empty mapping, a misspelled
+    column or the time column mapped as a reading reported success and
+    stored timestamp-only rows, which INSERT OR IGNORE then kept against
+    the corrected import. Both doors refuse before the job starts."""
+    import json as _json
+    _make_device(client, "AABBCC000060")
+    mac = "AA:BB:CC:00:00:60"
+    csv = "when,Temperature\n1700100000,71.5\n"
+    j = client.post("/api/import/csv", headers=H, json={
+        "mac": mac, "csv": csv, "mapping": mapping, "time_column": "when"})
+    assert j.status_code == 400 and needle in j.json()["detail"], j.text
+    f = client.post("/api/import/csv/file", headers=H, content=csv.encode(),
+                    params={"mac": mac, "time_column": "when",
+                            "mapping": _json.dumps(mapping)})
+    assert f.status_code == 400 and needle in f.json()["detail"], f.text
+    assert ai.reserve() is True, "a refusal gives the slot back"
+    ai.release()
+
+
+def test_a_duplicated_header_is_refused():
+    assert "Temperature" in ai.mapping_problem(
+        {"Temperature": "tempf"}, ["when", "Temperature", "Temperature"], "when")
+
+
+def test_a_row_with_no_readings_is_not_an_observation():
+    assert ai.csv_row({"t": "1700000000", "Temp": ""}, {"Temp": "tempf"},
+                      time_column="t") is None
+    assert ai.csv_row({"t": "1700000000", "Temp": "70"}, {"Temp": "tempf"},
+                      time_column="t")["tempf"] == 70
+
+
+def test_a_corrected_import_after_a_refused_one_stores_the_values(client):
+    """The review's missing repair case: nothing from the refused request
+    may hold the timestamp against the good one."""
+    _make_device(client, "AABBCC000061")
+    mac = "AA:BB:CC:00:00:61"
+    csv = "when,Temperature\n1700100000,71.5\n1700100300,\n"
+    bad = client.post("/api/import/csv", headers=H, json={
+        "mac": mac, "csv": csv, "mapping": {"Temprature": "tempf"}, "time_column": "when"})
+    assert bad.status_code == 400
+    good = client.post("/api/import/csv", headers=H, json={
+        "mac": mac, "csv": csv, "mapping": {"Temperature": "tempf"}, "time_column": "when"})
+    assert good.status_code == 200, good.text
+    st = _wait_import()
+    assert st["state"] == "done" and st["inserted"] == 1, st   # the blank row is dropped
+    from app import db
+
+    async def stored():
+        async with db.connect() as conn:
+            return [tuple(r) for r in await (await conn.execute(
+                "SELECT dateutc_ms, tempf FROM observations WHERE mac=? "
+                "AND dateutc_ms BETWEEN 1700000000000 AND 1701000000000",
+                (mac,))).fetchall()]   # _make_device's own live reading is not ours
+    assert asyncio.run(stored()) == [(1700100000000, 71.5)]
+
+
+def test_a_bom_csv_imports_through_the_json_door_too():
+    """PR #50 review: the header check dropped the BOM and the row parser
+    did not, so a spreadsheet export passed validation and imported none."""
+    t = "﻿when,Temperature\n1700100000,71.5\n"
+    assert ai.mapping_problem({"Temperature": "tempf"}, ai.csv_header(t), "when") is None
+    rows = list(ai.csv_rows(t, {"Temperature": "tempf"}, time_column="when"))
+    assert [r["tempf"] for r in rows] == [71.5]
+
+
+def test_a_wide_header_is_checked_in_one_pass():
+    import time as _t
+    header = [f"c{i}" for i in range(20000)]
+    t0 = _t.perf_counter()
+    assert ai.mapping_problem({"c1": "tempf"}, header, "c0") is None
+    assert _t.perf_counter() - t0 < 0.2

@@ -350,7 +350,10 @@ async def record_sources(now_ms: int) -> None:
 
 async def check_sources(cfg, now_ms: int, deliver,
                         quiet_minutes: float | None = None) -> None:
-    from . import source_status
+    # source_history too: the 2.5 refactor moved its import into
+    # record_sources and left these reads raising NameError inside their
+    # broad excepts (R25-14, the 2.5 detailed review).
+    from . import source_history, source_status
     from .config import settings
 
     minutes = settings.source_alert_minutes if quiet_minutes is None else quiet_minutes

@@ -8,6 +8,36 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.5.1] — 2026-09-28
+
+### Fixed
+- **Source alerts say what the day looked like again.** In 2.5.0 a
+  source-down alert lost its 24 hour summary and a recovery lost how
+  long the source was out.
+- **A CSV mapping that would import nothing is refused.** An empty
+  mapping, a misspelled column or the time column mapped as a reading
+  used to report success and store readings with no values, which a
+  corrected import could then not fill. Both CSV doors now check the
+  mapping against the file's header first, and a row with no reading is
+  skipped.
+- **The update request file can never replace something vital.**
+  `UPDATE_REQUEST_FILE` pointing at the database, its `-wal`/`-shm`
+  files, a pre-upgrade snapshot or `.env` is refused, and the Update
+  button is not offered until the path is fixed. A second tap for a
+  release already requested takes no second snapshot, and a folder the
+  server cannot write is reported before the snapshot rather than after.
+- **A restore or a deleted station takes its 2.5 state with it**: the
+  arrival strips, the sensor checks and refusal counts not yet written.
+- **Rain Start off means off**: a countdown already showing ends, and
+  the next few hours line stops using a prediction from before.
+- **Only the owner's token can force a new nearby-station search**,
+  which spends the owner's Weather Underground quota; a guest or share
+  token is served the stored list.
+- A station Weather Underground stops listing leaves the nearby list;
+  accepted and refused readings in Sensor checks cover the same days;
+  the CSV door reserves room for narrow files before the upload; the
+  nearby readings are indexed by time.
+
 ## [2.5.0] — 2026-09-27
 
 ### Added

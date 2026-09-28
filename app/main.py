@@ -12,6 +12,7 @@ import secrets
 import shutil
 import sqlite3
 import tempfile
+import calendar
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -358,6 +359,12 @@ async def lifespan(app: FastAPI):
         db._DAILY_ROLLUP_CACHE.clear()
         _RECORDS_CACHE.clear()
         _OBS_COUNT_CACHE.clear()
+        # 2.5 (R25-09): the arrival strips, the sensor checks and the
+        # refusal counts not yet flushed all describe the old database;
+        # the pending ones would otherwise be written into the new one.
+        _ARRIVAL_CACHE.clear()
+        _SENSOR_HEALTH_CACHE.clear()
+        db._QC_PENDING.clear()
         _PUBLIC_DASH_CACHE = None
         _SHARE_TEST_LAST.clear()
         _wu._stats.clear()
@@ -2446,6 +2453,9 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
     # updater instead, through every gate the Fly path uses.
     on_fly = self_update._on_fly()
     if not on_fly:
+        problem = self_update.request_file_problem()
+        if problem:
+            raise HTTPException(status_code=409, detail=problem)
         if self_update.one_tap_mode() != "request_file":
             raise HTTPException(status_code=409,
                                 detail=self_update.OFF_FLY_DETAIL)
@@ -2472,6 +2482,23 @@ async def _update_apply_locked(self_update, is_newer, parse_version) -> dict[str
             detail=f"release v{latest} has no published image yet — "
                    "try again in a few minutes")
     if not on_fly:
+        # A second tap (or an HTTP retry) for the tag already waiting on
+        # the operator's updater: no second snapshot and no second trigger
+        # for a watcher that fires on every change (R25-16).
+        pending = self_update.pending_request(__version__)
+        if pending and pending["tag"] == latest:
+            return JSONResponse(status_code=202, content={
+                "ok": True, "requested": latest, "already_requested": True,
+                "note": "this release is already requested; the server's "
+                        "own updater installs it"})
+        # Checked before the snapshot, not after it (R25-29): a folder this
+        # server cannot write fails now, not after minutes of VACUUM INTO.
+        target = self_update._request_file()
+        if target is None or not os.access(target.parent, os.W_OK):
+            raise HTTPException(
+                status_code=500,
+                detail="could not write UPDATE_REQUEST_FILE; check the path "
+                       "exists and this server can write to its folder")
         # The same safety net apply_update() lays before a Fly swap: the
         # host's updater runs the migrations the moment it acts, and a
         # vouched major may carry some. Best effort, like on Fly: no room
@@ -3876,8 +3903,10 @@ async def get_nowcast() -> JSONResponse:
     """The rain the nowcast expects, if any (2.5, C12): the dashboard's
     "next few hours" line reads it beside the station's own trend. `rain`
     is null when nothing is expected or the nowcast is off."""
-    from . import nowcast
-    return JSONResponse({"rain": await nowcast.upcoming(int(time.time() * 1000))})
+    from . import alerts as _alerts, nowcast
+    cfg = await _alerts.effective_config()
+    return JSONResponse({"rain": await nowcast.upcoming(
+        int(time.time() * 1000), enabled=bool(getattr(cfg, "rain_start", False)))})
 
 
 # ── The watering call (2.5, C6) ─────────────────────────────────────────
@@ -3959,20 +3988,23 @@ async def get_sensor_health(mac: str,
     from .alerts import _FIELD_LABELS
     from .ingest import _PLAUSIBLE_BANDS, _format_mac
     m = _format_mac(mac)
+    # One window for both sides (R25-31, the 2.5 detailed review): the
+    # refusals are kept per UTC day, so the accepted count starts at the
+    # same UTC midnight instead of a rolling instant partway through it.
+    since_day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+    since_ms = int(calendar.timegm(time.strptime(since_day, "%Y-%m-%d"))) * 1000
     key = (m, days)
     hit = _SENSOR_HEALTH_CACHE.get(key)
-    if hit and time.monotonic() - hit[0] < _SENSOR_HEALTH_TTL_S:
+    if hit and time.monotonic() - hit[0] < _SENSOR_HEALTH_TTL_S \
+            and hit[1].get("since_day") == since_day:
         body = dict(hit[1])
     else:
-        now_ms = int(time.time() * 1000)
-        since_ms = now_ms - days * 86_400_000
         fields = list(_PLAUSIBLE_BANDS)
         accepted = await db.accepted_counts(m, since_ms, fields)
-        body = {"days": days, "accepted": accepted}
+        body = {"days": days, "accepted": accepted, "since_day": since_day}
         _SENSOR_HEALTH_CACHE[key] = (time.monotonic(), body)
         body = dict(body)
     # Refusals are cheap and must be current (a flush a minute ago counts).
-    since_day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
     rejected = await db.sensor_rejections(m, since_day)
     rows = []
     for f in sorted(set(body["accepted"]) | set(rejected)):
@@ -4065,10 +4097,16 @@ async def _device_coords(mac: str) -> tuple[float, float] | None:
 
 @app.get("/api/neighbors", dependencies=[Depends(require_token)])
 async def get_neighbors(mac: str,
-                        refresh: bool = Query(False)) -> JSONResponse:
+                        refresh: bool = Query(False),
+                        authorization: Annotated[str | None, Header()] = None) -> JSONResponse:
     """The WU stations near one of yours, nearest first."""
     from . import neighbors
     from .ingest import _format_mac
+    # A forced search spends the owner's WU quota, so only the owner's
+    # token can force one; a guest or share token is served the stored
+    # list (R25-13, the 2.5 detailed review).
+    if refresh and not tokens_match(_extract_bearer(authorization), settings.write_tokens):
+        refresh = False
     coords = await _device_coords(_format_mac(mac))
     body: dict[str, Any] = {"configured": bool(await neighbors.api_key()),
                             "stations": [], "error": None}
@@ -4578,6 +4616,13 @@ async def start_csv_import(body: ArchiveImportIn) -> JSONResponse:
                 status_code=400,
                 detail=("these fields are not readings this server stores: "
                         + ", ".join(unknown)))
+        header = archive_import.csv_header(body.csv)
+        if body.time_column not in header:
+            raise HTTPException(status_code=400,
+                                detail=f"the file has no column named {body.time_column!r}")
+        problem = archive_import.mapping_problem(body.mapping, header, body.time_column)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
         rows = archive_import.csv_rows(
             body.csv, body.mapping,
             system=archive_import.UNIT_SYSTEMS[body.units],
@@ -4722,9 +4767,13 @@ async def start_csv_file_import(
                                        + ", ".join(unknown))
         if units not in archive_import.UNIT_SYSTEMS:
             raise HTTPException(status_code=400, detail="unknown units")
-        # The sort's copy is compact JSON per row, about twice the CSV's bytes.
+            # The sort's copy is compact JSON per row plus its index: about twice
+        # a wide CSV's bytes, but 5.65x for a narrow one (R25-06, the 2.5
+        # detailed review, measured). Reserve for the narrow case so a file
+        # that cannot sort is refused here, before the upload, rather than
+        # at the spill's floor after it; the floor still backs this up.
         tmp = await _stream_upload_to_temp(request, suffix=".csv", prefix=".csv-",
-                                           sort_copies=2)
+                                           sort_copies=5)
         try:
             header = archive_import.csv_file_header(str(tmp))
         except Exception:
@@ -4734,6 +4783,10 @@ async def start_csv_file_import(
             tmp.unlink(missing_ok=True)
             raise HTTPException(status_code=400,
                                 detail=f"the file has no column named {time_column!r}")
+        problem = archive_import.mapping_problem(cols, header, time_column)
+        if problem:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=problem)
 
         async def _run() -> None:
             try:
@@ -5545,9 +5598,21 @@ async def delete_device(mac: str) -> JSONResponse:
     retiring a source (e.g. you stopped polling a cloud feed) so a stale
     device doesn't sit on the dashboard. Returns a count summary."""
     from .ingest import _format_mac
-    counts = await db.delete_device(_format_mac(mac))
+    m = _format_mac(mac)
+    counts = await db.delete_device(m)
     if counts["devices"] == 0:
         raise HTTPException(status_code=404, detail="device not found")
+    # The per-station caches go with it (R25-10): a MAC re-added within the
+    # hour must not be served the deleted station's strip or checks.
+    _ARRIVAL_CACHE.pop(m, None)
+    for key in [k for k in _SENSOR_HEALTH_CACHE if k[0] == m]:
+        _SENSOR_HEALTH_CACHE.pop(key, None)
+    _RECORDS_CACHE.pop(m, None)
+    # And the older per-station caches (Greptile, PR #50): a MAC re-added
+    # before they expired showed the deleted station's count and rain.
+    _OBS_COUNT_CACHE.pop(m, None)
+    for key in [k for k in db._DAILY_ROLLUP_CACHE if k[0] == m]:
+        db._DAILY_ROLLUP_CACHE.pop(key, None)
     return JSONResponse({"ok": True, "deleted_mac": _format_mac(mac), **counts})
 
 

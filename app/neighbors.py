@@ -28,6 +28,7 @@ error the routes return (`source_status.redact`).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import re
@@ -158,6 +159,14 @@ def _discovery_key(lat: float, lon: float) -> str:
     return f"neighbors.discovered.{lat:.2f},{lon:.2f}"
 
 
+def _ids_key(lat: float, lon: float) -> str:
+    """Membership of one search, by the EXACT point it searched from: the
+    discovery key rounds to 0.01 degrees, so two stations in one cell
+    shared a list and the second search overwrote the first's (Greptile,
+    PR #50)."""
+    return f"neighbors.ids.{lat:.5f},{lon:.5f}"
+
+
 async def stations_near(lat: float, lon: float, now_ms: int | None = None,
                         refresh: bool = False) -> list[dict[str, Any]]:
     """The nearby stations, nearest first, discovering them when the stored
@@ -166,8 +175,18 @@ async def stations_near(lat: float, lon: float, now_ms: int | None = None,
     now_ms = now_ms or int(time.time() * 1000)
     key = _discovery_key(lat, lon)
     async with _lock(key):
-        seen = await db.get_kv(key)
-        stale = refresh or not seen or now_ms - int(seen) > DISCOVERY_TTL_MS
+        # Judged by THIS point's own last search (PR #50): the shared cell
+        # timestamp stayed fresh while another point in the same 0.01-degree
+        # cell kept searching, so this point's list never aged out
+        # (CodeRabbit); and a point with no list of its own (its cell
+        # searched from elsewhere, or a search from before 2.5.1) listed
+        # every stored station in range, vanished ones included (Greptile).
+        raw_own = await db.get_kv(_ids_key(lat, lon))
+        own_ms = 0
+        if raw_own:
+            parsed_own = json.loads(raw_own)
+            own_ms = int(parsed_own.get("ms") or 0) if isinstance(parsed_own, dict) else 0
+        stale = refresh or not own_ms or now_ms - own_ms > DISCOVERY_TTL_MS
         if stale:
             k = await api_key()
             if not k:
@@ -189,6 +208,26 @@ async def stations_near(lat: float, lon: float, now_ms: int | None = None,
                          s["qc_status"], now_ms))
                 await conn.commit()
             await db.set_kv(key, str(now_ms))
+            await db.set_kv(_ids_key(lat, lon), json.dumps(
+                {"ms": now_ms, "ids": [s["station_id"] for s in found]}))
+            # Bounded (CodeRabbit, PR #50): a list no search has refreshed in
+            # two discovery periods belongs to a point nothing asks about any
+            # more (a moved station), and is swept.
+            async with db.connect() as conn:
+                await conn.execute(
+                    "DELETE FROM server_kv WHERE k LIKE 'neighbors.ids.%' "
+                    "AND COALESCE(json_extract(v, '$.ms'), 0) < ?",
+                    (now_ms - 2 * DISCOVERY_TTL_MS,))
+                await conn.commit()
+    # Only what THIS spot's latest search returned (R25-30, the 2.5
+    # detailed review): a station WU stopped listing kept its old row and
+    # stayed on the list forever. Kept per spot, not by the station's
+    # shared seen_ms, which another spot's search refreshes (CodeRabbit and
+    # Greptile, PR #50). Every point has its list by here (a point without
+    # one searched above).
+    raw_ids = await db.get_kv(_ids_key(lat, lon))
+    parsed = json.loads(raw_ids) if raw_ids else {}
+    listed = set(parsed.get("ids") or [] if isinstance(parsed, dict) else parsed or [])
     own = await _own_wu_ids()
     async with db.connect() as conn:
         rows = await (await conn.execute(
@@ -196,7 +235,7 @@ async def stations_near(lat: float, lon: float, now_ms: int | None = None,
             "FROM neighbor_stations")).fetchall()
     out = []
     for r in rows:
-        if r["station_id"] in own:
+        if r["station_id"] in own or (listed is not None and r["station_id"] not in listed):
             continue
         d = distance_km(lat, lon, r["lat"], r["lon"])
         if d > MAX_DISTANCE_KM:

@@ -148,7 +148,7 @@ async def _storm_open(devices: list[dict[str, Any]]) -> bool:
 
 
 async def end_activity_if_due(devices: list[dict[str, Any]],
-                              now_ms: int) -> bool:
+                              now_ms: int, *, force: bool = False) -> bool:
     """End the rain-start Live Activity once it is due: the predicted onset
     is ACTIVITY_LIFETIME_MS old, or a storm episode opened. Silent (the
     rain either came, which the storm watch announces, or it did not, which
@@ -160,7 +160,8 @@ async def end_activity_if_due(devices: list[dict[str, Any]],
     start_ms = int(state.get("start_ms") or 0)
     if not start_ms or state.get("ended_ms"):
         return False
-    if now_ms < start_ms + ACTIVITY_LIFETIME_MS and not await _storm_open(devices):
+    if (not force and now_ms < start_ms + ACTIVITY_LIFETIME_MS
+            and not await _storm_open(devices)):
         return False
     try:
         from . import apns
@@ -190,11 +191,13 @@ async def _get_state() -> dict[str, Any]:
         return {}
 
 
-async def upcoming(now_ms: int) -> dict[str, Any] | None:
+async def upcoming(now_ms: int, enabled: bool = True) -> dict[str, Any] | None:
     """The rain the nowcast currently expects, for the dashboard's "next
     few hours" line (2.5, C12): the start and the expected total, while
     the start is still ahead or under an hour past. None otherwise,
     including when the nowcast is switched off (it then never writes)."""
+    if not enabled:
+        return None   # R25-12: a stored prediction from before it was switched off
     state = await _get_state()
     start = int(state.get("start_ms") or 0)
     if not start or state.get("ended_ms") or now_ms > start + ACTIVITY_LIFETIME_MS:
@@ -210,6 +213,10 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
     to keep this module import-cycle-free and trivially testable."""
     global _next_poll_ms
     if not getattr(cfg, "rain_start", False):
+        # Switched off: a countdown already on the Lock Screen ends now
+        # rather than running out its hour for a watch the owner stopped
+        # (R25-12, the 2.5 detailed review).
+        await end_activity_if_due(devices, now_ms, force=True)
         return
     # A live countdown card ends on its own schedule, whatever this
     # tick decides about polling.

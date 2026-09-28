@@ -272,3 +272,120 @@ def test_only_stations_near_this_one_are_witnesses(client, station):
     asyncio.run(seed())
     body = client.get(f"/api/neighbors/check?mac={MAC}", headers=H).json()
     assert body["neighbours"] == 0 and body["fields"] == {}
+
+
+def test_only_the_owner_can_force_a_new_search(client, wu, station):
+    """R25-13 (the 2.5 detailed review): refresh=true spends the owner's
+    WU quota, and any read-only guest or share token could send it. A
+    guest is served the stored list; the owner still forces a search."""
+    calls, answers = wu
+    answers[neighbors.NEAR_URL] = _near(["KAZN1"])
+    client.get(f"/api/neighbors?mac={MAC}", headers=H)
+    searches = sum(1 for u, _ in calls if u == neighbors.NEAR_URL)
+    g = client.post("/api/guest-tokens", headers=H,
+                    json={"label": "family", "write": False}).json()["token"]
+    r = client.get(f"/api/neighbors?mac={MAC}&refresh=true",
+                   headers={"Authorization": f"Bearer {g}"})
+    assert r.status_code == 200 and r.json()["stations"]
+    assert sum(1 for u, _ in calls if u == neighbors.NEAR_URL) == searches
+    client.get(f"/api/neighbors?mac={MAC}&refresh=true", headers=H)
+    assert sum(1 for u, _ in calls if u == neighbors.NEAR_URL) == searches + 1
+
+
+def test_a_station_wu_stops_listing_leaves_the_list(client, wu, station):
+    """R25-30 (the 2.5 detailed review): a refreshed search updated the
+    stations it returned and left the rest listed forever."""
+    calls, answers = wu
+    answers[neighbors.NEAR_URL] = _near(["KAZN1", "KAZGONE1"])
+    first = client.get(f"/api/neighbors?mac={MAC}", headers=H).json()["stations"]
+    assert {s["id"] for s in first} == {"KAZN1", "KAZGONE1"}
+    answers[neighbors.NEAR_URL] = _near(["KAZN1"])
+    again = client.get(f"/api/neighbors?mac={MAC}&refresh=true", headers=H).json()["stations"]
+    assert {s["id"] for s in again} == {"KAZN1"}
+
+
+def test_neighbour_timestamps_are_indexed(client):
+    async def names():
+        async with db.connect() as conn:
+            return [r[0] for r in await (await conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='neighbor_observations'")).fetchall()]
+    assert "neighbor_observations_ts" in asyncio.run(names())
+
+
+def test_another_spots_search_does_not_bring_a_vanished_station_back(client, wu):
+    """PR #50 review: membership was judged by the station's shared
+    seen_ms, which a search from a second location refreshes. Spot A drops
+    a station on refresh; spot B still lists it; A must not show it."""
+    calls, answers = wu
+    asyncio.run(db.set_kv("wu_api_key", KEY))
+    a, b = (33.30, -111.80), (33.31, -111.81)
+    answers[neighbors.NEAR_URL] = _near(["KAZN1", "KAZBOTH"])
+    asyncio.run(neighbors.stations_near(*a))
+    answers[neighbors.NEAR_URL] = _near(["KAZN1"])
+    asyncio.run(neighbors.stations_near(*a, refresh=True))
+    answers[neighbors.NEAR_URL] = _near(["KAZBOTH"])
+    asyncio.run(neighbors.stations_near(*b, refresh=True))
+    got = asyncio.run(neighbors.stations_near(*a))
+    assert {s["id"] for s in got} == {"KAZN1"}
+
+
+def test_two_spots_in_one_cell_keep_their_own_lists(client, wu):
+    """PR #50 review: the discovery key rounds to 0.01 degrees, so two
+    stations in one cell shared a membership list and the later search
+    replaced the earlier one's."""
+    calls, answers = wu
+    asyncio.run(db.set_kv("wu_api_key", KEY))
+    a, b = (33.3001, -111.8001), (33.3049, -111.8049)
+    answers[neighbors.NEAR_URL] = _near(["KAZA1"])
+    asyncio.run(neighbors.stations_near(*a, refresh=True))
+    answers[neighbors.NEAR_URL] = _near(["KAZB1"])
+    asyncio.run(neighbors.stations_near(*b, refresh=True))
+    assert {s["id"] for s in asyncio.run(neighbors.stations_near(*a))} == {"KAZA1"}
+    assert {s["id"] for s in asyncio.run(neighbors.stations_near(*b))} == {"KAZB1"}
+
+
+def test_a_point_with_no_list_of_its_own_searches(client, wu):
+    """PR #50 review: a point whose cell was searched from elsewhere (or
+    before 2.5.1) had no membership list and showed every stored station
+    in range, vanished ones included. It searches for its own list."""
+    calls, answers = wu
+    asyncio.run(db.set_kv("wu_api_key", KEY))
+    a, b = (33.3001, -111.8001), (33.3049, -111.8049)
+    answers[neighbors.NEAR_URL] = _near(["KAZA1", "KAZGONE"])
+    asyncio.run(neighbors.stations_near(*b, refresh=True))
+    answers[neighbors.NEAR_URL] = _near(["KAZA1"])
+    got = asyncio.run(neighbors.stations_near(*a))
+    assert {s["id"] for s in got} == {"KAZA1"}
+    assert sum(1 for u, _ in calls if u == neighbors.NEAR_URL) == 2
+
+
+def test_membership_lists_for_points_nobody_asks_about_are_swept(client, wu):
+    """PR #50 review: one list per searched point, never removed, grew
+    without bound for a station whose coordinates keep changing."""
+    calls, answers = wu
+    asyncio.run(db.set_kv("wu_api_key", KEY))
+    answers[neighbors.NEAR_URL] = _near(["KAZN1"])
+    t0 = 1_790_000_000_000
+    asyncio.run(neighbors.stations_near(33.3001, -111.8001, now_ms=t0))
+    later = t0 + 2 * neighbors.DISCOVERY_TTL_MS + 60_000
+    asyncio.run(neighbors.stations_near(33.9001, -111.2001, now_ms=later))
+    assert asyncio.run(db.get_kv(neighbors._ids_key(33.3001, -111.8001))) is None
+    assert asyncio.run(db.get_kv(neighbors._ids_key(33.9001, -111.2001))) is not None
+
+
+def test_a_points_list_ages_by_its_own_search_not_its_cell(client, wu):
+    """PR #50 review: staleness read the shared cell timestamp, which
+    another point in the cell kept fresh, so this point's list never
+    aged out."""
+    calls, answers = wu
+    asyncio.run(db.set_kv("wu_api_key", KEY))
+    a, b = (33.3001, -111.8001), (33.3049, -111.8049)
+    t0 = 1_790_000_000_000
+    answers[neighbors.NEAR_URL] = _near(["KAZA1"])
+    asyncio.run(neighbors.stations_near(*a, now_ms=t0))
+    week = neighbors.DISCOVERY_TTL_MS
+    asyncio.run(neighbors.stations_near(*b, now_ms=t0 + week - 60_000))   # keeps the cell fresh
+    before = sum(1 for u, _ in calls if u == neighbors.NEAR_URL)
+    asyncio.run(neighbors.stations_near(*a, now_ms=t0 + week + 60_000))
+    assert sum(1 for u, _ in calls if u == neighbors.NEAR_URL) == before + 1

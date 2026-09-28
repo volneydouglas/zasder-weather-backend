@@ -183,7 +183,11 @@ def csv_rows(text: str, mapping: dict[str, str], *, system: int = US,
     separately because it is the one field with no reading in it, and
     `time_format` is a strptime pattern, or empty for an epoch.
     """
-    reader = _csv.DictReader(io.StringIO(text))
+    # The BOM a spreadsheet export carries is dropped here as csv_header
+    # drops it: validated against a clean header, parsed against the raw
+    # one, the first column became "\ufeffwhen" and every row fell out
+    # (CodeRabbit and Greptile, PR #50).
+    reader = _csv.DictReader(io.StringIO(text.lstrip("\ufeff")))
     for raw in reader:
         row = csv_row(raw, mapping, system=system, time_column=time_column,
                       time_format=time_format)
@@ -323,6 +327,31 @@ def sorted_on_disk(rows: Iterable[dict], workdir: str,
     yield from read_spilled(spill_sorted(rows, workdir, chunk))
 
 
+def csv_header(text: str) -> list[str]:
+    """The header row of CSV text (the JSON door's), BOM dropped."""
+    return next(_csv.reader(io.StringIO(text.lstrip("\ufeff"))), [])
+
+
+def mapping_problem(mapping: dict[str, str], header: list[str],
+                    time_column: str) -> str | None:
+    """Why this mapping cannot import this file, or None (R25-02, the 2.5
+    detailed review). Checked before the job starts, because rows go in
+    with INSERT OR IGNORE: an import that stored timestamps with no
+    readings could never be repaired by importing the file again."""
+    if not mapping:
+        return "map at least one column to a reading"
+    if time_column in mapping:
+        return f"the time column {time_column!r} cannot also be a reading"
+    from collections import Counter
+    twice = sorted(c for c, n in Counter(header).items() if n > 1)
+    if twice:
+        return "the header names these columns more than once: " + ", ".join(twice)
+    missing = sorted(c for c in mapping if c not in header)
+    if missing:
+        return "the file has no column named " + ", ".join(repr(c) for c in missing)
+    return None
+
+
 def csv_row(raw: dict[str, Any], mapping: dict[str, str], *, system: int = US,
             time_column: str = "", time_format: str = "") -> dict | None:
     ts_ms = _parse_time(raw.get(time_column), time_format)
@@ -338,6 +367,11 @@ def csv_row(raw: dict[str, Any], mapping: dict[str, str], *, system: int = US,
             out[field] = value
     out["source"] = "csv-import"
     _band(out, "csv")
+    # A row that carried no reading (blank cells, or every value refused
+    # by the bands) is not an observation: stored, it would hold the
+    # timestamp against a later import that has the values (R25-02).
+    if not any(v is not None for k, v in out.items() if k not in ("dateutc", "source")):
+        return None
     return out
 
 

@@ -135,3 +135,59 @@ async def test_smart_alerts_off_does_not_erase_the_watchdogs_memory(client, monk
     now[0] += 60_000
     await mon._tick()
     assert sent.count("source_down") == 1
+
+
+async def test_the_alert_carries_its_day_and_the_recovery_its_length(
+        client, deliver, delivered, monkeypatch, caplog):
+    """R25-14 (the 2.5 detailed review): check_sources used source_history
+    without importing it, inside a broad except, so every source-down
+    alert lost its 24 hour sentence and every recovery its outage length
+    while the tests above stayed green. Assert the content and the log."""
+    import logging
+    health_watch, source_status = _mods()
+    source_status.declare("airgradient", True)
+    t0 = 1_788_800_000_000
+    monkeypatch.setattr(source_status, "_now_ms", lambda: t0)
+    source_status.record_success("airgradient", rows=2)
+    for i in range(6):
+        _fail("airgradient", "AirGradient request failed: ReadTimeout",
+              t0 + 120_000 * (i + 1), monkeypatch)
+    with caplog.at_level(logging.ERROR):
+        await health_watch.check_sources(_Cfg(), t0 + 62 * 60_000, deliver)
+        monkeypatch.setattr(source_status, "_now_ms", lambda: t0 + 80 * 60_000)
+        source_status.record_success("airgradient", rows=2)
+        await health_watch.check_sources(_Cfg(), t0 + 80 * 60_000, deliver)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], \
+        [r.getMessage() for r in caplog.records]
+
+
+async def test_the_summary_and_duration_are_real_not_the_fallback(
+        client, deliver, delivered, monkeypatch):
+    """PR #50 review: the test above would also pass on the "less than an
+    hour of health history" fallback. With two hours recorded (an hour
+    working, an hour of the vendor not answering) the alert must carry the
+    real day sentence and the recovery the outage length."""
+    from app import source_history
+    health_watch, source_status = _mods()
+    source_status.declare("airgradient", True)
+    t0 = 1_788_800_000_000
+    for m in range(0, 61, 5):
+        await source_history.record("airgradient", source_history.OK,
+                                    t0 - 60 * 60_000 + m * 60_000)
+    for m in range(5, 66, 5):
+        await source_history.record("airgradient", source_history.VENDOR,
+                                    t0 + m * 60_000)
+    monkeypatch.setattr(source_status, "_now_ms", lambda: t0)
+    source_status.record_success("airgradient", rows=2)
+    for i in range(6):
+        _fail("airgradient", "AirGradient request failed: ReadTimeout",
+              t0 + 120_000 * (i + 1), monkeypatch)
+    await health_watch.check_sources(_Cfg(), t0 + 65 * 60_000, deliver)
+    body = delivered[0]["body"]
+    assert "less than an hour" not in body, body
+    assert "was working for" in body and "the service not answering" in body, body
+    monkeypatch.setattr(source_status, "_now_ms", lambda: t0 + 70 * 60_000)
+    source_status.record_success("airgradient", rows=2)
+    await health_watch.check_sources(_Cfg(), t0 + 70 * 60_000, deliver)
+    assert delivered[-1]["kind"] == "source_recovered"
+    assert "It was out for" in delivered[-1]["body"], delivered[-1]["body"]

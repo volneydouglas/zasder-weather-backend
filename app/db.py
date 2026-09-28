@@ -558,6 +558,11 @@ CREATE TABLE IF NOT EXISTS neighbor_observations (
     dailyrainin  REAL,
     PRIMARY KEY (station_id, ts_ms)
 ) WITHOUT ROWID;
+-- The retention sweep and the drift check filter on ts_ms across every
+-- station, which the (station_id, ts_ms) key cannot serve (R25-33). Safe in
+-- this every-boot script, unlike idx_obs_chart above: the table is bounded
+-- (KEEP_MS, eight days of about ten stations), so the build is instant.
+CREATE INDEX IF NOT EXISTS neighbor_observations_ts ON neighbor_observations(ts_ms);
 
 -- Sensor checks (2.5, C4): readings the plausibility bands refused, per
 -- station, UTC day and field. Written from an in-memory buffer the alert
@@ -1801,6 +1806,18 @@ def touch_ingest_token(token: str) -> None:
 
 # 2.5 (C4): refusals waiting for the next flush, (mac, day, field) → n.
 _QC_PENDING: dict[tuple[str, str, str], int] = {}
+# A flush and a device delete take turns (PR #50 review): a flush that had
+# taken a deleted station's counts out of _QC_PENDING wrote them back after
+# the delete committed. Built lazily: an asyncio.Lock binds to the first
+# loop that awaits it, and the suite runs a loop per test (conftest resets).
+_QC_LOCK: asyncio.Lock | None = None
+
+
+def _qc_lock() -> asyncio.Lock:
+    global _QC_LOCK
+    if _QC_LOCK is None:
+        _QC_LOCK = asyncio.Lock()
+    return _QC_LOCK
 
 
 def note_rejections(mac: str, dropped: list[str], now_ms: int | None = None) -> None:
@@ -1822,6 +1839,11 @@ async def flush_qc_rejections() -> None:
     (Greptile, PR #48: they were dropped, and sensor checks undercounted)."""
     if not _QC_PENDING:
         return
+    async with _qc_lock():
+        await _flush_qc_locked()
+
+
+async def _flush_qc_locked() -> None:
     pending = list(_QC_PENDING.items())
     for k, _ in pending:
         _QC_PENDING.pop(k, None)
@@ -2744,6 +2766,11 @@ async def delete_device(mac: str) -> dict[str, int]:
     """Remove a device and everything tied to it. Used when a source goes
     away (e.g. you stop polling a cloud feed) so a stale row doesn't sit on
     the dashboard. Returns a count summary; device count = 0 means unknown MAC."""
+    async with _qc_lock():
+        return await _delete_device_locked(mac)
+
+
+async def _delete_device_locked(mac: str) -> dict[str, int]:
     async with connect() as db:
         async def _del(sql: str) -> int:
             cur = await db.execute(sql, (mac,))
@@ -2779,13 +2806,19 @@ async def delete_device(mac: str) -> dict[str, int]:
         n_wu    = await _del("DELETE FROM wu_station_map      WHERE mac = ?")
         n_daily = await _del("DELETE FROM daily_rollups       WHERE mac = ?")
         n_hour  = await _del("DELETE FROM hour_rollups        WHERE mac = ?")
+        # 2.5 (R25-10): the sensor checks' refusal counts, stored and still
+        # pending, so a re-added MAC does not inherit the old sensor's.
+        n_qc    = await _del("DELETE FROM sensor_qc_daily     WHERE mac = ?")
         await db.commit()
+    for key in [k for k in _QC_PENDING if k[0] == mac]:
+        _QC_PENDING.pop(key, None)
     return {"devices": n_devs, "observations": n_obs,
             "alert_prefs": n_pref, "alert_state": n_state,
             "rule_state": n_rule, "location": n_loc,
             "smart_alert_state": n_smart, "storm_state": n_storm,
             "pending_devices": n_pend, "ingest_token_assignments": n_asgn, "wu_station": n_wu,
-            "daily_rollups": n_daily, "hour_rollups": n_hour}
+            "daily_rollups": n_daily, "hour_rollups": n_hour,
+            "sensor_qc": n_qc}
 
 
 async def get_alert_states() -> dict[str, dict[str, Any]]:

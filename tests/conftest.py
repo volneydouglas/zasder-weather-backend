@@ -213,6 +213,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _d._GUEST_LAST_USED.clear()
         _d._INGEST_LAST_USED.clear()
         _d._QC_PENDING.clear()
+        _d._QC_LOCK = None     # rebound to each test's event loop
         # R5-33 rollup cache: a value computed against one test's DB must
         # not answer for the next test's — same isolation rule as above.
         _d._DAILY_ROLLUP_CACHE.clear()

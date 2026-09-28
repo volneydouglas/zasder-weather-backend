@@ -367,3 +367,21 @@ def test_a_fresh_alert_stamps_total_and_clears_the_ended_mark(monkeypatch):
                          "total_in": 0.1}
 
     asyncio.run(run())
+
+
+def test_switching_rain_start_off_ends_a_live_countdown(monkeypatch):
+    """R25-12: check() returned before the end step when Rain Start was
+    off, so a countdown already on the Lock Screen ran out its hour."""
+    import asyncio
+
+    async def run():
+        now = int(time.time() * 1000)
+        await _seed_card(now + 20 * 60_000, now - 5 * 60_000)
+        calls = _capture_end(monkeypatch)
+
+        class Off(_Cfg):
+            rain_start = False
+        await nowcast.check(Off(), [_device()], now, None)
+        assert len(calls) == 1 and calls[0][1]["aps"]["event"] == "end"
+        assert (await nowcast._get_state())["ended_ms"] == now
+    asyncio.run(run())

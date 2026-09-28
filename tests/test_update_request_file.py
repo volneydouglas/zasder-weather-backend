@@ -284,3 +284,83 @@ def test_no_documented_option_is_read_from_os_environ():
                  for i, line in enumerate(open(f), 1)
                  for m in direct.finditer(line) if m.group(1) in documented]
     assert not offenders, offenders
+
+
+@pytest.mark.parametrize("which", ["db", "wal", "shm", "journal", "snapshot", "dotenv", "dir"])
+def test_a_request_file_that_would_replace_something_vital_is_refused(
+        client, req, monkeypatch, tmp_path, which):
+    """R25-01 (the 2.5 detailed review): the write is an os.replace, so
+    UPDATE_REQUEST_FILE naming the database, a sidecar, a snapshot or
+    .env swapped that file for one line. A bad path never advertises
+    one-tap, and a direct apply is a 409 that names the problem, with the
+    database untouched."""
+    from pathlib import Path
+    from app.config import settings
+    db = Path(settings.database_path)
+    target = {"db": db, "wal": Path(f"{db}-wal"), "shm": Path(f"{db}-shm"),
+              "journal": Path(f"{db}-journal"),
+              "snapshot": db.with_name(f"{db.name}.pre-upgrade-{NEWER}.db"),
+              "dotenv": tmp_path / ".env", "dir": tmp_path}[which]
+    monkeypatch.setenv("UPDATE_REQUEST_FILE", str(target))
+    before = db.read_bytes()
+    assert client.get("/api/version").json()["one_tap"] is None
+    r = client.post("/api/update/apply", headers=H)
+    assert r.status_code == 409 and "UPDATE_REQUEST_FILE" in r.json()["detail"], r.text
+    assert db.read_bytes() == before
+
+
+def test_a_symlinked_request_file_is_refused(client, req, monkeypatch, tmp_path):
+    link = tmp_path / "update-link"
+    link.symlink_to(tmp_path / "elsewhere")
+    monkeypatch.setenv("UPDATE_REQUEST_FILE", str(link))
+    r = client.post("/api/update/apply", headers=H)
+    assert r.status_code == 409 and "symbolic link" in r.json()["detail"]
+
+
+def test_a_second_tap_for_the_pending_tag_takes_no_second_snapshot(client, req, monkeypatch):
+    """R25-16: a double tap or an HTTP retry snapshotted the database again
+    and rewrote the file, firing the operator's watcher twice."""
+    from app import self_update
+    snaps: list[str] = []
+
+    async def snap(tag):
+        snaps.append(tag)
+        return None
+    monkeypatch.setattr(self_update, "snapshot_before_upgrade", snap)
+    first = client.post("/api/update/apply", headers=H)
+    assert first.status_code == 202
+    mtime = req.stat().st_mtime_ns
+    second = client.post("/api/update/apply", headers=H)
+    assert second.status_code == 202 and second.json().get("already_requested") is True
+    assert snaps == [NEWER], "one snapshot for one request"
+    assert req.stat().st_mtime_ns == mtime, "the watcher is not triggered twice"
+
+
+def test_an_unwritable_folder_fails_before_the_snapshot(client, req, monkeypatch):
+    """R25-29: the folder check ran only at the write, after minutes of
+    VACUUM INTO on a big database."""
+    import os as _os
+    from app import self_update
+    snaps: list[str] = []
+
+    async def snap(tag):
+        snaps.append(tag)
+        return None
+    monkeypatch.setattr(self_update, "snapshot_before_upgrade", snap)
+    real_access = _os.access
+    monkeypatch.setattr(_os, "access", lambda p, mode: False if str(p) == str(req.parent)
+                        else real_access(p, mode))
+    r = client.post("/api/update/apply", headers=H)
+    assert r.status_code == 500 and snaps == [] and not req.exists()
+
+
+def test_a_name_that_merely_starts_like_the_database_is_allowed(client, req, monkeypatch):
+    """PR #50 review: the sidecar check matched any "<db>-" prefix, so a
+    request file named weather.db-update-request disabled one-tap."""
+    from pathlib import Path
+    from app import self_update
+    from app.config import settings
+    db = Path(settings.database_path)
+    target = db.with_name(f"{db.name}-update-request")
+    monkeypatch.setenv("UPDATE_REQUEST_FILE", str(target))
+    assert self_update.request_file_problem() is None

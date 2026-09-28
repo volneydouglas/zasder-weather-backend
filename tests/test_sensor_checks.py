@@ -81,3 +81,102 @@ def test_a_failed_flush_keeps_its_counts_for_the_next_tick(client, monkeypatch):
     monkeypatch.setattr(db, "connect", real)
     asyncio.run(db.flush_qc_rejections())
     assert not db._QC_PENDING
+
+
+def test_deleting_a_station_takes_its_sensor_checks_with_it(client):
+    """R25-10 (the 2.5 detailed review): delete_device left the stored
+    refusal counts, the pending ones and the cached report, so a MAC
+    re-added later inherited the old sensor's refusals."""
+    from app import db, main
+    _post(client, 30, 255.0)
+    asyncio.run(db.flush_qc_rejections())
+    db.note_rejections(MAC, ["windgustmph=255"])            # still pending
+    client.get(f"/api/devices/{MAC}/sensor-health", headers=H)   # cached
+    assert any(k[0] == MAC for k in main._SENSOR_HEALTH_CACHE)
+    r = client.delete(f"/api/devices/{MAC}", headers=H)
+    assert r.status_code == 200 and r.json()["sensor_qc"] >= 1
+    assert not any(k[0] == MAC for k in db._QC_PENDING)
+    assert not any(k[0] == MAC for k in main._SENSOR_HEALTH_CACHE)
+
+    async def stored():
+        async with db.connect() as conn:
+            return (await (await conn.execute(
+                "SELECT COUNT(*) FROM sensor_qc_daily WHERE mac=?", (MAC,))).fetchone())[0]
+    assert asyncio.run(stored()) == 0
+
+
+def test_a_restore_drops_the_old_databases_pending_and_cached_state(client):
+    """R25-09: the restore hook cleared the older caches but not the 2.5
+    ones, and the next alert tick flushed the old database's pending
+    refusal counts into the restored one."""
+    from app import db, main, restore
+    db.note_rejections(MAC, ["windgustmph=255"])
+    main._ARRIVAL_CACHE[MAC] = (0.0, {"stale": True})
+    main._SENSOR_HEALTH_CACHE[(MAC, 30)] = (0.0, {"stale": True})
+    hook = next(h for h in restore.POST_SWAP_HOOKS
+                if h.__name__ == "_reconcile_after_restore")
+    client.portal.call(hook)
+    assert not db._QC_PENDING
+    assert MAC not in main._ARRIVAL_CACHE and not main._SENSOR_HEALTH_CACHE
+
+
+def test_accepted_and_rejected_count_the_same_days(client):
+    """R25-31 (the 2.5 detailed review): refusals were read from the UTC
+    midnight 30 days back, accepted readings from a rolling instant later
+    that day, so the percentage mixed two windows. A reading a minute
+    after that midnight now counts on both sides."""
+    import calendar as _cal
+    day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 30 * 86400))
+    edge = datetime.fromtimestamp(_cal.timegm(time.strptime(day, "%Y-%m-%d")) + 60,
+                                  timezone.utc)
+    r = client.post("/ingest/custom", headers=IH, json={
+        "device": {"id": MAC, "name": "Yard"},
+        "timestamp_utc": edge.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "outdoor": {"tempf": 71.0}})
+    assert r.status_code in (200, 201, 202), r.text
+    body = client.get(f"/api/devices/{MAC}/sensor-health?days=30", headers=H).json()
+    rows = {x["field"]: x for x in body["fields"]}
+    assert rows["tempf"]["accepted"] >= 1
+
+
+def test_a_delete_waits_for_a_flush_in_flight(client, monkeypatch):
+    """PR #50 review: a flush that had taken a station's counts out of
+    the pending buffer wrote them back after the delete committed. With
+    the shared lock the delete runs after the flush and removes them."""
+    from app import db
+    db._QC_PENDING.clear()
+    db.note_rejections(MAC, ["windgustmph=255"])
+    _post(client, 5, 12.0)                         # the device exists
+    real_connect = db.connect
+    order: list[str] = []
+
+    import contextlib
+
+    async def race():
+        # An Event, not a fixed sleep: the delete starts only once the
+        # flush is inside its connection, however slow the runner
+        # (CodeRabbit, PR #50).
+        reached = asyncio.Event()
+
+        @contextlib.asynccontextmanager
+        async def slow_connect():
+            async with real_connect() as conn:
+                order.append("flush-connected")
+                reached.set()
+                await asyncio.sleep(0.05)          # the delete arrives here
+                yield conn
+
+        monkeypatch.setattr(db, "connect", slow_connect)
+        flush = asyncio.create_task(db.flush_qc_rejections())
+        await reached.wait()
+        monkeypatch.setattr(db, "connect", real_connect)
+        await db.delete_device(MAC)
+        order.append("deleted")
+        await flush
+
+        async with real_connect() as conn:
+            return (await (await conn.execute(
+                "SELECT COUNT(*) FROM sensor_qc_daily WHERE mac=?", (MAC,))).fetchone())[0]
+    left = asyncio.run(race())
+    assert order == ["flush-connected", "deleted"]
+    assert left == 0, "the flushed counts were deleted with the station"

@@ -3850,15 +3850,40 @@ async def get_forecast_correction(
     CORRECTION_DAYS of the scorecard. Shown beside the forecast in the
     apps, never in place of it. Empty when there is not enough to learn
     from (a new server, Insights off)."""
+    from . import forecast_snapshots, neighbors
     from .ingest import _format_mac
+    m = _format_mac(mac)
+    body: dict[str, Any] = {"provider": provider,
+                            "window_days": forecast_skill.CORRECTION_DAYS,
+                            "leads": [], "supported": True, "reason": None,
+                            "coords_station": None}
     if not settings.insights:
-        return JSONResponse({"provider": provider, "leads": []})
-    card = await forecast_skill.scorecard(_format_mac(mac), provider=provider,
+        body.update(supported=False, reason="Needs Insights on this server.")
+        return JSONResponse(body)
+    # Only an archived provider can be corrected (R25-A07): say so rather
+    # than answering an empty list the apps cannot explain.
+    if provider not in forecast_snapshots.ARCHIVED_PROVIDERS:
+        body.update(supported=False,
+                    reason="The yard correction is learned from archived Open-Meteo "
+                           "forecasts; this forecast source is not archived.")
+        return JSONResponse(body)
+    # The archive holds ONE sky, at the server's forecast station (R25-A06):
+    # a station far from it would be corrected with another place's errors.
+    devices = await db.list_devices()
+    sky = forecast_snapshots.coords_device(devices)
+    if sky is not None:
+        body["coords_station"] = sky.get("name") or sky.get("mac")
+        here = await _device_coords(m)
+        there = await _device_coords(sky["mac"])
+        if sky["mac"] != m and (here is None or there is None or
+                                neighbors.distance_km(*here, *there) > neighbors.MAX_DISTANCE_KM):
+            body["reason"] = (f"The correction is learned at {body['coords_station']}, "
+                              "and this station is too far from it to share it.")
+            return JSONResponse(body)
+    card = await forecast_skill.scorecard(m, provider=provider,
                                           days=forecast_skill.CORRECTION_DAYS)
-    leads = forecast_skill.corrections_from(card) if card.get("available") else []
-    return JSONResponse({"provider": provider,
-                         "window_days": forecast_skill.CORRECTION_DAYS,
-                         "leads": leads})
+    body["leads"] = forecast_skill.corrections_from(card) if card.get("available") else []
+    return JSONResponse(body)
 
 
 @app.get("/api/devices/{mac}/forecast-accuracy",
@@ -4088,10 +4113,18 @@ async def _device_coords(mac: str) -> tuple[float, float] | None:
         if d.get("mac") != mac:
             continue
         c = (((d.get("info") or {}).get("coords") or {}).get("coords") or {})
-        lat, lon = c.get("lat"), c.get("lon")
-        if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) \
-                and math.isfinite(lat) and math.isfinite(lon):
-            return float(lat), float(lon)
+        # Parsed the way forecast_snapshots.coords_device parses them
+        # (CodeRabbit, PR #52): a numeric string passed there and failed
+        # here, so two nearby stations were refused a shared correction.
+        from .ingest import valid_coords
+        raw_lat, raw_lon = c.get("lat"), c.get("lon")
+        if isinstance(raw_lat, bool) or isinstance(raw_lon, bool):
+            return None           # float(True) is 1.0, not a place (CodeRabbit, PR #52)
+        try:
+            lat, lon = float(raw_lat), float(raw_lon)
+        except (TypeError, ValueError):
+            return None
+        return (lat, lon) if valid_coords(lat, lon) else None
     return None
 
 

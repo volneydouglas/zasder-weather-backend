@@ -48,7 +48,13 @@ def _seed(frost_nights: int, other_rule: bool = True):
     return asyncio.run(go())
 
 
+def _smart(client, on: bool):
+    r = client.put("/api/alerts", headers=H, json={"smart_alerts": on})
+    assert r.status_code == 200, r.text
+
+
 def test_a_rule_firing_beside_the_frost_watch_is_offered_for_retirement(client):
+    _smart(client, True)
     cold_id, _ = _seed(frost_nights=3)
     r = client.get("/api/alerts/rules/overlaps", headers=H)
     assert r.status_code == 200, r.text
@@ -60,11 +66,13 @@ def test_a_rule_firing_beside_the_frost_watch_is_offered_for_retirement(client):
 
 
 def test_one_coincidence_is_not_a_pattern(client):
+    _smart(client, True)   # so the rule, not the switch, decides
     _seed(frost_nights=1)
     assert client.get("/api/alerts/rules/overlaps", headers=H).json()["overlaps"] == []
 
 
 def test_a_disabled_rule_is_not_offered(client):
+    _smart(client, True)   # so the rule, not the switch, decides
     cold_id, _ = _seed(frost_nights=3)
     asyncio.run(db.update_alert_rule(cold_id, enabled=False))
     assert client.get("/api/alerts/rules/overlaps", headers=H).json()["overlaps"] == []
@@ -72,3 +80,49 @@ def test_a_disabled_rule_is_not_offered(client):
 
 def test_overlaps_need_the_token(client):
     assert client.get("/api/alerts/rules/overlaps").status_code == 401
+
+
+def test_a_rule_is_never_offered_for_retirement_to_a_watch_that_is_off(client):
+    """R25-A04 (the 2.5 additional review): with smart alerts off, the
+    frost rule was still offered for retirement in favour of the frost
+    watch, and one tap left the owner with no frost alert at all."""
+    _smart(client, False)
+    _seed(frost_nights=3)
+    assert client.get("/api/alerts/rules/overlaps", headers=H).json()["overlaps"] == []
+    _smart(client, True)
+    assert client.get("/api/alerts/rules/overlaps", headers=H).json()["overlaps"] != []
+
+
+def test_active_kinds_follow_the_switches():
+    class Cfg:
+        smart_alerts = False
+        rain_start = True
+        storm_summary = False
+    assert rule_overlap.active_kinds(Cfg()) == {"rain_start"}
+    Cfg.smart_alerts = True
+    assert "frost" in rule_overlap.active_kinds(Cfg()) and "storm" not in rule_overlap.active_kinds(Cfg())
+
+
+def test_a_station_with_its_storm_summary_muted_offers_no_storm_retirement(client):
+    """Greptile, PR #52: the active-watch filter checked the server-wide
+    storm switch but not a station's own storm mute, which the storm tick
+    honours; retiring that station's rain rule would leave it with no rain
+    alert at all."""
+    from app.alerts import build_threshold_message
+    client.put("/api/alerts", headers=H, json={"storm_summary": True, "rain_start": False})
+
+    async def seed():
+        now = int(time.time() * 1000)
+        rule = await db.create_alert_rule(None, "hourlyrainin", "above", 0.5)
+        for n in range(3):
+            t = now - (n + 1) * 86_400_000
+            title, body = build_threshold_message("Chaucer Drive", "hourlyrainin", 0.8,
+                                                  "above", 0.5)
+            await db.log_alert(t, "rule", MAC, title, body, True)
+            await db.log_alert(t + 30 * 60_000, "storm", MAC, "Storm", "0.8 in", True)
+        return rule["id"]
+    rid = asyncio.run(seed())
+    got = client.get("/api/alerts/rules/overlaps", headers=H).json()["overlaps"]
+    assert [o["rule_id"] for o in got] == [rid]
+    asyncio.run(db.set_device_storm_summary(MAC, False))
+    assert client.get("/api/alerts/rules/overlaps", headers=H).json()["overlaps"] == []

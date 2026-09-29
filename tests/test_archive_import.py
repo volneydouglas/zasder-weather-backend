@@ -703,3 +703,156 @@ def test_a_wide_header_is_checked_in_one_pass():
     t0 = _t.perf_counter()
     assert ai.mapping_problem({"c1": "tempf"}, header, "c0") is None
     assert _t.perf_counter() - t0 < 0.2
+
+
+_RAIN_MAC = "AA:BB:CC:25:00:01"
+_RAIN_BASE = int(__import__("datetime").datetime(2026, 9, 27, tzinfo=__import__("datetime").timezone.utc).timestamp() * 1000)
+
+
+def _day_rain(mac):
+    from app import db
+    from app.day_rain import day_rain_in
+
+    async def go():
+        async with db.connect() as conn:
+            return day_rain_in(await (await conn.execute(
+                "SELECT * FROM daily_rollups WHERE mac=? AND day='2026-09-27'", (mac,))).fetchone())
+    return asyncio.run(go())
+
+
+def test_a_day_split_across_two_imports_keeps_all_its_rain(client, monkeypatch):
+    """R25-A01 (the 2.5 additional review): each import's running sum
+    started at zero and the day keeps its high-water mark, so four 0.05 in
+    intervals imported two and two left 0.10 in, not 0.20 in."""
+    from app import db
+    monkeypatch.setattr(db.settings, "insights", True)
+    monkeypatch.setattr(db.settings, "timezone", "UTC")
+    asyncio.run(db.upsert_device(_RAIN_MAC, {"name": "Rain"}))
+    rows = [ai.weewx_row({"dateTime": _RAIN_BASE // 1000 + i * 300, "usUnits": 1,
+                          "rain": 0.05, "outTemp": 70}) for i in range(4)]
+    asyncio.run(ai.run_import(_RAIN_MAC, rows[:2], kind="weewx"))
+    asyncio.run(ai.run_import(_RAIN_MAC, rows[2:], kind="weewx"))
+    assert _day_rain(_RAIN_MAC) == pytest.approx(0.20)
+
+
+def test_a_duplicate_interval_is_counted_once(client, monkeypatch):
+    """R25-A02: the day counter summed a duplicate timestamp that INSERT
+    OR IGNORE then dropped, so two unique 0.05 in intervals read 0.15."""
+    from app import db
+    monkeypatch.setattr(db.settings, "insights", True)
+    monkeypatch.setattr(db.settings, "timezone", "UTC")
+    asyncio.run(db.upsert_device(_RAIN_MAC, {"name": "Rain"}))
+    rows = [ai.weewx_row({"dateTime": _RAIN_BASE // 1000 + i * 300, "usUnits": 1,
+                          "rain": 0.05, "outTemp": 70}) for i in (0, 0, 1)]
+    st = asyncio.run(ai.run_import(_RAIN_MAC, rows, kind="csv"))
+    assert st["inserted"] == 2
+    assert _day_rain(_RAIN_MAC) == pytest.approx(0.10)
+
+
+def test_importing_the_same_file_again_repairs_an_earlier_import(client, monkeypatch):
+    """The repair path for days imported before 2.5.2: the recompute runs
+    over every day an import touches, even when all its rows are already
+    stored (INSERT OR IGNORE keeps them), so re-running the import fixes
+    the day. Here the stored total starts wrong, as the old code left it."""
+    from app import db
+    monkeypatch.setattr(db.settings, "insights", True)
+    monkeypatch.setattr(db.settings, "timezone", "UTC")
+    asyncio.run(db.upsert_device(_RAIN_MAC, {"name": "Rain"}))
+    rows = [ai.weewx_row({"dateTime": _RAIN_BASE // 1000 + i * 300, "usUnits": 1,
+                          "rain": 0.05, "outTemp": 70}) for i in range(4)]
+    asyncio.run(ai.run_import(_RAIN_MAC, rows, kind="weewx"))
+
+    async def damage():
+        async with db.connect() as conn:
+            await conn.execute("UPDATE daily_rollups SET rain_total = 0.10 WHERE mac=?", (_RAIN_MAC,))
+            await conn.commit()
+    asyncio.run(damage())
+    assert _day_rain(_RAIN_MAC) == pytest.approx(0.10)
+    st = asyncio.run(ai.run_import(_RAIN_MAC, rows, kind="weewx"))
+    assert st["inserted"] == 0
+    assert _day_rain(_RAIN_MAC) == pytest.approx(0.20)
+
+
+def test_live_rain_and_imported_intervals_in_different_hours_add_up(client, monkeypatch):
+    """Greptile, PR #52: 0.10 in recorded live before noon and 0.10 in of
+    imported intervals after noon is 0.20 in, not the larger 0.10 in."""
+    from app import db
+    monkeypatch.setattr(db.settings, "insights", True)
+    monkeypatch.setattr(db.settings, "timezone", "UTC")
+    mac = "AA:BB:CC:25:00:03"
+
+    async def run():
+        await db.upsert_device(mac, {"name": "Mixed"})
+        await db.insert_observations(mac, [
+            {"dateutc": _RAIN_BASE + h * 3_600_000, "dailyrainin": v}
+            for h, v in ((8, 0.05), (10, 0.10))])
+        rows = [ai.weewx_row({"dateTime": _RAIN_BASE // 1000 + 14 * 3600 + i * 300,
+                              "usUnits": 1, "rain": 0.05, "outTemp": 70}) for i in range(2)]
+        await ai.run_import(mac, rows, kind="weewx")
+    asyncio.run(run())
+    assert _day_rain(mac) == pytest.approx(0.20)
+
+
+def test_the_rebuild_pauses_between_days(client, monkeypatch):
+    """Greptile, PR #52: the rebuild ran every day of a long archive in one
+    transaction, holding the writer lock against live ingest. It commits
+    per day and pauses every REBUILD_DAYS_PER_PAUSE days."""
+    from app import db
+    monkeypatch.setattr(db.settings, "insights", True)
+    monkeypatch.setattr(db.settings, "timezone", "UTC")
+    mac = "AA:BB:CC:25:00:04"
+    pauses: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def count_sleep(s, *a, **k):
+        if s == ai.BATCH_PAUSE_S:
+            pauses.append(s)
+        return await real_sleep(0)
+    monkeypatch.setattr(ai.asyncio, "sleep", count_sleep)
+    days = [f"2026-0{m}-{d:02d}" for m in (7, 8) for d in range(1, 29)]
+
+    async def run():
+        await db.upsert_device(mac, {"name": "Long"})
+        return await ai.rebuild_interval_days(mac, days)
+    asyncio.run(run())
+    assert len(pauses) >= len(days) // ai.REBUILD_DAYS_PER_PAUSE - 1
+
+
+def test_live_rain_after_imported_intervals_is_not_added_twice(client, monkeypatch):
+    """Greptile, PR #52: a live dailyrainin counts from midnight, so live
+    readings AFTER the imported morning intervals already include them;
+    adding the two counted the morning twice."""
+    from app import db
+    monkeypatch.setattr(db.settings, "insights", True)
+    monkeypatch.setattr(db.settings, "timezone", "UTC")
+    mac = "AA:BB:CC:25:00:05"
+
+    async def run():
+        await db.upsert_device(mac, {"name": "Morning import"})
+        rows = [ai.weewx_row({"dateTime": _RAIN_BASE // 1000 + 6 * 3600 + i * 300,
+                              "usUnits": 1, "rain": 0.05, "outTemp": 70}) for i in range(2)]
+        await db.insert_observations(mac, [
+            {"dateutc": _RAIN_BASE + 14 * 3_600_000, "dailyrainin": 0.15}])
+        await ai.run_import(mac, rows, kind="weewx")
+    asyncio.run(run())
+    assert _day_rain(mac) == pytest.approx(0.15)
+
+
+def test_a_cancel_during_the_rebuild_reports_cancelled(client, monkeypatch):
+    """Greptile, PR #52: cancelling during the multi-day rebuild left the
+    remaining days unrebuilt while the job read done."""
+    from app import db
+    monkeypatch.setattr(db.settings, "insights", True)
+    monkeypatch.setattr(db.settings, "timezone", "UTC")
+    mac = "AA:BB:CC:25:00:06"
+    real = ai.rebuild_interval_days
+
+    async def cancelling(m, days):
+        ai.JOB["cancel"] = True
+        return await real(m, days)
+    monkeypatch.setattr(ai, "rebuild_interval_days", cancelling)
+    rows = [ai.weewx_row({"dateTime": _RAIN_BASE // 1000 + i * 300, "usUnits": 1,
+                          "rain": 0.05, "outTemp": 70}) for i in range(2)]
+    asyncio.run(db.upsert_device(mac, {"name": "Cancel"}))
+    st = asyncio.run(ai.run_import(mac, rows, kind="weewx"))
+    assert st["state"] == "cancelled"

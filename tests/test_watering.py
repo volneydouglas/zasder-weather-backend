@@ -134,3 +134,19 @@ def test_a_morning_with_no_call_yet_tries_again_later(client, monkeypatch):
     devices = asyncio.run(db.list_devices())
     assert asyncio.run(watering.send_if_due(devices, now_ms + 3_600_000)) is True
     assert sent == ["water"]
+
+
+def test_a_day_the_station_barely_covered_is_not_a_measured_day(client, monkeypatch):
+    """R25-A03 (the 2.5 additional review): four days of one reading each
+    made tmin == tmax, so ET read 0 and the call was a confident "skip"."""
+    monkeypatch.setattr(db.settings, "insights", True)
+    base = int(datetime(2026, 9, 27, tzinfo=timezone.utc).timestamp() * 1000)
+
+    async def go():
+        await db.upsert_device(MAC, {"name": "Partial"})
+        await db.insert_observations(MAC, [
+            {"dateutc": base - k * 86_400_000 + 12 * 3_600_000,
+             "tempf": 80.0, "dailyrainin": 0.0} for k in range(4, 0, -1)])
+        return await watering.for_station(MAC, date(2026, 9, 27), 33.3)
+    result = asyncio.run(go())
+    assert result["days_used"] == 0 and result["verdict"] is None, result

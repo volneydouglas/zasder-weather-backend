@@ -93,6 +93,7 @@ def verdict(days: list[dict[str, Any]]) -> dict[str, Any]:
 async def for_station(mac: str, today: date, lat: float | None) -> dict[str, Any]:
     from .climate import _rollup_rows
     from .day_rain import day_rain_in
+    from .forecast_skill import covered
     first = today - timedelta(days=DAYS)
     last = today - timedelta(days=1)
     rows = {r["day"]: r for r in await _rollup_rows(mac, first.isoformat(),
@@ -101,6 +102,13 @@ async def for_station(mac: str, today: date, lat: float | None) -> dict[str, Any
     for k in range(DAYS):
         d = first + timedelta(days=k)
         r = rows.get(d.isoformat())
+        # A day the station did not cover is not a measured day (R25-A03,
+        # the 2.5 additional review): one reading makes tmin == tmax, so ET
+        # read 0 and a morning of data became a confident "skip" that also
+        # went to the webhooks. Rows without a span (folded before 2.3)
+        # cannot be judged and are taken as they are.
+        if r is not None and covered(dict(r)) is False:
+            r = None
         et = None
         if r is not None and lat is not None:
             et = hargreaves_et0_in(r["tempf_min"], r["tempf_max"], lat,

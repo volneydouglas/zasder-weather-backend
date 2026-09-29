@@ -170,3 +170,100 @@ def test_a_polled_station_gets_its_own_day_with_the_vendors_hours_marked(client)
     assert day["hours"][15:18] == "vvv", day["hours"]
     assert day["hours"][12] == "d", day["hours"]
     assert set(day["hours"][18:]) == {"o"} and set(day["hours"][:12]) == {"o"}
+
+
+def test_an_import_does_not_paint_the_strip(client):
+    """R25-A05 (the 2.5 additional review): arrival slots were read from
+    the readings' own timestamps, so importing the last day painted a day
+    the server never saw as healthy. From when stamping began, only a
+    receipt counts; an import is not one."""
+    import time as _t
+    from app import archive_import, db, main
+    mac = "AA:BB:CC:25:05:01"
+    now = int(_t.time() * 1000)
+
+    async def run():
+        await db.set_kv("arrival_rx.since_ms", str(now - 30 * 3_600_000))
+        await db.upsert_device(mac, {"name": "Imported"})
+        rows = [{"dateutc": t, "tempf": 70.0, "source": "csv-import"}
+                for t in range(now - 24 * 3_600_000, now - 600_000, 300_000)]
+        await archive_import.run_import(mac, rows, kind="csv")
+        main._ARRIVAL_CACHE.clear()
+        return await main._arrival_day(mac, [], now)
+    day = asyncio.run(run())
+    assert "o" not in day["hours"], day
+
+
+def test_a_backlog_flush_lights_only_the_slot_it_arrived_in(client):
+    """A relay flushing an hour of saved readings after an outage: the
+    readings are stored with their own times, but the server received them
+    all just now, so only the current slot counts as heard."""
+    import time as _t
+    from app import db
+    mac = "AA:BB:CC:25:05:02"
+    now = int(_t.time() * 1000)
+
+    async def run():
+        await db.set_kv("arrival_rx.since_ms", str(now - 30 * 3_600_000))
+        await db.upsert_device(mac, {"name": "Relay"})
+        await db.insert_observations(mac, [
+            {"dateutc": t, "tempf": 70.0} for t in range(now - 3_600_000, now, 300_000)])
+        return await db.arrival_slots(mac, now - 2 * 3_600_000, 300_000)
+    slots = asyncio.run(run())
+    assert slots == [(now // 300_000) * 300_000], slots
+
+
+def test_history_before_stamping_began_still_reads_timestamps(client):
+    """The first day after the upgrade must not come up blank: the window
+    before arrival_rx.since_ms reads the readings' own timestamps."""
+    import time as _t
+    from app import db
+    mac = "AA:BB:CC:25:05:03"
+    now = int(_t.time() * 1000)
+
+    async def run():
+        await db.upsert_device(mac, {"name": "Old"})
+        await db.insert_observations(mac, [{"dateutc": now - 5 * 3_600_000, "tempf": 70.0}],
+                                     received=False)
+        await db.set_kv("arrival_rx.since_ms", str(now - 3_600_000))
+        return await db.arrival_slots(mac, now - 6 * 3_600_000, 300_000)
+    slots = asyncio.run(run())
+    assert ((now - 5 * 3_600_000) // 300_000) * 300_000 in slots
+
+
+def test_the_first_receipt_slot_after_the_upgrade_counts(client):
+    """Greptile, PR #52: the cut-over was an exact time and receipt stamps
+    are floored to five minutes, so a reading received in the first
+    partial slot was dropped."""
+    import time as _t
+    from app import db
+    mac = "AA:BB:CC:25:05:04"
+    now = int(_t.time() * 1000)
+
+    async def run():
+        slot = (now // 300_000) * 300_000
+        await db.set_kv("arrival_rx.since_ms", str(slot + 1))     # mid-slot cut-over
+        await db.upsert_device(mac, {"name": "New"})
+        await db.insert_observations(mac, [{"dateutc": now, "tempf": 70.0}])
+        return slot, await db.arrival_slots(mac, now - 3_600_000, 300_000)
+    slot, slots = asyncio.run(run())
+    assert slot in slots, slots
+
+
+def test_an_import_in_the_first_day_does_not_paint_the_legacy_window(client):
+    """Greptile, PR #52: before arrival_rx.since_ms the strip reads reading
+    timestamps, and an import in the first day after the upgrade loaded
+    rows there; imported rows never count."""
+    import time as _t
+    from app import archive_import, db
+    mac = "AA:BB:CC:25:05:05"
+    now = int(_t.time() * 1000)
+
+    async def run():
+        await db.set_kv("arrival_rx.since_ms", str(now))
+        await db.upsert_device(mac, {"name": "Fresh upgrade"})
+        rows = [{"dateutc": t, "tempf": 70.0, "source": "csv-import"}
+                for t in range(now - 6 * 3_600_000, now - 600_000, 300_000)]
+        await archive_import.run_import(mac, rows, kind="csv")
+        return await db.arrival_slots(mac, now - 8 * 3_600_000, 300_000)
+    assert asyncio.run(run()) == []

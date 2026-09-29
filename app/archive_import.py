@@ -540,6 +540,9 @@ class _DayCounter:
         self._sum = 0.0
         self._dt = datetime
         self._utc = timezone.utc
+        # Every local day this import touched with interval rain, for the
+        # recompute from stored rows once the rows are in (R25-A01/A02).
+        self.days: set[str] = set()
 
     def apply(self, row: dict[str, Any]) -> None:
         inc = row.get("intervalRainIn")
@@ -552,18 +555,101 @@ class _DayCounter:
             self._day, self._sum = day, 0.0
         self._sum = round(self._sum + max(0.0, float(inc)), 4)
         row["dailyrainin"] = self._sum
+        self.days.add(day)
+
+
+# Days rebuilt between pauses (BATCH_PAUSE_S) after an import.
+REBUILD_DAYS_PER_PAUSE = 30
+
+
+async def rebuild_interval_days(mac: str, days: Iterable[str]) -> int:
+    """Recompute each day's interval-rain counter from the rows actually
+    stored (R25-A01/A02, the 2.5 additional review). The importer's running
+    sum starts at zero for every import, and the day's total is the
+    high-water mark of dailyrainin, so a day split across two imports kept
+    only the larger half; and it summed a duplicate timestamp that INSERT
+    OR IGNORE then dropped. Reading back the stored rows (one per
+    timestamp, in time order) and their intervalRainIn fixes both, and
+    running it again over the same days repairs an earlier import. Rows
+    without an interval (live readings) keep their own counter, and the
+    day's rain_total is the larger of the two. Returns the days rewritten.
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = timezone.utc
+    done = 0
+    for n, day in enumerate(sorted(set(days))):
+        # One day per transaction, paced like the insert batches (Greptile,
+        # PR #52): a decade of archive is thousands of days, and one
+        # transaction over all of them held the writer lock against live
+        # ingest. A cancel stops between days; every day done is whole.
+        if JOB.get("cancel"):
+            break
+        if n and n % REBUILD_DAYS_PER_PAUSE == 0:
+            await asyncio.sleep(BATCH_PAUSE_S)
+        start = datetime.fromisoformat(day).replace(tzinfo=tz)
+        lo = int(start.timestamp() * 1000)
+        hi = int((start + timedelta(days=1)).timestamp() * 1000)
+        async with db.connect() as conn:
+            rows = await (await conn.execute(
+                "SELECT dateutc_ms, dailyrainin, "
+                "json_extract(data_json, '$.intervalRainIn') AS inc "
+                "FROM observations WHERE mac = ? AND dateutc_ms >= ? "
+                "AND dateutc_ms < ? ORDER BY dateutc_ms", (mac, lo, hi))).fetchall()
+            running = 0.0
+            live_max: float | None = None
+            int_span: list[int] = []
+            live_span: list[int] = []
+            for r in rows:
+                inc = r["inc"]
+                if isinstance(inc, (int, float)):
+                    running = round(running + max(0.0, float(inc)), 4)
+                    int_span.append(int(r["dateutc_ms"]))
+                    await conn.execute(
+                        "UPDATE observations SET dailyrainin = ? "
+                        "WHERE mac = ? AND dateutc_ms = ?", (running, mac, r["dateutc_ms"]))
+                elif isinstance(r["dailyrainin"], (int, float)):
+                    live_max = max(live_max or 0.0, float(r["dailyrainin"]))
+                    live_span.append(int(r["dateutc_ms"]))
+            if not int_span:
+                continue
+            # A live dailyrainin counts from local midnight, so only live
+            # readings that all come BEFORE the imported intervals add to
+            # them (Greptile, PR #52: 0.10 live before noon + 0.10 imported
+            # after is 0.20). Live readings after the intervals already hold
+            # that earlier rain, and overlapping ones describe the same rain:
+            # the larger stands.
+            if live_max is not None and max(live_span) < min(int_span):
+                total = round(live_max + running, 4)
+            else:
+                total = max(running, live_max or 0.0)
+            try:
+                await conn.execute(
+                    "UPDATE daily_rollups SET rain_total = ? WHERE mac = ? AND day = ?",
+                    (total, mac, day))
+            except Exception:     # no rollups table on a box without insights
+                pass
+            await conn.commit()
+        done += 1
+    for key in [k for k in db._DAILY_ROLLUP_CACHE if k[0] == mac]:
+        db._DAILY_ROLLUP_CACHE.pop(key, None)
+    return done
 
 
 def day_counter_from_intervals(rows: Iterable[dict], *,
                                ordered: bool = True,
-                               spill_dir: str | None = None) -> Iterator[dict]:
+                               spill_dir: str | None = None,
+                               counter: "_DayCounter | None" = None) -> Iterator[dict]:
     """Rows in ascending time with `dailyrainin` synthesised from
     `intervalRainIn`. A running sum only means something in order:
     WeeWX rows arrive ORDER BY dateTime from a generator and are taken
     as they come, so a decade of archive is never held in memory; a CSV
     can come any way its author left it and is already in memory, so
     its door passes `ordered=False` and the rows are sorted here."""
-    counter = _DayCounter()
+    counter = counter if counter is not None else _DayCounter()
     if not ordered:
         # 2.5: the file door sorts on disk; the in-memory JSON door (whose
         # rows are already in memory, 16 MiB at most) sorts in memory.
@@ -610,7 +696,8 @@ async def run_import(mac: str, rows: Iterable[dict], *, kind: str,
                 JOB.update(state="cancelled", finished_ms=_now_ms())
                 return status()
             rows, ordered = read_spilled(spilled), True
-        for row in day_counter_from_intervals(rows, ordered=ordered,
+        counter = _DayCounter()
+        for row in day_counter_from_intervals(rows, ordered=ordered, counter=counter,
                                               spill_dir=spill_dir):
             if JOB.get("cancel"):
                 JOB.update(state="cancelled", finished_ms=_now_ms())
@@ -619,11 +706,19 @@ async def run_import(mac: str, rows: Iterable[dict], *, kind: str,
             JOB["read"] += 1
             if len(batch) >= BATCH_ROWS:
                 if not dry_run:
-                    JOB["inserted"] += await db.insert_observations(mac, batch)
+                    JOB["inserted"] += await db.insert_observations(mac, batch, received=False)
                 batch = []
                 await asyncio.sleep(BATCH_PAUSE_S)
         if batch and not dry_run:
-            JOB["inserted"] += await db.insert_observations(mac, batch)
+            JOB["inserted"] += await db.insert_observations(mac, batch, received=False)
+        if not dry_run and counter.days:
+            await rebuild_interval_days(mac, counter.days)
+        # A cancel during the rebuild leaves the remaining days as the
+        # running sum wrote them: report it as cancelled, not done
+        # (Greptile, PR #52). Importing the same file again finishes them.
+        if JOB.get("cancel"):
+            JOB.update(state="cancelled", finished_ms=_now_ms())
+            return status()
         JOB.update(state="done", finished_ms=_now_ms())
     except asyncio.CancelledError:
         # Not an Exception: without this the job read "running" until a

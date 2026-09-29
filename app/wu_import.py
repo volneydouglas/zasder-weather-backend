@@ -271,7 +271,7 @@ async def _run(mac: str, station_id: str, api_key: str,
                 if not rows:
                     _state["empty_days"] += 1
                 elif not dry_run:
-                    _state["rows_inserted"] += await db.insert_observations(mac, rows)
+                    _state["rows_inserted"] += await db.insert_observations(mac, rows, received=False)
                 if not dry_run:
                     # Ledger AFTER the insert: a day is "done" only once its
                     # rows are on disk. Empty days ledger too — WU has

@@ -32,6 +32,10 @@ log = logging.getLogger("forecast-snap")
 _INTERVAL_MS = 6 * 3_600_000
 _KV_LAST = "forecast_snapshots.last_ms"
 _KEEP_DAYS = 400
+# The providers this module archives. The forecast correction can only be
+# learned for these (R25-A07, the 2.5 additional review): TWC is fetched
+# live but never archived, so its correction was silently always empty.
+ARCHIVED_PROVIDERS = frozenset({"open-meteo"})
 
 
 def coords_device(devices: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -49,7 +53,7 @@ def coords_device(devices: list[dict[str, Any]]) -> dict[str, Any] | None:
         info = d.get("info") or {}
         coords = (info.get("coords") or {}).get("coords") or {}
         lat, lon = coords.get("lat"), coords.get("lon")
-        if lat is None or lon is None:
+        if lat is None or lon is None or isinstance(lat, bool) or isinstance(lon, bool):
             continue
         # Stored coords are operator data — one non-numeric record must
         # skip to the next station, not raise (the nws_watch lesson), and
@@ -136,7 +140,7 @@ async def check(devices: list[dict[str, Any]], now_ms: int) -> None:
             "precip_in": col("precipitation_sum"),
         })
     if rows:
-        await db.insert_forecast_snapshots("open-meteo", now_ms, rows,
+        await db.insert_forecast_snapshots("open-meteo", now_ms, rows,  # in ARCHIVED_PROVIDERS
                                            keep_days=_KEEP_DAYS)
         log.debug("snapshotted %d forecast days", len(rows))
 

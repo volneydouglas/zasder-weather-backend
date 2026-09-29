@@ -8,6 +8,30 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.5.2] — 2026-09-28
+
+### Fixed
+- **A threshold rule is only offered for retirement to a watch that is
+  switched on.** With smart alerts off, a frost rule could be offered for
+  retirement in favour of the frost watch, and one tap left no frost
+  alert at all.
+- **Rain from interval imports adds up across imports.** A day split
+  across two CSV or WeeWX imports kept only the larger half, and a
+  duplicated row in a CSV was counted twice. Each import now rebuilds
+  the days it touched from the rows actually stored. To repair a day
+  imported before 2.5.2, import the same file again.
+- **The watering call does not count a day the station barely covered.**
+  A day with a single reading looked like a day with no evaporation, and
+  a morning of such days gave a confident "skip", webhook included.
+- **The yard correction says where it was learned.** It is learned at
+  the server's forecast station and is no longer handed to a station
+  more than 25 km from it; a forecast source that is not archived
+  (Weather Underground) answers that it cannot be corrected instead of
+  an empty list.
+- **The 24 hour strip counts what the server received.** An import, or
+  a relay flushing a backlog after an outage, no longer paints the
+  missing hours as healthy.
+
 ## [2.5.1] — 2026-09-28
 
 ### Fixed

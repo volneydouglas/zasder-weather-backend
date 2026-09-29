@@ -577,6 +577,18 @@ CREATE TABLE IF NOT EXISTS sensor_qc_daily (
     PRIMARY KEY (mac, day, field)
 ) WITHOUT ROWID;
 
+-- 2.5.2 (R25-A05): the 5-minute slots a station's readings were RECEIVED
+-- in, by the server's clock. The arrival strip reads these instead of the
+-- readings' own timestamps, so an import or a relay flushing a backlog no
+-- longer paints an outage green. One row per station per slot, swept past
+-- ARRIVAL_RX_KEEP_MS; history before stamping began (server_kv
+-- arrival_rx.since_ms) still reads the timestamps.
+CREATE TABLE IF NOT EXISTS arrival_rx (
+    mac     TEXT NOT NULL,
+    slot_ms INTEGER NOT NULL,
+    PRIMARY KEY (mac, slot_ms)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS imported_days (
     mac         TEXT NOT NULL,
     day         TEXT NOT NULL,        -- YYYY-MM-DD
@@ -1159,6 +1171,13 @@ async def init_db(path: str | None = None) -> None:
                 "INSERT INTO server_kv (k, v) VALUES (?, '1') "
                 "ON CONFLICT(k) DO NOTHING", (LIGHTNING_BACKFILL_KEY,))
             await db.commit()
+        # 2.5.2 (R25-A05): when receipt stamping began. The arrival strip
+        # reads readings' own timestamps before this and receipt slots
+        # after it, so the first day after the upgrade is not blank.
+        await db.execute(
+            "INSERT INTO server_kv (k, v) VALUES ('arrival_rx.since_ms', ?) "
+            "ON CONFLICT(k) DO NOTHING", (str(int(time.time() * 1000)),))
+        await db.commit()
         if await _kv_in(db, LIGHTNING_BACKFILL_KEY) is not None:
             # One-time backfill from data_json: the poller captured
             # lightning into the blob before these columns existed
@@ -2464,8 +2483,17 @@ def _scrub_nonfinite(v: Any) -> Any:
     return v
 
 
-async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
-    """Insert observations, ignoring duplicates by (mac, dateutc). Returns rows added."""
+ARRIVAL_RX_SLOT_MS = 300_000
+ARRIVAL_RX_KEEP_MS = 3 * 86_400_000
+
+
+async def insert_observations(mac: str, rows: list[dict[str, Any]],
+                              received: bool = True) -> int:
+    """Insert observations, ignoring duplicates by (mac, dateutc). Returns rows added.
+
+    `received` stamps the receipt slot the arrival strip reads (R25-A05);
+    history loaders (archive and WU imports) pass False, because loading
+    last year is not the station reporting now."""
     if not rows:
         return 0
     payload = []
@@ -2533,8 +2561,16 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]]) -> int:
             fresh = [scrubbed_by_ts[ts] for ts in sorted(new_ts)
                      if ts in scrubbed_by_ts]
             await update_rollups(db, mac, fresh)
+        added = cur.rowcount or 0
+        if received and added:
+            slot = (int(time.time() * 1000) // ARRIVAL_RX_SLOT_MS) * ARRIVAL_RX_SLOT_MS
+            stamped = await db.execute(
+                "INSERT OR IGNORE INTO arrival_rx (mac, slot_ms) VALUES (?, ?)", (mac, slot))
+            if stamped.rowcount:      # a new slot: sweep this station's old ones
+                await db.execute("DELETE FROM arrival_rx WHERE mac = ? AND slot_ms < ?",
+                                 (mac, slot - ARRIVAL_RX_KEEP_MS))
         await db.commit()
-        return cur.rowcount or 0
+        return added
 
 
 async def last_stored_observation(mac: str) -> tuple[int, dict[str, Any]] | None:
@@ -2582,12 +2618,39 @@ async def arrival_slots(mac: str, since_ms: int, slot_ms: int) -> list[int]:
     range scan on the (mac, dateutc_ms) primary key, grouped, so a day
     of one-second readings still returns at most a slot's worth of rows."""
     step = max(1, int(slot_ms))
+    # Receipt slots from when stamping began (R25-A05); the readings' own
+    # timestamps only for the part of the window before that.
+    began = await get_kv("arrival_rx.since_ms")
+    # Floored to a receipt slot (Greptile, PR #52): stamps are rounded down
+    # to ARRIVAL_RX_SLOT_MS, so an exact cut-over dropped the first slot.
+    began_ms = ((int(began) // ARRIVAL_RX_SLOT_MS) * ARRIVAL_RX_SLOT_MS
+                if began and began.isdigit() else None)
+    legacy_until = int(since_ms) if began_ms is None else max(int(since_ms), began_ms)
     async with connect() as db:
-        rows = await (await db.execute(
-            "SELECT (dateutc_ms / ?) * ? FROM observations "
-            "WHERE mac = ? AND dateutc_ms >= ? GROUP BY dateutc_ms / ?",
-            (step, step, mac, int(since_ms), step))).fetchall()
-    return [int(r[0]) for r in rows]
+        legacy_hi = legacy_until if began_ms is not None else None
+        if began_ms is None or began_ms > since_ms:
+            # Rows an import loaded were never received live: in the legacy
+            # window too they do not count (Greptile, PR #52), so importing
+            # yesterday in the first day after the upgrade cannot paint it.
+            q = ("SELECT (dateutc_ms / ?) * ? FROM observations "
+                 "WHERE mac = ? AND dateutc_ms >= ?"
+                 + (" AND dateutc_ms < ?" if legacy_hi is not None else "")
+                 + " AND COALESCE(json_extract(data_json, '$.source'), '') NOT IN "
+                   "('csv-import', 'weewx-import', 'wu-import')"
+                 + " GROUP BY dateutc_ms / ?")
+            args = [step, step, mac, int(since_ms)]
+            if legacy_hi is not None:
+                args.append(legacy_hi)
+            args.append(step)
+            old = {int(r[0]) for r in await (await db.execute(q, args)).fetchall()}
+        else:
+            old = set()
+        rx: set[int] = set()
+        if began_ms is not None:
+            rx = {(int(r[0]) // step) * step for r in await (await db.execute(
+                "SELECT slot_ms FROM arrival_rx WHERE mac = ? AND slot_ms >= ?",
+                (mac, max(int(since_ms), began_ms)))).fetchall()}
+    return sorted(old | rx)
 
 
 async def get_kv(key: str) -> str | None:

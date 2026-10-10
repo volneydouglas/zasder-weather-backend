@@ -33,9 +33,33 @@ from .day_rain import day_rain_in
 
 log = logging.getLogger("zasder.insights")
 
-# Fixed reference tiers (°F) for the heat ledger; percentile tiers ride
-# alongside. Fahrenheit because storage is API-native — clients convert.
+# Heat ledger tiers (°F; storage is API-native, clients convert). CLIMATE-
+# ADAPTIVE since 2.6, the cold ledger's way: the shipped 80..110 ladder is
+# right for most of the country and topped out in Chandler, where a 115.3°F
+# day read "highest threshold cleared 110" (Volney, 2026-09-28), while a
+# cool coast never reached its second rung. Picked by the station's own
+# p90 of daily highs, in buckets so the round numbers people quote stay.
+# LEDGER_TIERS is the default and the ladder a new station starts on.
 LEDGER_TIERS = (80.0, 90.0, 95.0, 100.0, 105.0, 110.0)
+HEAT_TIERS_COOL = (70.0, 75.0, 80.0, 85.0, 90.0, 95.0)
+HEAT_TIERS_HOT = (90.0, 100.0, 105.0, 110.0, 115.0, 120.0)
+
+
+def heat_tiers_for(p90_high: float | None) -> tuple[float, ...]:
+    """Tier ladder for this station's summers, bucketed by its own
+    90th-percentile high. None (under ~2 months of days) keeps the shipped
+    ladder, so a brand-new station changes nothing. The hot cut is 105, not
+    100: at a p90 near 100 (Sacramento, Dallas) the shipped ladder's 105
+    and 110 rungs still mean something; it is the desert station whose
+    ordinary hot day is past 105 (Chandler, Phoenix, Las Vegas) that ran
+    out of ladder."""
+    if p90_high is None:
+        return LEDGER_TIERS
+    if p90_high >= 105:
+        return HEAT_TIERS_HOT
+    if p90_high < 78:
+        return HEAT_TIERS_COOL
+    return LEDGER_TIERS
 DEGREE_DAY_BASE_F = 65.0
 
 # Cold ledger: days whose LOW reached at or below each tier. CLIMATE-
@@ -1087,6 +1111,7 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
     # five test rows) would otherwise flap onto a cold ladder and flip back
     # months later. Under ~2 months of days, keep the shipped warm ladder.
     cold_tiers = cold_tiers_for(p10_low if len(lows) >= 60 else None)
+    heat_tiers = heat_tiers_for(p90 if len(highs) >= 60 else None)
 
     def day_rain(d) -> float | None:
         # The one rain rule (day_rain.py). None when the station never
@@ -1127,8 +1152,8 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
             # station was not there for. Days arrive in date order, so the
             # first row seen IS the year's first day.
             "first_day": d[0], "last_day": d[0],
-            "tiers": {str(int(t)): 0 for t in LEDGER_TIERS},
-            "tiers_to_date": {str(int(t)): 0 for t in LEDGER_TIERS},
+            "tiers": {str(int(t)): 0 for t in heat_tiers},
+            "tiers_to_date": {str(int(t)): 0 for t in heat_tiers},
             "cold": {str(int(t)): 0 for t in cold_tiers},
             # The cold ladder's to-date mirror, for the same reason the heat
             # ladder has one: a running year compared against finished ones
@@ -1159,7 +1184,7 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
             yr["days_to_date"] += 1
         hi, lo = d[2], d[1]
         if hi is not None:
-            for t in LEDGER_TIERS:
+            for t in heat_tiers:
                 if hi >= t:
                     yr["tiers"][str(int(t))] += 1
                     if to_date:
@@ -1324,7 +1349,7 @@ async def assemble(mac: str, today: date | None = None) -> dict[str, Any]:
         "last_day": days[-1][0] if days else None,
         "p90_high": p90, "p99_high": p99,
         "p10_low": p10_low,
-        "ledger_tiers": [int(t) for t in LEDGER_TIERS],
+        "ledger_tiers": [int(t) for t in heat_tiers],
         # The month-day every year's `*_to_date` counts stop at (2.0).
         "ledger_anchor": anchor_md,
         # The comparability rule, spelled out so a client can explain its

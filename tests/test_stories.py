@@ -167,8 +167,10 @@ def test_heat_ledger_leads_with_the_most_quotable_tier(engine):
         "nearly one in every two days.")
 
     assert s["viz"]["kind"] == "ledger_pyramid"
-    assert [b["days"] for b in s["viz"]["series"]] == [196, 157, 135, 108, 84, 42]
-    assert [b["threshold"] for b in s["viz"]["series"]] == [80, 90, 95, 100, 105, 110]
+    # A desert year (p90 of highs past 105): the hot ladder since 2.6, so
+    # the pyramid climbs to 120 and the quotable tier is still 100.
+    assert [b["days"] for b in s["viz"]["series"]] == [157, 108, 84, 42, 0, 0]
+    assert [b["threshold"] for b in s["viz"]["series"]] == [90, 100, 105, 110, 115, 120]
     assert s["viz"]["highlight"] == 100
 
     # A finished year is not labelled "so far".
@@ -184,8 +186,11 @@ def test_heat_ledger_leads_with_the_most_quotable_tier(engine):
     assert (c["delta"], c["delta_pct"], c["direction"]) == (8.0, 8.0, "above")
 
     # 0.40·quotability + 0.35·reach + 0.25·standout, all three present.
-    assert s["interestingness"] == pytest.approx(0.871, abs=5e-4)
-    assert s["score_parts"]["reach"] == 1.0                # 110°F was cleared
+    # Reach is 4 of 6 on the hot ladder: 110°F was cleared, 115 was not, and
+    # in the desert that is a hot year, not the top of the ladder (it was
+    # 6 of 6 and 0.871 on the fixed 80..110 ladder before 2.6).
+    assert s["interestingness"] == pytest.approx(0.7543, abs=5e-4)
+    assert s["score_parts"]["reach"] == pytest.approx(4 / 6, abs=1e-4)
 
 
 def test_station_attribution_carries_the_measured_span(engine):
@@ -391,7 +396,9 @@ def test_thresholds_state_the_comparison_honestly(engine):
     streak = next((x for x in s["supporting"]
                    if x["key"] == "longest_p90_streak"), None)
     assert streak is not None
-    assert "≥" in streak["label"] and "90th-percentile" in streak["label"]
+    assert "≥" in streak["label"] and "top 10% of highs" in streak["label"]
+    # Two lines on the share card, uppercased (it truncated at 65).
+    assert len(streak["label"]) <= 44, streak["label"]
 
 
 def test_every_stat_carries_a_native_unit(engine):
@@ -401,9 +408,12 @@ def test_every_stat_carries_a_native_unit(engine):
     db = engine
     _seed(db, MAC, _run(2025, date(2025, 1, 1), _LADDER_240))
     s = _heat()["stories"][0]
-    from app.insights import LEDGER_TIERS
     assert s["viz"]["unit"] == "F"
-    assert [b["threshold"] for b in s["viz"]["series"]] == [int(t) for t in LEDGER_TIERS]
+    # The ladder the insights payload chose for this station's climate,
+    # still in °F (2.6: the ladder is climate-adaptive).
+    from app.insights import HEAT_TIERS_COOL, HEAT_TIERS_HOT, LEDGER_TIERS
+    ladders = [[int(t) for t in L] for L in (LEDGER_TIERS, HEAT_TIERS_COOL, HEAT_TIERS_HOT)]
+    assert [b["threshold"] for b in s["viz"]["series"]] in ladders
     for stat in [s["hero"], *s["supporting"]]:
         assert stat["unit"] in {"F", "days"}, stat
     hottest = next(x for x in s["supporting"] if x["key"] == "hottest")

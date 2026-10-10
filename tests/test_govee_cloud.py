@@ -24,7 +24,7 @@ os.environ.setdefault("API_TOKEN", "test-api-token")
 
 from app.govee_cloud_client import GoveeCloudClient, GoveeCloudError  # noqa: E402
 from app.govee_cloud_poller import (  # noqa: E402
-    REPOST_AFTER_S, GoveeCloudPoller, build_payload, capability_values,
+    REPOST_AFTER_S, build_payload, capability_values,
     is_air_monitor_listing, parse_device_ids, synth_mac,
     temperature_is_celsius)
 

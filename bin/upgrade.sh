@@ -155,6 +155,29 @@ case "$MODE" in
         # Exported for this run only: a later plain `docker compose up -d`
         # goes back to :latest, which is never older than a vetted request.
         export ZASDER_IMAGE_TAG="$TAG"
+        # The image the request vetted is the one that gets pulled (R25-05,
+        # the 2.5 detailed review): the git pull above may have changed
+        # docker-compose.yml, and an override file can swap the image or
+        # drop the tag variable, so resolve the EFFECTIVE image now and
+        # refuse anything but the repository the server vetted, at the
+        # requested tag. Nothing is pulled on a mismatch. The vetted
+        # repository is the server's own setting, AUTO_UPDATE_IMAGE_REPO
+        # (environment, else this install's .env, else the public image),
+        # never the compose file: a compose file changed to another
+        # repository would otherwise vouch for itself (CodeRabbit, PR #87).
+        repo="${AUTO_UPDATE_IMAGE_REPO:-}"
+        if [ -z "$repo" ] && [ -f .env ]; then
+          repo="$(sed -n 's/^[[:space:]]*AUTO_UPDATE_IMAGE_REPO[[:space:]]*=[[:space:]]*["'"'"']\{0,1\}\([^"'"'"'[:space:]#]*\).*/\1/p' .env | tail -1)"
+        fi
+        repo="${repo:-ghcr.io/volneydouglas/zasder-weather-backend}"
+        resolved="$(docker compose config --images 2>/dev/null | grep -m1 '^ghcr\.io' || true)"
+        if [ "$resolved" != "${repo}:${TAG}" ]; then
+          err "--request: the effective image is '${resolved:-unknown}', not ${repo}:${TAG}."
+          err "The server vets releases against ${repo} (AUTO_UPDATE_IMAGE_REPO);"
+          err "an override file or a changed docker-compose.yml points elsewhere."
+          err "Nothing was pulled. Point both at the same repository and re-run."
+          exit 1
+        fi
         info "Pulling the requested release image v${TAG}…"
       else
         info "Pulling the published image…"

@@ -1111,8 +1111,9 @@ async def how_hot_is_hot(ctx: StoryContext) -> list[Story]:
         # shipped saying "above 113°" while counting 113.
         supporting.append(Stat(
             "longest_p90_streak",
-            f"longest run of days ≥{u.temp_deg(float(p90))} "
-            f"(the station's 90th-percentile high)",
+            # Short enough for two lines on the share card, still naming
+            # what the number is (Volney 09-28: the long form truncated).
+            f"longest streak ≥{u.temp_deg(float(p90))} (top 10% of highs)",
             streak, UNIT_DAYS))
 
     share = _share_phrase(hero_count, days)
@@ -1314,8 +1315,7 @@ async def how_cold_is_cold(ctx: StoryContext) -> list[Story]:
     if p10 is not None and streak > 0:
         supporting.append(Stat(
             "longest_p10_streak",
-            f"longest run of nights ≤{u.temp_deg(float(p10))} "
-            f"(the station's 10th-percentile low)",
+            f"longest streak ≤{u.temp_deg(float(p10))} (bottom 10% of lows)",
             streak, UNIT_NIGHTS))
 
     share = _share_phrase(hero_count, days, "nights")
@@ -2957,7 +2957,7 @@ async def humid_month(ctx: StoryContext) -> list[Story]:
         delta = month_share - station_share
         comparison = Comparison(
             kind="station_days",
-            label=(f"vs the rest of this station's record"),
+            label=("vs the rest of this station's record"),
             value=round(month_share, 4),
             baseline=round(station_share, 4),
             baseline_label=(f"{len(other_dew)} other days measured here"),
@@ -5735,7 +5735,7 @@ async def tonights_sky(ctx: StoryContext) -> list[Story]:
         hero_line = "THE SKY NEVER GETS FULLY DARK TONIGHT"
     elif window is None:
         title, emoji = "Tonight's Sky", "🌕" if edition == "full_moon" else "🌙"
-        hero_line = (f"A FULL MOON, UP ALL NIGHT" if edition == "full_moon"
+        hero_line = ("A FULL MOON, UP ALL NIGHT" if edition == "full_moon"
                      else f"THE MOON IS UP ALL NIGHT · {lit} LIT")
     elif edition == "new_moon":
         title, emoji = "Tonight's Sky", "🌑"

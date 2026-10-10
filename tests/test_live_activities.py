@@ -138,7 +138,7 @@ def test_storm_watch_disabled_pref_is_inert(client, monkeypatch):
 
 def test_heat_day_lifecycle(client, monkeypatch):
     calls = _fake_apns(monkeypatch)
-    from app import db, heat_watch
+    from app import heat_watch
     cfg = _cfg()
     now = int(time.time() * 1000)
     # Pin the local hour: this test exercises the TEMPERATURE close, and

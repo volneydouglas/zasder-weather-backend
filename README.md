@@ -603,8 +603,28 @@ By default the status page at `/` shows the app screenshots. Set
 `PUBLIC_DASHBOARD=1` to replace them with a live, read-only dashboard of your
 station — current conditions plus inline 24-hour charts, and a "Get the iOS app"
 link. It's fully server-rendered: no client JavaScript, no public data API. Your
-`/api/*` endpoints stay token-gated; only the pre-rendered numbers and charts on
-that one page are exposed.
+`/api/*` endpoints stay token-gated; only the pre-rendered pages below are
+exposed.
+
+Since 2.6 the page links four more, published with it and 404 while it is off:
+
+- **History** (`/weather/history`): each field over 7 days or 30 days, and
+  daily highs and lows, rain and peak gust over a year.
+- **Records & climate** (`/weather/records`): highs and lows for today, the
+  month, the year and all time, today against the NOAA 1991-2020 normals, and
+  the year's month-by-month climate table with each month's coverage.
+- **Storms** (`/weather/storms`): the 50 most recent recorded storms, and the latest one at
+  `/weather/storms/latest`.
+- **Reports** (`/weather/reports`): the NOAA-format monthly and yearly
+  climatological summaries as plain text, always-current at
+  `/weather/reports/noaa/latest-month.txt` and `latest-year.txt`, and each
+  year's daily summary as CSV at `/weather/data/YYYY.csv`.
+
+They publish the station's own measurements, plus the NOAA 1991-2020 normals
+on Records & climate: stations are named by a public id (never the MAC), and
+no coordinates, settings or forecast text appear. A station with a lightning detector also gets a lightning card on the
+main page, centred on the point the station map publishes (plain rings when
+the station is not on the map).
 
 - `PUBLIC_DASHBOARD_MACS` — unset shows your **primary** (first) station only;
   `all` shows every visible device; or a comma-separated MAC allowlist.

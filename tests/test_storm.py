@@ -876,3 +876,73 @@ def test_deliver_hands_the_html_to_smtp(client, monkeypatch):
                                      html="<!DOCTYPE html>x")
     assert asyncio.run(run()) is True
     assert got == ["<!DOCTYPE html>x"]
+
+
+# ── stitched_rain (R25-11): every counter, each hundredth once ────────────
+
+def _rows(*pairs):
+    """[(yearly, daily), ...] in time order; None where a row lacks one."""
+    return [{"yearlyrainin": y, "dailyrainin": d} for y, d in pairs]
+
+
+COLS = ("yearlyrainin", "dailyrainin")
+
+
+def test_stitched_a_stray_yearly_row_does_not_win_the_window():
+    """The review's shape: yearly only at the edges, daily throughout."""
+    rows = _rows((10.0, 0.0), (None, 0.1), (None, 0.2), (None, 0.3), (10.05, 0.3))
+    assert storm.stitched_rain(rows, COLS) == pytest.approx(0.3)
+
+
+def test_stitched_counts_a_row_with_both_counters_once():
+    rows = _rows((10.0, 0.0), (10.1, 0.1), (10.2, 0.2))
+    assert storm.stitched_rain(rows, COLS) == pytest.approx(0.2)
+
+
+def test_stitched_crosses_a_midnight_reset_of_the_daily_counter():
+    rows = _rows((None, 0.4), (None, 0.5), (None, 0.0), (None, 0.1))
+    assert storm.stitched_rain(rows, COLS) == pytest.approx(0.2)
+
+
+def test_stitched_follows_a_source_that_switches_counters_midway():
+    """Yearly for the first half, daily for the second: both halves count,
+    and the one increment at the switch, which no scale can bridge, is
+    the only rain not counted."""
+    rows = _rows((10.0, None), (10.1, None), (10.2, None),
+                 (None, 0.0), (None, 0.1), (None, 0.3))
+    assert storm.stitched_rain(rows, COLS) == pytest.approx(0.2 + 0.3)
+
+
+def test_stitched_a_returning_counter_rebaselines_instead_of_double_counting():
+    """Yearly reappears after daily rows carried the rain: its jump is
+    the rain already counted."""
+    rows = _rows((10.0, 0.0), (None, 0.1), (None, 0.2), (10.2, 0.2), (10.3, 0.3))
+    assert storm.stitched_rain(rows, COLS) == pytest.approx(0.3)
+
+
+def test_stitched_ignores_rows_with_no_counter_and_an_empty_window():
+    assert storm.stitched_rain([], COLS) == 0.0
+    assert storm.stitched_rain(_rows((None, None), (None, None)), COLS) == 0.0
+
+
+def test_a_counter_that_catches_up_a_reading_later_is_not_counted_twice():
+    """R26-04 (the 2.6 detailed review): the yearly counter rose on one
+    reading and the daily counter caught up on the next. Taking the
+    largest increment PER ROW counted the same 0.10 in on both rows."""
+    from app import storm
+    cols = ("yearlyrainin", "dailyrainin")
+    rows = [{"yearlyrainin": 10.00, "dailyrainin": 0.00},
+            {"yearlyrainin": 10.10, "dailyrainin": 0.00},
+            {"yearlyrainin": 10.10, "dailyrainin": 0.10}]
+    assert storm.stitched_rain(rows, cols) == pytest.approx(0.10)
+    # Lagging by several readings, and the other way round.
+    rows = [{"yearlyrainin": 10.00, "dailyrainin": 0.00},
+            {"yearlyrainin": 10.05, "dailyrainin": 0.00},
+            {"yearlyrainin": 10.10, "dailyrainin": 0.00},
+            {"yearlyrainin": 10.10, "dailyrainin": 0.05},
+            {"yearlyrainin": 10.10, "dailyrainin": 0.10}]
+    assert storm.stitched_rain(rows, cols) == pytest.approx(0.10)
+    rows = [{"yearlyrainin": 10.00, "dailyrainin": 0.00},
+            {"yearlyrainin": 10.00, "dailyrainin": 0.10},
+            {"yearlyrainin": 10.10, "dailyrainin": 0.10}]
+    assert storm.stitched_rain(rows, cols) == pytest.approx(0.10)

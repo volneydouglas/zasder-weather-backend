@@ -29,7 +29,7 @@ def public(client, monkeypatch):
 
 
 def test_a_stale_cache_restamps_its_age_on_every_serve(public, monkeypatch):
-    from app import main as M, public_dashboard as pd
+    from app import main as M
     now = time.time()
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     assert _post(public, stamp).status_code == 200
@@ -41,8 +41,8 @@ def test_a_stale_cache_restamps_its_age_on_every_serve(public, monkeypatch):
     # Age the READING two hours, keep the cache 'fresh': the phrase must
     # follow the reading's age, not the build's.
     aged = first.replace(m.group(0), f'data-as-of-ms="{int((now - 7200) * 1000)}">updated 0s ago')
-    built_at, html = M._PUBLIC_DASH_CACHE
-    monkeypatch.setattr(M, "_PUBLIC_DASH_CACHE", (built_at, aged))
+    built_at, html, gen = M._PUBLIC_DASH_CACHE
+    monkeypatch.setattr(M, "_PUBLIC_DASH_CACHE", (built_at, aged, gen))
     served = public.get("/embed").text
     assert "updated 2h ago" in served, served[:400]
     assert "updated 0s ago" not in served

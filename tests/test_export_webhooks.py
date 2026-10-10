@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime as _dt
-import time
 
 AUTH = {"Authorization": "Bearer test-api-token"}
 INGEST = {"Authorization": "Bearer test-ingest-token"}
@@ -65,7 +64,6 @@ def test_webhook_crud_and_dispatch(client, monkeypatch):
 
     # Public https accepted (resolution stubbed so CI needs no network).
     monkeypatch.setattr(wh, "validate_webhook_url", lambda url: None)
-    import app.main as m
     r = client.post("/api/webhooks", headers=AUTH,
                     json={"url": "https://hooks.example.com/zasder"})
     assert r.status_code == 200

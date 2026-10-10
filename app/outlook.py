@@ -14,7 +14,6 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
-from zoneinfo import ZoneInfo
 
 log = logging.getLogger("zasder.outlook")
 
@@ -78,14 +77,26 @@ def _clock(v: Any) -> str | None:
     return hm if len(hm) == 5 and hm[2] == ":" else None
 
 
-def _narrative_for(narrative: list[Any] | None, when: str) -> str | None:
+def _narrative_for(narrative: list[Any] | None, when: str,
+                   target_iso: str | None = None) -> str | None:
     """TWC's prose comes per DAYPART ("Today", "Tonight", "Tomorrow",
     "Tomorrow night", then weekday names), twice as many entries as days
-    and the first one expired by evening, so the day's words are found by
-    name, never by index. A plain list of strings (a test, another
-    provider) falls back to day order."""
+    and the first one expired by evening. Dated entries (forecast_twc
+    stamps each with its day and half) are chosen by the date the report
+    describes, the daytime half first: before TWC's first morning issue
+    "Tonight" is YESTERDAY's night, and choosing by name read it as today
+    (R26-02, the 2.6 detailed review). Undated entries fall back to the
+    names, and a plain list of strings (a test, another provider) to day
+    order."""
     if not narrative:
         return None
+    dated = [e for e in narrative if isinstance(e, dict) and e.get("date")]
+    if dated and target_iso:
+        same = [e for e in dated if str(e.get("date"))[:10] == target_iso]
+        pick = (next((e for e in same if not e.get("night")), None)
+                or next(iter(same), None))
+        t = pick.get("text") or pick.get("narrative") if pick else None
+        return str(t) if t else None
     wanted = ("tomorrow",) if when == "tomorrow" else ("today", "tonight")
     for entry in narrative:
         if isinstance(entry, dict):
@@ -108,21 +119,28 @@ def slot_for(local_hour: int) -> str:
 def build(daily: dict[str, Any], *, narrative: list[Any] | None, when: str,
           now_local: datetime, source: str,
           fallback_from: str | None = None) -> OutlookReport:
-    i = 0 if when == "today" else 1
-    target = (now_local + timedelta(days=i)).date()
-    provider_day = _at(daily, "time", i)
-    if isinstance(provider_day, str) and len(provider_day) >= 10:
-        # Trust the provider's own date for the row; label from it too.
-        try:
-            target = datetime.strptime(provider_day[:10], "%Y-%m-%d").date()
-        except ValueError:
-            pass
+    # The row is the one DATED the day the report describes, never simply
+    # row 0 or 1 (R26-02, the 2.6 detailed review): before TWC's first
+    # morning issue its row 0 is yesterday, and the report read yesterday's
+    # high under today's heading with yesterday's for_date, which is also
+    # the dedupe and delivery key. A provider that sent dates but not this
+    # one gives an unavailable report, not another day's forecast; one
+    # that sent no dates at all keeps day order.
+    target = (now_local + timedelta(days=0 if when == "today" else 1)).date()
+    times = daily.get("time") if isinstance(daily.get("time"), list) else []
+    dated = [str(t)[:10] for t in times if isinstance(t, str) and len(t) >= 10]
+    if dated:
+        iso = target.isoformat()
+        i = next((k for k, t in enumerate(times)
+                  if isinstance(t, str) and t[:10] == iso), len(times))
+    else:
+        i = 0 if when == "today" else 1
     code = _at(daily, "weather_code", i)
     sky = SKY_WORDS.get(int(code)) if isinstance(code, (int, float)) else None
     pp = _num(_at(daily, "precipitation_probability_max", i))
     # Whitespace-only prose is no prose (CodeRabbit, PR #39): the push
     # and the HTML card key off truthiness.
-    text = _narrative_for(narrative, when)
+    text = _narrative_for(narrative, when, target.isoformat())
     text = " ".join(text.split()) or None if text else None
     return OutlookReport(
         date_label=target.strftime("%A, %B %-d"),

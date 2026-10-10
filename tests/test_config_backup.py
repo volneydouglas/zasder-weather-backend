@@ -7,7 +7,6 @@ silently doing nothing.
 """
 from __future__ import annotations
 
-import pytest
 
 H = {"Authorization": "Bearer test-api-token"}
 READ_ONLY = {"Authorization": "Bearer test-reviewer-token"}

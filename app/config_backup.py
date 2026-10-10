@@ -61,6 +61,8 @@ _ALERT_PREF_KEYS = (
     # 2.2: the outlook report's schedule and source, and sky notes
     # (2.2 release review R22-06: export dropped them, import ignored them).
     "outlook_hour", "outlook_minute", "outlook_source",
+    # 2.6: the outlook's second time.
+    "outlook2_hour", "outlook2_minute",
     "sky_notes", "sky_good_only",
     # 2.3: the NWS relay's switch and filter, and the storm Live Activity
     # switch (R23: a restore reset Doren's NWS-off back to on — R22-06
@@ -82,6 +84,8 @@ _ALERT_PREF_KEYS = (
     # would silently switch lightning, frost, heat and the battery
     # alerts back off — the R22-06 shape in its loudest form yet.
     "smart_alerts",
+    # 2.6: the lightning alert's own switch and distance.
+    "lightning_alert", "lightning_alert_mi",
 )
 # Columns set_alert_prefs stores that the backup deliberately leaves out,
 # each with its reason. test_config_backup checks _ALERT_PREF_KEYS is
@@ -140,7 +144,7 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
                "rain_start", "heat_day",
                "nws_push", "nws_warnings_only", "storm_live_activity",
                "lightning_live_activity", "wind_live_activity",
-               "freeze_live_activity", "smart_alerts"):
+               "freeze_live_activity", "smart_alerts", "lightning_alert"):
         if isinstance(v, bool) or v in (0, 1):
             return 1 if v else 0
         return _INVALID
@@ -157,6 +161,15 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
         except (TypeError, ValueError):
             return _INVALID
         return f if math.isfinite(f) else _INVALID
+    if key == "lightning_alert_mi":
+        # NULL (any distance) or 1..40 mi, the bounds PUT /api/alerts takes.
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return _INVALID
+        return f if math.isfinite(f) and 1.0 <= f <= 40.0 else _INVALID
     if key in ("lightning_live_mi", "wind_live_mph"):
         # A trigger distance or speed, within the same bounds AlertPrefsIn
         # puts on PUT /api/alerts (1..40 mi, 10..120 mph), or skipped: a
@@ -189,11 +202,13 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
     if key == "outlook_source":
         return v if v in ("open-meteo", "twc") else _INVALID
     if key in ("quiet_start_min", "quiet_end_min", "digest_hour",
-               "digest_minute", "outlook_hour", "outlook_minute"):
+               "digest_minute", "outlook_hour", "outlook_minute",
+               "outlook2_hour", "outlook2_minute"):
         # The same bounds PUT /api/alerts enforces.
         hi = {"quiet_start_min": 1439, "quiet_end_min": 1439,
               "digest_hour": 23, "digest_minute": 59,
-              "outlook_hour": 23, "outlook_minute": 59}[key]
+              "outlook_hour": 23, "outlook_minute": 59,
+              "outlook2_hour": 23, "outlook2_minute": 59}[key]
         if isinstance(v, bool) or not isinstance(v, (int, float)):
             return _INVALID
         n = int(v)

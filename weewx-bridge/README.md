@@ -10,12 +10,11 @@ outbound POST per archive interval to your server's `/ingest/custom`.
 
 ## Install
 
-WeeWX 5:
+WeeWX 5, from a checkout of this repository:
 
 ```sh
-weectl extension install https://github.com/volneydouglas/zasder-weather-backend/releases/latest/download/weewx-zasder.zip
-# or from a local checkout:
-weectl extension install /path/to/weewx-bridge
+git clone https://github.com/volneydouglas/zasder-weather-backend.git
+weectl extension install zasder-weather-backend/weewx-bridge
 ```
 
 WeeWX 4:
@@ -36,7 +35,7 @@ Then edit `weewx.conf`:
         # device_id = weewx                 # storage key; keep it stable
 ```
 
-The ingest token is in the Zasder Weather app under **Settings → Data**
+The ingest token is in the Zasder Weather app under **Settings → Data** on the Mac, **Settings → Data & Integrations** on the iPhone and iPad
 (or your server's `INGEST_TOKEN` secret). Restart WeeWX; the station
 appears in the app within one archive interval.
 

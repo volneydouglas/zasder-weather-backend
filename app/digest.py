@@ -39,10 +39,22 @@ class StationDay:
 
 @dataclass(frozen=True)
 class Outlook:
-    """Today per the forecast (best-effort; the report stands without it)."""
+    """Today per the forecast (best-effort; the report stands without it).
+    Built from the owner's outlook source, the evening outlook's own path,
+    so the morning and evening reports read the same forecast (2.6,
+    Doren): `narrative` is the provider's prose (TWC), `source` the
+    provider that answered."""
     hi_f: float | None
     lo_f: float | None
     precip_pct: int | None
+    sky: str | None = None
+    narrative: str | None = None
+    source: str | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        return (self.hi_f is None and self.lo_f is None
+                and self.precip_pct is None and not self.narrative)
 
 
 @dataclass(frozen=True)
@@ -281,13 +293,20 @@ def _outlook_block(o: Outlook) -> str:
                      '</b>')
     if o.precip_pct is not None:
         parts.append(f'a <b>{o.precip_pct}%</b> chance of rain')
-    if not parts:
+    if not parts and not o.narrative:
         return ""
+    body = ("Today looks like a " + ", ".join(parts) + ".") if parts else ""
+    if o.narrative:
+        prose = html.escape(o.narrative)
+        body += (f'<div style="padding-top:{8 if parts else 0}px;'
+                 f'color:{_TEXT};">{prose}</div>')
+    if o.source == "twc":
+        body += (f'<div style="padding-top:6px;font-size:11px;color:{_DIM};">'
+                 'Forecast from The Weather Company</div>')
     return (f'<div style="{_LABEL}padding:18px 0 6px;">TODAY&#8217;S '
             'OUTLOOK</div>'
             f'<div style="{_TILE}font:400 14px -apple-system,\'Segoe UI\','
-            f'Arial,sans-serif;color:{_TEXT};">Today looks like a '
-            + ", ".join(parts) + ".</div>")
+            f'Arial,sans-serif;color:{_TEXT};">' + body + "</div>")
 
 
 def _alerts_block(alerts: list[AlertLine]) -> str:
@@ -391,9 +410,7 @@ def build_text(r: Report) -> str:
     if (sp := compute_spread(r.stations)):
         out += ["", sp["headline"] + "."]
         out += ["  " + line for line in spread_lines(sp)]
-    if r.outlook and (r.outlook.hi_f is not None
-                      or r.outlook.lo_f is not None
-                      or r.outlook.precip_pct is not None):
+    if r.outlook and not r.outlook.is_empty:
         o = r.outlook
         bits = []
         if o.hi_f is not None:
@@ -402,7 +419,15 @@ def build_text(r: Report) -> str:
             bits.append(f"low around {o.lo_f:.0f}F")
         if o.precip_pct is not None:
             bits.append(f"{o.precip_pct}% chance of rain")
-        out += ["", "Today: " + ", ".join(bits)]
+        out.append("")
+        if bits:
+            out.append("Today: " + ", ".join(bits))
+        if o.narrative:
+            out.append(("  " if bits else "Today: ") + o.narrative)
+        if o.source == "twc":
+            # The HTML card names the provider; a text-only reader is owed
+            # the same (CodeRabbit, PR #82).
+            out.append("  Forecast from The Weather Company.")
     out.append("")
     if r.alerts:
         out.append("Alert log:")

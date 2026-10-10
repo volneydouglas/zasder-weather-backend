@@ -575,7 +575,6 @@ def test_a_cancelled_import_still_removes_the_sort_file(client, tmp_path):
     """CodeRabbit, PR #48: cancelling the import task cannot stop the
     spill's worker thread; whatever it writes is removed when it ends."""
     import threading
-    import time as _t
     started, finish = threading.Event(), threading.Event()
 
     def rows():
@@ -856,3 +855,95 @@ def test_a_cancel_during_the_rebuild_reports_cancelled(client, monkeypatch):
     asyncio.run(db.upsert_device(mac, {"name": "Cancel"}))
     st = asyncio.run(ai.run_import(mac, rows, kind="weewx"))
     assert st["state"] == "cancelled"
+
+
+def test_the_import_doors_read_their_files_off_the_loop(client, tmp_path, monkeypatch):
+    """R25-03's remainder (the 2.5 detailed review): the CSV door's header
+    read and the WeeWX door's summary ran on the event loop, so a large
+    upload held every other request while the file was read. Both go
+    through asyncio.to_thread now: observed by wrapping the real functions
+    and asking whether a loop is running on the calling thread, which is
+    true only on the loop's own thread (the TestClient runs the app on a
+    worker thread, so "the main thread" would prove nothing)."""
+    import json as _json
+    from app import archive_import
+    seen = []
+    real_header, real_summary = archive_import.csv_file_header, archive_import.weewx_summary
+
+    def on_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+
+    def header(path):
+        seen.append(("header", on_loop()))
+        return real_header(path)
+
+    def summary(path):
+        seen.append(("summary", on_loop()))
+        return real_summary(path)
+    monkeypatch.setattr(archive_import, "csv_file_header", header)
+    monkeypatch.setattr(archive_import, "weewx_summary", summary)
+
+    _make_device(client, "AABBCC00004B")
+    r = client.post("/api/import/csv/file", headers=H, content=b"when,temp\n1789992000,71\n",
+                    params={"mac": "AA:BB:CC:00:00:4B", "time_column": "when",
+                            "mapping": _json.dumps({"temp": "tempf"})})
+    assert r.status_code == 200, r.text
+    _wait_import()
+    path = str(tmp_path / "weewx.sdb")
+    _weewx_db(path, [(1_700_200_000 + i * 300, ai.US, 70.0 + i, 5.0, 29.9, 0.0, 40) for i in range(3)])
+    with open(path, "rb") as f:
+        r = client.post("/api/import/weewx?mac=AA:BB:CC:00:00:4B&dry_run=true",
+                        headers=H, content=f.read())
+    assert r.status_code == 200, r.text
+    assert ("header", False) in seen, seen
+    assert ("summary", False) in seen, seen
+    assert all(not on for _, on in seen), "a read on the loop's thread blocks it"
+
+
+def test_a_client_that_hangs_up_during_the_header_read_leaves_no_upload(client, monkeypatch):
+    """CodeRabbit, PR #71: once the CSV header read moved off the loop it
+    became a point at which the request task can be cancelled, and
+    CancelledError is not an Exception, so the `except Exception` that
+    unlinked the upload let a hung-up request leave its file in the
+    temporary directory. The door unlinks on any exit now, the WeeWX
+    door's shape. Driven through httpx's ASGI transport so the request
+    runs on this test's loop and can be cancelled from it."""
+    import json as _json
+    import tempfile
+    import threading
+    import httpx
+    from pathlib import Path
+    from app import archive_import
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_header(path):
+        entered.set()
+        release.wait(5)
+        return ["when", "temp"]
+    monkeypatch.setattr(archive_import, "csv_file_header", slow_header)
+    _make_device(client, "AABBCC00004C")
+    tmpdir = Path(tempfile.gettempdir())
+    before = set(tmpdir.glob(".csv-*"))
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=client.app),
+                                     base_url="http://test") as c:
+            task = asyncio.ensure_future(c.post(
+                "/api/import/csv/file", headers=H, content=b"when,temp\n1789992000,71\n",
+                params={"mac": "AA:BB:CC:00:00:4C", "time_column": "when",
+                        "mapping": _json.dumps({"temp": "tempf"})}))
+            while not entered.is_set():
+                await asyncio.sleep(0.01)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    asyncio.run(go())
+    left = set(tmpdir.glob(".csv-*")) - before
+    assert not left, f"the cancelled upload stayed behind: {left}"
+    assert archive_import.reserve(), "the import slot was not released"
+    archive_import.release()

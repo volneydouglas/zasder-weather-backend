@@ -100,10 +100,10 @@ def _coords(device: dict[str, Any],
     """The station's own coordinates, else the server's forecast station
     (one sky per server)."""
     from . import forecast_snapshots as fs
-    own = fs._coords([device])
+    own = fs.coords([device])
     if own is not None:
         return own
-    return fs._coords(devices)
+    return fs.coords(devices)
 
 
 def _next_sunrise_ms(coords: tuple[float, float] | None,

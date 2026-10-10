@@ -23,7 +23,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Reques
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               PlainTextResponse, StreamingResponse)
+                               PlainTextResponse, Response, StreamingResponse)
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
@@ -355,6 +355,10 @@ async def lifespan(app: FastAPI):
         restore report done."""
         global _PUBLIC_DASH_CACHE
         from . import wu_upload as _wu, share_targets as _st, alerts as _al
+        # First the epoch, then the clears: a producer mid-await against
+        # the OLD database fails its token check instead of refilling a
+        # cache we just emptied (2.6, the per-MAC generation).
+        db.invalidate_caches()
         db._YEAR_PRIOR_CACHE.clear()
         db._DAILY_ROLLUP_CACHE.clear()
         _RECORDS_CACHE.clear()
@@ -366,6 +370,9 @@ async def lifespan(app: FastAPI):
         _SENSOR_HEALTH_CACHE.clear()
         db._QC_PENDING.clear()
         _PUBLIC_DASH_CACHE = None
+        # A restored database brings its own sharing settings (F26-01).
+        from . import publish_policy as _pp
+        _pp.bump()
         _SHARE_TEST_LAST.clear()
         _wu._stats.clear()
         _st._last_send_ms.clear()
@@ -987,13 +994,15 @@ async def _security_headers(request: Request, call_next):
     fa = "frame-ancestors *" if framable else "frame-ancestors 'none'"
     if _DEBUG:
         csp = ("default-src 'self'; "
-               "img-src 'self' data:; "
+               "img-src 'self' data: https://tile.openstreetmap.org; "
                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
                f"script-src 'self' {_csp_script_hashes()} https://cdn.jsdelivr.net; "
                f"connect-src 'self'; {fa}")
     else:
+        # OpenStreetMap's tiles for the lightning rings' basemap (2.6), the
+        # only third-party origin the page loads, and only images.
         csp = ("default-src 'self'; "
-               "img-src 'self' data:; "
+               "img-src 'self' data: https://tile.openstreetmap.org; "
                "style-src 'self' 'unsafe-inline'; "
                f"script-src 'self' {_csp_script_hashes()}; "
                f"connect-src 'self'; {fa}")
@@ -1340,7 +1349,8 @@ async def embed_page(
     from . import public_dashboard as _pd
     devices = await db.list_devices()
     now_ms = int(time.time() * 1000)
-    dash = await _cached_public_dashboard(devices, now_ms)
+    from . import public_pages as _pages
+    dash = _pages.for_embed(await _cached_public_dashboard(devices, now_ms))
     # ?theme=light|dark pins the palette (an embedding page's theme matters
     # more than the visitor's OS); auto/absent follows prefers-color-scheme.
     attr = f' data-theme="{theme}"' if theme in ("light", "dark") else ""
@@ -1367,6 +1377,321 @@ async def embed_page(
 </body>
 </html>"""
     return HTMLResponse(page)
+
+
+# ── The public site's deeper pages (2.6, Volney 10-10) ─────────────────
+#
+# History, records and climate, storms and reports for people without the
+# apps. Anonymous BY OPT-IN exactly like /embed: every one 404s unless the
+# public dashboard is on, shows only the stations the front page shows,
+# names a station by its public id (map_beacon.station_id, never the MAC),
+# and publishes only the station's own measurements: no coordinates, no
+# settings, and none of the owner's licensed forecast text. Cached per
+# address for ten minutes under the publishing-policy generation, so a
+# sharing change reaches the next visitor (F26-01).
+
+_PUBLIC_PAGE_CACHE: dict[str, tuple[float, Any, int]] = {}
+_PUBLIC_PAGE_TTL_S = 600
+_PUBLIC_PAGE_MAX = 64
+# One build per (address, publishing generation), shared by every visitor
+# who arrives while it runs (addendum review A26-03): a burst of cold
+# visitors or a crawler costs one aggregation, not one each.
+_PUBLIC_PAGE_INFLIGHT: dict[tuple[str, int], "asyncio.Task"] = {}
+# And at most this many DIFFERENT pages build at once, so a crawler walking
+# every address cannot stack aggregations on a small box. Built lazily per
+# event loop (the suite runs a loop per test; see _PUBLIC_DASH_LOCK).
+_PUBLIC_PAGE_BUILDS = 3
+_PUBLIC_PAGE_SEM: "tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None" = None
+
+
+def _public_page_sem() -> asyncio.Semaphore:
+    global _PUBLIC_PAGE_SEM
+    loop = asyncio.get_running_loop()
+    if _PUBLIC_PAGE_SEM is None or _PUBLIC_PAGE_SEM[0] is not loop:
+        _PUBLIC_PAGE_SEM = (loop, asyncio.Semaphore(_PUBLIC_PAGE_BUILDS))
+    return _PUBLIC_PAGE_SEM[1]
+
+
+async def _public_page(key: str, op) -> Any:
+    """Run `op`, the WHOLE authorized operation (choose the public station,
+    then read and render), at most once per address and publishing
+    generation, and hand its result only to visitors whose request it can
+    still answer.
+
+    If the publishing policy changes while `op` runs (sharing turned off, a
+    station removed from the public set), its result is thrown away and the
+    operation starts again from the station check, so a revoked station
+    gets a 404, never the page built for it a moment before (A26-01). A
+    policy that keeps changing gets a short "updating" answer instead."""
+    from . import publish_policy as _pp
+    for _ in range(3):
+        gen = _pp.generation()
+        hit = _PUBLIC_PAGE_CACHE.get(key)
+        if hit is not None and hit[2] == gen and time.time() - hit[0] < _PUBLIC_PAGE_TTL_S:
+            return hit[1]
+        task = _PUBLIC_PAGE_INFLIGHT.get((key, gen))
+        if task is None or task.get_loop() is not asyncio.get_running_loop():
+            async def run() -> Any:
+                async with _public_page_sem():
+                    return await op()
+            task = asyncio.get_running_loop().create_task(run())
+            _PUBLIC_PAGE_INFLIGHT[(key, gen)] = task
+            task.add_done_callback(
+                lambda t, k=(key, gen): _PUBLIC_PAGE_INFLIGHT.pop(k, None)
+                if _PUBLIC_PAGE_INFLIGHT.get(k) is t else None)
+        # shield: one visitor hanging up must not cancel everyone's build.
+        out = await asyncio.shield(task)
+        if gen != _pp.generation():
+            continue                    # built under a policy no longer in force
+        if len(_PUBLIC_PAGE_CACHE) >= _PUBLIC_PAGE_MAX and key not in _PUBLIC_PAGE_CACHE:
+            oldest = min(_PUBLIC_PAGE_CACHE, key=lambda k: _PUBLIC_PAGE_CACHE[k][0])
+            _PUBLIC_PAGE_CACHE.pop(oldest, None)
+        _PUBLIC_PAGE_CACHE[key] = (time.time(), out, gen)
+        return out
+    raise HTTPException(status_code=503, detail="This page is updating. Try again in a moment.")
+
+
+async def _public_station(station: str | None) -> tuple[list[tuple[str, str]], str, dict]:
+    """(every public weather station as (public id, name), the chosen id,
+    its device). 404 when the public pages are off, nothing is public, or
+    the id names no public station."""
+    eff = await _pd_effective()
+    if not eff["enabled"]:
+        raise HTTPException(status_code=404, detail="public pages are off")
+    from . import map_beacon as _mb
+    devices = await db.list_devices()
+    by_mac = {d["mac"]: d for d in devices}
+    server_id = await ensure_server_id()
+    stations = []
+    for mac in _public_macs(devices, eff):
+        d = by_mac.get(mac)
+        if d is None or db.is_air_monitor_device(d):
+            continue
+        stations.append((_mb.station_id(server_id, mac), d.get("name") or "Station", d))
+    if not stations:
+        raise HTTPException(status_code=404, detail="no public station")
+    if station:
+        hit = next((s for s in stations if s[0] == station), None)
+        if hit is None:
+            raise HTTPException(status_code=404, detail="no such public station")
+    else:
+        hit = stations[0]
+    return [(s, n) for s, n, _ in stations], hit[0], hit[2]
+
+
+def _sid_param(station: str | None) -> str | None:
+    if station is not None and not re.fullmatch(r"[0-9a-f]{16}", station):
+        raise HTTPException(status_code=404, detail="no such public station")
+    return station
+
+
+def _local_noon_ms(day: str) -> int:
+    """A station-local calendar day as the instant its noon falls on: where
+    daily values sit on a time axis."""
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:                            # noqa: BLE001
+        tz = timezone.utc
+    d = _date.fromisoformat(day)
+    return int(datetime(d.year, d.month, d.day, 12, tzinfo=tz).timestamp() * 1000)
+
+
+async def _public_days(mac: str, first: str, last: str) -> list[dict[str, Any]]:
+    from . import climate
+    out = []
+    for r in await climate._rollup_rows(mac, first, last):
+        d = climate._day_stats(r)
+        d["ms"] = _local_noon_ms(d["day"])
+        out.append(d)
+    return out
+
+
+@app.get("/weather/history", response_class=HTMLResponse)
+async def public_history(station: str | None = Query(None),
+                         range: str = Query("7d", pattern="^(7d|30d|1y)$")) -> HTMLResponse:
+    from . import climate, public_pages as pp
+    from .public_dashboard import _num as _pd_num
+    _sid_param(station)
+    range_key = range
+
+    async def op() -> str:
+        stations, sid, dev = await _public_station(station)
+        mac = dev["mac"]
+        days_n = pp.RANGES[range_key][0]
+        # The window the page claims to show, end to end, for every chart
+        # (A26-02): data that starts late or stops early leaves its side of
+        # the chart empty instead of stretching to fill the labels.
+        end = int(time.time() * 1000)
+        domain = (end - days_n * 86_400_000, end)
+        series: dict[str, list[tuple[int, float]]] = {}
+        if range_key != "1y":
+            rows = await db.history(mac, domain[0], domain[1], limit=2000)
+            for key in pp.HISTORY_FIELDS:
+                series[key] = [(int(r["dateutc"]), v) for r in rows
+                               if (v := _pd_num(r.get(key))) is not None]
+        days = None
+        day_domain = None
+        if settings.insights:
+            from datetime import timedelta as _td
+            today = climate.local_today()
+            first = (today - _td(days=days_n - 1)).isoformat()
+            days = await _public_days(mac, first, today.isoformat())
+            day_domain = (_local_noon_ms(first), _local_noon_ms(today.isoformat()))
+        body = (pp.station_picker(stations, sid, "/weather/history", range=range_key)
+                + pp.render_history(range_key, series, days, settings.insights, sid,
+                                    domain=domain, day_domain=day_domain))
+        return pp.page("History", "history", sid, body, dev.get("name") or "")
+    return HTMLResponse(await _public_page(f"history:{station}:{range_key}", op))
+
+
+@app.get("/weather/records", response_class=HTMLResponse)
+async def public_records(station: str | None = Query(None),
+                         year: int | None = Query(None, ge=1970, le=2100)) -> HTMLResponse:
+    from . import climate, public_pages as pp
+    _sid_param(station)
+
+    async def op() -> str:
+        stations, sid, dev = await _public_station(station)
+        mac = dev["mac"]
+        recs = await _cached_records(mac)
+        body = pp.station_picker(stations, sid, "/weather/records")
+        normal = None
+        coords = ((dev.get("info") or {}).get("coords") or {}).get("coords") or {}
+        if coords.get("lat") is not None and coords.get("lon") is not None:
+            try:
+                from . import normals
+                normal = await asyncio.wait_for(
+                    normals.today(float(coords["lat"]), float(coords["lon"])), 8)
+            except Exception:                    # noqa: BLE001
+                normal = None
+        body += pp.render_normals(normal, None, (recs.get("periods") or {}).get("today"))
+        body += '<h2 class="pp-h2">Highs and lows</h2>' + pp.render_records(recs, settings.timezone)
+        if settings.insights:
+            cov = await db.rollup_coverage(mac)
+            years = sorted({int(m[:4]) for m in cov})
+            y = year or (years[-1] if years else climate.local_today().year)
+            if years and y not in years:
+                raise HTTPException(status_code=404, detail="no such year")
+            summary = await climate.year_summary(mac, y) if years else None
+            body += (f'<h2 class="pp-h2">Climate, {y}</h2>'
+                     + pp.render_climate(summary, y, years, sid, climate.local_today()))
+        return pp.page("Records & climate", "records", sid, body, dev.get("name") or "")
+    return HTMLResponse(await _public_page(f"records:{station}:{year}", op))
+
+
+@app.get("/weather/storms", response_class=HTMLResponse)
+async def public_storms(station: str | None = Query(None)) -> HTMLResponse:
+    from . import public_pages as pp
+    _sid_param(station)
+
+    async def op() -> str:
+        stations, sid, dev = await _public_station(station)
+        storms = await db.list_storms(dev["mac"], 50)
+        body = (pp.station_picker(stations, sid, "/weather/storms")
+                + pp.render_storms(storms, settings.timezone, sid))
+        return pp.page("Storms", "storms", sid, body, dev.get("name") or "")
+    return HTMLResponse(await _public_page(f"storms:{station}", op))
+
+
+@app.get("/weather/storms/latest", response_class=HTMLResponse)
+async def public_latest_storm(station: str | None = Query(None)) -> HTMLResponse:
+    from . import public_pages as pp
+    _sid_param(station)
+
+    async def op() -> str:
+        _stations, sid, dev = await _public_station(station)
+        storms = await db.list_storms(dev["mac"], 1)
+        body = (pp.render_storm_detail(storms[0], settings.timezone) if storms
+                else pp.unavailable("No storms recorded yet."))
+        return pp.page("Latest storm", "storms", sid, body, dev.get("name") or "")
+    return HTMLResponse(await _public_page(f"storm-latest:{station}", op))
+
+
+@app.get("/weather/reports", response_class=HTMLResponse)
+async def public_reports(station: str | None = Query(None)) -> HTMLResponse:
+    from . import public_pages as pp
+    _sid_param(station)
+
+    async def op() -> str:
+        stations, sid, dev = await _public_station(station)
+        cov = await db.rollup_coverage(dev["mac"]) if settings.insights else {}
+        has_storm = bool(await db.list_storms(dev["mac"], 1))
+        body = (pp.station_picker(stations, sid, "/weather/reports")
+                + pp.render_reports(sid, cov, has_storm))
+        return pp.page("Reports", "reports", sid, body, dev.get("name") or "")
+    return HTMLResponse(await _public_page(f"reports:{station}", op))
+
+
+def _noaa_period(name: str) -> tuple[str, int | None, int | None]:
+    """('latest-month'|'latest-year'|'period', year, month) for a report
+    file name, or 404. Parsed before any data is read."""
+    if name == "latest-month.txt":
+        return "latest-month", None, None
+    if name == "latest-year.txt":
+        return "latest-year", None, None
+    mt = re.fullmatch(r"(\d{4})(?:-(\d{2}))?\.txt", name)
+    if not mt:
+        raise HTTPException(status_code=404, detail="no such report")
+    m = int(mt.group(2)) if mt.group(2) else None
+    if m is not None and not 1 <= m <= 12:
+        raise HTTPException(status_code=404, detail="no such month")
+    return "period", int(mt.group(1)), m
+
+
+@app.get("/weather/reports/noaa/{name}", response_class=PlainTextResponse)
+async def public_noaa(name: str, station: str | None = Query(None)) -> PlainTextResponse:
+    """latest-month.txt, latest-year.txt, YYYY.txt or YYYY-MM.txt: the
+    NOAA-format summary, the same text the apps' Reports pane holds.
+    "Latest" is the newest month or year this station has summaries for."""
+    from . import climate
+    _sid_param(station)
+    kind, y, m = _noaa_period(name)
+    if not settings.insights:
+        raise HTTPException(status_code=404, detail="no daily summaries on this server")
+
+    async def op() -> str:
+        _stations, _sid, dev = await _public_station(station)
+        cov = await db.rollup_coverage(dev["mac"])
+        if not cov:
+            raise HTTPException(status_code=404, detail="no daily summaries yet")
+        newest = max(cov)
+        yy, mm = y, m
+        if kind == "latest-month":
+            yy, mm = int(newest[:4]), int(newest[5:7])
+        elif kind == "latest-year":
+            yy, mm = int(newest[:4]), None
+        if (mm is None and not any(k.startswith(f"{yy}-") for k in cov)) or \
+                (mm is not None and f"{yy}-{mm:02d}" not in cov):
+            raise HTTPException(status_code=404, detail="no daily summaries for that period")
+        stn = dev.get("name") or "Station"
+        if mm is None:
+            return await climate.noaa_year_report(dev["mac"], stn, yy)
+        return await climate.noaa_month_report(dev["mac"], stn, yy, mm)
+    return PlainTextResponse(await _public_page(f"noaa:{station}:{name}", op))
+
+
+@app.get("/weather/data/{name}")
+async def public_daily_csv(name: str, station: str | None = Query(None)) -> Response:
+    """YYYY.csv: one row per local day of that year, the station's own
+    daily summary (high, low, mean, rain, peak gust, degree days)."""
+    from . import public_pages as pp
+    _sid_param(station)
+    mt = re.fullmatch(r"(\d{4})\.csv", name)
+    if not settings.insights or not mt:
+        raise HTTPException(status_code=404, detail="no such file")
+    y = int(mt.group(1))
+
+    async def op() -> str:
+        _stations, _sid, dev = await _public_station(station)
+        cov = await db.rollup_coverage(dev["mac"])
+        if not any(k.startswith(f"{y}-") for k in cov):
+            raise HTTPException(status_code=404, detail="no daily summaries for that year")
+        return pp.daily_csv(await _public_days(dev["mac"], f"{y}-01-01", f"{y}-12-31"))
+    body = await _public_page(f"csv:{station}:{y}", op)
+    return Response(body, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'inline; filename="weather-{y}.csv"'})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1472,8 +1797,10 @@ async def _cached_observation_count(mac: str) -> int:
         if running is None or running.done():
             async def _recount() -> None:
                 try:
-                    _OBS_COUNT_CACHE[mac] = (time.time(),
-                                             await db.observation_count(mac))
+                    token = db.cache_token()
+                    n = await db.observation_count(mac)
+                    if db.cache_token_current(token):
+                        _OBS_COUNT_CACHE[mac] = (time.time(), n)
                 except Exception:
                     log.exception("count refresh failed for %s", mac)
             task = asyncio.create_task(_recount())
@@ -1482,12 +1809,16 @@ async def _cached_observation_count(mac: str) -> int:
                 lambda t, m=mac: _OBS_COUNT_TASKS.pop(m, None)
                 if _OBS_COUNT_TASKS.get(m) is t else None)
         return hit[1]
+    token = db.cache_token()
     n = await db.observation_count(mac)
-    _OBS_COUNT_CACHE[mac] = (time.time(), n)
+    if db.cache_token_current(token):
+        _OBS_COUNT_CACHE[mac] = (time.time(), n)
     return n
 
 
-_PUBLIC_DASH_CACHE: tuple[float, str] | None = None
+# (built_at, html, publish_policy generation it was built under). Served
+# only while that generation is current: see publish_policy (F26-01).
+_PUBLIC_DASH_CACHE: tuple[float, str, int] | None = None
 _PUBLIC_DASH_TTL_S = 100
 # Serve-stale ceiling. A cold build takes ~7s on a large history (measured
 # on Doren's 1.15M-row box, 2026-08-25 — his "embed takes 10sec" report),
@@ -1569,15 +1900,20 @@ def _refresh_public_dashboard_soon(devices: list[dict], now_ms: int) -> None:
 
     async def _run() -> None:
         global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK, _PUBLIC_DASH_REFRESHING
+        from . import publish_policy as _pp
         try:
             if _PUBLIC_DASH_LOCK is None:
                 _PUBLIC_DASH_LOCK = asyncio.Lock()
             async with _PUBLIC_DASH_LOCK:
                 hit = _PUBLIC_DASH_CACHE
-                if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
+                if _servable(hit) and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
                     return          # someone else already rebuilt
+                gen = _pp.generation()
                 html = await _build_public_dashboard(devices, now_ms)
-                _PUBLIC_DASH_CACHE = (time.time(), html)
+                # Built under a policy that has since changed: drop it,
+                # the next visitor builds under the current one.
+                if gen == _pp.generation():
+                    _PUBLIC_DASH_CACHE = (time.time(), html, gen)
         except Exception:
             log.exception("background public-dashboard refresh failed")
         finally:
@@ -1594,14 +1930,23 @@ async def _cached_public_dashboard(devices: list[dict], now_ms: int) -> str:
     return _pd.restamp_ages(await _cached_public_dashboard_raw(devices, now_ms))
 
 
+def _servable(hit: "tuple[float, str, int] | None") -> bool:
+    """A cached page may be served (fresh or stale) only if it was built
+    under the publishing policy in force now (F26-01)."""
+    from . import publish_policy as _pp
+    return hit is not None and hit[2] == _pp.generation()
+
+
 async def _cached_public_dashboard_raw(devices: list[dict], now_ms: int) -> str:
     global _PUBLIC_DASH_CACHE, _PUBLIC_DASH_LOCK
+    from . import publish_policy as _pp
     hit = _PUBLIC_DASH_CACHE
-    if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
+    if _servable(hit) and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
         return hit[1]
     # Stale-while-revalidate: between the TTL and the stale ceiling, the
     # visitor gets the old page NOW and the rebuild happens behind them.
-    if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_STALE_MAX_S:
+    # Never a page from an older policy: that one blocks for a rebuild.
+    if _servable(hit) and time.time() - hit[0] < _PUBLIC_DASH_STALE_MAX_S:
         _refresh_public_dashboard_soon(devices, now_ms)
         return hit[1]
     if _PUBLIC_DASH_LOCK is None:      # no await between test and assignment
@@ -1610,29 +1955,30 @@ async def _cached_public_dashboard_raw(devices: list[dict], now_ms: int) -> str:
         # Re-check under the lock: a caller that queued behind an in-flight
         # build takes its result rather than running an identical second one.
         hit = _PUBLIC_DASH_CACHE
-        if hit is not None and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
+        if _servable(hit) and time.time() - hit[0] < _PUBLIC_DASH_TTL_S:
             return hit[1]
-        html = await _build_public_dashboard(devices, now_ms)
-        _PUBLIC_DASH_CACHE = (time.time(), html)
-        return html
-
-
-async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
-    """Gather current + 24h history for the selected station(s) and render the
-    dashboard section. Selection: PUBLIC_DASHBOARD_MACS ('all' | csv | unset →
-    primary/first device)."""
-    from . import public_dashboard as pd
-    eff = await _pd_effective()
-    if not devices:
-        # A fresh deployment with the dashboard already on: the selection
-        # below indexes devices[0], which 500'd /embed before any station
-        # ever posted (CodeRabbit on the 1.6.1 retro-review, 2026-08-21).
+        # A policy change during the build makes its page unpublishable:
+        # build again under the new one. Bounded: if the settings change
+        # during every attempt (an owner flipping switches), say so rather
+        # than send a page built under a policy that is no longer in force.
+        for _ in range(3):
+            gen = _pp.generation()
+            html = await _build_public_dashboard(devices, now_ms)
+            if gen == _pp.generation():
+                _PUBLIC_DASH_CACHE = (time.time(), html, gen)
+                return html
         return ('<div class="station"><div class="chart-empty">'
-                'No stations reporting yet — data appears here as soon as '
-                'the first reading arrives.</div></div>')
-    fields = pd.resolve_fields(settings.public_dashboard_fields)
+                'This page is updating. Refresh in a moment.</div></div>')
+
+
+def _public_macs(devices: list[dict], eff: dict) -> list[str]:
+    """The stations the public pages show, in page order: the owner's
+    selection (PUBLIC_DASHBOARD_MACS or the app's sharing screen: 'all',
+    a csv, or unset for the primary station). One rule for the front page
+    and every 2.6 public page, so no page shows a station another hides."""
+    if not devices:
+        return []
     sel = (eff["macs"] or "").strip()
-    by_mac = {d["mac"]: d for d in devices}
     # Air monitors render as their own card (2.0, pd.render_air_station):
     # they are selectable like any device, by explicit mac or "all". Only
     # the PRIMARY fallback still prefers a weather station, so a fleet
@@ -1657,9 +2003,33 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
     else:
         # primary = first WEATHER station (monitor-first fleets fall back).
         macs = [(weather or devices)[0]["mac"]]
+    return macs
+
+
+async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
+    """Gather current + 24h history for the selected station(s) and render the
+    dashboard section. Selection: PUBLIC_DASHBOARD_MACS ('all' | csv | unset →
+    primary/first device)."""
+    from . import public_dashboard as pd
+    eff = await _pd_effective()
+    if not devices:
+        # A fresh deployment with the dashboard already on: the selection
+        # below indexes devices[0], which 500'd /embed before any station
+        # ever posted (CodeRabbit on the 1.6.1 retro-review, 2026-08-21).
+        return ('<div class="station"><div class="chart-empty">'
+                'No stations reporting yet — data appears here as soon as '
+                'the first reading arrives.</div></div>')
+    fields = pd.resolve_fields(settings.public_dashboard_fields)
+    by_mac = {d["mac"]: d for d in devices}
+    macs = _public_macs(devices, eff)
 
     start_ms = now_ms - 24 * 3600 * 1000
     stations = []
+    # 2.6: the station map's settings, read once. They decide both the
+    # lightning rings' centre and the "on the station map" link: neither
+    # shows a station the owner has not put on the map.
+    from . import map_beacon as _mb
+    map_cfg = await _mb.get_config()
     for mac in macs:
         d = by_mac.get(mac)
         if not d:
@@ -1721,12 +2091,34 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
         # than approximating one.
         if obs:
             await _fill_rain_periods(mac, obs)
+        # 2.6: lightning rings for a station with a detector that struck in
+        # the window, centred on the point the station map publishes (none
+        # = rings without a basemap; the page never shows more than that).
+        published = _mb.published_point(map_cfg, d, devices)
+        lightning = None
+        n1 = (obs or {}).get("lightning_last_1hr")
+        if isinstance(n1, (int, float)) and not isinstance(n1, bool):
+            from . import lightning_map as _lm
+            strikes = await db.recent_strikes(mac, now_ms - _lm.WINDOW_MS)
+            if strikes:
+                lightning = {"strikes": strikes, "now_ms": now_ms,
+                             "center": published,
+                             "counts": (obs.get("lightning_last_1hr"),
+                                        obs.get("lightning_last_3hr"))}
+        # 2.6 (Volney 10-10): a station that is on the map links to its pin.
+        map_url = ""
+        if published is not None:
+            map_url = (f"{_mb.directory_url()}/?station="
+                       f"{_mb.station_id(await ensure_server_id(), mac)}")
         stations.append({"name": d.get("name") or mac, "obs": obs,
                          "series": series, "wind_samples": wind_samples,
-                         "records": recs, "summary": pd.summary_stats(rows)})
+                         "records": recs, "summary": pd.summary_stats(rows),
+                         "lightning": lightning, "map_url": map_url})
+    from . import public_pages as _pages
+    more = _pages.more_links() if any(not s.get("air") for s in stations) else ""
     return pd.render_dashboard(stations, fields, tz_name=settings.timezone,
                                app_url=settings.public_dashboard_app_url,
-                               location=eff["location"])
+                               location=eff["location"], more_html=more)
 
 
 def _humanize_age(seconds: float) -> str:
@@ -2046,7 +2438,6 @@ async def _run_db_backup(job: dict[str, Any], dest: Path) -> None:
     statements in progress and VACUUM refuses; a raw file copy of a live
     WAL database can capture a torn state). Consistent, compacted, and on
     aiosqlite's worker thread so the event loop never blocks."""
-    import aiosqlite
     from . import copy_jobs
     try:
         await db.wait_open()
@@ -2054,11 +2445,10 @@ async def _run_db_backup(job: dict[str, Any], dest: Path) -> None:
         # not report our own second copy of the database as the volume
         # filling up (D2, Doren 2026-09-20).
         with copy_jobs.running("backup", dest):
-            conn = await db.open_connection(settings.database_path)
-            try:
+            # A counted connection (B-02): a restore cannot rename the
+            # database under the VACUUM; it waits or answers 409.
+            async with db.counted_open_connection(settings.database_path) as conn:
                 await conn.execute("VACUUM INTO ?", (str(dest),))
-            finally:
-                await conn.close()
         job.update(state="ready", size=dest.stat().st_size,
                    finished_ms=int(time.time() * 1000))
     except Exception as e:
@@ -2154,19 +2544,17 @@ async def api_backup_database() -> FileResponse:
             dest, media_type="application/vnd.sqlite3",
             filename=f"zasder-weather-{stamp}.db",
             background=BackgroundTask(_cleanup))
-    import aiosqlite
     from . import copy_jobs
     dest = _db_backup_dest()
     await db.wait_open()
     with copy_jobs.running("backup", dest):
-        conn = await db.open_connection(settings.database_path)
+        # Counted (B-02), like the background snapshot above.
         try:
-            await conn.execute("VACUUM INTO ?", (str(dest),))
+            async with db.counted_open_connection(settings.database_path) as conn:
+                await conn.execute("VACUUM INTO ?", (str(dest),))
         except Exception:
             dest.unlink(missing_ok=True)
             raise
-        finally:
-            await conn.close()
     return FileResponse(
         dest, media_type="application/vnd.sqlite3",
         filename=f"zasder-weather-{stamp}.db",
@@ -2809,6 +3197,8 @@ async def api_public_dashboard_put(body: PublicDashboardBody) -> dict[str, Any]:
     # next visit, not two minutes later. Cleared under the build lock: a
     # bare clear raced an in-flight build, which could assign the OLD html
     # back into the cache after this PUT returned (CodeRabbit, 2026-08-21).
+    from . import publish_policy as _pp
+    _pp.bump()
     await _invalidate_public_dashboard_cache()
     return await _pd_effective()
 
@@ -3029,9 +3419,11 @@ async def _arrival_day(mac: str, watch: list[dict[str, Any]],
     # One extra quiet window before the day, so its first slots know
     # whether the station was already silent.
     since = now_ms - source_history.WINDOW_MS - source_history.DEVICE_QUIET_MS
+    token = db.cache_token()
     slots = await db.arrival_slots(mac, since, source_history.ARRIVAL_SLOT_MS)
     day = source_history.arrival_day(slots, watch, now_ms, outages=outages, kind=kind)
-    _ARRIVAL_CACHE[mac] = (now, day)
+    if db.cache_token_current(token):
+        _ARRIVAL_CACHE[mac] = (now, day)
     return day
 
 
@@ -3088,6 +3480,9 @@ class AlertPrefsIn(BaseModel):
     outlook_hour: int | None = Field(default=None, ge=-1, le=23)
     outlook_minute: int | None = Field(default=None, ge=-1, le=59)
     outlook_source: str | None = Field(default=None, pattern="^(open-meteo|twc)$")
+    # 2.6: the outlook's second time, -1 clears.
+    outlook2_hour: int | None = Field(default=None, ge=-1, le=23)
+    outlook2_minute: int | None = Field(default=None, ge=-1, le=59)
     # 2.2 sky notes.
     sky_notes: bool | None = None
     sky_good_only: bool | None = None
@@ -3115,6 +3510,10 @@ class AlertPrefsIn(BaseModel):
     freeze_live_activity: bool | None = None
     lightning_live_mi: float | None = Field(default=None, ge=1, le=40)
     wind_live_mph: float | None = Field(default=None, ge=10, le=120)
+    # 2.6: the lightning alert's own switch and distance in miles
+    # (API-native). 0 = any distance, which stores NULL.
+    lightning_alert: bool | None = None
+    lightning_alert_mi: float | None = Field(default=None, ge=0, le=40)
 
 
 class DeviceAlertIn(BaseModel):
@@ -3191,6 +3590,11 @@ async def _alerts_state() -> dict[str, Any]:
         "digest_minute": cfg.digest_minute,
         "outlook_hour": cfg.outlook_hour,
         "outlook_minute": cfg.outlook_minute,
+        "outlook2_hour": cfg.outlook2_hour,
+        "outlook2_minute": cfg.outlook2_minute,
+        # The app shows the second-time row only when this is true; an
+        # absent and a null outlook2_hour decode the same in Swift.
+        "outlook2_supported": True,
         # Effective, never null: the app shows the Outlook controls when a
         # server answers this field at all (CodeRabbit, PR #37).
         "outlook_source": cfg.outlook_source or "open-meteo",
@@ -3218,6 +3622,10 @@ async def _alerts_state() -> dict[str, Any]:
         "freeze_live_activity": cfg.freeze_live_activity,
         "lightning_live_mi": cfg.lightning_live_mi,
         "wind_live_mph": cfg.wind_live_mph,
+        # 2.6: effective, never null, so an app can tell a server that
+        # has these from one that does not. 0 = any distance.
+        "lightning_alert": cfg.lightning_alert,
+        "lightning_alert_mi": cfg.lightning_alert_mi or 0,
         # Smart-alert firing state, so a client with no push channel of its
         # own (the macOS app) can edge-detect these the way it now does
         # threshold rules. Rides on this response rather than a new endpoint
@@ -3464,10 +3872,17 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             detail="quiet_start_min and quiet_end_min must be set together "
                    "(use -1 for both to clear)")
     for f in ("quiet_start_min", "quiet_end_min", "digest_hour",
-              "digest_minute", "outlook_hour", "outlook_minute"):
+              "digest_minute", "outlook_hour", "outlook_minute",
+              "outlook2_hour", "outlook2_minute"):
         v = getattr(body, f)
         if v is not None:
             fields[f] = None if v < 0 else v
+    # Turning the outlook off turns its second time off too (R26-03, the
+    # 2.6 detailed review): a pre-2.6 app sends only outlook_hour=-1 and
+    # would otherwise leave a hidden second schedule running.
+    if body.outlook_hour is not None and body.outlook_hour < 0:
+        fields["outlook2_hour"] = None
+        fields["outlook2_minute"] = None
     if body.outlook_source is not None:
         fields["outlook_source"] = body.outlook_source
     if body.report_theme is not None:
@@ -3481,7 +3896,7 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     for f in ("sky_notes", "sky_good_only", "nws_push", "nws_warnings_only",
               "storm_live_activity", "lightning_live_activity",
               "wind_live_activity", "freeze_live_activity",
-              "smart_alerts"):
+              "smart_alerts", "lightning_alert"):
         v = getattr(body, f)
         if v is not None:
             fields[f] = 1 if v else 0
@@ -3489,6 +3904,11 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
         v = getattr(body, f)
         if v is not None:
             fields[f] = v
+    if body.lightning_alert_mi is not None:
+        if 0 < body.lightning_alert_mi < 1:
+            raise HTTPException(status_code=400,
+                                detail="lightning_alert_mi is 0 (any distance) or 1 to 40")
+        fields["lightning_alert_mi"] = body.lightning_alert_mi or None
     if body.storm_quiet_minutes is not None:
         fields["storm_quiet_minutes"] = body.storm_quiet_minutes
     if body.storm_min_total_in is not None:
@@ -3864,8 +4284,18 @@ async def get_forecast_correction(
     # than answering an empty list the apps cannot explain.
     if provider not in forecast_snapshots.ARCHIVED_PROVIDERS:
         body.update(supported=False,
-                    reason="The yard correction is learned from archived Open-Meteo "
-                           "forecasts; this forecast source is not archived.")
+                    reason="The yard correction is learned from archived forecasts "
+                           "(Open-Meteo, and TWC when a Weather Underground key is "
+                           "set); this forecast source is not archived.")
+        return JSONResponse(body)
+    # TWC is archived only while a key exists (2.6): without one the strip
+    # has been falling back to Open-Meteo anyway, and a reader asking for
+    # TWC deserves the reason, not a list that never fills.
+    if provider == "twc" and not await forecast_snapshots.twc_key():
+        body.update(supported=False,
+                    reason="This server has no Weather Underground key, so TWC "
+                           "forecasts are not archived and no TWC correction can "
+                           "be learned.")
         return JSONResponse(body)
     # The archive holds ONE sky, at the server's forecast station (R25-A06):
     # a station far from it would be corrected with another place's errors.
@@ -3921,6 +4351,65 @@ async def get_storms(mac: str,
     from .ingest import _format_mac
     return JSONResponse({"storms": await db.list_storms(_format_mac(mac),
                                                         limit)})
+
+
+@app.get("/api/devices/{mac}/lightning/strikes",
+         dependencies=[Depends(require_token)])
+async def get_lightning_strikes(
+    mac: str,
+    hours: int = Query(3, ge=1, le=24),
+    authorization: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    """The strikes behind the lightning rings (2.6): each distinct strike
+    in the window with its distance, newest first, and the point to centre
+    the rings on. The detector knows distance, never direction, so there
+    is no bearing to send. The owner gets the station's own position; a
+    guest or reviewer gets only the point the station map publishes, or
+    null (rings with no basemap), the same rule as the public page."""
+    from .ingest import _format_mac
+    from . import lightning_map as _lm, map_beacon as _mb
+    mac = _format_mac(mac)
+    devices = await db.list_devices()
+    station = next((d for d in devices if str(d.get("mac") or "").upper() == mac), None)
+    if station is None:
+        raise HTTPException(status_code=404, detail="no such device")
+    now_ms = int(time.time() * 1000)
+    window_ms = hours * 3_600_000
+    rows = await db.recent_strikes(mac, now_ms - window_ms, limit=_lm.QUERY_CAP)
+    # The drawing gets at most MAX_DRAWN reports, thinned evenly, and says
+    # so (F26-04). The trend reads only the last hour, from its own query,
+    # so neither the drawing nor the query cap can change it (addendum
+    # review's note on "every report").
+    every = _lm.strikes_in_window(rows, now_ms, window_ms)
+    strikes = _lm.thin(every)
+    hour = await db.recent_strikes(mac, now_ms - _lm.TREND_WINDOW_MS, limit=_lm.QUERY_CAP)
+    trend = _lm.trend(_lm.strikes_in_window(hour, now_ms, _lm.TREND_WINDOW_MS))
+    obs = await db.latest_observation(mac) or {}
+    if _is_limited_read(authorization):
+        center = _mb.published_point(await _mb.get_config(), station, devices)
+    else:
+        from .share_targets import _coords
+        center = _coords(station)
+    return JSONResponse({
+        "strikes": strikes,
+        "band_mi": _lm.BAND_MI,
+        "reference_rings_mi": list(_lm.REFERENCE_RINGS_MI),
+        "center": ({"lat": center[0], "lon": center[1]} if center else None),
+        "window_hours": hours,
+        "trend": trend,
+        # 2.6 follow-up (F26-04): `strikes` are sampled LAST-strike distance
+        # reports, at most one per reading, so their number is not a strike
+        # count. The detector's own trailing counts are, and the server's
+        # clock lets the app age the reports itself between fetches.
+        "now_ms": now_ms,
+        "count_1h": _lm._count(obs.get("lightning_last_1hr")),
+        "count_3h": _lm._count(obs.get("lightning_last_3hr")),
+        # When the station reported those counts: a station gone quiet
+        # still has counts from its last reading, and they are that old.
+        "counts_ms": (int(obs["dateutc"]) if isinstance(obs.get("dateutc"), (int, float))
+                      and not isinstance(obs.get("dateutc"), bool) else None),
+        "truncated": len(strikes) < len(every) or len(rows) >= _lm.QUERY_CAP,
+    })
 
 
 @app.get("/api/nowcast", dependencies=[Depends(require_token)])
@@ -4005,6 +4494,23 @@ async def get_coverage(mac: str) -> JSONResponse:
 
 _SENSOR_HEALTH_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 _SENSOR_HEALTH_TTL_S = 3600.0
+# `mac` is an unvalidated path parameter readable with any guest token, and
+# every distinct one left a permanent entry (B-04, the 2.6 architecture
+# review; the same hole _prune_records_cache closed for records). Far above
+# any real device count.
+_SENSOR_HEALTH_MAX_ENTRIES = 256
+
+
+def _prune_sensor_health_cache() -> None:
+    """Drop expired entries, then the oldest beyond the cap."""
+    now = time.monotonic()
+    for k, (ts, _) in list(_SENSOR_HEALTH_CACHE.items()):
+        if now - ts >= _SENSOR_HEALTH_TTL_S:
+            del _SENSOR_HEALTH_CACHE[k]
+    # Runs before the store, so leave room for the entry about to land.
+    while len(_SENSOR_HEALTH_CACHE) >= _SENSOR_HEALTH_MAX_ENTRIES:
+        oldest = min(_SENSOR_HEALTH_CACHE, key=lambda k: _SENSOR_HEALTH_CACHE[k][0])
+        del _SENSOR_HEALTH_CACHE[oldest]
 
 
 @app.get("/api/devices/{mac}/sensor-health", dependencies=[Depends(require_token)])
@@ -4019,15 +4525,18 @@ async def get_sensor_health(mac: str,
     since_day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
     since_ms = int(calendar.timegm(time.strptime(since_day, "%Y-%m-%d"))) * 1000
     key = (m, days)
+    _prune_sensor_health_cache()
     hit = _SENSOR_HEALTH_CACHE.get(key)
     if hit and time.monotonic() - hit[0] < _SENSOR_HEALTH_TTL_S \
             and hit[1].get("since_day") == since_day:
         body = dict(hit[1])
     else:
         fields = list(_PLAUSIBLE_BANDS)
+        token = db.cache_token()
         accepted = await db.accepted_counts(m, since_ms, fields)
         body = {"days": days, "accepted": accepted, "since_day": since_day}
-        _SENSOR_HEALTH_CACHE[key] = (time.monotonic(), body)
+        if db.cache_token_current(token):
+            _SENSOR_HEALTH_CACHE[key] = (time.monotonic(), body)
         body = dict(body)
     # Refusals are cheap and must be current (a flush a minute ago counts).
     rejected = await db.sensor_rejections(m, since_day)
@@ -4070,17 +4579,23 @@ async def get_storm_compare(mac: str, started_ms: int = Query(..., ge=0),
         if db.is_air_monitor_device(d):
             continue
         m = d["mac"]
-        # The counter this station actually kept IN THE WINDOW, in the storm
-        # module's own preference order (yearly first: it survives
-        # midnight). The latest reading is not a safe guide: a source can
-        # change which counters it sends.
-        field, counted = "yearlyrainin", 0
-        for f in storm._COUNTER_FIELDS:
-            n = await db.count_non_null_between(m, f, started_ms, ended_ms)
-            if n:
-                field, counted = f, n
-                break
-        stats = await db.storm_window_stats(m, started_ms, ended_ms, field)
+        # Peak rate, gust and temperatures come from the window's rows
+        # whatever counter the station kept; the counter column passed
+        # here only feeds a total this route does not use.
+        stats = await db.storm_window_stats(m, started_ms, ended_ms, "yearlyrainin")
+        # The rain total comes from EVERY counter the station posted in
+        # the window, each hundredth counted once (storm.stitched_rain):
+        # a source that switched counters midway, or posts both, is not
+        # measured by one of them alone, and no single counter has to be
+        # picked first. Picking one used to be the job (R25-11: the first
+        # counter with ANY row, then the one with the most rows), and each
+        # rule had a case it got wrong: a stray yearly row beside a daily
+        # sequence, then a counter stored garbled (text in a REAL column)
+        # counting as coverage (CodeRabbit, PR #70). Only finite values
+        # count in the stitch.
+        stitched, counted = await db.storm_window_rain_stitched(
+            m, started_ms, ended_ms, storm._COUNTER_FIELDS)
+        stats["total_in"] = stitched
         count = await db.count_observations_between(m, started_ms, ended_ms)
         capture = await db.storm_close_capture(m, started_ms, ended_ms, now_ms)
         out.append({
@@ -4808,10 +5323,22 @@ async def start_csv_file_import(
         tmp = await _stream_upload_to_temp(request, suffix=".csv", prefix=".csv-",
                                            sort_copies=5)
         try:
-            header = archive_import.csv_file_header(str(tmp))
-        except Exception:
+            try:
+                # Off the loop (R25-03, the 2.5 detailed review): the header
+                # read decodes the file's first lines, which on a 512 MiB
+                # upload is still a blocking read every other request waits
+                # behind.
+                header = await asyncio.to_thread(archive_import.csv_file_header, str(tmp))
+            except Exception:
+                raise HTTPException(status_code=400, detail="that does not read as a UTF-8 CSV")
+        except BaseException:
+            # The WeeWX door's shape: a client that hangs up during the
+            # read cancels the request task, and CancelledError is not an
+            # Exception, so the upload outlived the request (CodeRabbit,
+            # PR #71). The read was synchronous before R25-03 and had no
+            # point at which to be cancelled.
             tmp.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail="that does not read as a UTF-8 CSV")
+            raise
         if time_column not in header:
             tmp.unlink(missing_ok=True)
             raise HTTPException(status_code=400,
@@ -4866,7 +5393,9 @@ async def start_weewx_import(
         tmp = await _stream_upload_to_temp(request, suffix=".sdb", prefix=".weewx-")
         try:
             try:
-                summary = archive_import.weewx_summary(str(tmp))
+                # Off the loop (R25-03): the summary opens the SQLite file
+                # and counts its archive, seconds on a decade of WeeWX.
+                summary = await asyncio.to_thread(archive_import.weewx_summary, str(tmp))
             except Exception as e:
                 raise HTTPException(
                     status_code=400,
@@ -5642,10 +6171,9 @@ async def delete_device(mac: str) -> JSONResponse:
         _SENSOR_HEALTH_CACHE.pop(key, None)
     _RECORDS_CACHE.pop(m, None)
     # And the older per-station caches (Greptile, PR #50): a MAC re-added
-    # before they expired showed the deleted station's count and rain.
+    # before they expired showed the deleted station's count and rain. The
+    # db-side rain caches are evicted by db.delete_device itself (2.6).
     _OBS_COUNT_CACHE.pop(m, None)
-    for key in [k for k in db._DAILY_ROLLUP_CACHE if k[0] == m]:
-        db._DAILY_ROLLUP_CACHE.pop(key, None)
     return JSONResponse({"ok": True, "deleted_mac": _format_mac(mac), **counts})
 
 
@@ -6396,9 +6924,11 @@ async def _warm_records(mac: str) -> dict:
         hit = _RECORDS_CACHE.get(mac)
         if hit and time.time() - hit[0] < _RECORDS_TTL_S:
             return hit[1]
+        token = db.cache_token()
         data = await db.records(mac, settings.timezone)
-        _RECORDS_CACHE[mac] = (time.time(), data)
-        _prune_records_cache()
+        if db.cache_token_current(token):
+            _RECORDS_CACHE[mac] = (time.time(), data)
+            _prune_records_cache()
         return data
 
 
@@ -6517,6 +7047,39 @@ async def get_captures(slug: str, tail: int = Query(50, ge=1, le=10_000)) -> JSO
     if skipped:
         out["skipped_malformed"] = skipped
     return JSONResponse(out)
+
+
+@app.get("/api/forecast/hourly", dependencies=[Depends(require_token)])
+async def get_forecast_hourly(
+    mac: str | None = None,
+    hours: int = Query(48, ge=1, le=72),
+) -> JSONResponse:
+    """The next hours of Open-Meteo's hourly model at a station, in the
+    station's own units and keyed by its own field names, for the charts'
+    dashed continuation (2.6). `mac` picks the station; without it the
+    server's forecast location, then the first located station. Answers
+    no coordinates (the times and values only), so a guest can draw it."""
+    from . import forecast_hourly
+    coords: tuple[float, float] | None = None
+    if mac:
+        from .ingest import _format_mac
+        coords = await _device_coords(_format_mac(mac))
+        if coords is None:
+            raise HTTPException(status_code=404, detail="that station has no location")
+    elif settings.forecast_lat is not None and settings.forecast_lon is not None:
+        coords = (float(settings.forecast_lat), float(settings.forecast_lon))
+    else:
+        from . import forecast_snapshots as fs
+        coords = fs.coords(await db.list_devices())
+    if coords is None:
+        raise HTTPException(status_code=400, detail="no station has a location")
+    try:
+        return JSONResponse(await forecast_hourly.fetch(coords[0], coords[1], hours))
+    except httpx.HTTPError as e:
+        log.warning("hourly forecast upstream failed: %s", type(e).__name__)
+        raise HTTPException(status_code=502, detail="forecast upstream unavailable")
+    except ValueError:
+        raise HTTPException(status_code=502, detail="forecast upstream unavailable")
 
 
 @app.get("/api/forecast", dependencies=[Depends(require_token)])

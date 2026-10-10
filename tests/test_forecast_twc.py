@@ -37,6 +37,17 @@ def test_transform_maps_to_open_meteo_shape():
     assert d["weather_code"] == [1, 95]
 
 
+def test_qpf_halves_add_into_precipitation_sum_and_a_silent_day_stays_none():
+    """2.6: TWC forecasts are archived for the scorecard, which grades rain
+    calls from precipitation_sum. The two 12 h amounts add; a day whose
+    halves are both null is None, not a dry call."""
+    from app import forecast_twc
+    assert forecast_twc.transform(TWC_FIXTURE)["daily"]["precipitation_sum"] == [None, None]
+    fx = dict(TWC_FIXTURE)
+    fx["daypart"] = [dict(TWC_FIXTURE["daypart"][0], qpf=[None, 0.1, 0.2, 0.05])]
+    assert forecast_twc.transform(fx)["daily"]["precipitation_sum"] == [0.1, 0.25]
+
+
 def test_icon_36_hot_maps_to_clear_not_overcast():
     """R3-89: TWC iconCode 36 is "Hot" — a hot clear day must not fall
     through to the overcast default on exactly the hottest days."""

@@ -88,11 +88,19 @@ def _num(v: Any) -> float | None:
     return f if f == f and f not in (float("inf"), float("-inf")) else None
 
 
-async def _calls(provider: str, since: _dt.date, lead: int
+async def _calls(provider: str, since: _dt.date, lead: int,
+                 near: tuple[float, float] | None = None
                  ) -> dict[str, dict[str, Any]]:
-    """The newest run's call per valid date at this lead."""
+    """The newest run's call per valid date at this lead, for the sky at
+    `near` (2.6: runs archived for another sky are left out)."""
     from . import forecast_snapshots as fs
-    return await fs.day_ahead_calls(provider, since, lead_days=lead)
+    return await fs.day_ahead_calls(provider, since, lead_days=lead, near=near)
+
+
+async def _sky_coords() -> tuple[float, float] | None:
+    """Where this server's forecasts are fetched for, today."""
+    from .forecast_snapshots import coords
+    return coords(await db.list_devices())
 
 
 async def _measured(mac: str, since: _dt.date) -> dict[str, dict[str, Any]]:
@@ -200,8 +208,9 @@ async def scorecard(mac: str, *, provider: str = "open-meteo",
 
     leads: list[dict[str, Any]] = []
     matched_any = False
+    near = await _sky_coords()
     for lead in LEADS:
-        calls = await _calls(provider, since, lead)
+        calls = await _calls(provider, since, lead, near)
         hi_err: list[tuple[str, float]] = []
         lo_err: list[tuple[str, float]] = []
         both: list[str] = []

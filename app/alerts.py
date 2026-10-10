@@ -362,6 +362,29 @@ ALERT_SEVERITY: dict[str, str] = {
 }
 
 
+async def _morning_outlook(coords, local):
+    """Today's forecast for the morning report, from the owner's outlook
+    source (TWC with its narrative, or Open-Meteo; a TWC call without a
+    key or that fails falls back to Open-Meteo, as the evening outlook
+    does)."""
+    from . import digest as dg
+    from . import outlook as ol
+    cfg = await effective_config()
+    source = cfg.outlook_source if cfg.outlook_source in ol.SOURCES else ol.SOURCE_OPEN_METEO
+    wu_key = None
+    if source == ol.SOURCE_TWC:
+        from .main import effective_wu_key
+        wu_key = await effective_wu_key()
+    daily, narrative, used, fallback = await ol.fetch_daily(
+        coords[0], coords[1], source=source, wu_key=wu_key,
+        tz_name=settings.timezone)
+    r = ol.build(daily, narrative=narrative, when="today", now_local=local,
+                 source=used, fallback_from=fallback)
+    out = dg.Outlook(hi_f=r.hi_f, lo_f=r.lo_f, precip_pct=r.precip_pct,
+                     sky=r.sky, narrative=r.narrative, source=r.source)
+    return None if out.is_empty else out
+
+
 async def build_morning_report(devices, now_ms: int, window_start: int,
                                tz, local):
     """Gather the morning report: yesterday's rollup row per weather
@@ -429,38 +452,19 @@ async def build_morning_report(devices, now_ms: int, window_start: int,
     if not rows and not stations:
         return None, [], []
 
-    # Today's outlook — best-effort, ten seconds, the report stands
-    # without it. Same Open-Meteo daily fields the forecast route uses.
+    # Today's outlook, best-effort, the report stands without it. The
+    # evening outlook's own path (outlook.fetch_daily + outlook.build) with
+    # the owner's outlook source, so the morning report reads the same
+    # forecast and, on TWC, the same written words; before 2.6 this block
+    # asked Open-Meteo whatever the source said (Doren, 10-06).
     outlook = None
     if primary_coords is None and settings.forecast_lat is not None \
             and settings.forecast_lon is not None:
         primary_coords = (settings.forecast_lat, settings.forecast_lon)
     if primary_coords is not None:
         try:
-            import httpx
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    "https://api.open-meteo.com/v1/forecast",
-                    params={"latitude": primary_coords[0],
-                            "longitude": primary_coords[1],
-                            "daily": "temperature_2m_max,"
-                                     "temperature_2m_min,"
-                                     "precipitation_probability_max",
-                            "temperature_unit": "fahrenheit",
-                            "forecast_days": 1,
-                            "timezone": settings.timezone})
-                daily = resp.json().get("daily") or {}
-
-                def _first(key):
-                    v = daily.get(key) or []
-                    return v[0] if v and isinstance(v[0], (int, float)) \
-                        else None
-                outlook = dg.Outlook(
-                    hi_f=_first("temperature_2m_max"),
-                    lo_f=_first("temperature_2m_min"),
-                    precip_pct=(int(_first("precipitation_probability_max"))
-                                if _first("precipitation_probability_max")
-                                is not None else None))
+            outlook = await asyncio.wait_for(
+                _morning_outlook(primary_coords, local), timeout=20)
         except Exception:
             outlook = None
 
@@ -776,6 +780,10 @@ class EffectiveAlertConfig:
     outlook_hour: int | None = None
     outlook_minute: int | None = None
     outlook_source: str | None = None
+    # 2.6 (Doren): a second time for the same outlook, so tomorrow's can
+    # arrive in the evening and today's on its own in the morning.
+    outlook2_hour: int | None = None
+    outlook2_minute: int | None = None
     # 2.2 sky notes (Doren): a note around sunset with the sun, the moon
     # and a stargazing verdict; `sky_good_only` sends it on good nights only.
     sky_notes: bool = False
@@ -815,6 +823,12 @@ class EffectiveAlertConfig:
     # the row still means "whatever SMART_ALERTS says", so an operator
     # who set the env keeps what they configured.
     smart_alerts: bool = False
+    # 2.6: the lightning alert (lightning_watch), its own switch since it
+    # was buried in the watches above, and how near a strike has to be.
+    # Effective: the switch follows smart_alerts until the owner sets it;
+    # lightning_alert_mi None = any strike the detector hears (~25 mi).
+    lightning_alert: bool = False
+    lightning_alert_mi: float | None = None
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -868,6 +882,13 @@ async def effective_config() -> EffectiveAlertConfig:
             return int(v) if v is not None else None
         except (TypeError, ValueError):
             return None
+    smart = (bool(p["smart_alerts"]) if p.get("smart_alerts") is not None
+             else settings.smart_alerts)
+    # Out of range or garbled reads as "any distance": a stored value the
+    # API would refuse must not silently narrow the alert.
+    lt_mi = _float_or(p.get("lightning_alert_mi"), 0.0)
+    if not 1.0 <= lt_mi <= 40.0:
+        lt_mi = None
     return EffectiveAlertConfig(
         enabled, transport, recipients, float(default_thr), float(repeat),
         smtp_host, smtp_port, smtp_username, smtp_password, smtp_from,
@@ -881,6 +902,8 @@ async def effective_config() -> EffectiveAlertConfig:
         digest_minute=_int_or_none(p.get("digest_minute")),
         outlook_hour=_int_or_none(p.get("outlook_hour")),
         outlook_minute=_int_or_none(p.get("outlook_minute")),
+        outlook2_hour=_int_or_none(p.get("outlook2_hour")),
+        outlook2_minute=_int_or_none(p.get("outlook2_minute")),
         outlook_source=(str(p["outlook_source"]) if p.get("outlook_source") else None),
         sky_notes=bool(p.get("sky_notes")),
         sky_good_only=bool(p.get("sky_good_only")),
@@ -898,8 +921,10 @@ async def effective_config() -> EffectiveAlertConfig:
         nws_warnings_only=bool(p.get("nws_warnings_only")),
         nws_muted_families=_muted_families(p.get("nws_families")),
         report_theme=_report_theme(p.get("report_theme")),
-        smart_alerts=(bool(p["smart_alerts"]) if p.get("smart_alerts") is not None
-                      else settings.smart_alerts))
+        smart_alerts=smart,
+        lightning_alert=(bool(p["lightning_alert"])
+                         if p.get("lightning_alert") is not None else smart),
+        lightning_alert_mi=lt_mi)
 
 
 async def report_theme_now(cfg, devices: list[dict[str, Any]] | None = None
@@ -1129,9 +1154,15 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
         # the app's Recent list becomes the only place it's visible at all.
         ts_ms = int(time.time() * 1000)
         try:
+            rule_id = None
+            if kind == "rule" and route and route.startswith("rule/"):
+                try:
+                    rule_id = int(route.split("/", 1)[1])
+                except ValueError:
+                    rule_id = None
             await db.log_alert(ts_ms, kind, mac,
                                push_title, push_body, delivered,
-                               severity=eff_severity)
+                               severity=eff_severity, rule_id=rule_id)
         except Exception as e:
             log.exception("alert history write failed: %s", e)
         # 1.8 webhooks (Pillar B): every HANDLED alert fans out to the
@@ -1334,18 +1365,20 @@ class AlertMonitor:
         #
         # cfg, not settings: 2.4 gave this an app switch. The env is
         # still the fallback for a box whose owner set it there.
-        if cfg.smart_alerts:
-            await self._check_smart_alerts(cfg, devices, now_ms)
-            # 1.8 seasonal one-shots (first frost of the season).
-            await self._check_seasonal_events(cfg, devices, now_ms)
-            # 1.8 lightning proximity + the NWS 30-minute all-clear.
-            # Guarded like nws_watch below: an exception here must not
-            # abort the digest/storm/nowcast half of the tick.
+        # 1.8 lightning proximity + the NWS 30-minute all-clear. Its own
+        # switch since 2.6 (it follows smart_alerts until the owner sets
+        # it). Guarded like nws_watch below: an exception here must not
+        # abort the digest/storm/nowcast half of the tick.
+        if cfg.lightning_alert:
             from . import lightning_watch
             try:
                 await lightning_watch.check(cfg, devices, now_ms, _deliver)
             except Exception:
                 log.exception("lightning watch failed")
+        if cfg.smart_alerts:
+            await self._check_smart_alerts(cfg, devices, now_ms)
+            # 1.8 seasonal one-shots (first frost of the season).
+            await self._check_seasonal_events(cfg, devices, now_ms)
             # 1.8 station health: battery flags, sensors gone quiet,
             # flatlined readings (Pillar D).
             from . import health_watch
@@ -1826,6 +1859,26 @@ class AlertMonitor:
             log.exception("digest send failed; will retry next tick")
 
     async def _maybe_send_outlook(self, cfg, devices, now_ms: int) -> None:
+        """Each outlook time the owner set, once per local day. The second
+        time (2.6, Doren) is the same report from the same source; which
+        day it describes follows its own hour (before noon today, from
+        noon tomorrow), and two times on the same side of noon send the
+        one report once (the delivery marker is per day described)."""
+        # The first time is the switch (R26-03, the 2.6 detailed review):
+        # a second time left set under an outlook that is off, by an older
+        # app's "off" or a restore, never sends on its own.
+        if cfg.outlook_hour is None:
+            return
+        slots = ((cfg.outlook_hour, cfg.outlook_minute, "alerts.outlook.day"),
+                 (cfg.outlook2_hour, cfg.outlook2_minute, "alerts.outlook2.day"))
+        for hour, minute, day_key in slots:
+            if hour is None:
+                continue
+            await self._send_outlook_slot(cfg, devices, now_ms, int(hour),
+                                          int(minute or 0), day_key)
+
+    async def _send_outlook_slot(self, cfg, devices, now_ms: int, hour: int,
+                                 minute: int, day_key: str) -> None:
         """2.2 (Doren): the forecast at a chosen time. Once per local day
         at/after outlook_hour: tomorrow's forecast when the hour is noon
         or later, today's before; from the owner's source; stored as a
@@ -1833,25 +1886,22 @@ class AlertMonitor:
         recipients. Stamped only when something was delivered (or there
         was nobody to deliver to), so a transient failure retries next
         tick, the morning report's rule."""
-        if cfg.outlook_hour is None:
-            return
         try:
             tz = ZoneInfo(settings.timezone)
         except Exception:
             tz = ZoneInfo("UTC")
         local = datetime.fromtimestamp(now_ms / 1000, tz)
-        minute = int(cfg.outlook_minute or 0)
-        if local.hour * 60 + local.minute < int(cfg.outlook_hour) * 60 + minute:
+        if local.hour * 60 + local.minute < hour * 60 + minute:
             return
-        if await db.get_kv("alerts.outlook.day") == local.date().isoformat():
+        if await db.get_kv(day_key) == local.date().isoformat():
             return
         from . import forecast_snapshots as fs
         from . import outlook as ol
         from . import reports as rp
-        coords = fs._coords(devices)
+        coords = fs.coords(devices)
         if coords is None:
             log.info("outlook report skipped: no station coordinates")
-            await db.set_kv("alerts.outlook.day", local.date().isoformat())
+            await db.set_kv(day_key, local.date().isoformat())
             return
         source = cfg.outlook_source if cfg.outlook_source in ol.SOURCES else ol.SOURCE_OPEN_METEO
         wu_key = None
@@ -1860,7 +1910,12 @@ class AlertMonitor:
             wu_key = await effective_wu_key()
         daily, narrative, used, fallback = await self._fetch_outlook(
             coords, source, wu_key, settings.timezone)
-        report = ol.build(daily, narrative=narrative, when=ol.slot_for(local.hour),
+        # The day the SLOT describes, from its configured hour, not the
+        # hour the tick happens to run: a server back at 13:00 with an
+        # 08:00 slot still owes today's forecast, and sending tomorrow's
+        # there would also mark the evening slot's report delivered
+        # (CodeRabbit, PR #82).
+        report = ol.build(daily, narrative=narrative, when=ol.slot_for(hour),
                           now_local=local, source=used, fallback_from=fallback)
         # Three facts, kept apart (2.2 release review R22-09): the archive
         # row, the delivery, and the day. The day is stamped only when
@@ -1915,7 +1970,7 @@ class AlertMonitor:
                 await db.set_kv(sent_key, "1")
                 already_sent = True
         if report_id is not None and already_sent:
-            await db.set_kv("alerts.outlook.day", local.date().isoformat())
+            await db.set_kv(day_key, local.date().isoformat())
             log.info("outlook report done (%s, %s): stored %s, delivered %s",
                      report.when, report.source, report_id, sent_any)
 
@@ -1936,7 +1991,7 @@ class AlertMonitor:
             return
         from . import almanac, sky
         from . import forecast_snapshots as fs
-        coords = fs._coords(devices)
+        coords = fs.coords(devices)
         if coords is None:
             await db.set_kv("alerts.sky.day", day_key)
             return

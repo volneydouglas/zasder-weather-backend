@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 
-import pytest
 
 HEADERS = {"Authorization": "Bearer test-api-token"}
 

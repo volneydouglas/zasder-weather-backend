@@ -10,7 +10,6 @@ import asyncio
 import json
 import os
 
-import pytest
 
 os.environ.setdefault("API_TOKEN", "test-api-token")
 
@@ -30,8 +29,10 @@ class _Station:
 
 
 class _Outlook:
-    def __init__(self, hi_f=101.0, lo_f=80.0, precip_pct=30):
+    def __init__(self, hi_f=101.0, lo_f=80.0, precip_pct=30,
+                 sky=None, narrative=None, source="open-meteo"):
         self.hi_f, self.lo_f, self.precip_pct = hi_f, lo_f, precip_pct
+        self.sky, self.narrative, self.source = sky, narrative, source
 
 
 class _Alert:

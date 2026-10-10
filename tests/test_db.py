@@ -572,7 +572,6 @@ async def test_rain_rollups_derives_periods_from_daily_counters(db_module):
     total is the day's MAX — WeatherFlow revises the accumulator downward
     mid-day and re-climbs, so last-value drops a low-revision day and
     increment-summing counts every re-climb twice."""
-    import time
     from datetime import datetime, timezone
     db = db_module
     await db.init_db()
@@ -612,7 +611,6 @@ async def _seed_three_days(db, mac):
     and 02:00 UTC, records() excluded it (end_ms = now), and the whole
     records family failed for two hours a day (found live 2026-08-20 at
     00:35 UTC)."""
-    import time
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     now_ms = int(now.timestamp() * 1000)

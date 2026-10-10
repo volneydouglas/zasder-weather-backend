@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import os
 
-import pytest
 
 os.environ.setdefault("API_TOKEN", "test-api-token")
 
@@ -864,3 +863,66 @@ def test_every_html_email_declares_its_colour_scheme():
         # The head goes BEFORE the body it describes, or it describes
         # nothing.
         assert html_body.index("<head>") < html_body.index("<body")
+
+
+
+def test_the_morning_outlook_reads_the_owners_source(client, monkeypatch):
+    """2.6 (Doren 10-06): the evening outlook followed the owner's source
+    (TWC, with its written forecast) while the morning report asked
+    Open-Meteo whatever the setting said, so the two never matched. The
+    morning report now goes through outlook.fetch_daily with the same
+    source and carries the narrative into the email, the text and the
+    stored payload."""
+    import asyncio
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from app import alerts as al
+    from app import db
+    from app import outlook as ol
+    from app import reports as rp
+    asked = []
+
+    async def fake_fetch(lat, lon, *, source, wu_key, tz_name):
+        asked.append(source)
+        return ({"time": ["2026-10-06", "2026-10-07"],
+                 "temperature_2m_max": [64, 66], "temperature_2m_min": [45, 47],
+                 "precipitation_probability_max": [30, 10], "weather_code": [61, 1]},
+                [{"name": "Today", "text": "Morning showers, then clearing. High 64F."},
+                 {"name": "Tonight", "text": "Clear. Low 45F."}],
+                ol.SOURCE_TWC, None)
+    monkeypatch.setattr(ol, "fetch_daily", fake_fetch)
+
+    async def fake_key():
+        return "k"
+    import app.main as main
+    monkeypatch.setattr(main, "effective_wu_key", fake_key)
+
+    async def go():
+        await db.set_alert_prefs(outlook_source="twc")
+        tz = ZoneInfo("America/New_York")
+        now = datetime(2026, 10, 6, 7, 0, tzinfo=tz)
+        out = await al._morning_outlook((40.33, -79.70), now)
+        return out
+    o = asyncio.run(go())
+    assert asked == ["twc"], asked
+    assert o.source == "twc" and o.hi_f == 64 and o.precip_pct == 30
+    assert o.narrative == "Morning showers, then clearing. High 64F."
+    r = dg.Report(date_label="Tuesday, October 6", stations=[], alerts=[], outlook=o)
+    html_body = dg.build_html(r)
+    assert "Morning showers, then clearing" in html_body
+    assert "The Weather Company" in html_body
+    assert "Morning showers, then clearing" in dg.build_text(r)
+    assert "The Weather Company" in dg.build_text(r)
+    payload = rp.morning_payload(r)
+    assert payload["outlook"]["narrative"].startswith("Morning showers")
+    assert payload["outlook"]["source"] == "twc"
+
+
+def test_a_narrative_alone_is_an_outlook():
+    """A provider that sent words but no numbers still has something to
+    say; the gate used to look at the three numbers only."""
+    o = dg.Outlook(hi_f=None, lo_f=None, precip_pct=None, narrative="Fog early.", source="twc")
+    assert not o.is_empty
+    r = dg.Report(date_label="Tuesday, October 6", stations=[], alerts=[], outlook=o)
+    assert "Fog early." in dg.build_text(r)
+    assert "Fog early." in dg.build_html(r)

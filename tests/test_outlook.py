@@ -325,3 +325,211 @@ def test_the_outlook_push_lands_in_the_history_and_reaches_webhooks(client, monk
     import json
     body = json.loads(hooked[0])
     assert body["kind"] == "outlook" and body["title"] == pushes[0][0]
+
+
+def _second_slot_setup(client, monkeypatch, mac, prefs):
+    from app import alerts, apns, config
+    client.post("/ingest/custom",
+                headers={"Authorization": "Bearer test-ingest-token",
+                         "Content-Type": "application/json"},
+                json={"device": {"id": mac, "name": "Yard",
+                                 "coords": {"lat": 33.3, "lon": -111.9}},
+                      "timestamp_utc": "2026-09-10T20:00:00Z",
+                      "outdoor": {"tempf": 100}})
+    assert client.put("/api/alerts", headers=H, json=prefs).status_code == 200
+    pushes = []
+
+    async def fake_configured():
+        return True
+
+    async def fake_send_to_all(title, body, route=None, **kw):
+        pushes.append(title)
+        return {"sent": 1, "total": 1}
+
+    async def fake_fetch(self, coords, source, wu_key, tz_name):
+        return DAILY, [], "open-meteo", None
+    monkeypatch.setattr(apns, "push_configured", fake_configured)
+    monkeypatch.setattr(apns, "send_to_all", fake_send_to_all)
+    monkeypatch.setattr(alerts.AlertMonitor, "_fetch_outlook", fake_fetch)
+    monkeypatch.setattr(config.settings, "timezone", "America/Phoenix")
+    return pushes
+
+
+def test_a_second_outlook_time_sends_today_in_the_morning(client, monkeypatch):
+    """2.6 (Doren 09-27): one outlook time could carry tomorrow in the
+    evening OR today in the morning, never both. The second time is the
+    same report from the same source; each time describes the day its own
+    hour says, and each is stamped on its own."""
+    from app import alerts, db
+    pushes = _second_slot_setup(client, monkeypatch, "AA:BB:CC:DD:EE:61",
+                                {"outlook_hour": 19, "outlook_minute": 0,
+                                 "outlook2_hour": 6, "outlook2_minute": 30})
+    tz = ZoneInfo("America/Phoenix")
+    morning = int(datetime(2026, 9, 10, 6, 35, tzinfo=tz).timestamp() * 1000)
+    evening = int(datetime(2026, 9, 10, 19, 5, tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        devs = await db.list_devices()
+        mon = alerts.AlertMonitor()
+        await mon._maybe_send_outlook(cfg, devs, morning)
+        after_morning = await db.list_reports(kind="outlook")
+        await mon._maybe_send_outlook(cfg, devs, evening)
+        await mon._maybe_send_outlook(cfg, devs, evening + 60_000)
+        return (after_morning, await db.list_reports(kind="outlook"),
+                await db.get_kv("alerts.outlook.day"), await db.get_kv("alerts.outlook2.day"))
+    after_morning, rows, first, second = asyncio.run(run())
+    assert [r["for_date"] for r in after_morning] == ["2026-09-10"]
+    assert sorted(r["for_date"] for r in rows) == ["2026-09-10", "2026-09-11"]
+    assert len(pushes) == 2, pushes
+    assert first == second == "2026-09-10"
+
+
+def test_two_times_on_the_same_side_of_noon_send_once(client, monkeypatch):
+    """Both times before noon describe today: the second finds today's
+    report already delivered and stays quiet instead of repeating it."""
+    from app import alerts, db
+    pushes = _second_slot_setup(client, monkeypatch, "AA:BB:CC:DD:EE:62",
+                                {"outlook_hour": 6, "outlook_minute": 0,
+                                 "outlook2_hour": 9, "outlook2_minute": 0})
+    tz = ZoneInfo("America/Phoenix")
+    late_morning = int(datetime(2026, 9, 10, 9, 5, tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        mon = alerts.AlertMonitor()
+        await mon._maybe_send_outlook(cfg, await db.list_devices(), late_morning)
+        return await db.list_reports(kind="outlook")
+    rows = asyncio.run(run())
+    assert len(rows) == 1 and len(pushes) == 1, (rows, pushes)
+
+
+def test_the_second_time_round_trips_and_clears(client):
+    r = client.put("/api/alerts", headers=H, json={"outlook2_hour": 6, "outlook2_minute": 30})
+    assert r.status_code == 200
+    g = client.get("/api/alerts", headers=H).json()
+    assert (g["outlook2_hour"], g["outlook2_minute"]) == (6, 30)
+    assert g["outlook2_supported"] is True
+    client.put("/api/alerts", headers=H, json={"outlook2_hour": -1, "outlook2_minute": -1})
+    g = client.get("/api/alerts", headers=H).json()
+    assert g["outlook2_hour"] is None and g["outlook2_minute"] is None
+    assert client.put("/api/alerts", headers=H, json={"outlook2_hour": 24}).status_code == 422
+    from app import config_backup
+    assert config_backup._coerce_alert_pref("outlook2_hour", 6) == 6
+    assert config_backup._coerce_alert_pref("outlook2_hour", 24) is config_backup._INVALID
+
+
+
+def test_a_slot_caught_up_late_still_describes_its_own_day(client, monkeypatch):
+    """CodeRabbit, PR #82: a server back at 13:00 with slots at 08:00 and
+    18:00 ran the missed morning slot at 13:00, and the day was read from
+    13:00 (tomorrow), so the morning slot sent tomorrow's report and the
+    delivery marker then silenced the evening slot. Each slot describes the
+    day its own hour says."""
+    from app import alerts, db
+    pushes = _second_slot_setup(client, monkeypatch, "AA:BB:CC:DD:EE:63",
+                                {"outlook_hour": 18, "outlook_minute": 0,
+                                 "outlook2_hour": 8, "outlook2_minute": 0})
+    tz = ZoneInfo("America/Phoenix")
+    back_at_one = int(datetime(2026, 9, 10, 13, 0, tzinfo=tz).timestamp() * 1000)
+    evening = int(datetime(2026, 9, 10, 18, 5, tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        mon = alerts.AlertMonitor()
+        await mon._maybe_send_outlook(cfg, await db.list_devices(), back_at_one)
+        late = await db.list_reports(kind="outlook")
+        await mon._maybe_send_outlook(cfg, await db.list_devices(), evening)
+        return late, await db.list_reports(kind="outlook")
+    late, rows = asyncio.run(run())
+    assert [r["for_date"] for r in late] == ["2026-09-10"], late
+    assert sorted(r["for_date"] for r in rows) == ["2026-09-10", "2026-09-11"]
+    assert len(pushes) == 2
+
+
+def test_an_older_app_turning_the_outlook_off_stops_the_second_time_too(client, monkeypatch):
+    """R26-03 (the 2.6 detailed review): a 2.5 app turns the outlook off
+    with outlook_hour=-1 and knows nothing of the second time, so the
+    second time kept sending under an outlook that read off everywhere.
+    The first time is the master switch, on the server as in the app."""
+    from app import alerts, db
+    pushes = _second_slot_setup(client, monkeypatch, "AA:BB:CC:DD:EE:64",
+                                {"outlook_hour": 22, "outlook_minute": 0,
+                                 "outlook2_hour": 6, "outlook2_minute": 30})
+    assert client.put("/api/alerts", headers=H,
+                      json={"outlook_hour": -1, "outlook_minute": -1}).status_code == 200
+    g = client.get("/api/alerts", headers=H).json()
+    assert g["outlook_hour"] is None and g["outlook2_hour"] is None, g
+    tz = ZoneInfo("America/Phoenix")
+    at = int(datetime(2026, 9, 10, 7, 0, tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        await alerts.AlertMonitor()._maybe_send_outlook(cfg, await db.list_devices(), at)
+        return await db.list_reports(kind="outlook")
+    assert asyncio.run(run()) == [] and pushes == []
+
+
+def test_a_second_time_alone_never_sends(client, monkeypatch):
+    """A restore or a hand-edited row can leave the second time set with
+    the first off; the scheduler treats the first as the switch."""
+    from app import alerts, db
+    pushes = _second_slot_setup(client, monkeypatch, "AA:BB:CC:DD:EE:65",
+                                {"outlook_hour": 22, "outlook_minute": 0})
+    asyncio.run(db.set_alert_prefs(outlook_hour=None, outlook2_hour=6, outlook2_minute=30))
+    tz = ZoneInfo("America/Phoenix")
+    at = int(datetime(2026, 9, 10, 7, 0, tzinfo=tz).timestamp() * 1000)
+
+    async def run():
+        cfg = await alerts.effective_config()
+        await alerts.AlertMonitor()._maybe_send_outlook(cfg, await db.list_devices(), at)
+        return await db.list_reports(kind="outlook")
+    assert asyncio.run(run()) == [] and pushes == []
+
+
+# TWC's shape before its first morning issue: day 0 is still yesterday,
+# and its prose is dated (forecast_twc.transform sets "date" and "night").
+OVERNIGHT = {
+    "time": ["2026-10-04", "2026-10-05", "2026-10-06"],
+    "temperature_2m_max": [104.0, 80.0, 82.0],
+    "temperature_2m_min": [75.0, 66.0, 67.0],
+    "precipitation_probability_max": [0, 70, 20],
+    "weather_code": [0, 63, 2],
+}
+OVERNIGHT_PROSE = [
+    {"name": "Tonight", "text": "Clear overnight. Low 75F.", "night": True, "date": "2026-10-04"},
+    {"name": "Tomorrow", "text": "Rain likely. High 80F.", "night": False, "date": "2026-10-05"},
+    {"name": "Tomorrow night", "text": "Showers ending. Low 66F.", "night": True, "date": "2026-10-05"},
+    {"name": "Tuesday", "text": "Partly cloudy. High 82F.", "night": False, "date": "2026-10-06"},
+]
+
+
+def test_an_overnight_twc_issue_describes_today_not_yesterday():
+    """R26-02 (the 2.6 detailed review): at 06:30 TWC's day 0 is still
+    yesterday, and build() took row 0, so the morning report read
+    yesterday's 104°F and "Clear overnight" under today's heading, and its
+    for_date (the dedupe and delivery key) was yesterday's. Rows and prose
+    are chosen by the date the report describes."""
+    from app import outlook as ol
+    tz = ZoneInfo("America/Phoenix")
+    morning = datetime(2026, 10, 5, 6, 30, tzinfo=tz)
+    r = ol.build(OVERNIGHT, narrative=OVERNIGHT_PROSE, when="today",
+                 now_local=morning, source=ol.SOURCE_TWC)
+    assert r.for_date == "2026-10-05"
+    assert (r.hi_f, r.lo_f, r.precip_pct, r.sky) == (80.0, 66.0, 70, "rain")
+    assert r.narrative == "Rain likely. High 80F."
+    evening = datetime(2026, 10, 5, 22, 0, tzinfo=tz)
+    t = ol.build(OVERNIGHT, narrative=OVERNIGHT_PROSE, when="tomorrow",
+                 now_local=evening, source=ol.SOURCE_TWC)
+    assert t.for_date == "2026-10-06" and t.hi_f == 82.0
+    assert t.narrative == "Partly cloudy. High 82F."
+
+
+def test_a_missing_day_is_unavailable_not_another_days_forecast():
+    from app import outlook as ol
+    tz = ZoneInfo("America/Phoenix")
+    later = datetime(2026, 10, 9, 6, 30, tzinfo=tz)       # past the last row
+    r = ol.build(OVERNIGHT, narrative=OVERNIGHT_PROSE, when="today",
+                 now_local=later, source=ol.SOURCE_TWC)
+    assert r.for_date == "2026-10-09"
+    assert (r.hi_f, r.lo_f, r.precip_pct, r.narrative) == (None, None, None, None)

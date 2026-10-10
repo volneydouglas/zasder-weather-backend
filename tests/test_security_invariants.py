@@ -98,6 +98,15 @@ PUBLIC_BY_DESIGN = {
     ("GET", "/.well-known/oauth-protected-resource"),
     ("GET", "/.well-known/oauth-authorization-server"),
     ("GET", "/oauth/authorize"),
+    # The public site's deeper pages (2.6). Anonymous BY OPT-IN like
+    # /embed: each 404s unless the public dashboard is on, serves only the
+    # stations the front page shows (by public id, never the MAC), and only
+    # the station's own measurements: no coordinates, settings, or the
+    # owner's licensed forecast text (app/public_pages.py).
+    ("GET", "/weather/history"), ("GET", "/weather/records"),
+    ("GET", "/weather/storms"), ("GET", "/weather/storms/latest"),
+    ("GET", "/weather/reports"), ("GET", "/weather/reports/noaa/{name}"),
+    ("GET", "/weather/data/{name}"),
 }
 
 # Routes that are anonymous AND mutating, on purpose: the OAuth 2.1
@@ -221,7 +230,7 @@ def test_every_undeclared_route_authenticates_in_its_handler():
 def test_the_public_route_list_has_not_quietly_grown():
     """PUBLIC_BY_DESIGN is the whole unauthenticated surface. It should change
     only by deliberate edit, never as a side effect."""
-    assert len(PUBLIC_BY_DESIGN) == 10  # +/embed (1.6.1); +4 OAuth discovery/consent (2.1)
+    assert len(PUBLIC_BY_DESIGN) == 17  # +/embed (1.6.1); +4 OAuth (2.1); +7 public pages (2.6)
     assert all(m == "GET" for m, _ in PUBLIC_BY_DESIGN), (
         "a mutating route was added to the public-by-design list")
     assert len(ANONYMOUS_BY_DESIGN) == 4, (

@@ -65,11 +65,13 @@ async def _measured(db, on: date, lo: float | None, hi: float | None,
 
 
 async def _filed(db, valid: date, lead: int, *, hi: float, lo: float,
-                 pop: float | None = 10.0, issued_hour: int = 12) -> None:
+                 pop: float | None = 10.0, issued_hour: int = 12,
+                 sky: tuple[float, float] | None = None) -> None:
     await db.insert_forecast_snapshots(
         "open-meteo", _ms(valid - timedelta(days=lead), issued_hour),
         [{"valid_date": valid.isoformat(), "lead_days": lead,
-          "tmax_f": hi, "tmin_f": lo, "pop": pop, "precip_in": 0.0}])
+          "tmax_f": hi, "tmin_f": lo, "pop": pop, "precip_in": 0.0}],
+        lat=None if sky is None else sky[0], lon=None if sky is None else sky[1])
 
 
 @pytest.fixture()
@@ -283,7 +285,7 @@ def test_a_full_day_from_the_ledger_itself_covers_the_scorecard(box):
     """Through the real fold: a station posting through the day gets a
     span from the rollup and is scored; the review's noon-only shape is
     not. Neither row was written by hand."""
-    from app import forecast_skill as fs, insights
+    from app import forecast_skill as fs
     db = box
     full, glimpse = _days(2)
 

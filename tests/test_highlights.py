@@ -75,7 +75,6 @@ def test_rain_ends_a_streak_and_humidity_is_a_z_score(client):
 
 
 def test_the_endpoint_answers_empty_for_a_station_without_record(client):
-    from app import highlights as hl
     client.post("/ingest/custom",
                 headers={"Authorization": "Bearer test-ingest-token",
                          "Content-Type": "application/json"},

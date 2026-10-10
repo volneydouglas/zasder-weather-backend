@@ -499,7 +499,16 @@ def _coords(device: dict[str, Any]) -> tuple[float, float] | None:
     lat, lon = coords.get("lat"), coords.get("lon")
     if lat is None or lon is None:
         return None
-    return float(lat), float(lon)
+    # A malformed stored coordinate is no position, never a 500: this
+    # helper feeds the lightning strikes route, the station map and the
+    # public page (CodeRabbit, PR #87).
+    try:
+        lat_f, lon_f = float(lat), float(lon)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(lat_f) and math.isfinite(lon_f)):
+        return None
+    return lat_f, lon_f
 
 
 def station_for(cfg: dict | None, devices: list[dict[str, Any]]) -> dict[str, Any] | None:

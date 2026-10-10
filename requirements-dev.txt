@@ -5,3 +5,7 @@ pytest>=8.0
 # turn the public suite red on its own. Runtime pins in requirements.txt
 # are the maintainer's call and stay as they are.
 pytest-asyncio>=0.24,<2
+# The static gate CI runs over app/ and tests/ (2.6, R25-34): pyflakes-class
+# rules only (F) plus syntax errors (E9). The one real 2.5 regression that
+# 2,500 tests did not catch was an F821 (R25-14). Capped like pytest-asyncio.
+ruff>=0.14,<1

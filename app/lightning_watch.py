@@ -9,6 +9,10 @@ app proved out — never a ping per strike), and it sends an explicit
 ALL CLEAR exactly once, 30 minutes after the last detected strike,
 with the timer resetting on every new one.
 
+Since 2.6 the owner can set a distance (`lightning_alert_mi`): only a
+strike at or inside it opens or escalates an alert, while every strike,
+near or far, still restarts the all-clear clock.
+
 Strike detection rides the station's own detector (the Tempest's
 lightning columns): `lightningcount` is the cumulative counter — a rise
 means new strikes; a fall is a counter reset (day rollover / reboot)
@@ -66,10 +70,20 @@ def _fmt_mi(d: float | None) -> str:
     return f", nearest ~{d:.0f} mi" if d >= 1.5 else ", very close"
 
 
+def within(dist: float | None, limit: float | None) -> bool:
+    """Does a strike at `dist` count for an alert set to `limit` miles?
+    No limit: every strike counts. A limit: only a strike with a known
+    distance at or inside it."""
+    if limit is None:
+        return True
+    return dist is not None and dist <= limit
+
+
 async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
                 deliver) -> None:
     """One monitor-tick entry point. `deliver` is alerts._deliver, passed
     in to stay import-cycle-free (the nowcast pattern)."""
+    limit = getattr(cfg, "lightning_alert_mi", None)
     for d in devices:
         last = d.get("lastData") or {}
         count = _f(last.get("lightningcount"))
@@ -98,18 +112,27 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
         active = bool(st.get("active"))
 
         if new_strikes:
+            # Every strike restarts the all-clear clock, near or far: the
+            # NWS 30 minutes run from the last strike, not the last one
+            # inside the owner's distance.
             st["last_strike_ms"] = now_ms
             announced = _f(st.get("announced_mi"))
             last_alert = int(st.get("last_alert_ms") or 0)
-            should_alert = (
+            # 2.6: the owner's distance. A strike farther out, or one the
+            # detector gave no distance for, is not "within N miles" and
+            # never opens an alert. Without a distance set, any strike
+            # does (1.8 to 2.5).
+            in_range = within(dist, limit)
+            should_alert = in_range and (
                 not active
                 or (dist is not None
                     and (announced is None or dist <= announced - _CLOSER_MI)
                     and now_ms - last_alert >= _MIN_REALERT_MS))
             if should_alert:
                 closer = active
+                where = f" within {limit:g} mi" if limit is not None else ""
                 title = (f"{name}: Lightning closing" if closer
-                         else f"{name}: Lightning detected")
+                         else f"{name}: Lightning detected{where}")
                 body = (f"New strikes{_fmt_mi(dist)}. Danger continues "
                         f"until 30 minutes after the last strike.")
                 if await deliver(cfg, f"[Zasder Weather] {title}", body,

@@ -70,7 +70,7 @@ def test_prefs_round_trip(client):
 
 
 def test_note_goes_out_once_after_sunset_and_good_only_holds(client, monkeypatch):
-    from app import alerts, db, config, sky
+    from app import alerts, db, config
     monkeypatch.setattr(config.settings, "timezone", "America/Phoenix")
     client.post("/ingest/custom",
                 headers={"Authorization": "Bearer test-ingest-token",

@@ -326,7 +326,7 @@ def test_force_subrange_keeps_ledger_outside_the_range(client, monkeypatch):
     """CodeRabbit PR #33: force over a SUBRANGE must not unledger the
     rest of the station's days — a later normal import would refetch
     (quota) and refill what thinning removed."""
-    from app import db, wu_import
+    from app import wu_import
 
     fetched: list[str] = []
 

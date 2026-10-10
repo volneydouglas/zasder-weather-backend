@@ -168,7 +168,6 @@ def test_used_pct_denominator_is_writable_space(monkeypatch):
     import collections
     import shutil as _sh
 
-    import app.disk_watch as dw
 
     Usage = collections.namedtuple("usage", "total used free")
     monkeypatch.setattr(_sh, "disk_usage",

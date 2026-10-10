@@ -52,10 +52,20 @@ def _connect(path: str) -> sqlite3.Connection:
     """Maintenance writers share the database file with live ingest; without
     a busy_timeout a briefly-held ingest write lock surfaces as an instant
     "database is locked" instead of a short wait (R11 V9). Same 10s budget
-    ingest itself uses."""
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA busy_timeout = 10000")
-    return conn
+    ingest itself uses. Counted by the maintenance lease (2.6, B-02): a
+    restore waits for this connection to close instead of renaming the
+    file under it, and refuses to start while the pass runs (in_flight)."""
+    from . import db
+    return db.sync_connection(path, busy_timeout_ms=10_000)
+
+
+# What the retention thread is doing right now, for restore.busy_reason
+# (B-02): the lease sees the connection, the operator sees the reason.
+_IN_FLIGHT: str | None = None
+
+
+def in_flight() -> str | None:
+    return _IN_FLIGHT
 
 
 def _analyze(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[float, int]]:
@@ -1367,7 +1377,7 @@ def seconds_until_thin_window(start_hhmm: str, tz=None) -> float:
     return max((nxt - now_local).total_seconds(), 1.0)
 
 
-def run_thin_night(eff: dict, db_path: str | None = None) -> dict:
+def _run_thin_night_pass(eff: dict, db_path: str | None = None) -> dict:
     """One night of history aging inside the budget from `eff` (the
     effective_retention() document): the worker-thread entry the
     scheduler calls at the window start. Row thinning first (the
@@ -1842,6 +1852,17 @@ def _colfill_is_pending(conn: sqlite3.Connection) -> bool:
     return conn.execute(
         "SELECT 1 FROM server_kv WHERE k = 'colfill_1_9_pending'"
     ).fetchone() is not None
+
+
+def run_thin_night(eff: dict, db_path: str | None = None) -> dict:
+    """The nightly retention pass, announced to the restore admission
+    while it runs (B-02); the work is _run_thin_night_pass."""
+    global _IN_FLIGHT
+    _IN_FLIGHT = "the nightly retention pass"
+    try:
+        return _run_thin_night_pass(eff, db_path)
+    finally:
+        _IN_FLIGHT = None
 
 
 def trim_json(apply: bool = False, db_path: str | None = None,

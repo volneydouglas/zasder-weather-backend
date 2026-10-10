@@ -28,7 +28,6 @@ under its own free-space bound (app/restore.py), so an anonymous request
 still costs no memory: FastAPI answers 401 without touching the stream.
 """
 
-import os
 
 from .envfile import env_value
 

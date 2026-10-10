@@ -103,7 +103,10 @@ def morning_payload(report: Any) -> dict[str, Any]:
         "outlook": None if report.outlook is None else {
             "hi_f": _num(report.outlook.hi_f),
             "lo_f": _num(report.outlook.lo_f),
-            "precip_pct": _int(report.outlook.precip_pct)},
+            "precip_pct": _int(report.outlook.precip_pct),
+            "sky": report.outlook.sky,
+            "narrative": report.outlook.narrative,
+            "source": report.outlook.source},
         # 2.1: how far the stations disagreed (None with one station).
         "spread": _spread_wire(report),
     }
@@ -390,7 +393,6 @@ def sky_payload(*, headline: str, body: str, verdict: str, score: float,
 
 
 def sky_summary_line(payload: dict[str, Any], units: Any = None) -> str:
-    u = _units(units)
     bits: list[str] = []
     v = payload.get("verdict")
     if v == "good":

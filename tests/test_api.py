@@ -13,6 +13,13 @@ import pytest
 
 # ───────────────────────── liveness + read auth ─────────────────────────
 
+
+def _policy_gen() -> int:
+    """The publishing-policy generation a seeded public-page cache entry
+    must carry to be servable (2.6, F26-01)."""
+    from app import publish_policy
+    return publish_policy.generation()
+
 def test_healthz_open(client):
     from app.version import __version__
     r = client.get("/healthz")
@@ -3460,7 +3467,6 @@ def test_public_dashboard_api_kv_over_env(client, monkeypatch):
     field-by-field; PUT is partial (empty string clears to env); a config
     change busts the page cache immediately; owner-only both directions."""
     import datetime as _dt
-    from app.config import settings
     H = {"Authorization": "Bearer test-api-token"}
 
     # Owner-only: reading exposure posture or changing it needs write auth.
@@ -4150,7 +4156,7 @@ def test_public_dashboard_serves_stale_while_revalidating(client, monkeypatch):
     monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
     # Seed a cache entry that is past the TTL but inside the stale ceiling.
     stale_at = _time.time() - _m._PUBLIC_DASH_TTL_S - 5
-    _m._PUBLIC_DASH_CACHE = (stale_at, "<html>stale-page</html>")
+    _m._PUBLIC_DASH_CACHE = (stale_at, "<html>stale-page</html>", _policy_gen())
 
     page = client.get("/embed").text
     assert "stale-page" in page, \
@@ -4186,7 +4192,7 @@ def test_quarter_hour_old_embed_still_serves_instantly(client, monkeypatch):
 
     monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
     twenty_min = _time.time() - 20 * 60
-    _m._PUBLIC_DASH_CACHE = (twenty_min, "<html>stale-20m</html>")
+    _m._PUBLIC_DASH_CACHE = (twenty_min, "<html>stale-20m</html>", _policy_gen())
 
     page = client.get("/embed").text
     assert "stale-20m" in page, \
@@ -4208,7 +4214,7 @@ def test_public_dashboard_blocks_past_stale_ceiling(client, monkeypatch):
 
     monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
     ancient = _time.time() - _m._PUBLIC_DASH_STALE_MAX_S - 1
-    _m._PUBLIC_DASH_CACHE = (ancient, "<html>ancient</html>")
+    _m._PUBLIC_DASH_CACHE = (ancient, "<html>ancient</html>", _policy_gen())
 
     page = client.get("/embed").text
     assert "fresh" in page and "ancient" not in page, \
@@ -4232,7 +4238,7 @@ def test_public_dashboard_single_background_refresh(client, monkeypatch):
 
     monkeypatch.setattr(_m, "_build_public_dashboard", fake_build)
     stale_at = _time.time() - _m._PUBLIC_DASH_TTL_S - 5
-    _m._PUBLIC_DASH_CACHE = (stale_at, "<html>stale</html>")
+    _m._PUBLIC_DASH_CACHE = (stale_at, "<html>stale</html>", _policy_gen())
     # Simulate the burst: mark a refresh already in flight, then hit again.
     _m._PUBLIC_DASH_REFRESHING = True
     try:

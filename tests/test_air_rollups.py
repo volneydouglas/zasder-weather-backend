@@ -4,7 +4,6 @@ Old rows read NULL for the new columns and the migration marks the
 rollups dirty so a rebuild folds history in.
 """
 import asyncio
-import json
 
 H = {"Authorization": "Bearer test-api-token"}
 
@@ -100,7 +99,7 @@ def test_migration_adds_columns_and_marks_rollups_dirty(client):
 
 
 def test_mcp_daily_summary_reports_air_and_means(client, monkeypatch):
-    from app import db, insights, config, mcp
+    from app import insights, config, mcp
     monkeypatch.setattr(config.settings, "insights", True)
     monkeypatch.setattr(insights.settings, "insights", True)
     mac = "5D:5D:07:00:00:43"

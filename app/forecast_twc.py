@@ -67,6 +67,9 @@ def transform(twc: dict[str, Any]) -> dict[str, Any]:
     dp_wind = dp0.get("windSpeed") or []
     dp_dir = dp0.get("windDirection") or []
     dp_icon = dp0.get("iconCode") or []
+    # Liquid precipitation per daypart, inches under units=e (2.6: the
+    # snapshot archive scores rain calls, and TWC's are archived now).
+    dp_qpf = dp0.get("qpf") or []
     # The written forecast, which we already download and used to discard
     # (Doren's request, 2026-08-16). `narrative` is the prose and
     # `daypartName` is its own heading — and TWC advances that heading itself
@@ -80,8 +83,8 @@ def transform(twc: dict[str, Any]) -> dict[str, Any]:
 
     days: dict[str, list] = {k: [] for k in (
         "time", "weather_code", "temperature_2m_max", "temperature_2m_min",
-        "precipitation_probability_max", "wind_speed_10m_max",
-        "wind_direction_10m_dominant")}
+        "precipitation_probability_max", "precipitation_sum",
+        "wind_speed_10m_max", "wind_direction_10m_dominant")}
 
     for i in range(n):
         t = times[i]
@@ -104,6 +107,11 @@ def transform(twc: dict[str, Any]) -> dict[str, Any]:
                    if c is not None]
         days["precipitation_probability_max"].append(
             int(max(chances)) if chances else None)
+        # Day and night halves ADD (two 12 h amounts); a day with neither
+        # stays None rather than claiming a dry day the feed never called.
+        amounts = [q for q in (_num(at(dp_qpf, d_idx)), _num(at(dp_qpf, n_idx)))
+                   if q is not None]
+        days["precipitation_sum"].append(round(sum(amounts), 3) if amounts else None)
         winds = [w for w in (_num(at(dp_wind, d_idx)), _num(at(dp_wind, n_idx)))
                  if w is not None]
         days["wind_speed_10m_max"].append(max(winds) if winds else None)

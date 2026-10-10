@@ -225,7 +225,6 @@ def test_a_high_cadence_day_is_summed_to_its_end(client, monkeypatch):
     from datetime import datetime, timezone
     from types import SimpleNamespace
     from app import db, main
-    H = {"Authorization": "Bearer test-api-token"}
     ing = {"Authorization": "Bearer test-ingest-token"}
     client.post("/ingest/custom", headers=ing, json={
         "device": {"id": "AABBCC000063", "model": "Derived"},
@@ -252,7 +251,6 @@ def test_the_window_reader_pages_to_the_end(client):
     exhausted; 4 999, 5 000 and 5 001 rows all come back whole."""
     import asyncio
     from app import db
-    mac = "AA:BB:CC:00:00:65"
     async def run():
         for n in (4_999, 5_000, 5_001, 10_001):
             m = f"AA:BB:CC:00:{n // 100:02X}:{n % 100:02X}"

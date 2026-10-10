@@ -50,6 +50,53 @@ def test_refusals_are_counted_per_field_and_flushed(client):
     assert again["windgustmph"]["rejected"] == 3
 
 
+def test_dew_point_and_feels_like_count_as_accepted(client):
+    """B-01 (the 2.6 architecture review): the bands name these fields by
+    their API names and accepted_counts matched them against the column
+    map's KEYS, so neither was ever counted as accepted and one refused
+    dew point read as 100% rejected."""
+    for i in range(6):
+        ts = datetime.fromtimestamp(time.time() - (i + 1) * 60, timezone.utc)
+        r = client.post("/ingest/custom", headers=IH, json={
+            "device": {"id": MAC, "name": "Yard"},
+            "timestamp_utc": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "outdoor": {"tempf": 71.0, "humidity": 40.0, "dew_point_f": 45.0}})
+        assert r.status_code in (200, 201, 202), r.text
+    # One refused dew point (out of the band) on its own reading.
+    ts = datetime.fromtimestamp(time.time() - 30, timezone.utc)
+    r = client.post("/ingest/custom", headers=IH, json={
+        "device": {"id": MAC, "name": "Yard"},
+        "timestamp_utc": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "outdoor": {"tempf": 71.0, "humidity": 40.0, "dew_point_f": 500.0}})
+    assert r.status_code in (200, 201, 202), r.text
+    rows = {r["field"]: r for r in client.get(
+        f"/api/devices/{MAC}/sensor-health", headers=H).json()["fields"]}
+    # Seven, not six: the refused reading's dew point is DERIVED from its
+    # temperature and humidity and stored (ingest's fill-in), so the row
+    # counts six measured plus one derived against one refusal. Before the
+    # fix this read accepted 0, rejected 1, 100% rejected.
+    assert rows["dewPoint"]["accepted"] == 7, rows["dewPoint"]
+    assert rows["dewPoint"]["rejected"] == 1
+    assert rows["dewPoint"]["rejected_pct"] < 20
+    # feelsLike is derived on every accepted reading; it counts too.
+    assert rows["feelsLike"]["accepted"] >= 6
+
+
+def test_the_sensor_checks_cache_is_bounded(client):
+    """B-04: the MAC is any string a guest token types; the cache must not
+    keep one entry per string forever."""
+    import sys
+    main = sys.modules["app.main"]
+    for i in range(300):
+        client.get(f"/api/devices/AA:BB:CC:F0:{i // 256:02X}:{i % 256:02X}/sensor-health", headers=H)
+    assert len(main._SENSOR_HEALTH_CACHE) <= main._SENSOR_HEALTH_MAX_ENTRIES
+    # And an expired entry goes at the next request, however few there are.
+    main._SENSOR_HEALTH_CACHE[("AA:BB:CC:F0:FF:FF", 30)] = (
+        time.monotonic() - main._SENSOR_HEALTH_TTL_S - 1, {"since_day": "2000-01-01"})
+    client.get(f"/api/devices/{MAC}/sensor-health", headers=H)
+    assert ("AA:BB:CC:F0:FF:FF", 30) not in main._SENSOR_HEALTH_CACHE
+
+
 def test_a_clean_station_reports_no_refusals(client):
     _post(client, 10, 12.0)
     rows = client.get(f"/api/devices/{MAC}/sensor-health", headers=H).json()["fields"]

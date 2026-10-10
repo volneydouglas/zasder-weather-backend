@@ -28,7 +28,6 @@ import json
 import logging
 import math
 import re
-import time
 from pathlib import Path
 from typing import Any
 
@@ -142,6 +141,10 @@ async def get_config() -> dict[str, Any]:
 
 async def set_config(cfg: dict[str, Any]) -> None:
     await db.set_kv(CONFIG_KEY, json.dumps(cfg) if cfg else None)
+    # What the public pages may place on a map just changed (F26-01): no
+    # page built before this write may be served after it.
+    from . import publish_policy
+    publish_policy.bump()
 
 
 async def get_status() -> dict[str, Any]:
@@ -442,6 +445,31 @@ def conditions(obs: dict[str, Any]) -> dict[str, float]:
         if v is not None:
             out[f] = round(v, 2)
     return out
+
+
+def published_point(cfg: dict[str, Any] | None, station: dict[str, Any],
+                    devices: list[dict[str, Any]]) -> tuple[float, float] | None:
+    """The point the station map publishes for `station`, or None when the
+    owner has not put this station on the map. The one rule for every other
+    public surface that would show where a station is (the lightning map,
+    2.6): it never reveals more than this."""
+    cfg = cfg or {}
+    if not cfg.get("enabled"):
+        return None
+    mac = str(station.get("mac") or "").upper()
+    if not mac or effective_mac(cfg, devices) != mac:
+        return None
+    from .share_targets import _coords
+    coords = _coords(station)
+    if coords is None:
+        return None
+    precision = precision_of(cfg)
+    if precision == "custom":
+        custom = custom_point(cfg, mac, coords[0], coords[1])
+        if custom is not None:
+            return custom
+        precision = "city"
+    return place(coords[0], coords[1], precision)
 
 
 def build(*, server_id: str, station: dict[str, Any], cfg: dict[str, Any],

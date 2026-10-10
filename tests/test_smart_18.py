@@ -107,7 +107,6 @@ def test_front_grouping_delivers_once(client, monkeypatch):
         # History: mild temps and steady wind an hour ago, so the current
         # reading computes big deltas. Write directly via ingest-shaped
         # observation rows using db.value_at_or_before's source table.
-        import app.main  # ensure db initialized by client fixture
         await db.insert_observations(mac, [{
             "dateutc": now - 3_700_000, "tempf": 92.0,
             "windspeedmph": 4.0, "baromrelin": 29.90}])
@@ -129,7 +128,6 @@ def test_front_grouping_delivers_once(client, monkeypatch):
 
 def test_first_frost_fires_once_per_season(client, monkeypatch):
     import app.alerts as al
-    from app import db
     delivered = []
 
     async def fake_deliver(cfg, subject, body, pt, pb, **kw):
@@ -401,7 +399,7 @@ def test_battery_low_conventions_only():
 
 
 def test_sensor_quiet_and_recovery(client, monkeypatch):
-    from app import health_watch as hw, db
+    from app import health_watch as hw
     delivered = []
 
     async def fake_deliver(cfg, subject, body, pt, pb, **kw):
@@ -673,7 +671,6 @@ def test_first_frost_ignores_stale_reading(client, monkeypatch):
         devs = [{"mac": "AA:BB:CC:00:00:70", "name": "Dead",
                  "lastData": {"tempf": 28.0, "dateutc": stale}}]
         await mon._check_seasonal_events(cfg, devs, now)
-        keys = [k for k in []]
         return await db.get_kv(
             f"seasonal.first_frost.AA:BB:CC:00:00:70.{2026}")
 

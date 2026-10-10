@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
 from datetime import date, datetime, timedelta, timezone
 
 os.environ.setdefault("API_TOKEN", "test-api-token-0123456789abcdef0123")
@@ -74,6 +73,15 @@ def test_the_route_answers_for_the_last_seven_days(client):
     assert body["method"] == "hargreaves" and body["rain_in"] == 0
 
 
+async def _send(devices, now_ms):
+    """send_if_due, with its fire-and-forget delivery settled (R25-32):
+    the call rides a background task the tick no longer waits for."""
+    sent = await watering.send_if_due(devices, now_ms)
+    if watering._DISPATCH_TASKS:
+        await asyncio.gather(*watering._DISPATCH_TASKS, return_exceptions=True)
+    return sent
+
+
 def test_the_morning_call_goes_to_webhooks_once(client, monkeypatch):
     from app import webhooks
     sent = []
@@ -95,12 +103,53 @@ def test_the_morning_call_goes_to_webhooks_once(client, monkeypatch):
     _seed(local.date())
     devices = asyncio.run(db.list_devices())
     now_ms = int(local.timestamp() * 1000)
-    assert asyncio.run(watering.send_if_due(devices, now_ms)) is True
-    assert asyncio.run(watering.send_if_due(devices, now_ms + 60_000)) is False
+    assert asyncio.run(_send(devices, now_ms)) is True
+    assert asyncio.run(_send(devices, now_ms + 60_000)) is False
     assert sent == [("watering", "water")]
     early = int(local.replace(hour=4).timestamp() * 1000)
     asyncio.run(db.set_kv("watering.sent_day", None))
-    assert asyncio.run(watering.send_if_due(devices, early)) is False
+    assert asyncio.run(_send(devices, early)) is False
+
+
+def test_a_slow_webhook_does_not_hold_the_morning_tick(client, monkeypatch):
+    """R25-32 (the 2.5 detailed review): two 10 s delivery attempts plus a
+    pause were awaited inside the alert monitor's tick, so one slow hook
+    held every leak, source and NWS check behind it for ~22 s. The call
+    now rides a background task; send_if_due answers at once."""
+    from app import webhooks
+    started = asyncio.Event()
+
+    async def never(event, data):
+        started.set()
+        await asyncio.sleep(3600)
+    monkeypatch.setattr(webhooks, "dispatch_event", never)
+
+    async def hooks(enabled_only=False):
+        return [{"id": 1}]
+    monkeypatch.setattr(db, "list_webhooks", hooks)
+    from zoneinfo import ZoneInfo
+    from app.config import settings
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = timezone.utc
+    local = datetime.now(tz).replace(hour=6, minute=0, second=0, microsecond=0)
+    _seed(local.date())
+
+    async def go():
+        devices = await db.list_devices()
+        t0 = asyncio.get_running_loop().time()
+        sent = await asyncio.wait_for(watering.send_if_due(devices, int(local.timestamp() * 1000)), 2.0)
+        elapsed = asyncio.get_running_loop().time() - t0
+        await asyncio.wait_for(started.wait(), 1.0)      # the delivery did start ...
+        for t in list(watering._DISPATCH_TASKS):          # ... and is still going
+            assert not t.done()
+            t.cancel()
+        await asyncio.gather(*watering._DISPATCH_TASKS, return_exceptions=True)
+        return sent, elapsed
+    sent, elapsed = asyncio.run(go())
+    assert sent is True and elapsed < 1.0
+    assert not watering._DISPATCH_TASKS, "the reap runs on cancel too"
 
 
 def test_a_morning_with_no_call_yet_tries_again_later(client, monkeypatch):
@@ -128,11 +177,11 @@ def test_a_morning_with_no_call_yet_tries_again_later(client, monkeypatch):
     asyncio.run(db.upsert_device(MAC, {"name": "Yard", "info": {
         "coords": {"coords": {"lat": 33.3, "lon": -111.8}}}}))
     devices = asyncio.run(db.list_devices())
-    assert asyncio.run(watering.send_if_due(devices, now_ms)) is False
+    assert asyncio.run(_send(devices, now_ms)) is False
     assert sent == []
     _seed(local.date())
     devices = asyncio.run(db.list_devices())
-    assert asyncio.run(watering.send_if_due(devices, now_ms + 3_600_000)) is True
+    assert asyncio.run(_send(devices, now_ms + 3_600_000)) is True
     assert sent == ["water"]
 
 
@@ -150,3 +199,27 @@ def test_a_day_the_station_barely_covered_is_not_a_measured_day(client, monkeypa
         return await watering.for_station(MAC, date(2026, 9, 27), 33.3)
     result = asyncio.run(go())
     assert result["days_used"] == 0 and result["verdict"] is None, result
+
+
+def test_a_failed_dispatch_logs_the_error_type_not_its_text(caplog):
+    """CodeRabbit, PR #87: an httpx error's text carries the URL, and a
+    webhook URL can hold a secret; the log names the type only."""
+    import asyncio
+    import logging
+    from app import watering
+
+    async def boom():
+        raise RuntimeError("POST https://hooks.example.com/abc?token=SECRET failed")
+
+    async def go():
+        t = asyncio.ensure_future(boom())
+        try:
+            await t
+        except RuntimeError:
+            pass
+        return t
+    task = asyncio.run(go())
+    with caplog.at_level(logging.WARNING, logger=watering.log.name):
+        watering._reap_dispatch(task)
+    assert "RuntimeError" in caplog.text
+    assert "SECRET" not in caplog.text and "hooks.example.com" not in caplog.text

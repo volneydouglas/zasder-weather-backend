@@ -416,3 +416,35 @@ def test_a_gauge_added_later_does_not_file_earlier_years_as_dry(insights_on):
     assert by_year[first]["rain_total"] is None and by_year[first]["rain_series"] is None
     assert by_year[second]["rain_total"] == pytest.approx(0.6)
     assert len(by_year[second]["rain_series"]) == 3
+
+
+def test_the_heat_ladder_follows_the_stations_summers():
+    """2.6 (Volney 09-28): a fixed 80..110 ladder topped out in Chandler,
+    where a 115.3°F day read "highest threshold cleared 110", and a cool
+    coast never left its first rung. The ladder is picked from the
+    station's own p90 of daily highs, the cold ladder's way, and a station
+    with under ~2 months of days keeps the shipped one."""
+    from app.insights import (HEAT_TIERS_COOL, HEAT_TIERS_HOT, LEDGER_TIERS,
+                              heat_tiers_for)
+    assert heat_tiers_for(None) == LEDGER_TIERS
+    assert heat_tiers_for(88.0) == LEDGER_TIERS
+    assert heat_tiers_for(109.5) == HEAT_TIERS_HOT and 115.0 in HEAT_TIERS_HOT
+    assert heat_tiers_for(72.0) == HEAT_TIERS_COOL
+    assert heat_tiers_for(105.0) == HEAT_TIERS_HOT and heat_tiers_for(104.9) == LEDGER_TIERS
+    assert heat_tiers_for(100.0) == LEDGER_TIERS     # Sacramento, Dallas keep the shipped ladder
+    assert heat_tiers_for(78.0) == LEDGER_TIERS and heat_tiers_for(77.9) == HEAT_TIERS_COOL
+
+
+def test_a_desert_station_counts_its_days_on_the_hot_ladder(insights_on):
+    """Seventy days of desert summer: the payload names the hot ladder and
+    the year's counts are keyed by it, so 115 is a rung a 115.3 day clears."""
+    client = insights_on
+    base = dt.datetime(2026, 6, 1, 12, 0, tzinfo=dt.timezone.utc)
+    highs = [104.0 + (i % 12) for i in range(69)] + [115.3]
+    for i, hi in enumerate(highs):
+        _post(client, base + dt.timedelta(days=i), hi)
+    body = client.get("/api/insights?mac=" + MAC, headers=_H).json()
+    assert body["ledger_tiers"] == [90, 100, 105, 110, 115, 120]
+    yr = body["years"][0]
+    assert set(yr["tiers"]) == {"90", "100", "105", "110", "115", "120"}
+    assert yr["tiers"]["115"] >= 1 and yr["tiers"]["120"] == 0

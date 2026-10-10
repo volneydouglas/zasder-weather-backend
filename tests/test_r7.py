@@ -218,7 +218,7 @@ def test_nws_bad_coords_skips_station_not_pass(client, monkeypatch):
 
 
 def test_battery_recovery_notifies_and_persists_after_deliver(client):
-    from app import health_watch as hw, db
+    from app import health_watch as hw
 
     mac = "AA:BB:CC:00:00:86"
     now = int(time.time() * 1000)
@@ -413,4 +413,4 @@ def test_ingest_refuses_coords_that_are_not_a_place(client):
                   {"mac": "AA:BB:CC:DD:EE:64", "name": "Here",
                    "info": {"coords": {"coords": {"lat": 33.3, "lon": -111.9}}}}]
     assert fs.coords_device(stored_bad)["mac"] == "AA:BB:CC:DD:EE:64"
-    assert fs._coords(stored_bad[:2]) is None
+    assert fs.coords(stored_bad[:2]) is None

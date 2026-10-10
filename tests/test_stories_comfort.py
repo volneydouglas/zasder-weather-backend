@@ -14,7 +14,7 @@ outside. The rules this file pins:
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+from datetime import date
 
 import pytest
 

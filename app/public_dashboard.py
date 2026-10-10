@@ -60,8 +60,12 @@ def _fmt(v: float | None, unit: str) -> str:
     return f"{v:.2f} {unit}"
 
 
+DAY_AXIS = ("24h ago", "12h", "now")
+
+
 def _axis_html(lo: float, hi: float, unit: str,
-               py, height: int) -> tuple[str, str, str]:
+               py, height: int,
+               time_labels: tuple[str, str, str] = DAY_AXIS) -> tuple[str, str, str]:
     """(svg gridlines, HTML y-labels, HTML time row) for a 24h chart.
 
     Volney, 2026-08-21: "a chart without x and y legend markers" — the old
@@ -81,8 +85,9 @@ def _axis_html(lo: float, hi: float, unit: str,
         pct = round(y * 100.0 / height, 1)
         labels.append(f'<span class="chart-yl" style="top:{pct}%">'
                       f'{_fmt(v, "")}{_esc(unit)}</span>')
-    time_row = ('<div class="chart-axis"><span>24h ago</span>'
-                '<span>12h</span><span>now</span></div>')
+    a, b, c = time_labels
+    time_row = (f'<div class="chart-axis"><span>{_esc(a)}</span>'
+                f'<span>{_esc(b)}</span><span>{_esc(c)}</span></div>')
     return "".join(grid), "".join(labels), time_row
 
 
@@ -113,14 +118,41 @@ def _extreme_markers(pts: list[tuple[int, float]],
     return "".join(out)
 
 
+def split_gaps(pts: list[tuple[int, float]], gap_ms: int | None) -> list[list[tuple[int, float]]]:
+    """Runs of consecutive points no further apart than `gap_ms` (one run
+    when it is None)."""
+    if not pts:
+        return []
+    if gap_ms is None:
+        return [pts]
+    runs, cur = [], [pts[0]]
+    for p in pts[1:]:
+        if p[0] - cur[-1][0] > gap_ms:
+            runs.append(cur)
+            cur = []
+        cur.append(p)
+    runs.append(cur)
+    return runs
+
+
 def svg_chart(points: list[tuple[int, float]], color: str,
               width: int = 640, height: int = 120,
               overlay: list[tuple[int, float]] | None = None,
               overlay_color: str = "#ff5a5f",
               primary_label: str | None = None,
               overlay_label: str | None = None,
-              unit: str = "") -> str:
+              unit: str = "",
+              time_labels: tuple[str, str, str] = DAY_AXIS,
+              empty: str = "no data in the last 24h",
+              domain: tuple[int, int] | None = None,
+              gap_ms: int | None = None) -> str:
     """Inline SVG area+line chart for a (timestamp_ms, value) series.
+
+    `domain` (2.6, the public History page; addendum review A26-02) fixes
+    the time axis to the window the labels name, so data that starts late
+    or stops early leaves that side empty instead of stretching to fill
+    it. `gap_ms` breaks the line wherever readings are further apart than
+    that, so an outage reads as one rather than as a straight line.
 
     An optional `overlay` series (same units, e.g. feels-like on the temp
     chart) is drawn as a dashed line on the SAME axis so the gap between the
@@ -129,13 +161,16 @@ def svg_chart(points: list[tuple[int, float]], color: str,
     """
     pts = [(t, v) for t, v in points if v is not None]
     ov = [(t, v) for t, v in (overlay or []) if v is not None]
+    if domain is not None:
+        pts = [(t, v) for t, v in pts if domain[0] <= t <= domain[1]]
+        ov = [(t, v) for t, v in ov if domain[0] <= t <= domain[1]]
     if len(pts) < 2:
-        return ('<div class="chart-empty">no data in the last 24h</div>')
+        return f'<div class="chart-empty">{_esc(empty)}</div>'
     ys = [v for _, v in pts] + [v for _, v in ov]
     lo, hi = min(ys), max(ys)
     span = (hi - lo) or 1.0
     ts = [t for t, _ in pts] + [t for t, _ in ov]
-    t0, t1 = min(ts), max(ts)
+    t0, t1 = domain if domain is not None else (min(ts), max(ts))
     tspan = (t1 - t0) or 1
     pad = 4.0
 
@@ -148,24 +183,32 @@ def svg_chart(points: list[tuple[int, float]], color: str,
     def poly(seq: list[tuple[int, float]]) -> str:
         return " ".join(f"{px(t)},{py(v)}" for t, v in seq)
 
-    line = poly(pts)
-    area = f"{px(pts[0][0])},{height} {line} {px(pts[-1][0])},{height}"
-    grid, ylabels, time_row = _axis_html(lo, hi, unit, py, height)
+    grid, ylabels, time_row = _axis_html(lo, hi, unit, py, height, time_labels)
     svg = [
         f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
         f'class="chart-svg" role="img">',
         grid,
-        f'<polygon points="{area}" fill="{color}" fill-opacity="0.14"/>',
     ]
+    runs = split_gaps(pts, gap_ms)
+    for run in runs:
+        if len(run) == 1:
+            t, v = run[0]
+            svg.append(f'<circle cx="{px(t)}" cy="{py(v)}" r="1.8" fill="{color}"/>')
+            continue
+        line = poly(run)
+        svg.append(f'<polygon points="{px(run[0][0])},{height} {line} '
+                   f'{px(run[-1][0])},{height}" fill="{color}" fill-opacity="0.14"/>')
     if len(ov) >= 2:
-        svg.append(
-            f'<polyline points="{poly(ov)}" fill="none" stroke="{overlay_color}" '
-            f'stroke-width="1.6" stroke-dasharray="4 3" stroke-linejoin="round"/>'
-        )
-    svg.append(
-        f'<polyline points="{line}" fill="none" stroke="{color}" '
-        f'stroke-width="2" stroke-linejoin="round"/>'
-    )
+        for run in split_gaps(ov, gap_ms):
+            if len(run) >= 2:
+                svg.append(
+                    f'<polyline points="{poly(run)}" fill="none" stroke="{overlay_color}" '
+                    f'stroke-width="1.6" stroke-dasharray="4 3" stroke-linejoin="round"/>')
+    for run in runs:
+        if len(run) >= 2:
+            svg.append(
+                f'<polyline points="{poly(run)}" fill="none" stroke="{color}" '
+                f'stroke-width="2" stroke-linejoin="round"/>')
     svg.append('</svg>')
 
     legend = ""
@@ -201,17 +244,23 @@ OVERLAY_FIELDS: list[tuple[str, str, str]] = [
 
 def svg_multi_chart(series_list: list[tuple[str, str, list[tuple[int, float]]]],
                     width: int = 640, height: int = 130,
-                    unit: str = "") -> str:
+                    unit: str = "",
+                    time_labels: tuple[str, str, str] = DAY_AXIS,
+                    domain: tuple[int, int] | None = None,
+                    gap_ms: int | None = None) -> str:
     """N same-unit series on one axis: (label, color, points) each. Lines
     only — stacked area fills over each other read as mud. Series with
     fewer than 2 points are dropped rather than drawn as specks."""
-    drawn = [(label, color, [(t, v) for t, v in pts if v is not None])
+    drawn = [(label, color, [(t, v) for t, v in pts if v is not None
+                             and (domain is None or domain[0] <= t <= domain[1])])
              for label, color, pts in series_list]
     drawn = [(label, color, pts) for label, color, pts in drawn if len(pts) >= 2]
     if len(drawn) < 2:
         return ""
     ys = [v for _, _, pts in drawn for _, v in pts]
     ts = [t for _, _, pts in drawn for t, _ in pts]
+    if domain is not None:
+        ts = [domain[0], domain[1]]
     lo, hi = min(ys), max(ys)
     span = (hi - lo) or 1.0
     t0, t1 = min(ts), max(ts)
@@ -224,14 +273,17 @@ def svg_multi_chart(series_list: list[tuple[str, str, list[tuple[int, float]]]],
     def py(v: float) -> float:
         return round((height - pad) - ((v - lo) / span) * (height - pad * 2), 1)
 
-    grid, ylabels, time_row = _axis_html(lo, hi, unit, py, height)
+    grid, ylabels, time_row = _axis_html(lo, hi, unit, py, height, time_labels)
     all_pts = [p for _, _, pts in drawn for p in pts]
     svg = [f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
            f'class="chart-svg" role="img">', grid]
     for _, color, pts in drawn:
-        line = " ".join(f"{px(t)},{py(v)}" for t, v in pts)
-        svg.append(f'<polyline points="{line}" fill="none" stroke="{color}" '
-                   f'stroke-width="1.8" stroke-linejoin="round"/>')
+        for run in split_gaps(pts, gap_ms):
+            if len(run) < 2:
+                continue
+            line = " ".join(f"{px(t)},{py(v)}" for t, v in run)
+            svg.append(f'<polyline points="{line}" fill="none" stroke="{color}" '
+                       f'stroke-width="1.8" stroke-linejoin="round"/>')
     svg.append("</svg>")
     legend = ('<div class="chart-legend">'
               + "".join(f'<span class="lg"><i style="background:{color}"></i>'
@@ -782,7 +834,9 @@ def render_station(name: str, obs: dict[str, Any] | None,
                    tz_name: str = "UTC",
                    summary: dict[str, Any] | None = None,
                    app_url: str = "", location: str | None = None,
-                   air: bool = False) -> str:
+                   air: bool = False,
+                   lightning: dict[str, Any] | None = None,
+                   map_url: str = "") -> str:
     """One station block: current-conditions header + a chart per field.
 
     The temperature chart overlays the feels-like line (from
@@ -817,6 +871,11 @@ def render_station(name: str, obs: dict[str, Any] | None,
             f'<span class="cc-v" style="color:{meta["color"]}">{_fmt(v, meta["unit"])}</span></div>'
         )
 
+    from . import lightning_map as _lt
+    lt_chip = _lt.chip(o)
+    if lt_chip:
+        chips.append(lt_chip)
+
     charts = []
     for key in fields:
         meta = FIELD_META[key]
@@ -842,6 +901,20 @@ def render_station(name: str, obs: dict[str, Any] | None,
                 f'{svg_wind_rose(wind_samples)}</div>'
             )
 
+    # 2.6: lightning rings, for a station that has a detector and struck
+    # within the window (the caller passes `lightning` only then).
+    # One card's failure is that card missing, never the whole page
+    # (follow-up review F26-05).
+    if lightning is not None:
+        try:
+            charts.append(_lt.render_card(lightning.get("strikes") or [],
+                                          int(lightning.get("now_ms") or 0),
+                                          lightning.get("center"),
+                                          lightning.get("counts") or (None, None)))
+        except Exception:                        # noqa: BLE001
+            import logging
+            logging.getLogger("public_dashboard").exception("lightning card failed")
+
     # The app main page's summary boards (Volney, 2026-08-20: the public
     # page should replace screenshots, so it carries the same boards).
     boards = render_summary_strip(summary, tz_name) + render_rain_periods(o)
@@ -851,12 +924,19 @@ def render_station(name: str, obs: dict[str, Any] | None,
     loc_html = (f'<span class="cc-loc"> · {_esc(location)}</span>'
                 if location else "")
     side_html = ""
+    links = []
     if app_url:
         import html as _h
-        side_html = (f'<div class="cc-side">'
-                     f'<a class="cc-app" href="{_h.escape(app_url, quote=True)}" '
-                     f'target="_blank" rel="noopener">Get the iOS app ↗</a>'
-                     f'</div>')
+        links.append(f'<a class="cc-app" href="{_h.escape(app_url, quote=True)}" '
+                     f'target="_blank" rel="noopener">Get the iOS app ↗</a>')
+    if map_url:
+        # 2.6: the station's pin on maps.zasder.com, only for a station
+        # its owner put on the map (the caller passes "" otherwise).
+        import html as _h
+        links.append(f'<a class="cc-app cc-map" href="{_h.escape(map_url, quote=True)}" '
+                     f'target="_blank" rel="noopener">On the station map ↗</a>')
+    if links:
+        side_html = f'<div class="cc-side">{"".join(links)}</div>'
     return (
         f'<section class="station">'
         f'  <div class="cc">'
@@ -936,7 +1016,8 @@ def render_records(records: dict[str, Any] | None, tz_name: str) -> str:
 
 def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                      tz_name: str = "UTC",
-                     app_url: str = "", location: str | None = None) -> str:
+                     app_url: str = "", location: str | None = None,
+                     more_html: str = "") -> str:
     """Full dashboard section for all selected stations. With 2+ stations a
     side-by-side compare block leads (temp/feels/humidity/pressure, every
     station on one axis per field), then the per-station blocks."""
@@ -958,9 +1039,11 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                        # page, however many stations it shows.
                        app_url=app_url if i == 0 else "",
                        location=location if i == 0 else None,
-                       air=bool(s.get("air")))
+                       air=bool(s.get("air")),
+                       lightning=s.get("lightning"),
+                       map_url=s.get("map_url") or "")
         for i, s in enumerate(stations)
-    ))
+    ) + more_html)
 
 
 # Shared theme tokens for every page that renders the dashboard fragment
@@ -1005,7 +1088,9 @@ DASHBOARD_CSS = """
     .cc { margin-bottom: 14px; display:flex; align-items:flex-start;
         justify-content:space-between; gap:16px; flex-wrap:wrap; }
     .cc-main { min-width:0; }
-    .cc-side { flex-shrink:0; padding-top:22px; }
+    .cc-side { flex-shrink:0; padding-top:22px; display:flex; flex-direction:column;
+        align-items:flex-end; gap:6px; }
+    .cc-map { background:transparent; color:var(--ink-90, inherit); }
     .cc-app { display:inline-flex; align-items:center; gap:6px; font-size:12px;
         font-weight:600; color:#0b0d13; background:#fff; border:1px solid var(--card-edge); border-radius:9px;
         padding:8px 14px; text-decoration:none; white-space:nowrap; }
@@ -1145,4 +1230,22 @@ SPINNER_HTML = """
   </svg>
 </div>
 <script>""" + SPINNER_SCRIPT + """</script>
+"""
+
+
+# 2.6: the lightning card's styles ride with the dashboard's (status page
+# and /embed alike).
+from . import lightning_map as _lightning_map  # noqa: E402
+
+DASHBOARD_CSS += _lightning_map.CSS
+
+# 2.6: the row of links to the deeper public pages (public_pages.more_links).
+DASHBOARD_CSS += """
+    .pp-more { display:flex; flex-wrap:wrap; gap:6px; margin:16px 0 4px; }
+    .pp-more::before { content:"More from this station"; flex-basis:100%;
+        font-size:11px; font-weight:800; letter-spacing:1.2px; text-transform:uppercase;
+        color:var(--ink-50); }
+    .pp-more a { font-size:12px; font-weight:600; text-decoration:none;
+        color:var(--ink-70); border:1px solid var(--card-edge); border-radius:999px;
+        padding:6px 13px; background:var(--card-bg); }
 """

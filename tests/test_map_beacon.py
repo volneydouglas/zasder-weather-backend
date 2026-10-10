@@ -147,7 +147,7 @@ def test_key_rotation_carries_the_old_keys_blessing_until_acknowledged(client, m
     import time as _time
     from datetime import datetime, timezone
     from cryptography.hazmat.primitives.asymmetric import ed25519
-    from app import map_beacon as mb, db
+    from app import map_beacon as mb
     mb._reset_for_tests()
     now = int(_time.time() * 1000)
     stamp = datetime.fromtimestamp((now - 60_000) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -263,7 +263,7 @@ def test_a_concurrent_first_mint_keeps_one_key(client):
     """R23: two first-enable paths (the GET's pubkey and the tick's
     beacon) minted two keys; whichever the directory pinned first, the
     other signed with a key it never held."""
-    from app import map_beacon as mb, db
+    from app import map_beacon as mb
     mb._reset_for_tests()
 
     async def run():
@@ -557,7 +557,7 @@ def test_the_link_mode_decides_whether_the_beacon_names_this_server(client, monk
     address to the directory privately and the pin carries a redirect."""
     import time as _time
     from datetime import datetime, timezone
-    from app import map_beacon as mb, db
+    from app import map_beacon as mb
     mb._reset_for_tests()
     now = int(_time.time() * 1000)
     stamp = datetime.fromtimestamp((now - 300_000) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

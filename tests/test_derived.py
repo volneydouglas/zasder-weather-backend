@@ -7,7 +7,6 @@ import asyncio
 import datetime as _dt
 import time
 
-import pytest
 
 from app import derived as d
 

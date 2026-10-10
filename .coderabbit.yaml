@@ -20,6 +20,10 @@ reviews:
   auto_review:
     enabled: true
     drafts: false
+    # Release branches in the mirror are feature/<version> too; a PR into
+    # one is reviewed on push, not only when asked. Regex; main is implied.
+    base_branches:
+      - "feature/.*"
 
   path_filters:
     # The reviewer-notes documents never ship in this mirror, but the
@@ -60,6 +64,11 @@ reviews:
         POST /oauth/token, POST /oauth/revoke: open per the MCP
         authorization spec, rate-limited, granting nothing without a connect
         code minted in the app, or the API token, on the consent page);
+        since 2.6 the opt-in public pages are open too (GET /weather/history,
+        /weather/records, /weather/storms, /weather/storms/latest,
+        /weather/reports, /weather/reports/noaa/{name},
+        /weather/data/{name}: 404 unless the public dashboard is on, public
+        stations only, no MAC, coordinates or settings);
         POST /mcp takes the bearer or an OAuth access token; every other
         /api/* route is token-gated, and /ingest/custom is gated by a
         separate INGEST_TOKEN.

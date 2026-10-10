@@ -252,6 +252,12 @@ def test_the_suite_never_reads_the_developers_dotenv(monkeypatch, tmp_path):
     ("app.self_update", "_image_repo", "AUTO_UPDATE_IMAGE_REPO", "ghcr.io/x/y", "ghcr.io/x/y"),
     ("app.limits", "_max_bytes", "MAX_REQUEST_BYTES", "12345", 12345),
     ("app.oauth", "_allowed_hosts", "ALLOWED_HOSTS", "a.example,B.example", ["a.example", "b.example"]),
+    # R25-35 (the 2.5 detailed review): the rest of the family, each run,
+    # not scanned. One hour of maturity delay is 3,600,000 ms; the daily
+    # update check reads its switch and its repository the same way.
+    ("app.self_update", "_min_age_ms", "AUTO_UPDATE_MIN_AGE_HOURS", "1", 3_600_000),
+    ("app.updates", "_enabled", "UPDATE_CHECK", "0", False),
+    ("app.updates", "_repo", "UPDATE_CHECK_REPO", "someone/else", "someone/else"),
 ])
 def test_every_direct_read_takes_dotenv(monkeypatch, tmp_path, module, attr, name, value, expect):
     """The same bug in each module that read os.environ for a documented
@@ -261,6 +267,38 @@ def test_every_direct_read_takes_dotenv(monkeypatch, tmp_path, module, attr, nam
     _dotenv_only(monkeypatch, tmp_path, f"{name}={value}\n")
     monkeypatch.delenv(name, raising=False)
     assert getattr(mod, attr)() == expect
+
+
+def test_the_fcm_service_account_in_dotenv_is_read(monkeypatch, tmp_path):
+    """R25-35: FCM_SERVICE_ACCOUNT_JSON set only in `.env` configures push
+    on a bare install; the parser still wants the three fields it needs."""
+    import json
+    from app import fcm
+    sa = {"type": "service_account", "project_id": "p", "client_email": "a@p",
+          "private_key": "-----BEGIN PRIVATE KEY-----\\nx\\n-----END PRIVATE KEY-----"}
+    _dotenv_only(monkeypatch, tmp_path, "FCM_SERVICE_ACCOUNT_JSON=" + json.dumps(sa) + "\n")
+    monkeypatch.delenv("FCM_SERVICE_ACCOUNT_JSON", raising=False)
+    monkeypatch.delenv("FCM_SERVICE_ACCOUNT_FILE", raising=False)
+    monkeypatch.setattr(fcm, "_sa_cache", None)
+    got = fcm._service_account()
+    assert got is not None and got["project_id"] == "p"
+    # And a file named only in `.env` is read the same way.
+    path = tmp_path / "sa.json"
+    path.write_text(json.dumps(dict(sa, project_id="from-file")))
+    _dotenv_only(monkeypatch, tmp_path, f"FCM_SERVICE_ACCOUNT_FILE={path}\n")
+    monkeypatch.setattr(fcm, "_sa_cache", None)
+    assert fcm._service_account()["project_id"] == "from-file"
+
+
+def test_the_capture_log_lives_beside_the_dotenv_database_path(monkeypatch, tmp_path):
+    """R25-35: the capture log's directory follows DATABASE_PATH from
+    `.env` on a bare install, not the ./data default."""
+    from app import capture
+    db_path = tmp_path / "vol" / "weather.db"
+    _dotenv_only(monkeypatch, tmp_path, f"DATABASE_PATH={db_path}\n")
+    monkeypatch.delenv("DATABASE_PATH", raising=False)
+    assert capture._log_path("wind") == db_path.parent / "captures" / "wind.jsonl"
+    assert (db_path.parent / "captures").is_dir()
 
 
 def test_no_documented_option_is_read_from_os_environ():

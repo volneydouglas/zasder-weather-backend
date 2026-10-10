@@ -8,6 +8,107 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.6.0] — 2026-10-10
+
+### Added
+- **The morning report reads the same forecast as the outlook.** Its
+  "Today" block now comes from the outlook's forecast source, so a
+  server set to The Weather Company carries the written forecast in the
+  morning email, the stored report and both apps, the same as the
+  evening outlook. It used to read Open-Meteo whatever the setting said.
+- **A second outlook time.** The outlook can arrive twice a day, for
+  example tomorrow's at 10 PM and today's at 6:30 AM. Each time
+  describes the day its own hour says (before noon today, from noon
+  tomorrow); two times on the same side of noon send the one report
+  once. Set it under Quiet Hours in the app.
+- **Charts continue into the next hours.** `GET /api/forecast/hourly`
+  answers Open-Meteo's hourly model at a station, in the station's own
+  units, and the apps draw it as a dashed line after the last reading.
+- **The yard correction works for The Weather Company.** Its forecasts
+  are archived now, so a server reading TWC builds a correction like an
+  Open-Meteo one. Without a Weather Underground key the correction says
+  so instead of staying empty.
+- **"How Hot Is Hot?" climbs as high as the station's summers do.** The
+  heat ledger picks its steps from the station's own climate: a desert
+  station's ladder reaches 115 and 120°F, a cool coast's starts at 70.
+  A station with under two months of history keeps the 80 to 110 ladder.
+- **Lightning on a map.** A station with a lightning detector shows each
+  strike as a ring at its distance (the detector measures distance, not
+  direction), coloured by age from white to dark red, with a count per
+  age, a distance-over-time strip and a line saying whether the storm is
+  approaching, holding or moving away. The public page draws it on an
+  OpenStreetMap basemap centred on the point the station map publishes,
+  and plain rings when the station is not on the map. The apps show it
+  under the lightning charts. `GET /api/devices/{mac}/lightning/strikes`
+  serves it: the owner gets the station's position, a guest only the
+  published point.
+- **A lightning alert at the distance you choose.** The lightning alert
+  has its own switch and a "within N miles" setting (any distance by
+  default, as before). Only a strike at or inside the distance alerts;
+  every strike still restarts the 30 minute all-clear clock. Until you
+  set the switch it follows Weather watches, so nothing changes for a
+  server that has not touched it.
+- **More public pages.** With the public dashboard on, the page now
+  links History (7 days, 30 days, a year), Records & climate (highs and
+  lows by period, today against the NOAA normals, the year's climate
+  table with each month's coverage), Storms (the 50 most recent, with a
+  fixed address for the latest one) and Reports (NOAA-format monthly and yearly summaries
+  at fixed "latest" addresses, and each year's daily summary as CSV).
+  They publish the station's own measurements and, on Records & climate,
+  the NOAA normals; stations are named by a public id, never the MAC, and
+  no coordinates or settings appear.
+- **The public page links to the station's map pin** when the station
+  is on the station map.
+
+### Fixed
+- **Storm Compare counts every rain counter once.** A station that
+  posts both counters, switches midway, or sends a garbled or negative
+  reading is measured from every usable reading, and a window with no
+  usable reading says the station was not measuring instead of 0.00.
+- **Each archived forecast names where it was fetched for.** Forecast
+  skill compares a station only with forecasts for its own location.
+- **A deleted station's numbers do not come back.** A history import or
+  rollup still running during a device delete could refill its caches.
+- **A restore waits for the nightly thinning and a running backup.**
+  Both now count as open connections, so a restore no longer swaps the
+  database under them.
+- **The morning watering call runs on its own.** A slow webhook no
+  longer holds up the alert checks.
+- **Imports read their files without stalling the server.** The CSV
+  header and the WeeWX summary are read off the event loop, and an
+  upload whose client hangs up is removed.
+- **`bin/upgrade.sh --request` installs the image it vetted, or
+  nothing.** A compose file pointing at another image is refused.
+- **Sensor checks count dew point and feels like.**
+- **Turning map sharing off reaches the next visitor at once.** The
+  public page's cache follows the sharing settings: a page built before a
+  change is never served after it, fresh or stale, and a request already
+  being built when sharing is turned off answers "not found".
+- **The morning report and the outlook describe the day they name.** An
+  overnight forecast issue no longer hands over yesterday's text, and a
+  missing day reads as unavailable.
+- **Turning the outlook off turns its second time off too,** including
+  from an older app.
+- **A rain counter that drops out for a reading cannot count rain
+  twice,** and a lagging copy of a counter catches up instead of adding.
+- **A cancelled request keeps its database connection counted until it
+  closes,** so a restore cannot start under it.
+- **A malformed stored coordinate is treated as no position** instead of
+  failing the lightning, map or public page.
+- **Rule alerts in the history name their rule** (`rule_id` on
+  `/api/alerts/recent`), so the Mac app pairs each one exactly.
+
+### Changed
+- **`PUBLIC_DASHBOARD` now publishes more.** Turning the public page on
+  also publishes the History, Records & climate, Storms and Reports
+  pages and the yearly CSV (all opt-in with it, all 404 while it is
+  off). Their addresses are listed in `AGENTS.md`'s open routes.
+- The operator table in `AGENTS.md` names every update option
+  (`UPDATE_REQUEST_FILE`, `UPDATE_CHECK`, `LOG_FILE`, the
+  `AUTO_UPDATE` settings).
+- The WeeWX extension installs from a checkout of this repository; its
+  README no longer points at a download no release has carried.
+
 ## [2.5.2] — 2026-09-28
 
 ### Fixed
@@ -167,13 +268,16 @@ the backend checks GitHub daily and shows an "update available" banner
 - **The 24 hour source record is written on a box with no alert
   channels.** It was written after the alert tick's channel check, so a
   box with no email, push or webhook never kept one.
-- **Options in `.env` work on a bare install.** A handful of options were
-  read straight from the process environment, which Docker fills from
-  `.env` and a bare `uvicorn` does not: `UPDATE_REQUEST_FILE`,
-  `AUTO_UPDATE`, `ALLOWED_HOSTS`, `DEBUG`, `LOG_FILE`, `MAX_REQUEST_BYTES`
-  and `CAPTURE_TOKEN` set only in `.env` were silently ignored outside
-  Docker. They now read the environment first and `.env` second, like
-  every other setting. Found by adam8833 (issue #5).
+- **Options in `.env` work on a bare install.** Every option read outside
+  the settings object came straight from the process environment, which
+  Docker fills from `.env` and a bare `uvicorn` does not, so a value set
+  only in `.env` was silently ignored outside Docker. Among them
+  `UPDATE_REQUEST_FILE`, `AUTO_UPDATE` and its `_MIN_AGE_HOURS` and
+  `_IMAGE_REPO`, `UPDATE_CHECK` and `_REPO`, `ALLOWED_HOSTS`, `DEBUG`,
+  `LOG_FILE`, `MAX_REQUEST_BYTES`, `CAPTURE_TOKEN` and the capture
+  database path, and the FCM settings. They all read the environment
+  first and `.env` second now, like every other setting (`app/envfile.py`
+  is the one door). Found by adam8833 (issue #5).
 
 ## [2.4.2] — 2026-09-25
 

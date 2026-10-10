@@ -101,6 +101,9 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _m = sys.modules.get("app.main")
     if _m is not None:
         _m._PUBLIC_DASH_CACHE = None
+        _m._PUBLIC_PAGE_CACHE.clear()   # 2.6 public pages
+        _m._PUBLIC_PAGE_INFLIGHT.clear()
+        _m._PUBLIC_PAGE_SEM = None      # rebound to each test's event loop
         _m._PUBLIC_DASH_LOCK = None     # rebound to each test's event loop
         _m._PUBLIC_DASH_REFRESHING = False   # a test's leaked flag would
         _m._PUBLIC_DASH_REFRESH_TASK = None  # silently disable SWR forever
@@ -157,6 +160,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     async def _no_fetch(lat, lon):  # noqa: ANN001
         return None
     _fs._fetch_daily = _no_fetch
+    _fs._fetch_twc = _no_fetch      # 2.6: TWC is archived on the same beat
     # Disk watch (1.9) reads the HOST machine's real volume — a developer
     # laptop past 85% used makes every tick fire disk_low and skews any
     # test that counts _deliver calls. Pin a healthy fake; disk tests
@@ -217,7 +221,10 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         # R5-33 rollup cache: a value computed against one test's DB must
         # not answer for the next test's — same isolation rule as above.
         _d._DAILY_ROLLUP_CACHE.clear()
+        from app import forecast_hourly as _fh
+        _fh._CACHE.clear()
         _d._YEAR_PRIOR_CACHE.clear()
+        _d._CACHE_EPOCH = 0            # 2.6 cache epoch
         # 1.9 write-audit buffer + auth-time label cache (R12): a pending
         # audit row from one test must not flush into another test's
         # database, and a stale token→label entry must not attribute it.

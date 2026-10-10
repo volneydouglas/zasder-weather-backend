@@ -6,7 +6,6 @@ the fix.
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 
 import pytest
@@ -139,7 +138,6 @@ def test_scorecard_comparison_uses_the_slide_rule_on_the_models_days(client, mon
 # ───────────── SEC-9: a control character in a posted name ─────────────
 
 def test_a_name_with_a_carriage_return_is_dropped_not_stored(client, monkeypatch):
-    from app import db
     from app.config import settings
     monkeypatch.setattr(settings, "prometheus_metrics", True)
     body = {"device": {"id": "AABBCC0000C3", "name": "Evil\r\nStation"},

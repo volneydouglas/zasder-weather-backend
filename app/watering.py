@@ -26,8 +26,12 @@ can act on. It never pushes to a phone.
 from __future__ import annotations
 
 import math
+import asyncio
+import logging
 from datetime import date, datetime, timedelta
 from typing import Any
+
+log = logging.getLogger("watering")
 
 DAYS = 7
 MIN_DAYS = 4
@@ -152,9 +156,29 @@ async def send_if_due(devices: list[dict[str, Any]], now_ms: int) -> bool:
         # PR #48). The check is a seven-row rollup read.
         return False
     await db.set_kv("watering.sent_day", day)
-    await webhooks.dispatch_event("watering", {
+    # Fire-and-forget, as the alert path delivers (R25-32, the 2.5
+    # detailed review): two 10 s attempts plus a pause is ~22 s, and
+    # awaiting it here held the alert monitor's tick, and every leak,
+    # source and NWS check behind it, for that long once a morning.
+    # Strong ref so the task is not collected mid-flight; the exception
+    # is consumed on reap so asyncio does not log it at GC time.
+    task = asyncio.create_task(webhooks.dispatch_event("watering", {
         "mac": station["mac"], "day": day, "verdict": call["verdict"],
         "rain_in": call["rain_in"], "et_in": call["et_in"],
         "balance_in": call["balance_in"], "days_used": call["days_used"],
-        "method": call["method"], "ts_ms": now_ms})
+        "method": call["method"], "ts_ms": now_ms}))
+    _DISPATCH_TASKS.add(task)
+    task.add_done_callback(_reap_dispatch)
     return True
+
+
+# Strong refs for the in-flight morning call (one a day; the set is tiny).
+_DISPATCH_TASKS: set = set()
+
+
+def _reap_dispatch(task) -> None:
+    _DISPATCH_TASKS.discard(task)
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        # The type only: an httpx error's text carries the URL, and a
+        # webhook URL can hold a secret (CodeRabbit, PR #87).
+        log.warning("watering call delivery failed: %s", type(exc).__name__)

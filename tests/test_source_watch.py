@@ -109,7 +109,7 @@ async def test_smart_alerts_off_does_not_erase_the_watchdogs_memory(client, monk
     install) the tick cleared EVERY smart_alert_state row before the source
     watchdog ran, so a poller down for an hour re-announced its outage on
     every tick. Only the smart family's own edges may be forgotten."""
-    from app import alerts, apns, db, source_status
+    from app import alerts, apns, source_status
     health_watch, _ = _mods()
     sent = []
 

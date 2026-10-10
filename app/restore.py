@@ -538,6 +538,12 @@ def busy_reason() -> str | None:
             return "the chart index is being rebuilt; try again in a few minutes"
     except Exception:
         pass
+    try:
+        from . import maintenance
+        if (what := maintenance.in_flight()) is not None:
+            return f"{what} is running; try again when it finishes"
+    except Exception:
+        pass
     return None
 
 

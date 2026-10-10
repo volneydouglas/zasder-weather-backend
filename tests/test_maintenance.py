@@ -352,7 +352,7 @@ def test_trim_head_backs_up_and_removes_only_the_head_of_one_station(client, mon
     every other station stay; the station's rollups refold from what is
     left. A dry run removes nothing."""
     import asyncio, json, glob
-    from app import db, maintenance, insights
+    from app import db, maintenance
     from app.config import settings
     monkeypatch.setattr(settings, "insights", True)
     mac, other = "EC:EC:0F:00:00:01", "AA:BB:CC:00:00:02"

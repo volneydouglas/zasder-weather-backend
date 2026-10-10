@@ -410,7 +410,9 @@ CREATE TABLE IF NOT EXISTS forecast_snapshots (
     tmax_f     REAL,
     tmin_f     REAL,
     pop        REAL,              -- precipitation probability, %
-    precip_in  REAL
+    precip_in  REAL,
+    lat        REAL,              -- 2.6: the sky this run was fetched for
+    lon        REAL               --      (NULL on rows filed before 2.6)
 );
 CREATE INDEX IF NOT EXISTS idx_fsnap_valid
     ON forecast_snapshots (provider, valid_date);
@@ -1269,6 +1271,8 @@ async def init_db(path: str | None = None) -> None:
             # 2.2 outlook report: send time + forecast source.
             ("outlook_hour", "INTEGER"), ("outlook_minute", "INTEGER"),
             ("outlook_source", "TEXT"),
+            # 2.6 the outlook's second time.
+            ("outlook2_hour", "INTEGER"), ("outlook2_minute", "INTEGER"),
             # 2.2 sky notes.
             ("sky_notes", "INTEGER"), ("sky_good_only", "INTEGER"),
             # 2.3 NWS relay switch (NULL = on, the pre-2.3 behaviour) and
@@ -1303,6 +1307,11 @@ async def init_db(path: str | None = None) -> None:
             # never fired for anybody (Doren, 2026-09-21, asking for a
             # feature he already owned).
             ("smart_alerts", "INTEGER"),
+            # 2.6: the lightning alert gets its own switch and distance
+            # (Volney 10-10: "a lightning alert for a specific distance").
+            # NULL switch = follow smart_alerts, which is how it ran from
+            # 1.8 to 2.5; NULL distance = any strike the detector hears.
+            ("lightning_alert", "INTEGER"), ("lightning_alert_mi", "REAL"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
@@ -1318,6 +1327,14 @@ async def init_db(path: str | None = None) -> None:
         if "calibration_json" not in existing:
             await db.execute(
                 "ALTER TABLE devices ADD COLUMN calibration_json TEXT")
+        # 2.6 (plan item 5, R25-A06): each archived forecast run names the
+        # sky it was fetched for, so a server whose forecast station moved
+        # or changed scores only the runs made for the sky it has now.
+        cur = await db.execute("PRAGMA table_info(forecast_snapshots)")
+        existing = {r[1] for r in await cur.fetchall()}
+        for col in ("lat", "lon"):           # a literal pair, the whitelist
+            if col not in existing:
+                await db.execute(f"ALTER TABLE forecast_snapshots ADD COLUMN {col} REAL")
         # 1.8: update-token discriminator, after the table shipped in 1.7.
         cur = await db.execute("PRAGMA table_info(live_activity_tokens)")
         existing = {r[1] for r in await cur.fetchall()}
@@ -1339,6 +1356,12 @@ async def init_db(path: str | None = None) -> None:
         if "severity" not in existing:
             await db.execute(
                 "ALTER TABLE alert_log ADD COLUMN severity TEXT")
+        # 2.6 (addendum review A26-05): which threshold rule a "rule" row
+        # is, so the Mac's catch-up pairs it with the rule exactly instead
+        # of by its title. NULL for every other kind and for older rows.
+        if "rule_id" not in existing:
+            await db.execute(
+                "ALTER TABLE alert_log ADD COLUMN rule_id INTEGER")
         # Same migration for device_alert_prefs: storm_summary (1.7 per-
         # station mute) came after the table shipped in 1.4. NULL = on.
         cur = await db.execute("PRAGMA table_info(device_alert_prefs)")
@@ -1839,6 +1862,44 @@ def _qc_lock() -> asyncio.Lock:
     return _QC_LOCK
 
 
+# Cache epoch (2.6, CodeRabbit on PR #50): dropping a MAC's cache entries at
+# delete time is not enough when a producer is mid-await on the database. It
+# read the station's rows before the DELETE, resumes after the pop, and
+# writes the pre-delete answer back into a cache that will answer for the
+# re-added MAC. Every per-MAC cache store therefore reads the epoch BEFORE
+# its await and stores only if it is unchanged; a device delete (known MAC
+# or not: the path parameter is any string, so a per-MAC map would grow
+# without bound, PR #54 review) and a restore both bump it. A delete also
+# costs every OTHER station's in-flight producer its store, which is one
+# recompute on the next request, a few times a year. Reset per test.
+_CACHE_EPOCH = 0
+
+
+def cache_token() -> int:
+    """What a producer reads before its await (see cache_token_current)."""
+    return _CACHE_EPOCH
+
+
+def cache_token_current(token: int) -> bool:
+    """False once any station was deleted or the database swapped since
+    `token` was read: the producer's answer may describe rows that are gone."""
+    return _CACHE_EPOCH == token
+
+
+def invalidate_caches(mac: str | None = None) -> None:
+    """Bump the epoch, and evict this module's entries for `mac` (the rain
+    memos a re-added MAC would otherwise be served for up to six hours,
+    PR #54 review). main.py evicts its own per-MAC caches beside this."""
+    global _CACHE_EPOCH
+    _CACHE_EPOCH += 1
+    if mac is None:
+        return
+    for key in [k for k in _DAILY_ROLLUP_CACHE if k[0] == mac]:
+        _DAILY_ROLLUP_CACHE.pop(key, None)
+    for key in [k for k in _YEAR_PRIOR_CACHE if k[0] == mac]:
+        _YEAR_PRIOR_CACHE.pop(key, None)
+
+
 def note_rejections(mac: str, dropped: list[str], now_ms: int | None = None) -> None:
     """Count what the plausibility bands refused. `dropped` is the band
     filter's own list ("windgustmph=255", "windspeedmph=40(anemometer)")."""
@@ -1899,8 +1960,16 @@ async def sensor_rejections(mac: str, since_day: str) -> dict[str, int]:
 
 async def accepted_counts(mac: str, since_ms: int, fields: list[str]) -> dict[str, int]:
     """Stored (non-null) readings per field since `since_ms`. Field names
-    are whitelisted through _FIELD_MAP before they reach the SQL."""
-    cols = [(f, _FIELD_MAP[f]) for f in fields if f in _FIELD_MAP]
+    are whitelisted through _FIELD_MAP before they reach the SQL.
+
+    `fields` are API names (the plausibility bands' keys: feelsLike,
+    dewPoint) and _FIELD_MAP is keyed by COLUMN (feels_like, dew_point);
+    matching on the keys skipped every field whose two names differ, so a
+    single refused dew point read as "100% rejected" in Sensor Checks
+    (B-01, the 2.6 architecture review). Resolve API name -> column the
+    way aggregate() does; the columns are still the whitelist's own."""
+    inverse = {v: k for k, v in _FIELD_MAP.items()}
+    cols = [(f, inverse[f]) for f in fields if f in inverse]
     if not cols:
         return {}
     sel = ", ".join(f"COUNT({c})" for _, c in cols)
@@ -2181,6 +2250,10 @@ _LEASE_HOLDER: contextvars.ContextVar[bool] = contextvars.ContextVar(
 _GATE_EVENT: "asyncio.Event | None" = None
 _GATE_LOOP: "asyncio.AbstractEventLoop | None" = None
 _ACTIVE_CONNECTIONS = 0
+# The counter is moved from the event loop AND from worker threads (the
+# nightly retention pass, storage breakdown, B-02 of the 2.6 architecture
+# review), so every move takes this lock.
+_COUNT_LOCK = threading.Lock()
 GATE_WAIT_S = 20.0          # how long a new connection waits for a transition
 DRAIN_TIMEOUT_S = 15.0      # how long the lease waits for open connections
 _DRAIN_POLL_S = 0.01
@@ -2249,7 +2322,8 @@ async def wait_open(timeout_s: float | None = None) -> None:
 
 
 def active_connections() -> int:
-    return _ACTIVE_CONNECTIONS
+    with _COUNT_LOCK:
+        return _ACTIVE_CONNECTIONS
 
 
 @asynccontextmanager
@@ -2263,15 +2337,19 @@ async def maintenance_lease(drain_timeout_s: float | None = None
     if _GATE_CLOSED:
         raise DatabaseUnavailable("another maintenance transition is in progress")
     event = _gate_event()
-    _GATE_CLOSED = True
+    # Under the same lock sync_connection admits under (CodeRabbit, PR
+    # #64): a worker thread that passed the gate check but had not yet
+    # counted itself would otherwise be invisible to the drain below.
+    with _COUNT_LOCK:
+        _GATE_CLOSED = True
     event.clear()
     token = _LEASE_HOLDER.set(True)
     try:
         timeout = DRAIN_TIMEOUT_S if drain_timeout_s is None else drain_timeout_s
         deadline = time.monotonic() + timeout
-        while _ACTIVE_CONNECTIONS > 0:
+        while active_connections() > 0:
             if time.monotonic() >= deadline:
-                raise LeaseBusy(f"{_ACTIVE_CONNECTIONS} database connection(s) "
+                raise LeaseBusy(f"{active_connections()} database connection(s) "
                                 f"still open after {timeout:.0f}s; the "
                                 "transition was not started")
             await asyncio.sleep(_DRAIN_POLL_S)
@@ -2285,17 +2363,143 @@ async def maintenance_lease(drain_timeout_s: float | None = None
             log.error("database stays closed after the maintenance lease: %s", _GATE_HELD)
 
 
+def _count_connection(delta: int) -> None:
+    global _ACTIVE_CONNECTIONS
+    with _COUNT_LOCK:
+        _ACTIVE_CONNECTIONS += delta
+
+
 @asynccontextmanager
 async def connect() -> AsyncIterator[aiosqlite.Connection]:
-    global _ACTIVE_CONNECTIONS
     if not _LEASE_HOLDER.get():
         await wait_open()
-    _ACTIVE_CONNECTIONS += 1
+    _count_connection(+1)
     try:
         async with _connect_unguarded() as db:
             yield db
     finally:
-        _ACTIVE_CONNECTIONS -= 1
+        _count_connection(-1)
+
+
+@asynccontextmanager
+async def counted_open_connection(path: str | Path) -> AsyncIterator[aiosqlite.Connection]:
+    """open_connection, counted by the maintenance lease (B-02). For the
+    VACUUM INTO copies: VACUUM refuses a connection with a statement in
+    progress, which connect()'s set-up leaves behind, so the copies open a
+    plain connection; counting it here is what lets a restore wait for the
+    copy instead of renaming the database under it."""
+    if not _LEASE_HOLDER.get():
+        await wait_open()
+    _count_connection(+1)
+    try:
+        # daemon BEFORE the await that starts the thread (the
+        # _connect_unguarded rule; CodeRabbit, PR #64).
+        conn = open_connection(path)
+        if hasattr(conn, "daemon"):      # aiosqlite's Connection IS a Thread
+            conn.daemon = True
+
+        async def _acquire():
+            return await conn
+        # The acquisition and the close run to completion even when this
+        # task is cancelled, and the count is held until they have (R26-05,
+        # the 2.6 detailed review): a cancel during the connect used to
+        # release the count at once while the worker went on to open SQLite
+        # inside the lease's exclusive window and stayed alive.
+        db = await _settle(asyncio.ensure_future(_acquire()), on_cancel=_close_quietly)
+        try:
+            yield db
+        finally:
+            await _settle(asyncio.ensure_future(db.close()))
+    finally:
+        _count_connection(-1)
+
+
+async def _close_quietly(db) -> None:
+    try:
+        await db.close()
+    except Exception:
+        log.debug("closing an abandoned connection failed", exc_info=True)
+
+
+async def _settle(task, on_cancel=None):
+    """Await `task` to the end however often the caller is cancelled
+    meanwhile; then re-raise the cancel, after `on_cancel(result)` has run
+    for a task that produced something nobody will use."""
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.done():
+                if task.cancelled():
+                    raise
+                if task.exception() is not None:
+                    raise task.exception()
+                result = task.result()
+                cancelled = True
+                break
+            cancelled = True
+    if cancelled:
+        if on_cancel is not None:
+            await _settle(asyncio.ensure_future(on_cancel(result)))
+        raise asyncio.CancelledError()
+    return result
+
+
+class _CountedSyncConnection(sqlite3.Connection):
+    """A plain sqlite3 connection the maintenance lease can see (B-02):
+    counted on open, released once the SQLite handle is closed, once.
+    The order matters (CodeRabbit, PR #64): releasing first opened an
+    interval in which the lease saw zero connections while the handle
+    was still open."""
+    _counted = False
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self._release()
+
+    def _release(self) -> None:
+        if self._counted:
+            self._counted = False
+            _count_connection(-1)
+
+    def __del__(self) -> None:
+        # A path that forgot to close must not hold the lease forever:
+        # close the handle, then release.
+        try:
+            super().close()
+        except Exception:
+            pass
+        self._release()
+
+
+def sync_connection(path: str | Path, *, busy_timeout_ms: int = 10_000) -> sqlite3.Connection:
+    """A sqlite3 connection for a worker THREAD that the maintenance lease
+    counts like an aiosqlite one (2.6, B-02 of the architecture review).
+
+    The lease's promise, "drain every open connection, then hand the
+    caller an exclusive window", held only for connect(): the nightly
+    retention pass and the backup opened the file on their own, invisible
+    to the drain, so a restore could rename the database under a writing
+    thread and its remaining writes went into an unlinked WAL. Refused
+    while the gate is closed (the pass skips its tick; a thread cannot
+    wait on the loop's event), counted until close() otherwise."""
+    global _ACTIVE_CONNECTIONS
+    # Gate check, open and count as ONE step under the lock the lease
+    # closes the gate under (CodeRabbit, PR #64): between a passed check
+    # and the count, the lease used to be able to see zero connections
+    # and rename the database under a connection that was already open.
+    with _COUNT_LOCK:
+        if _GATE_CLOSED:
+            raise DatabaseUnavailable("a maintenance transition is in progress")
+        conn = sqlite3.connect(str(path), factory=_CountedSyncConnection)
+        conn._counted = True
+        _ACTIVE_CONNECTIONS += 1
+    conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+    return conn
 
 
 @asynccontextmanager
@@ -2309,7 +2513,14 @@ async def _connect_unguarded() -> AsyncIterator[aiosqlite.Connection]:
     # daemonizing only changes what an ABANDONED connection can hold up.
     conn = open_connection(settings.database_path)
     conn.daemon = True
-    async with conn as db:
+
+    async def _acquire():
+        return await conn
+    # connect() counts the connection before this runs, so the acquisition
+    # and the close finish even under a cancel, and only then does the
+    # count drop (R26-05, the 2.6 detailed review; counted_open_connection).
+    db = await _settle(asyncio.ensure_future(_acquire()), on_cancel=_close_quietly)
+    try:
         db.row_factory = aiosqlite.Row
         # Writers WAIT for the lock instead of failing instantly. Zero
         # timeout survived while every write was one fast statement; the
@@ -2323,6 +2534,8 @@ async def _connect_unguarded() -> AsyncIterator[aiosqlite.Connection]:
             yield db
         finally:
             _OPEN_TX.pop(id(db), None)
+    finally:
+        await _settle(asyncio.ensure_future(db.close()))
 
 
 # ───────────────── who holds the writer? (2.1) ─────────────────
@@ -2830,7 +3043,12 @@ async def delete_device(mac: str) -> dict[str, int]:
     away (e.g. you stop polling a cloud feed) so a stale row doesn't sit on
     the dashboard. Returns a count summary; device count = 0 means unknown MAC."""
     async with _qc_lock():
-        return await _delete_device_locked(mac)
+        counts = await _delete_device_locked(mac)
+    # Beside the rows, known MAC or not: a producer that awaited the database
+    # across this delete now fails its token check and keeps its stale
+    # answer out of every cache; the MAC's own rain memos go with it.
+    invalidate_caches(mac)
+    return counts
 
 
 async def _delete_device_locked(mac: str) -> dict[str, int]:
@@ -2927,12 +3145,13 @@ _ALERT_LOG_KEEP = 200
 
 async def log_alert(ts_ms: int, kind: str, mac: str | None, title: str,
                     body: str | None, delivered: bool,
-                    severity: str | None = None) -> None:
+                    severity: str | None = None,
+                    rule_id: int | None = None) -> None:
     async with connect() as db:
         await db.execute(
             "INSERT INTO alert_log (ts_ms, kind, mac, title, body, delivered, "
-            "severity) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (ts_ms, kind, mac, title, body, 1 if delivered else 0, severity),
+            "severity, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts_ms, kind, mac, title, body, 1 if delivered else 0, severity, rule_id),
         )
         await db.execute(
             "DELETE FROM alert_log WHERE id NOT IN "
@@ -2946,7 +3165,7 @@ async def recent_alerts(limit: int = 50) -> list[dict[str, Any]]:
     """Newest-first alert history for GET /api/alerts/recent."""
     async with connect() as db:
         rows = await (await db.execute(
-            "SELECT id, ts_ms, kind, mac, title, body, delivered, severity "
+            "SELECT id, ts_ms, kind, mac, title, body, delivered, severity, rule_id "
             "FROM alert_log ORDER BY id DESC LIMIT ?",
             (limit,),
         )).fetchall()
@@ -2961,13 +3180,15 @@ _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipie
                     "heat_day", "heat_day_threshold_f",
                     "quiet_start_min", "quiet_end_min", "digest_hour",
                     "digest_minute", "outlook_hour", "outlook_minute",
-                    "outlook_source", "sky_notes", "sky_good_only",
+                    "outlook_source", "outlook2_hour", "outlook2_minute",
+                    "sky_notes", "sky_good_only",
                     "nws_push", "nws_warnings_only", "nws_families",
                     "report_theme",
                     "storm_live_activity",
                     "lightning_live_activity", "wind_live_activity",
                     "freeze_live_activity", "lightning_live_mi",
-                    "wind_live_mph", "smart_alerts")
+                    "wind_live_mph", "smart_alerts",
+                    "lightning_alert", "lightning_alert_mi")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -3616,27 +3837,46 @@ async def storm_window_stats(mac: str, start_ms: int, end_ms: int,
     }
 
 
+async def storm_window_rain_stitched(mac: str, start_ms: int, end_ms: int,
+                                     counter_cols: tuple[str, ...]) -> tuple[float, int]:
+    """(rain in the window from every counter the station posted, rows
+    that carried any counter), see storm.stitched_rain. Columns are
+    whitelisted through _FIELD_MAP like every interpolated name here."""
+    for col in counter_cols:
+        if col not in _FIELD_MAP:
+            raise ValueError(f"refusing to interpolate unknown column {col!r}")
+    sel = ", ".join(counter_cols)
+    where_any = " OR ".join(f"{c} IS NOT NULL" for c in counter_cols)
+    async with connect() as db:
+        cur = await db.execute(
+            f"SELECT {sel} FROM observations WHERE mac = ? "
+            f"AND dateutc_ms BETWEEN ? AND ? AND ({where_any}) ORDER BY dateutc_ms",
+            (mac, start_ms, end_ms))
+        rows = [{c: _counter_value(r[i]) for i, c in enumerate(counter_cols)}
+                async for r in cur]
+    # Rows that carried a USABLE counter, not rows the SQL admitted: a
+    # window of garbled text is "not measuring rain", not a dry 0.00
+    # (CodeRabbit, PR #81; the absent-is-not-zero family).
+    usable = sum(1 for row in rows if any(v is not None for v in row.values()))
+    return _storm.stitched_rain(rows, counter_cols), usable
+
+
+def _counter_value(raw: Any) -> float | None:
+    """A rain counter reading the stitch can use: a finite number that is
+    not negative. A counter never runs backwards past zero, so a negative
+    is a garbled reading, and fed to the stitch it is a false baseline
+    that the next good reading climbs from as rain (CodeRabbit, PR #81:
+    -1.0 then 0.1 read as 1.1 in)."""
+    v = _as_float(raw)
+    return None if v is None or v < 0 else v
+
+
 async def count_observations_between(mac: str, start_ms: int, end_ms: int) -> int:
     """How many readings a station stored in a window (storm compare)."""
     async with connect() as db:
         row = await (await db.execute(
             "SELECT COUNT(*) FROM observations WHERE mac = ? "
             "AND dateutc_ms BETWEEN ? AND ?", (mac, start_ms, end_ms))).fetchone()
-    return int(row[0] or 0)
-
-
-async def count_non_null_between(mac: str, field: str, start_ms: int,
-                                 end_ms: int) -> int:
-    """Readings in a window that carry `field` (an API field name,
-    whitelisted through _FIELD_MAP before it reaches the SQL)."""
-    if field not in _FIELD_MAP:
-        raise ValueError(f"refusing to interpolate unknown column {field!r}")
-    col = _FIELD_MAP[field]
-    async with connect() as db:
-        row = await (await db.execute(
-            f"SELECT COUNT(*) FROM observations WHERE mac = ? "
-            f"AND dateutc_ms BETWEEN ? AND ? AND {col} IS NOT NULL",
-            (mac, start_ms, end_ms))).fetchone()
     return int(row[0] or 0)
 
 
@@ -3967,22 +4207,24 @@ async def stamp_webhook(wid: str, ok_ms: int | None, error: str | None) -> None:
 
 
 async def insert_forecast_snapshots(provider: str, issued_ms: int,
-                                    rows: list[dict], keep_days: int = 400
-                                    ) -> None:
+                                    rows: list[dict], keep_days: int = 400,
+                                    *, lat: float | None = None,
+                                    lon: float | None = None) -> None:
     """One forecast run's daily rows; prunes beyond keep_days on write so
-    the table can never grow unbounded on a forgotten server."""
+    the table can never grow unbounded on a forgotten server. `lat`/`lon`
+    are the sky the run was fetched for (2.6), one pair per run."""
     cutoff = issued_ms - keep_days * 86_400_000
     async with connect() as db:
         await db.executemany(
             """
             INSERT INTO forecast_snapshots
                 (provider, issued_ms, valid_date, lead_days,
-                 tmax_f, tmin_f, pop, precip_in)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 tmax_f, tmin_f, pop, precip_in, lat, lon)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [(provider, issued_ms, r["valid_date"], r["lead_days"],
               r.get("tmax_f"), r.get("tmin_f"), r.get("pop"),
-              r.get("precip_in")) for r in rows])
+              r.get("precip_in"), lat, lon) for r in rows])
         await db.execute(
             "DELETE FROM forecast_snapshots WHERE issued_ms < ?", (cutoff,))
         await db.commit()
@@ -4097,6 +4339,55 @@ async def observation_count(mac: str) -> int:
             "SELECT COUNT(*) AS n FROM observations WHERE mac = ?", (mac,)
         )).fetchone()
     return row["n"] if row else 0
+
+
+async def rollup_coverage(mac: str) -> dict[str, int]:
+    """'YYYY-MM' -> how many days that month has a daily summary for, for
+    the months that have any (2.6 public pages: which reports exist and
+    how complete each month is; addendum review A26-06 and its notes)."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT substr(day, 1, 7) AS ym, COUNT(*) AS n FROM daily_rollups "
+            "WHERE mac = ? GROUP BY ym ORDER BY ym", (mac,))).fetchall()
+    return {str(r["ym"]): int(r["n"]) for r in rows}
+
+
+async def rollup_span(mac: str) -> tuple[str, str] | None:
+    """(first day, last day) a station has daily summaries for, or None."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT MIN(day) AS lo, MAX(day) AS hi FROM daily_rollups WHERE mac = ?",
+            (mac,))).fetchone()
+    if not row or row["lo"] is None:
+        return None
+    return str(row["lo"]), str(row["hi"])
+
+
+async def rollup_years(mac: str) -> list[int]:
+    """The calendar years a station has daily summaries for, oldest first
+    (2.6 public pages: which NOAA reports and CSVs exist)."""
+    span = await rollup_span(mac)
+    if span is None:
+        return []
+    return list(range(int(span[0][:4]), int(span[1][:4]) + 1))
+
+
+async def recent_strikes(mac: str, since_ms: int, limit: int = 5000) -> list[dict[str, Any]]:
+    """Each distinct last-strike time a station reported since `since_ms`,
+    with its distance (2.6, the lightning rings). A station repeats its
+    last strike on every reading until the next one, so readings collapse
+    to strikes by that time. Numeric rows only: SQLite keeps text in a
+    REAL column, and a garbled distance is no ring."""
+    async with connect() as db:
+        cur = await db.execute(
+            "SELECT lightning_last_strike_ms AS ms, MAX(lightning_distance_mi) AS d "
+            "FROM observations WHERE mac = ? AND dateutc_ms >= ? "
+            "AND typeof(lightning_last_strike_ms) = 'integer' "
+            "AND typeof(lightning_distance_mi) IN ('integer','real') "
+            "AND lightning_last_strike_ms >= ? "
+            "GROUP BY lightning_last_strike_ms ORDER BY lightning_last_strike_ms DESC LIMIT ?",
+            (mac, since_ms, since_ms, limit))
+        return [{"ms": int(r[0]), "distance_mi": float(r[1])} async for r in cur]
 
 
 async def latest_observation(mac: str) -> dict[str, Any] | None:
@@ -4605,8 +4896,9 @@ async def _cached_rain_lookup(key: tuple, cached: bool, compute, *,
         if hit is not None and time.monotonic() < hit[0] \
                 and not (stale_if is not None and stale_if(hit[1])):
             return hit[1]
+    token = cache_token()
     value = await compute()
-    if cached:
+    if cached and cache_token_current(token):
         if len(_YEAR_PRIOR_CACHE) > _YEAR_PRIOR_CACHE_MAX:
             # Prune what has expired first; only a cache full of LIVE
             # entries is cleared outright (a boundary key per hour per
@@ -5041,6 +5333,7 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
 
     cache_key = (mac, start_of_today.date().isoformat())
     now_mono = time.monotonic()
+    token = cache_token()
     hit = _DAILY_ROLLUP_CACHE.get(cache_key)
     if hit is not None and now_mono < hit[0]:
         return dict(hit[1])
@@ -5077,7 +5370,7 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
     if len(ledger) == 3:
         for name, value in ledger.items():
             out[name] = round(max(0.0, value), 3)
-        _rollup_cache_store(cache_key, out, now_mono)
+        _rollup_cache_store(cache_key, out, now_mono, token)
         return out
 
     async with connect() as db:
@@ -5097,7 +5390,7 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
             (mac, anchor_ms))).fetchone()
         lo = _tolerant_float(floor_row["lo"]) if floor_row else None
         if lo is not None and lo > _DAILY_RAIN_RESET_FLOOR_IN:
-            _rollup_cache_store(cache_key, out, now_mono)
+            _rollup_cache_store(cache_key, out, now_mono, token)
             return out
         rows = await (await db.execute(
             """
@@ -5108,7 +5401,7 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
             """,
             (anchor_ms, day_ms, mac, anchor_ms))).fetchall()
     if not rows:
-        _rollup_cache_store(cache_key, out, now_mono)
+        _rollup_cache_store(cache_key, out, now_mono, token)
         return out
     days = [(r["day"], _tolerant_float(r["m"])) for r in rows]
     for name, boundary in (("weekly_in", start_of_week),
@@ -5125,7 +5418,7 @@ async def _rollups_from_daily(mac: str, tz) -> dict[str, float | None]:
                       + day_ms // 2) // day_ms)
         total = sum(m for d, m in days if d >= first_day and m is not None)
         out[name] = round(max(0.0, total), 3)
-    _rollup_cache_store(cache_key, out, now_mono)
+    _rollup_cache_store(cache_key, out, now_mono, token)
     return out
 
 
@@ -5138,7 +5431,9 @@ _DAILY_ROLLUP_TTL_S = 300.0   # was 60: a 6.7 s cold scan per minute per client 
 
 
 def _rollup_cache_store(key: tuple[str, str], value: dict[str, float | None],
-                        now_mono: float) -> None:
+                        now_mono: float, token: int) -> None:
+    if not cache_token_current(token):
+        return      # a station was deleted while this was computed
     stale = [k for k in _DAILY_ROLLUP_CACHE if k[1] != key[1]]
     for k in stale:
         _DAILY_ROLLUP_CACHE.pop(k, None)

@@ -95,6 +95,72 @@ def rain_increment(prev: float | None, curr: float | None) -> float:
 _RESET_FLOOR_IN = 0.02
 
 
+def stitched_rain(rows, cols) -> float:
+    """Rain over a window from EVERY counter a station posted, counted once
+    (R25-11, the 2.5 detailed review, the half the coverage rule left open).
+
+    `rows` are the window's readings in time order, each a mapping of
+    counter column to value (None when that row did not carry it); `cols`
+    the counters in preference order. Each counter keeps its own
+    high-water mark (counter_progress: resets re-baseline, downward
+    revisions hold) and its own progress since it joined. The window's
+    rain is the furthest any counter has carried the running total:
+    a counter joins (first seen, or returning after a row without it)
+    at the total so far, and from then on the total is the largest of
+    joined-at plus progress across the counters present.
+
+    So two counters measuring the same rain agree instead of adding: a
+    daily counter that catches up a reading after the yearly one (or
+    several readings after) reaches the total the yearly already set and
+    adds nothing (R26-04, the 2.6 detailed review; the earlier rule took
+    the largest increment PER ROW and counted a staggered 0.10 in twice).
+    A counter that takes over midway still extends the total from where
+    it joined. A counter back after a gap carries on from its own mark
+    when that mark still measures it, so the gap cannot credit the same
+    rain twice; only one back after a reset or an implausible jump
+    rejoins at the total. At a switch from one counter to another
+    the one increment no common scale can bridge is still the cost; a
+    stray row no longer wins the window.
+    """
+    peaks: dict[str, float | None] = {c: None for c in cols}
+    progress: dict[str, float] = {c: 0.0 for c in cols}
+    joined_at: dict[str, float] = {c: 0.0 for c in cols}
+    present_before: set[str] = set()
+    total = 0.0
+    for row in rows:
+        present = {c for c in cols if row.get(c) is not None}
+        if not present:
+            continue
+        for c in present:
+            if c not in present_before and (peaks[c] is None
+                                            or _rebaselines(peaks[c], row[c])):
+                # First seen, or back after a reset or an implausible jump
+                # its old mark cannot bridge: a fresh baseline, joining the
+                # total as it stands before this row.
+                peaks[c], progress[c], joined_at[c] = row[c], 0.0, total
+                continue
+            # Present last row, or back after a gap with a reading its own
+            # mark still measures: it carries on from where it was. What it
+            # gained while away is rain it measured too, and the total is
+            # the furthest any counter reached, so a counter catching up
+            # across a gap cannot count the same rain twice (follow-up
+            # review, R26-04: 0.0, missing, 0.0, 0.1 used to rejoin at the
+            # total and add the 0.1 the other counter already had).
+            inc, peaks[c] = counter_progress(peaks[c], row[c])
+            progress[c] += inc
+        total = max([total] + [joined_at[c] + progress[c] for c in present])
+        present_before = present
+    return total
+
+
+def _rebaselines(peak: float, curr: float) -> bool:
+    """True when counter_progress would start a NEW mark at `curr` (a period
+    reset, or a jump too large to be rain) rather than measure from `peak`."""
+    if curr < peak:
+        return curr <= _RESET_FLOOR_IN
+    return curr - peak > _MAX_SANE_INCREMENT_IN
+
+
 def counter_progress(peak: float | None, curr: float | None) -> tuple[float, float | None]:
     """(inches added, new high-water mark) for one counter reading.
 

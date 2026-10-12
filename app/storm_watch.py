@@ -51,12 +51,17 @@ async def _content_state(mac: str, started_ms: int, now_ms: int,
         mac, started_ms, now_ms, field or "yearlyrainin")
     def _num(v):
         return round(float(v), 2) if isinstance(v, (int, float)) else None
+    # endMs (2.6.1, Doren 10-11): when the storm ended, on the final beat
+    # only, so the card can show a fixed duration; without it the card's
+    # clock kept counting up from the start under "Storm ended". Older
+    # apps ignore the key.
     return {
         "startMs": int(started_ms),
         "totalIn": _num(stats.get("total_in")) or 0.0,
         "rateInHr": _num(stats.get("peak_rate_in_hr")),
         "gustMph": _num(stats.get("max_gust_mph")),
         "ended": bool(ended),
+        **({"endMs": int(now_ms)} if ended else {}),
     }
 
 

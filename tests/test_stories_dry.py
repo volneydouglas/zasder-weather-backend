@@ -345,7 +345,7 @@ def test_a_short_live_spell_yields_the_hero_slot_to_the_record(engine):
         s = _one()
     finally:
         _RAIN_DOY[2026] = rain[2026]
-    assert s["hero_line"] == "143 DAYS. NOT A DROP."
+    assert s["hero_line"] == "143 DAYS. NOT A DROP. APR TO AUG 2026."
     assert s["period"]["partial"] is False
     current = next(x for x in s["supporting"] if x["key"] == "current_spell")
     assert current["value"] == 4
@@ -368,7 +368,7 @@ def test_a_station_that_went_dark_is_not_still_counting(client, monkeypatch):
 
     monkeypatch.setattr(climate, "local_today", lambda: date(2026, 9, 20))
     stale = _one()
-    assert stale["hero_line"] == "148 DAYS. NOT A DROP."
+    assert stale["hero_line"] == "148 DAYS. NOT A DROP. APR TO AUG 2026."
     assert stale["period"]["partial"] is False
     assert "record_spell" not in {x["key"] for x in stale["supporting"]}
 
@@ -582,3 +582,13 @@ def test_the_window_label_does_not_follow_the_process_locale(engine):
         assert s["viz"]["axis_label"].endswith("through Aug 30")
     finally:
         locale.setlocale(locale.LC_TIME, "C")
+
+
+def test_a_finished_spell_says_when():
+    """2.6.1 (Doren 10-11): a finished spell under a rainy day read as a
+    claim about now; its hook names the months."""
+    from datetime import date
+    from app.stories import _spell_when
+    assert _spell_when(date(2026, 9, 2), date(2026, 9, 19)) == "SEP 2026"
+    assert _spell_when(date(2026, 8, 20), date(2026, 9, 6)) == "AUG TO SEP 2026"
+    assert _spell_when(date(2025, 12, 20), date(2026, 1, 6)) == "DEC 2025 TO JAN 2026"

@@ -926,3 +926,101 @@ def test_a_narrative_alone_is_an_outlook():
     r = dg.Report(date_label="Tuesday, October 6", stations=[], alerts=[], outlook=o)
     assert "Fog early." in dg.build_text(r)
     assert "Fog early." in dg.build_html(r)
+
+
+def test_a_phone_half_still_failing_hours_later_gives_up_for_the_day(client, monkeypatch):
+    """2.6.1 (Doren 10-11): the email went at 8 AM, the phone half kept
+    failing (the relay had refused his pushes), and its banner landed at
+    8 PM. Retries stop once the report is MORNING_RETRY_MAX_MIN late."""
+    import app.alerts as al
+    from app import apns, db, insights
+
+    monkeypatch.setattr(al, "_send_sync", lambda *a, **kw: None)
+    attempts = []
+
+    async def failing_la(payload, title, body, activity="rain"):
+        attempts.append(("la", activity))
+        raise OSError("relay 429")
+
+    async def failing_push(title, body, interruption_level=None, route=None, **kw):
+        attempts.append(("push", title))
+        raise OSError("relay 429")
+
+    async def configured():
+        return True
+    monkeypatch.setattr(apns, "send_live_activity_start", failing_la)
+    monkeypatch.setattr(apns, "send_to_all", failing_push)
+    monkeypatch.setattr(apns, "push_configured", configured)
+    now, now_ms = _digest_now()          # 08:00 local; the report is at 07:00
+
+    async def run():
+        import datetime as _dt
+        mac = "AA:BB:CC:DD:EE:96"
+        await db.upsert_device(mac, {"lastData": {"dateutc": now_ms, "tempf": 90.0}})
+        yday = now - _dt.timedelta(days=1)
+        await db.insert_observations(mac, [
+            {"dateutc": int(yday.replace(hour=15).timestamp() * 1000), "tempf": 98.0}])
+        await insights.rebuild(mac)
+        devices = await db.list_devices()
+        mon = al.AlertMonitor()
+        await mon._maybe_send_digest(_phone_cfg(), devices, now_ms)     # email ok, phone fails
+        early = len(attempts)
+        # Still within the window: it retries.
+        await mon._maybe_send_digest(_phone_cfg(), devices, now_ms + 2 * 3_600_000)
+        mid = len(attempts)
+        # 12 hours after the report time: no more attempts, the day is closed.
+        late = now_ms + 11 * 3_600_000
+        await mon._maybe_send_digest(_phone_cfg(), devices, late)
+        await mon._maybe_send_digest(_phone_cfg(), devices, late + 60_000)
+        return early, mid, len(attempts), await db.get_kv("alerts.digest.phone_day")
+
+    early, mid, final, phone_day = asyncio.run(run())
+    assert early > 0 and mid > early, "within the window the phone half retries"
+    assert final == mid, "past the window nothing more is attempted"
+    assert phone_day == now.date().isoformat(), "the day is closed for the phone half"
+
+
+def test_giving_up_on_the_email_keeps_its_alert_window(client, monkeypatch):
+    """CodeRabbit, PR #89: when the email half is abandoned for the day,
+    last_ms (where tomorrow's report starts its alert window) stays at the
+    last email that actually went."""
+    import app.alerts as al
+    from app import apns, db, insights
+
+    def failing_mail(*a, **kw):
+        raise OSError("smtp down")
+    monkeypatch.setattr(al, "_send_sync", failing_mail)
+
+    async def ok_la(payload, title, body, activity="rain"):
+        return {"sent": 1, "dead": [], "failed": 0}
+
+    async def ok_push(title, body, interruption_level=None, route=None, **kw):
+        return {"sent": 1}
+
+    async def configured():
+        return True
+    monkeypatch.setattr(apns, "send_live_activity_start", ok_la)
+    monkeypatch.setattr(apns, "send_to_all", ok_push)
+    monkeypatch.setattr(apns, "push_configured", configured)
+    now, now_ms = _digest_now()
+    earlier = str(now_ms - 86_400_000)
+
+    async def run():
+        import datetime as _dt
+        await db.set_kv("alerts.digest.last_ms", earlier)
+        mac = "AA:BB:CC:DD:EE:97"
+        await db.upsert_device(mac, {"lastData": {"dateutc": now_ms, "tempf": 90.0}})
+        yday = now - _dt.timedelta(days=1)
+        await db.insert_observations(mac, [
+            {"dateutc": int(yday.replace(hour=15).timestamp() * 1000), "tempf": 98.0}])
+        await insights.rebuild(mac)
+        devices = await db.list_devices()
+        mon = al.AlertMonitor()
+        await mon._maybe_send_digest(_phone_cfg(), devices, now_ms)       # phone ok, email fails
+        await mon._maybe_send_digest(_phone_cfg(), devices, now_ms + 11 * 3_600_000)   # give up
+        return (await db.get_kv("alerts.digest.last_ms"),
+                await db.get_kv("alerts.digest.email_abandoned_day"))
+
+    last_ms, abandoned = asyncio.run(run())
+    assert last_ms == earlier, "the alert window still starts at the last real email"
+    assert abandoned == now.date().isoformat()

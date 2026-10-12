@@ -2256,6 +2256,17 @@ class _Spell:
     broke_amount: float | None
 
 
+def _spell_when(start: date, end: date) -> str:
+    """'SEP 2026', 'AUG TO SEP 2026' or 'DEC 2025 TO JAN 2026'."""
+    a = _MONTHS[start.month - 1][:3].upper()
+    b = _MONTHS[end.month - 1][:3].upper()
+    if (start.year, start.month) == (end.year, end.month):
+        return f"{a} {end.year}"
+    if start.year == end.year:
+        return f"{a} TO {b} {end.year}"
+    return f"{a} {start.year} TO {b} {end.year}"
+
+
 def _dry_spells(rows: Sequence[dict[str, Any]]) -> list[_Spell]:
     """Every measured-dry run in the record, oldest first.
 
@@ -2501,8 +2512,11 @@ async def dry_spell(ctx: StoryContext) -> list[Story]:
 
     ongoing = hero_is_live
     u = ctx.units
+    # A finished spell says WHEN (2.6.1, Doren 10-11: "18 DAYS. NOT A DROP."
+    # under a day that rained read as a claim about now). The running one
+    # already says "and counting".
     hero_line = (f"{hero.days} DAYS AND COUNTING. NOT A DROP." if ongoing
-                 else f"{hero.days} DAYS. NOT A DROP.")
+                 else f"{hero.days} DAYS. NOT A DROP. {_spell_when(hero.start, hero.end)}.")
     # The definition ships ON the card, and so does the coverage rule — the
     # number means nothing without both, and a reader who cannot check the
     # claim has to take it on trust. The threshold is one bucket tip either
@@ -7321,7 +7335,14 @@ async def comfortable_months(ctx: StoryContext) -> list[Story]:
             row["note"] = f"{_hours_a_day(this_share[m])} h in {this_year}"
         series.append(row)
 
-    parts = {"spread": min(1.0, spread / COMFORT_FULL_SPREAD)}
+    # In season it is advice; out of season a fact about another month
+    # (2.6.1, Doren 10-11: "June was over 3 months ago... shouldn't this be
+    # current?"). Full weight within a month of the best month, less the
+    # further away, so Worth Sharing brings it forward when it matters.
+    gap = abs(ctx.today.month - best[0]) % 12
+    gap = min(gap, 12 - gap)
+    season = 1.0 if gap <= 1 else (0.6 if gap == 2 else 0.3)
+    parts = {"spread": min(1.0, spread / COMFORT_FULL_SPREAD), "season": season}
     return [Story(
         id=f"climate.comfortable_months.{daily[-1]['day']}",
         family=FAMILY_CLIMATE,
@@ -7347,7 +7368,7 @@ async def comfortable_months(ctx: StoryContext) -> list[Story]:
         station=ctx.station({"first_day": daily[0]["day"],
                              "last_day": daily[-1]["day"],
                              "day_count": len(daily)}),
-        interestingness=parts["spread"],
+        interestingness=round(parts["spread"] * season, 4),
         score_parts=parts,
     )]
 

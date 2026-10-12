@@ -8,6 +8,27 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.6.1] — 2026-10-12
+
+### Fixed
+- **A long storm no longer holds up your alerts.** On a server that sends
+  through the hosted push relay, a storm's lock-screen card is updated
+  every few minutes, and a day-long storm spent the relay's daily
+  allowance; the relay then refused rain alerts and the morning report's
+  notification until midnight UTC, when they all arrived at once. Card
+  updates now send only when the card's numbers changed (or to keep it
+  from going stale), and the relay gives lock-screen cards their own
+  allowance, so they can never use up the one alerts depend on.
+- **The morning report does not arrive in the evening.** A half of the
+  report that keeps failing stops retrying six hours after its time, the
+  same limit as a first send, instead of landing at 8 PM.
+- **An ended storm's card stops its clock.** The final update carries the
+  time the storm ended (`endMs`), and the 2.6.1 app shows a fixed duration
+  instead of a clock that kept counting under "Storm ended".
+- **Worth sharing says when.** A finished dry spell names its months
+  ("18 DAYS. NOT A DROP. SEP 2026."), and The Comfortable Months counts
+  most in its own season instead of leading in October.
+
 ## [2.6.0] — 2026-10-10
 
 ### Added

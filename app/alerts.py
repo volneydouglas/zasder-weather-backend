@@ -271,6 +271,11 @@ def rule_cleared(comparator: str, threshold: float, value: float,
 _REARM_DWELL_MS = 15 * 60_000
 # How far past its clock time the morning report may still go out.
 MORNING_GRACE_MIN = 6 * 60
+# And a half that went out partly (one of email/phone) stops retrying the
+# rest after the same span (2.6.1, Doren 10-11: his banner landed at 8 PM
+# after a day of refused pushes). Same limit as a first send, so a retry
+# can never land later than a first send could.
+MORNING_RETRY_MAX_MIN = MORNING_GRACE_MIN
 
 
 def rearm_transition(cleared: bool, clear_since_ms: int | None, now_ms: int,
@@ -1766,6 +1771,13 @@ class AlertMonitor:
         if last:
             last_local = datetime.fromtimestamp(last / 1000, tz)
             email_done = last_local.date() >= local.date()
+        # A day the email was given up on (2.6.1) is done for the email,
+        # without moving last_ms: last_ms is also where tomorrow's report
+        # starts its alert window, and it must stay at the last email that
+        # actually went (CodeRabbit, PR #89).
+        if (await db.get_kv("alerts.digest.email_abandoned_day")
+                == local.date().isoformat()):
+            email_done = True
         # Each half retries on its OWN stamp (R15): the email stamp alone
         # gated everything here, so a transient APNs outage during the
         # phone send could never retry — the email's success stamped the
@@ -1781,11 +1793,26 @@ class AlertMonitor:
         # MORNING_GRACE_MIN behind, the day is over for the report; the
         # first one goes tomorrow. A half that already ran today keeps
         # retrying: it is unfinished, not late.
+        late = ((local.hour * 60 + local.minute)
+                - (int(cfg.digest_hour) * 60 + minute))
         if not (email_done or phone_done):
-            late = ((local.hour * 60 + local.minute)
-                    - (int(cfg.digest_hour) * 60 + minute))
             if late > MORNING_GRACE_MIN:
                 return
+        elif late > MORNING_RETRY_MAX_MIN:
+            # 2.6.1 (Doren 10-11): a half that kept failing retried until the
+            # end of the day, and the morning report's banner landed at
+            # 8 PM. A late paper is still that day's paper for a few hours,
+            # not for twelve. Close the day for the half still owed.
+            if not email_done:
+                await db.set_kv("alerts.digest.email_abandoned_day",
+                                local.date().isoformat())
+            if not phone_done:
+                await db.set_kv("alerts.digest.phone_day",
+                                local.date().isoformat())
+            log.warning("morning report: %s half still undelivered %d min "
+                        "after its time; giving up for today",
+                        "email" if not email_done else "phone", late)
+            return
 
         from . import digest as dg
 

@@ -369,3 +369,19 @@ def test_an_hour_with_too_few_readings_has_no_share(engine):
     april = next(r for r in s["viz"]["series"] if r["label"] == "Apr")
     # 2025's April dropped out entirely (no covered hours): the mean is over 2024 and 2026.
     assert april["share"] == pytest.approx((0.85 + 0.7) / 2, abs=1e-3)
+
+
+def test_the_story_counts_most_in_its_own_season(engine, monkeypatch):
+    """2.6.1 (Doren 10-11: "June was over 3 months ago... shouldn't this be
+    current?"). The desert's best month is April: the story weighs fully in
+    March to May and least half a year away."""
+    from app import climate
+    _desert(engine)
+    scores = {}
+    for month in (4, 5, 6, 10):
+        monkeypatch.setattr(climate, "local_today", lambda m=month: date(2026, m, 15))
+        s = _card(_story())
+        scores[month] = (s["interestingness"], s["score_parts"]["season"])
+    assert scores[4][1] == scores[5][1] == 1.0
+    assert scores[6][1] == 0.6 and scores[10][1] == 0.3
+    assert scores[4][0] > scores[6][0] > scores[10][0]

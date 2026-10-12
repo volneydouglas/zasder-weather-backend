@@ -537,3 +537,141 @@ def test_push_test_can_play_either_tone(client, monkeypatch):
     _reset_push_throttle()
     assert client.post("/api/push/test", headers=TEST_PUSH_H,
                        json={"tier": "info"}).status_code == 400
+
+
+def test_the_storm_end_beat_carries_when_it_ended(client, monkeypatch):
+    """2.6.1 (Doren 10-11): the ended card's clock kept counting up from the
+    start; the end beat now carries endMs so the card can show a fixed
+    duration."""
+    calls = _fake_apns(monkeypatch)
+    from app import storm_watch
+    dev = {"mac": "AA:BB:CC:00:00:02", "name": "Chaucer"}
+    now = int(time.time() * 1000)
+    started = now - 24 * 60_000
+    ended = now - 60_000
+
+    async def run():
+        await storm_watch.on_open_tick(_cfg(), dev, started, now - 20 * 60_000, "dailyrainin")
+        await storm_watch.on_closed(_cfg(), dev, started, ended, now, "dailyrainin",
+                                    reported=True)
+    asyncio.run(run())
+    end = calls["update"][-1][1]["aps"]
+    assert end["event"] == "end" and end["content-state"]["ended"] is True
+    assert end["content-state"]["endMs"] == ended
+    assert end["content-state"]["endMs"] - end["content-state"]["startMs"] == 23 * 60_000
+    # A running card carries no endMs.
+    assert "endMs" not in calls["start"][0]["aps"]["content-state"]
+
+
+def _routine(n_s, total, stale_s=None):
+    from app import apns
+    return apns.build_live_activity_update(
+        {"startMs": 1, "totalIn": total, "ended": False}, now_s=n_s,
+        stale_s=stale_s)
+
+
+def test_an_unchanged_card_update_is_not_resent_while_fresh(client, monkeypatch):
+    """2.6.1: the same numbers every 3 minutes for 13 hours spent Doren's
+    relay allowance. An unchanged routine update is skipped until its card
+    nears its stale-date; a change, an end, or an audible beat always goes."""
+    from app import apns, db
+    sent = []
+
+    async def fake_push(rows, title, body, **kw):
+        sent.append(kw["payload"]["aps"])
+        return {"sent": len(rows), "dead": [], "failed": 0}
+    monkeypatch.setattr(apns, "_push_tokens", fake_push)
+    monkeypatch.setattr(apns.settings, "apns_key_id", "K", raising=False)
+    monkeypatch.setattr(type(apns.settings), "apns_configured", property(lambda s: True))
+
+    async def run():
+        await db.register_live_activity_token("b" * 64, "update", "prod", activity="storm")
+        t0 = 1_791_000_000
+        stale = lambda t: t + 30 * 60
+        r1 = await apns.send_live_activity_update("storm", _routine(t0, 1.0, stale(t0)), "t", "b")
+        r2 = await apns.send_live_activity_update("storm", _routine(t0 + 180, 1.0, stale(t0 + 180)), "t", "b")
+        r3 = await apns.send_live_activity_update("storm", _routine(t0 + 360, 1.2, stale(t0 + 360)), "t", "b")
+        # Unchanged again at 1.2: skipped until 25 min after the last send
+        # (5 min before its 30 min stale-date), then re-sent to stay fresh.
+        r4 = await apns.send_live_activity_update("storm", _routine(t0 + 360 + 24 * 60, 1.2, stale(t0 + 360 + 24 * 60)), "t", "b")
+        r5 = await apns.send_live_activity_update("storm", _routine(t0 + 360 + 25 * 60, 1.2, stale(t0 + 360 + 25 * 60)), "t", "b")
+        end = apns.build_live_activity_update({"startMs": 1, "totalIn": 1.2, "ended": True},
+                                              now_s=t0 + 2000, event="end", dismiss_s=t0 + 4000)
+        r6 = await apns.send_live_activity_update("storm", end, "t", "b")
+        return r1, r2, r3, r4, r5, r6
+    r1, r2, r3, r4, r5, r6 = asyncio.run(run())
+    assert r1["sent"] == 1 and r2.get("unchanged") and r3["sent"] == 1
+    assert r4.get("unchanged") and r5["sent"] == 1 and r6["sent"] == 1
+    assert len(sent) == 4
+
+
+def _setup_push(monkeypatch, fail_tokens=()):
+    from app import apns
+    sent = []
+
+    async def fake_push(rows, title, body, **kw):
+        ok = [r for r in rows if r["token"] not in fail_tokens]
+        sent.append(([r["token"] for r in ok], kw["payload"]["aps"]))
+        return {"sent": len(ok), "dead": [], "failed": len(rows) - len(ok)}
+    monkeypatch.setattr(apns, "_push_tokens", fake_push)
+    monkeypatch.setattr(type(apns.settings), "apns_configured", property(lambda s: True))
+    return sent
+
+
+def test_back_to_an_earlier_state_is_sent(client, monkeypatch):
+    """CodeRabbit, PR #89: A then B then A again must reach the card; only
+    a repeat of the state LAST delivered may be skipped."""
+    from app import apns, db
+    sent = _setup_push(monkeypatch)
+
+    async def run():
+        await db.register_live_activity_token("d" * 64, "update", "prod", activity="storm")
+        t = 1_791_000_000
+        for i, total in enumerate((1.0, 1.2, 1.0, 1.0)):
+            await apns.send_live_activity_update(
+                "storm", _routine(t + i * 180, total, t + i * 180 + 1800), "t", "b")
+    asyncio.run(run())
+    assert [a["content-state"]["totalIn"] for _, a in sent] == [1.0, 1.2, 1.0]
+
+
+def test_a_token_that_failed_or_joined_gets_the_repeat(client, monkeypatch):
+    """CodeRabbit, PR #89: a skip needs the same tokens, every one of
+    which took the last send."""
+    from app import apns, db
+    sent = _setup_push(monkeypatch, fail_tokens={"f" * 64})
+
+    async def run():
+        await db.register_live_activity_token("e" * 64, "update", "prod", activity="storm")
+        await db.register_live_activity_token("f" * 64, "update", "prod", activity="storm")
+        t = 1_791_000_000
+        # f fails: nothing is remembered, the repeat goes again.
+        await apns.send_live_activity_update("storm", _routine(t, 1.0, t + 1800), "t", "b")
+        r2 = await apns.send_live_activity_update("storm", _routine(t + 180, 1.0, t + 1980), "t", "b")
+        return r2
+    r2 = asyncio.run(run())
+    assert not r2.get("unchanged") and len(sent) == 2
+
+    sent.clear()
+    sent2 = _setup_push(monkeypatch)
+
+    async def run2():
+        t = 1_792_000_000
+        await apns.send_live_activity_update("storm", _routine(t, 2.0, t + 1800), "t", "b")
+        skipped = await apns.send_live_activity_update("storm", _routine(t + 180, 2.0, t + 1980), "t", "b")
+        await db.register_live_activity_token("g" * 64, "update", "prod", activity="storm")
+        joined = await apns.send_live_activity_update("storm", _routine(t + 360, 2.0, t + 2160), "t", "b")
+        return skipped, joined
+    skipped, joined = asyncio.run(run2())
+    assert skipped.get("unchanged") is True
+    assert not joined.get("unchanged") and len(sent2) == 2
+
+
+def test_a_failed_send_is_not_remembered(client, monkeypatch):
+    from app import apns, db
+    _setup_push(monkeypatch, fail_tokens={"c" * 64})
+
+    async def run():
+        await db.register_live_activity_token("c" * 64, "update", "prod", activity="storm")
+        await apns.send_live_activity_update("storm", _routine(1_791_000_000, 1.0, 1_791_001_800), "t", "b")
+        return apns.unchanged_update("storm", _routine(1_791_000_180, 1.0, 1_791_001_980), ["c" * 64])
+    assert asyncio.run(run()) is False

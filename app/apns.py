@@ -7,6 +7,7 @@ into the alert monitor alongside email so a device-down alert can also push.
 
 The .p8 is an EC P-256 private key; PyJWT[crypto] signs the provider JWT.
 """
+import json
 import logging
 import re
 import time
@@ -421,14 +422,82 @@ async def send_live_activity_start(payload: dict, title: str, body: str,
     return res
 
 
+# Routine card updates whose numbers have not moved are not re-sent (2.6.1,
+# Doren 10-11: a 13-hour storm re-sent the same card every 3 minutes, and
+# through the hosted relay those pushes spent the allowance his alerts
+# needed). Per activity, the LAST update delivered: its content-state, the
+# set of tokens it went to, and the stale-date it promised. A new update is
+# skipped only when it repeats that state, to the same tokens, every one of
+# which took it, while the promise still has REFRESH_BEFORE_STALE_S to run.
+# Anything else goes: a change (A to B and back to A included), a token that
+# failed or joined since, or a card nearing stale.
+_LA_LAST_SENT: dict[str, tuple[str, str, int]] = {}
+REFRESH_BEFORE_STALE_S = 5 * 60
+# Without a stale-date in the payload: re-send unchanged numbers at most
+# this often.
+UNCHANGED_RESEND_S = 20 * 60
+
+
+def _routine_state(payload: dict) -> str | None:
+    """The content-state of a routine update as a stable string, or None
+    for anything that must always go out (an end, an audible beat, a
+    dismissal)."""
+    aps = (payload or {}).get("aps") or {}
+    if aps.get("event") != "update" or "alert" in aps or "dismissal-date" in aps:
+        return None
+    try:
+        return json.dumps(aps.get("content-state"), sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+
+
+def _token_set(tokens: list[str]) -> str:
+    import hashlib
+    return hashlib.sha256("\n".join(sorted(tokens)).encode()).hexdigest()
+
+
+def unchanged_update(activity: str, payload: dict, tokens: list[str]) -> bool:
+    """True when this routine update repeats the last one delivered for
+    `activity`, to exactly these tokens, and that one is still fresh."""
+    state = _routine_state(payload)
+    last = _LA_LAST_SENT.get(activity)
+    if state is None or last is None:
+        return False
+    last_state, last_tokens, fresh_until = last
+    now_s = int(payload["aps"].get("timestamp") or 0)
+    return (state == last_state and _token_set(tokens) == last_tokens
+            and now_s < fresh_until - REFRESH_BEFORE_STALE_S)
+
+
+def _remember_update(activity: str, payload: dict, tokens: list[str],
+                     res: dict) -> None:
+    """Record what was delivered. Only a send every token took counts: a
+    failed token must get the next identical update, not a skip."""
+    state = _routine_state(payload)
+    if state is None or res.get("failed") or res.get("dead") \
+            or int(res.get("sent") or 0) < len(tokens):
+        _LA_LAST_SENT.pop(activity, None)
+        return
+    aps = payload["aps"]
+    now_s = int(aps.get("timestamp") or 0)
+    fresh_until = int(aps.get("stale-date") or
+                      (now_s + UNCHANGED_RESEND_S + REFRESH_BEFORE_STALE_S))
+    _LA_LAST_SENT[activity] = (state, _token_set(tokens), fresh_until)
+
+
 async def send_live_activity_update(activity: str, payload: dict,
                                     title: str, body: str) -> dict:
     """Fan an ActivityKit update payload out to every update token
     registered for `activity` ('rain' | 'storm' | 'heat'). Same transport
-    split and dead-token pruning as send_live_activity_start."""
+    split and dead-token pruning as send_live_activity_start. A routine
+    update that repeats the last one while it is still fresh is skipped
+    (`unchanged: True`), see _LA_LAST_SENT."""
     rows = await db.list_live_activity_tokens("update", activity=activity)
     if not rows:
         return {"sent": 0, "dead": [], "failed": 0}
+    tokens = [r["token"] for r in rows]
+    if unchanged_update(activity, payload, tokens):
+        return {"sent": 0, "dead": [], "failed": 0, "unchanged": True}
     if settings.apns_configured:
         res = await _push_tokens(rows, title, body,
                                  payload=payload, push_type="liveactivity")
@@ -449,6 +518,7 @@ async def send_live_activity_update(activity: str, payload: dict,
     # already accepted the deliveries, and an exception here would read
     # as sent_any=False upstream — next tick re-sends and STACKS cards,
     # the exact hole the per-half retry stamps exist to close.
+    _remember_update(activity, payload, tokens, res)
     try:
         for tok in res.get("dead", []):
             await db.remove_live_activity_token(tok)

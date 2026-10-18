@@ -134,8 +134,53 @@ async def _access_token(sa: dict) -> str | None:
     return tok
 
 
-async def push_tokens_fcm(tokens: list[str], title: str, body: str) -> dict[str, Any]:
-    """Send a notification to each FCM token. Returns {sent, dead, failed}.
+# The delivery tiers alerts.py sorts every push into (the keys of
+# apns.SOUND_FOR_TIER plus the ordinary "info"). The Android app maps a
+# tier to the notification channel that carries its tone
+# (AlertChannel.forTier); anything outside this set is dropped and the
+# phone uses the ordinary channel, as iOS plays "default".
+PUSH_TIERS = ("info", "watch", "major", "warning")
+
+
+def build_message(token: str, title: str, body: str,
+                  route: str | None = None,
+                  server_id: str | None = None,
+                  tier: str | None = None) -> dict:
+    """One FCM HTTP v1 message, DATA-ONLY (F10, Android review 2026-10-14).
+
+    No `notification` block on purpose: with one, a push that arrives while
+    the app is in the background or not running is drawn by the system on
+    the manifest's default channel, and onMessageReceived never sees it,
+    so the tier's channel (its tone) and the tap's route and site were
+    lost. A data-only message at high priority always reaches
+    FcmService.onMessageReceived, which builds the notification itself.
+
+    The keys are the iOS payload's vocabulary (apns.build_payload): `route`
+    and `server_id` validated by the same functions, plus `tier`. FCM data
+    values must be strings; an absent or invalid value is omitted, never
+    sent as null or "None"."""
+    from .apns import valid_route, valid_server_id
+    data: dict[str, str] = {"title": str(title or ""), "body": str(body or "")}
+    r = valid_route(route)
+    if r:
+        data["route"] = r
+    sid = valid_server_id(server_id)
+    if sid:
+        data["server_id"] = sid
+    if tier in PUSH_TIERS:
+        data["tier"] = tier  # type: ignore[assignment]
+    return {"message": {
+        "token": token,
+        "data": data,
+        "android": {"priority": "high"},
+    }}
+
+
+async def push_tokens_fcm(tokens: list[str], title: str, body: str,
+                          route: str | None = None,
+                          server_id: str | None = None,
+                          tier: str | None = None) -> dict[str, Any]:
+    """Send an alert to each FCM token. Returns {sent, dead, failed}.
     `dead` are tokens FCM reports as unregistered/invalid (caller prunes)."""
     sa = _service_account()
     if sa is None:
@@ -149,11 +194,8 @@ async def push_tokens_fcm(tokens: list[str], title: str, body: str) -> dict[str,
     sent, failed, dead = 0, 0, []
     async with httpx.AsyncClient(timeout=10) as client:
         for token in tokens:
-            payload = {"message": {
-                "token": token,
-                "notification": {"title": title, "body": body},
-                "android": {"priority": "high"},
-            }}
+            payload = build_message(token, title, body, route=route,
+                                    server_id=server_id, tier=tier)
             try:
                 resp = await client.post(url, headers=headers, json=payload)
             except Exception as e:  # noqa: BLE001

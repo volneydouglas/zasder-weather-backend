@@ -874,6 +874,34 @@ def test_history_write_throttle(client, monkeypatch):
     assert post("2026-05-25T10:01:50Z", 72, wind={"speed_mph": 5})["inserted"] == 1
 
 
+def test_history_write_throttle_keeps_a_changed_rain_counter(client, monkeypatch):
+    """Inside the throttle window a reading whose rain counter MOVED is
+    stored: the rollups (dashboard and WU rain) read the stored counter, so
+    coalescing it away left both short until the next stored row. Only a
+    change counts, so a dry spell (and every non-rain field) still
+    coalesces exactly as before (PR #103)."""
+    from app import config
+    ih = {"Authorization": "Bearer test-ingest-token"}
+
+    def post(ts, temp, yearly):
+        return client.post("/ingest/custom", headers=ih, json={
+            "device": {"id": "5D5D0200007D"}, "timestamp_utc": ts,
+            "outdoor": {"tempf": temp, "humidity": 50},
+            "rain": {"yearly_in": yearly},
+            "source": "fineoffset-wh24"}).json()
+    monkeypatch.setattr(config.settings, "ingest_min_interval_seconds", 60)
+    assert post("2026-05-25T10:00:00Z", 70, 18.47)["inserted"] == 1
+    # Same counter, other values changed: coalesced (volume unchanged).
+    r = post("2026-05-25T10:00:16Z", 71, 18.47)
+    assert r["inserted"] == 0 and r["throttled"] is True
+    # The counter rose: stored even inside the window.
+    r = post("2026-05-25T10:00:32Z", 71, 18.48)
+    assert r["inserted"] == 1 and r["throttled"] is False
+    # And the window restarts from that row: unchanged again, coalesced.
+    r = post("2026-05-25T10:00:48Z", 71, 18.48)
+    assert r["inserted"] == 0 and r["throttled"] is True
+
+
 def test_device_location_override(client):
     ih = {"Authorization": "Bearer test-ingest-token"}
     ah = {"Authorization": "Bearer test-api-token"}
@@ -4137,6 +4165,15 @@ def test_rule_patch_edits_threshold_and_target(client):
                         json={"enabled": True}).status_code == 404
 
 
+def _wait_for(cond, timeout_s: float = 5.0) -> None:
+    """Poll for a background task's effect (it runs on the TestClient's
+    loop thread, behind the response)."""
+    import time as _time
+    end = _time.monotonic() + timeout_s
+    while not cond() and _time.monotonic() < end:
+        _time.sleep(0.01)
+
+
 def test_public_dashboard_serves_stale_while_revalidating(client, monkeypatch):
     """Doren, 2026-08-25: cold /embed took ~7-10s on his 1.15M-row box and
     the 100s TTL made the FIRST visitor after every quiet spell pay it.
@@ -4161,8 +4198,9 @@ def test_public_dashboard_serves_stale_while_revalidating(client, monkeypatch):
     page = client.get("/embed").text
     assert "stale-page" in page, \
         "stale-but-serveable cache must be returned instantly"
-    # The TestClient portal runs the loop to completion, so the background
-    # refresh has landed by the time the request returns.
+    # The rebuild runs on the TestClient's loop behind the response; it
+    # reads the station list first (PR #92), so wait for it to land.
+    _wait_for(lambda: builds and _m._PUBLIC_DASH_REFRESHING is False)
     assert builds, "no background rebuild was scheduled"
     assert _m._PUBLIC_DASH_CACHE[1] == "<html>build-1</html>"
     assert _m._PUBLIC_DASH_REFRESHING is False
@@ -4197,6 +4235,7 @@ def test_quarter_hour_old_embed_still_serves_instantly(client, monkeypatch):
     page = client.get("/embed").text
     assert "stale-20m" in page, \
         "a 20-minute-old page must serve instantly, not block on a build"
+    _wait_for(lambda: builds)
     assert builds, "the background rebuild must still be scheduled"
 
 

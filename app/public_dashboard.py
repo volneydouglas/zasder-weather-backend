@@ -13,6 +13,7 @@ import html as _html
 import math
 import re
 import time
+from collections.abc import Collection
 from typing import Any
 
 # Core chartable/tile fields. key = API field name (as stored + returned by
@@ -135,6 +136,25 @@ def split_gaps(pts: list[tuple[int, float]], gap_ms: int | None) -> list[list[tu
     return runs
 
 
+def mark_lines(marks: list[tuple[int, str]] | None, px, t0: int, t1: int,
+               height: int) -> str:
+    """Station logbook markers (2.7, opt-in on the public History page):
+    a dashed vertical line at each (ms, note) inside the time domain, the
+    note as its hover title. Empty when there are none, so every chart
+    that is not given marks draws exactly what it drew before."""
+    out = []
+    for t, note in marks or ():
+        if not (t0 <= t <= t1):
+            continue
+        x = px(t)
+        out.append(f'<line class="chart-mark" x1="{x}" x2="{x}" y1="0" '
+                   f'y2="{height}" style="stroke:var(--ink-50)" '
+                   f'stroke-width="1" stroke-dasharray="3 3" '
+                   f'vector-effect="non-scaling-stroke">'
+                   f'<title>{_esc(note)}</title></line>')
+    return "".join(out)
+
+
 def svg_chart(points: list[tuple[int, float]], color: str,
               width: int = 640, height: int = 120,
               overlay: list[tuple[int, float]] | None = None,
@@ -145,7 +165,8 @@ def svg_chart(points: list[tuple[int, float]], color: str,
               time_labels: tuple[str, str, str] = DAY_AXIS,
               empty: str = "no data in the last 24h",
               domain: tuple[int, int] | None = None,
-              gap_ms: int | None = None) -> str:
+              gap_ms: int | None = None,
+              marks: list[tuple[int, str]] | None = None) -> str:
     """Inline SVG area+line chart for a (timestamp_ms, value) series.
 
     `domain` (2.6, the public History page; addendum review A26-02) fixes
@@ -189,6 +210,7 @@ def svg_chart(points: list[tuple[int, float]], color: str,
         f'class="chart-svg" role="img">',
         grid,
     ]
+    svg.append(mark_lines(marks, px, t0, t1, height))
     runs = split_gaps(pts, gap_ms)
     for run in runs:
         if len(run) == 1:
@@ -247,7 +269,8 @@ def svg_multi_chart(series_list: list[tuple[str, str, list[tuple[int, float]]]],
                     unit: str = "",
                     time_labels: tuple[str, str, str] = DAY_AXIS,
                     domain: tuple[int, int] | None = None,
-                    gap_ms: int | None = None) -> str:
+                    gap_ms: int | None = None,
+                    marks: list[tuple[int, str]] | None = None) -> str:
     """N same-unit series on one axis: (label, color, points) each. Lines
     only — stacked area fills over each other read as mud. Series with
     fewer than 2 points are dropped rather than drawn as specks."""
@@ -276,7 +299,8 @@ def svg_multi_chart(series_list: list[tuple[str, str, list[tuple[int, float]]]],
     grid, ylabels, time_row = _axis_html(lo, hi, unit, py, height, time_labels)
     all_pts = [p for _, _, pts in drawn for p in pts]
     svg = [f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none" '
-           f'class="chart-svg" role="img">', grid]
+           f'class="chart-svg" role="img">', grid,
+           mark_lines(marks, px, t0, t1, height)]
     for _, color, pts in drawn:
         for run in split_gaps(pts, gap_ms):
             if len(run) < 2:
@@ -545,6 +569,51 @@ def resolve_fields(raw: str | None) -> list[str]:
         return CORE_FIELDS
     out = [f.strip() for f in raw.split(",") if f.strip() in FIELD_META]
     return out or CORE_FIELDS
+
+
+# The fields that prove a page field was ever reported, in the all-time
+# records or the current reading. Rain is the whole rain family (2.7
+# follow-up F27-02): a gauge that posts only its lifetime counter (SDR,
+# LilyGO) never sends a daily or hourly figure and has no wettest-day
+# record (db.records reads rain_total), yet it measures rain; the page
+# charts the hourly key and the records hold the day's total.
+RAIN_EVIDENCE = ("hourlyrainin", "dailyrainin", "rainratein", "eventrainin",
+                 "weeklyrainin", "monthlyrainin", "yearlyrainin", "totalrainin")
+FIELD_RAIN = "hourlyrainin"
+_EVER_REPORTED_BY: dict[str, tuple[str, ...]] = {FIELD_RAIN: RAIN_EVIDENCE}
+
+
+def shown_fields(fields: list[str], obs: dict[str, Any] | None,
+                 series: dict[str, list], records: dict[str, Any] | None,
+                 measured: Collection[str] = ()) -> list[str]:
+    """`fields` minus the ones this station has never reported (2.7, mirror
+    #8: a barometer-less AcuRite showed an empty Pressure card that read as
+    broken). The all-time records list only fields with at least one
+    reading, so a field missing there, with no current value and nothing in
+    the last 24 hours, has never been sent. Temperature always stays (it is
+    the headline), and with no records yet (a cold cache) nothing is hidden:
+    unknown is not never. A current value keeps the field even without
+    history, which is a shared barometer filling a station that has none.
+
+    `measured`: page fields the caller found derived history for (the
+    daily rain ledger, which outlives the raw readings and holds a
+    counter-only gauge's rain). A value of 0.0 anywhere is evidence: a dry
+    day on a working gauge is not a missing gauge."""
+    if not records:
+        return fields
+    ever = (records.get("periods", {}).get("all", {}) or {}).get("fields")
+    if not isinstance(ever, dict):
+        return fields
+    o = obs or {}
+    out = []
+    for key in fields:
+        evidence = _EVER_REPORTED_BY.get(key, (key,))
+        if (key == "tempf" or key in measured
+                or any(k in ever for k in evidence)
+                or any(_num(o.get(k)) is not None for k in evidence)
+                or series.get(key)):
+            out.append(key)
+    return out
 
 
 def _esc(s: Any) -> str:
@@ -836,7 +905,8 @@ def render_station(name: str, obs: dict[str, Any] | None,
                    app_url: str = "", location: str | None = None,
                    air: bool = False,
                    lightning: dict[str, Any] | None = None,
-                   map_url: str = "") -> str:
+                   map_url: str = "",
+                   measured: Collection[str] = ()) -> str:
     """One station block: current-conditions header + a chart per field.
 
     The temperature chart overlays the feels-like line (from
@@ -851,6 +921,7 @@ def render_station(name: str, obs: dict[str, Any] | None,
         return render_air_station(name, obs, series, app_url=app_url,
                                   location=location)
     o = obs or {}
+    fields = shown_fields(fields, o, series, records, measured)
     temp = _num(o.get("tempf"))
     feels = _num(o.get("feelsLike"))
     temp_html = f"{round(temp)}°" if temp is not None else "—"
@@ -1041,7 +1112,8 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                        location=location if i == 0 else None,
                        air=bool(s.get("air")),
                        lightning=s.get("lightning"),
-                       map_url=s.get("map_url") or "")
+                       map_url=s.get("map_url") or "",
+                       measured=s.get("measured") or ())
         for i, s in enumerate(stations)
     ) + more_html)
 

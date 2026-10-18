@@ -1,0 +1,3277 @@
+{
+ "nobody|30": {
+  "available": false,
+  "leads": [
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 1,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 2,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 3,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 4,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_days": 10,
+  "provider": "nobody",
+  "reason": "the forecast archive has nothing to score yet",
+  "window_days": 30
+ },
+ "nobody|400": {
+  "available": false,
+  "leads": [
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 1,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 2,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 3,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 4,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_days": 10,
+  "provider": "nobody",
+  "reason": "the forecast archive has nothing to score yet",
+  "window_days": 400
+ },
+ "nobody|7": {
+  "available": false,
+  "leads": [
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 1,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 2,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 3,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 4,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_days": 10,
+  "provider": "nobody",
+  "reason": "the forecast archive has nothing to score yet",
+  "window_days": 7
+ },
+ "nobody|90": {
+  "available": false,
+  "leads": [
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 1,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 2,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 3,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 4,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_days": 10,
+  "provider": "nobody",
+  "reason": "the forecast archive has nothing to score yet",
+  "window_days": 90
+ },
+ "open-meteo-gfs|30": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": 0.64,
+     "mae_f": 3.95,
+     "within_3f": 0.4583,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 14.64
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 4.02,
+     "mae_f": 4.42,
+     "within_3f": 0.4167,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 12.31
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.6,
+     "false_alarms": 1,
+     "hits": 5,
+     "misses": 7,
+     "n": 20,
+     "quiet": 7
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": 0.47,
+     "mae_f": 4.0,
+     "within_3f": 0.4167,
+     "worst_day": "2026-08-11",
+     "worst_error_f": 10.51
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 3.92,
+     "mae_f": 4.44,
+     "within_3f": 0.4583,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 11.98
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.45,
+     "false_alarms": 4,
+     "hits": 4,
+     "misses": 7,
+     "n": 20,
+     "quiet": 5
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 3,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -0.26,
+     "mae_f": 3.78,
+     "within_3f": 0.52,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 10.82
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 4.82,
+     "mae_f": 5.18,
+     "within_3f": 0.28,
+     "worst_day": "2026-08-05",
+     "worst_error_f": 10.42
+    },
+    "n": 25,
+    "rain": {
+     "agreed": 0.5238,
+     "false_alarms": 2,
+     "hits": 3,
+     "misses": 8,
+     "n": 21,
+     "quiet": 8
+    },
+    "scored": 25
+   },
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": 0.02,
+     "mae_f": 4.39,
+     "within_3f": 0.3333,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 12.74
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 4.42,
+     "mae_f": 5.18,
+     "within_3f": 0.2917,
+     "worst_day": "2026-08-12",
+     "worst_error_f": 11.78
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.55,
+     "false_alarms": 3,
+     "hits": 6,
+     "misses": 6,
+     "n": 20,
+     "quiet": 5
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": 1.11,
+     "mae_f": 4.08,
+     "within_3f": 0.4583,
+     "worst_day": "2026-08-15",
+     "worst_error_f": 11.59
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 2.61,
+     "mae_f": 4.18,
+     "within_3f": 0.375,
+     "worst_day": "2026-08-12",
+     "worst_error_f": 7.98
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.4762,
+     "false_alarms": 4,
+     "hits": 4,
+     "misses": 7,
+     "n": 21,
+     "quiet": 6
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 3,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": 0.31,
+     "mae_f": 3.49,
+     "within_3f": 0.6,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 12.84
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 4.12,
+     "mae_f": 4.91,
+     "within_3f": 0.32,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 11.61
+    },
+    "n": 25,
+    "rain": {
+     "agreed": 0.4286,
+     "false_alarms": 4,
+     "hits": 4,
+     "misses": 8,
+     "n": 21,
+     "quiet": 5
+    },
+    "scored": 25
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo-gfs",
+  "rain_pop": 50.0,
+  "window_days": 30
+ },
+ "open-meteo-gfs|400": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 14,
+    "excluded_reasons": [
+     {
+      "n": 5,
+      "reason": "partial_day"
+     },
+     {
+      "n": 6,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-23",
+    "high": {
+     "bias_f": 2.01,
+     "mae_f": 4.22,
+     "within_3f": 0.4364,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 14.64
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 3.13,
+     "mae_f": 4.2,
+     "within_3f": 0.3909,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 12.31
+    },
+    "n": 110,
+    "rain": {
+     "agreed": 0.49,
+     "false_alarms": 31,
+     "hits": 18,
+     "misses": 20,
+     "n": 100,
+     "quiet": 31
+    },
+    "scored": 110
+   },
+   {
+    "enough": true,
+    "excluded": 14,
+    "excluded_reasons": [
+     {
+      "n": 5,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-24",
+    "high": {
+     "bias_f": 1.78,
+     "mae_f": 4.2,
+     "within_3f": 0.4037,
+     "worst_day": "2026-07-18",
+     "worst_error_f": 11.18
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 3.26,
+     "mae_f": 4.37,
+     "within_3f": 0.3853,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 11.98
+    },
+    "n": 109,
+    "rain": {
+     "agreed": 0.5368,
+     "false_alarms": 25,
+     "hits": 15,
+     "misses": 19,
+     "n": 95,
+     "quiet": 36
+    },
+    "scored": 109
+   },
+   {
+    "enough": true,
+    "excluded": 10,
+    "excluded_reasons": [
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-25",
+    "high": {
+     "bias_f": 1.91,
+     "mae_f": 4.63,
+     "within_3f": 0.4107,
+     "worst_day": "2026-06-01",
+     "worst_error_f": 13.63
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 3.27,
+     "mae_f": 4.19,
+     "within_3f": 0.4107,
+     "worst_day": "2026-05-14",
+     "worst_error_f": 12.27
+    },
+    "n": 112,
+    "rain": {
+     "agreed": 0.5612,
+     "false_alarms": 26,
+     "hits": 15,
+     "misses": 17,
+     "n": 98,
+     "quiet": 40
+    },
+    "scored": 112
+   },
+   {
+    "enough": true,
+    "excluded": 14,
+    "excluded_reasons": [
+     {
+      "n": 7,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 5,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     }
+    ],
+    "first_day": "2026-04-26",
+    "high": {
+     "bias_f": 1.86,
+     "mae_f": 4.66,
+     "within_3f": 0.3084,
+     "worst_day": "2026-05-20",
+     "worst_error_f": 13.23
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 3.77,
+     "mae_f": 4.56,
+     "within_3f": 0.3832,
+     "worst_day": "2026-08-12",
+     "worst_error_f": 11.78
+    },
+    "n": 107,
+    "rain": {
+     "agreed": 0.4947,
+     "false_alarms": 27,
+     "hits": 13,
+     "misses": 21,
+     "n": 95,
+     "quiet": 34
+    },
+    "scored": 107
+   },
+   {
+    "enough": true,
+    "excluded": 10,
+    "excluded_reasons": [
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-27",
+    "high": {
+     "bias_f": 2.35,
+     "mae_f": 4.31,
+     "within_3f": 0.4455,
+     "worst_day": "2026-06-01",
+     "worst_error_f": 13.43
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 3.06,
+     "mae_f": 4.08,
+     "within_3f": 0.4273,
+     "worst_day": "2026-06-10",
+     "worst_error_f": 12.11
+    },
+    "n": 110,
+    "rain": {
+     "agreed": 0.5152,
+     "false_alarms": 25,
+     "hits": 11,
+     "misses": 23,
+     "n": 99,
+     "quiet": 40
+    },
+    "scored": 110
+   },
+   {
+    "enough": true,
+    "excluded": 12,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-28",
+    "high": {
+     "bias_f": 1.99,
+     "mae_f": 4.21,
+     "within_3f": 0.4673,
+     "worst_day": "2026-07-17",
+     "worst_error_f": 13.74
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 3.52,
+     "mae_f": 4.62,
+     "within_3f": 0.3364,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 11.61
+    },
+    "n": 107,
+    "rain": {
+     "agreed": 0.4796,
+     "false_alarms": 29,
+     "hits": 12,
+     "misses": 22,
+     "n": 98,
+     "quiet": 35
+    },
+    "scored": 107
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo-gfs",
+  "rain_pop": 50.0,
+  "window_days": 400
+ },
+ "open-meteo-gfs|7": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -2.3,
+     "mae_f": 3.13,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -7.15
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 8.13,
+     "mae_f": 8.13,
+     "within_3f": 0.0,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 12.31
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 1.0,
+     "false_alarms": 0,
+     "hits": 0,
+     "misses": 0,
+     "n": 4,
+     "quiet": 4
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -2.56,
+     "mae_f": 2.83,
+     "within_3f": 0.6667,
+     "worst_day": "2026-08-24",
+     "worst_error_f": -7.34
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 6.11,
+     "mae_f": 6.11,
+     "within_3f": 0.1667,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 11.91
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.6,
+     "false_alarms": 2,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 3
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -2.62,
+     "mae_f": 3.26,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-24",
+     "worst_error_f": -6.12
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 7.31,
+     "mae_f": 7.31,
+     "within_3f": 0.0,
+     "worst_day": "2026-08-29",
+     "worst_error_f": 10.39
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 1.0,
+     "false_alarms": 0,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 5
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -2.6,
+     "mae_f": 4.08,
+     "within_3f": 0.1667,
+     "worst_day": "2026-08-27",
+     "worst_error_f": -7.42
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 7.18,
+     "mae_f": 7.18,
+     "within_3f": 0.0,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 9.91
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 1.0,
+     "false_alarms": 0,
+     "hits": 0,
+     "misses": 0,
+     "n": 4,
+     "quiet": 4
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -2.48,
+     "mae_f": 2.48,
+     "within_3f": 0.6667,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -7.1
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 4.63,
+     "mae_f": 4.63,
+     "within_3f": 0.3333,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 7.1
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.6,
+     "false_alarms": 2,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 3
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -1.28,
+     "mae_f": 2.55,
+     "within_3f": 0.8333,
+     "worst_day": "2026-08-27",
+     "worst_error_f": -6.56
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 6.98,
+     "mae_f": 6.98,
+     "within_3f": 0.0,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 11.61
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.0,
+     "false_alarms": 4,
+     "hits": 0,
+     "misses": 0,
+     "n": 4,
+     "quiet": 0
+    },
+    "scored": 6
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo-gfs",
+  "rain_pop": 50.0,
+  "window_days": 7
+ },
+ "open-meteo-gfs|90": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 10,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 4,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 1.94,
+     "mae_f": 3.95,
+     "within_3f": 0.4605,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 14.64
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 3.26,
+     "mae_f": 4.09,
+     "within_3f": 0.4211,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 12.31
+    },
+    "n": 76,
+    "rain": {
+     "agreed": 0.4853,
+     "false_alarms": 20,
+     "hits": 12,
+     "misses": 15,
+     "n": 68,
+     "quiet": 21
+    },
+    "scored": 76
+   },
+   {
+    "enough": true,
+    "excluded": 8,
+    "excluded_reasons": [
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 1.76,
+     "mae_f": 4.06,
+     "within_3f": 0.4359,
+     "worst_day": "2026-07-18",
+     "worst_error_f": 11.18
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 3.36,
+     "mae_f": 4.3,
+     "within_3f": 0.3974,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 11.98
+    },
+    "n": 78,
+    "rain": {
+     "agreed": 0.5,
+     "false_alarms": 19,
+     "hits": 10,
+     "misses": 15,
+     "n": 68,
+     "quiet": 24
+    },
+    "scored": 78
+   },
+   {
+    "enough": true,
+    "excluded": 7,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 1.83,
+     "mae_f": 4.49,
+     "within_3f": 0.4304,
+     "worst_day": "2026-06-01",
+     "worst_error_f": 13.63
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 2.9,
+     "mae_f": 3.91,
+     "within_3f": 0.443,
+     "worst_day": "2026-06-04",
+     "worst_error_f": 11.75
+    },
+    "n": 79,
+    "rain": {
+     "agreed": 0.597,
+     "false_alarms": 14,
+     "hits": 10,
+     "misses": 13,
+     "n": 67,
+     "quiet": 30
+    },
+    "scored": 79
+   },
+   {
+    "enough": true,
+    "excluded": 10,
+    "excluded_reasons": [
+     {
+      "n": 5,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 1.89,
+     "mae_f": 4.49,
+     "within_3f": 0.3421,
+     "worst_day": "2026-06-04",
+     "worst_error_f": 12.83
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 3.59,
+     "mae_f": 4.33,
+     "within_3f": 0.4079,
+     "worst_day": "2026-08-12",
+     "worst_error_f": 11.78
+    },
+    "n": 76,
+    "rain": {
+     "agreed": 0.5,
+     "false_alarms": 18,
+     "hits": 10,
+     "misses": 15,
+     "n": 66,
+     "quiet": 23
+    },
+    "scored": 76
+   },
+   {
+    "enough": true,
+    "excluded": 7,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 2.28,
+     "mae_f": 4.42,
+     "within_3f": 0.4051,
+     "worst_day": "2026-06-01",
+     "worst_error_f": 13.43
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 2.82,
+     "mae_f": 3.96,
+     "within_3f": 0.443,
+     "worst_day": "2026-06-10",
+     "worst_error_f": 12.11
+    },
+    "n": 79,
+    "rain": {
+     "agreed": 0.4789,
+     "false_alarms": 20,
+     "hits": 9,
+     "misses": 17,
+     "n": 71,
+     "quiet": 25
+    },
+    "scored": 79
+   },
+   {
+    "enough": true,
+    "excluded": 6,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 1.86,
+     "mae_f": 3.87,
+     "within_3f": 0.5125,
+     "worst_day": "2026-07-17",
+     "worst_error_f": 13.74
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 3.29,
+     "mae_f": 4.43,
+     "within_3f": 0.3625,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 11.61
+    },
+    "n": 80,
+    "rain": {
+     "agreed": 0.5342,
+     "false_alarms": 19,
+     "hits": 12,
+     "misses": 15,
+     "n": 73,
+     "quiet": 27
+    },
+    "scored": 80
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo-gfs",
+  "rain_pop": 50.0,
+  "window_days": 90
+ },
+ "open-meteo|30": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 5,
+    "excluded_reasons": [
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -1.1,
+     "mae_f": 3.84,
+     "within_3f": 0.4348,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 10.08
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 1.8,
+     "mae_f": 3.45,
+     "within_3f": 0.4348,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 8.62
+    },
+    "n": 23,
+    "rain": {
+     "agreed": 0.5263,
+     "false_alarms": 4,
+     "hits": 6,
+     "misses": 5,
+     "n": 19,
+     "quiet": 4
+    },
+    "scored": 23
+   },
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -1.17,
+     "mae_f": 3.82,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 9.55
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 1.93,
+     "mae_f": 3.35,
+     "within_3f": 0.5417,
+     "worst_day": "2026-08-12",
+     "worst_error_f": 8.43
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.3158,
+     "false_alarms": 6,
+     "hits": 3,
+     "misses": 7,
+     "n": 19,
+     "quiet": 3
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -1.12,
+     "mae_f": 3.68,
+     "within_3f": 0.4167,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 8.14
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 2.17,
+     "mae_f": 3.23,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 9.24
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.381,
+     "false_alarms": 4,
+     "hits": 3,
+     "misses": 9,
+     "n": 21,
+     "quiet": 5
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 3,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -0.86,
+     "mae_f": 3.48,
+     "within_3f": 0.52,
+     "worst_day": "2026-08-15",
+     "worst_error_f": 8.32
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 2.77,
+     "mae_f": 3.65,
+     "within_3f": 0.4,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 9.29
+    },
+    "n": 25,
+    "rain": {
+     "agreed": 0.3182,
+     "false_alarms": 6,
+     "hits": 3,
+     "misses": 9,
+     "n": 22,
+     "quiet": 4
+    },
+    "scored": 25
+   },
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-08-01",
+    "high": {
+     "bias_f": -1.39,
+     "mae_f": 4.07,
+     "within_3f": 0.4167,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 10.87
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 2.82,
+     "mae_f": 3.72,
+     "within_3f": 0.4167,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 9.07
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.5,
+     "false_alarms": 5,
+     "hits": 6,
+     "misses": 5,
+     "n": 20,
+     "quiet": 4
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 5,
+    "excluded_reasons": [
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -0.79,
+     "mae_f": 3.65,
+     "within_3f": 0.4348,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 7.69
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 1.78,
+     "mae_f": 2.73,
+     "within_3f": 0.6087,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 8.43
+    },
+    "n": 23,
+    "rain": {
+     "agreed": 0.5263,
+     "false_alarms": 2,
+     "hits": 4,
+     "misses": 7,
+     "n": 19,
+     "quiet": 6
+    },
+    "scored": 23
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo",
+  "rain_pop": 50.0,
+  "window_days": 30
+ },
+ "open-meteo|400": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 12,
+    "excluded_reasons": [
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 3,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-23",
+    "high": {
+     "bias_f": 0.53,
+     "mae_f": 4.01,
+     "within_3f": 0.4196,
+     "worst_day": "2026-05-18",
+     "worst_error_f": 10.15
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 1.6,
+     "mae_f": 3.15,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 8.62
+    },
+    "n": 112,
+    "rain": {
+     "agreed": 0.5556,
+     "false_alarms": 30,
+     "hits": 22,
+     "misses": 14,
+     "n": 99,
+     "quiet": 33
+    },
+    "scored": 112
+   },
+   {
+    "enough": true,
+    "excluded": 14,
+    "excluded_reasons": [
+     {
+      "n": 5,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-24",
+    "high": {
+     "bias_f": 0.34,
+     "mae_f": 3.99,
+     "within_3f": 0.367,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 9.55
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 1.56,
+     "mae_f": 3.19,
+     "within_3f": 0.5046,
+     "worst_day": "2026-08-12",
+     "worst_error_f": 8.43
+    },
+    "n": 109,
+    "rain": {
+     "agreed": 0.4574,
+     "false_alarms": 26,
+     "hits": 9,
+     "misses": 25,
+     "n": 94,
+     "quiet": 34
+    },
+    "scored": 109
+   },
+   {
+    "enough": true,
+    "excluded": 11,
+    "excluded_reasons": [
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-25",
+    "high": {
+     "bias_f": 0.32,
+     "mae_f": 4.01,
+     "within_3f": 0.4234,
+     "worst_day": "2026-07-17",
+     "worst_error_f": 10.0
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 1.55,
+     "mae_f": 3.04,
+     "within_3f": 0.5225,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 9.24
+    },
+    "n": 111,
+    "rain": {
+     "agreed": 0.47,
+     "false_alarms": 33,
+     "hits": 16,
+     "misses": 20,
+     "n": 100,
+     "quiet": 31
+    },
+    "scored": 111
+   },
+   {
+    "enough": true,
+    "excluded": 10,
+    "excluded_reasons": [
+     {
+      "n": 5,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-26",
+    "high": {
+     "bias_f": 0.62,
+     "mae_f": 3.84,
+     "within_3f": 0.3964,
+     "worst_day": "2026-05-20",
+     "worst_error_f": 11.22
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 1.81,
+     "mae_f": 3.21,
+     "within_3f": 0.5135,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 9.29
+    },
+    "n": 111,
+    "rain": {
+     "agreed": 0.59,
+     "false_alarms": 23,
+     "hits": 15,
+     "misses": 18,
+     "n": 100,
+     "quiet": 44
+    },
+    "scored": 111
+   },
+   {
+    "enough": true,
+    "excluded": 14,
+    "excluded_reasons": [
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 5,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-27",
+    "high": {
+     "bias_f": 0.57,
+     "mae_f": 3.89,
+     "within_3f": 0.4245,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 10.87
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 1.88,
+     "mae_f": 3.39,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 9.07
+    },
+    "n": 106,
+    "rain": {
+     "agreed": 0.5158,
+     "false_alarms": 25,
+     "hits": 14,
+     "misses": 21,
+     "n": 95,
+     "quiet": 35
+    },
+    "scored": 106
+   },
+   {
+    "enough": true,
+    "excluded": 12,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-28",
+    "high": {
+     "bias_f": 0.62,
+     "mae_f": 3.97,
+     "within_3f": 0.3832,
+     "worst_day": "2026-05-30",
+     "worst_error_f": 8.96
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 1.59,
+     "mae_f": 3.15,
+     "within_3f": 0.5514,
+     "worst_day": "2026-06-19",
+     "worst_error_f": 8.97
+    },
+    "n": 107,
+    "rain": {
+     "agreed": 0.5532,
+     "false_alarms": 26,
+     "hits": 18,
+     "misses": 16,
+     "n": 94,
+     "quiet": 34
+    },
+    "scored": 107
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo",
+  "rain_pop": 50.0,
+  "window_days": 400
+ },
+ "open-meteo|7": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": false,
+    "excluded": 1,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     }
+    ],
+    "first_day": "2026-08-24",
+    "high": {
+     "bias_f": -4.08,
+     "mae_f": 4.08,
+     "within_3f": 0.4,
+     "worst_day": "2026-08-27",
+     "worst_error_f": -6.57
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 3.99,
+     "mae_f": 3.99,
+     "within_3f": 0.4,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 8.62
+    },
+    "n": 5,
+    "rain": {
+     "agreed": 0.25,
+     "false_alarms": 3,
+     "hits": 0,
+     "misses": 0,
+     "n": 4,
+     "quiet": 1
+    },
+    "scored": 5
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -4.13,
+     "mae_f": 4.13,
+     "within_3f": 0.3333,
+     "worst_day": "2026-08-24",
+     "worst_error_f": -7.45
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 4.48,
+     "mae_f": 4.48,
+     "within_3f": 0.3333,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 7.88
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.4,
+     "false_alarms": 3,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 2
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 1,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     }
+    ],
+    "first_day": "2026-08-24",
+    "high": {
+     "bias_f": -4.37,
+     "mae_f": 4.37,
+     "within_3f": 0.2,
+     "worst_day": "2026-08-24",
+     "worst_error_f": -6.67
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 4.14,
+     "mae_f": 4.14,
+     "within_3f": 0.4,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 5.9
+    },
+    "n": 5,
+    "rain": {
+     "agreed": 0.8,
+     "false_alarms": 1,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 4
+    },
+    "scored": 5
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -3.43,
+     "mae_f": 3.43,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -5.96
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 5.66,
+     "mae_f": 5.66,
+     "within_3f": 0.0,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 8.0
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.4,
+     "false_alarms": 3,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 2
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -4.61,
+     "mae_f": 4.61,
+     "within_3f": 0.1667,
+     "worst_day": "2026-08-24",
+     "worst_error_f": -7.28
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 4.9,
+     "mae_f": 4.9,
+     "within_3f": 0.0,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 9.07
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.2,
+     "false_alarms": 4,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 1
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 1,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     }
+    ],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -4.05,
+     "mae_f": 4.05,
+     "within_3f": 0.2,
+     "worst_day": "2026-08-24",
+     "worst_error_f": -4.71
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 3.93,
+     "mae_f": 4.17,
+     "within_3f": 0.4,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 8.43
+    },
+    "n": 5,
+    "rain": {
+     "agreed": 0.75,
+     "false_alarms": 1,
+     "hits": 0,
+     "misses": 0,
+     "n": 4,
+     "quiet": 3
+    },
+    "scored": 5
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo",
+  "rain_pop": 50.0,
+  "window_days": 7
+ },
+ "open-meteo|90": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 9,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 3,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 0.58,
+     "mae_f": 3.94,
+     "within_3f": 0.4545,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 10.08
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 1.41,
+     "mae_f": 2.98,
+     "within_3f": 0.5325,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 8.62
+    },
+    "n": 77,
+    "rain": {
+     "agreed": 0.5373,
+     "false_alarms": 22,
+     "hits": 16,
+     "misses": 9,
+     "n": 67,
+     "quiet": 20
+    },
+    "scored": 77
+   },
+   {
+    "enough": true,
+    "excluded": 10,
+    "excluded_reasons": [
+     {
+      "n": 4,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 0.55,
+     "mae_f": 3.98,
+     "within_3f": 0.3816,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 9.55
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 1.41,
+     "mae_f": 2.95,
+     "within_3f": 0.5658,
+     "worst_day": "2026-08-12",
+     "worst_error_f": 8.43
+    },
+    "n": 76,
+    "rain": {
+     "agreed": 0.5156,
+     "false_alarms": 14,
+     "hits": 6,
+     "misses": 17,
+     "n": 64,
+     "quiet": 27
+    },
+    "scored": 76
+   },
+   {
+    "enough": true,
+    "excluded": 7,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 0.37,
+     "mae_f": 3.87,
+     "within_3f": 0.4177,
+     "worst_day": "2026-07-17",
+     "worst_error_f": 10.0
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 1.5,
+     "mae_f": 2.88,
+     "within_3f": 0.557,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 9.24
+    },
+    "n": 79,
+    "rain": {
+     "agreed": 0.4648,
+     "false_alarms": 24,
+     "hits": 13,
+     "misses": 14,
+     "n": 71,
+     "quiet": 20
+    },
+    "scored": 79
+   },
+   {
+    "enough": true,
+    "excluded": 6,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 2,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 0.55,
+     "mae_f": 3.74,
+     "within_3f": 0.425,
+     "worst_day": "2026-06-01",
+     "worst_error_f": 9.71
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 1.59,
+     "mae_f": 2.97,
+     "within_3f": 0.55,
+     "worst_day": "2026-08-02",
+     "worst_error_f": 9.29
+    },
+    "n": 80,
+    "rain": {
+     "agreed": 0.6111,
+     "false_alarms": 16,
+     "hits": 14,
+     "misses": 12,
+     "n": 72,
+     "quiet": 30
+    },
+    "scored": 80
+   },
+   {
+    "enough": true,
+    "excluded": 8,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 0.46,
+     "mae_f": 3.71,
+     "within_3f": 0.4487,
+     "worst_day": "2026-08-20",
+     "worst_error_f": 10.87
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 5,
+    "low": {
+     "bias_f": 1.88,
+     "mae_f": 3.2,
+     "within_3f": 0.5513,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 9.07
+    },
+    "n": 78,
+    "rain": {
+     "agreed": 0.507,
+     "false_alarms": 21,
+     "hits": 12,
+     "misses": 14,
+     "n": 71,
+     "quiet": 24
+    },
+    "scored": 78
+   },
+   {
+    "enough": true,
+    "excluded": 8,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": 0.48,
+     "mae_f": 3.81,
+     "within_3f": 0.3718,
+     "worst_day": "2026-07-17",
+     "worst_error_f": 8.68
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 6,
+    "low": {
+     "bias_f": 1.27,
+     "mae_f": 2.75,
+     "within_3f": 0.6282,
+     "worst_day": "2026-06-19",
+     "worst_error_f": 8.97
+    },
+    "n": 78,
+    "rain": {
+     "agreed": 0.5735,
+     "false_alarms": 18,
+     "hits": 14,
+     "misses": 11,
+     "n": 68,
+     "quiet": 25
+    },
+    "scored": 78
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "open-meteo",
+  "rain_pop": 50.0,
+  "window_days": 90
+ },
+ "twc|30": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 3,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -3.82,
+     "mae_f": 5.03,
+     "within_3f": 0.28,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -9.27
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 0.04,
+     "mae_f": 2.86,
+     "within_3f": 0.52,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 7.55
+    },
+    "n": 25,
+    "rain": {
+     "agreed": 0.5714,
+     "false_alarms": 5,
+     "hits": 7,
+     "misses": 4,
+     "n": 21,
+     "quiet": 5
+    },
+    "scored": 25
+   },
+   {
+    "enough": true,
+    "excluded": 3,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -2.6,
+     "mae_f": 4.25,
+     "within_3f": 0.4,
+     "worst_day": "2026-08-08",
+     "worst_error_f": -8.54
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": -0.25,
+     "mae_f": 3.21,
+     "within_3f": 0.56,
+     "worst_day": "2026-08-01",
+     "worst_error_f": -8.47
+    },
+    "n": 25,
+    "rain": {
+     "agreed": 0.2727,
+     "false_alarms": 5,
+     "hits": 1,
+     "misses": 11,
+     "n": 22,
+     "quiet": 5
+    },
+    "scored": 25
+   },
+   {
+    "enough": true,
+    "excluded": 4,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -3.17,
+     "mae_f": 4.92,
+     "within_3f": 0.3333,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -9.76
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 0.34,
+     "mae_f": 3.1,
+     "within_3f": 0.5417,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 7.71
+    },
+    "n": 24,
+    "rain": {
+     "agreed": 0.5714,
+     "false_alarms": 3,
+     "hits": 6,
+     "misses": 6,
+     "n": 21,
+     "quiet": 6
+    },
+    "scored": 24
+   },
+   {
+    "enough": true,
+    "excluded": 3,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "partial_day"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-07-31",
+    "high": {
+     "bias_f": -2.65,
+     "mae_f": 4.86,
+     "within_3f": 0.28,
+     "worst_day": "2026-08-13",
+     "worst_error_f": -9.87
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 1.14,
+     "mae_f": 3.09,
+     "within_3f": 0.56,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 8.1
+    },
+    "n": 25,
+    "rain": {
+     "agreed": 0.2857,
+     "false_alarms": 6,
+     "hits": 3,
+     "misses": 9,
+     "n": 21,
+     "quiet": 3
+    },
+    "scored": 25
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "twc",
+  "rain_pop": 50.0,
+  "window_days": 30
+ },
+ "twc|400": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 14,
+    "excluded_reasons": [
+     {
+      "n": 5,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-23",
+    "high": {
+     "bias_f": -1.83,
+     "mae_f": 4.58,
+     "within_3f": 0.3273,
+     "worst_day": "2026-05-25",
+     "worst_error_f": -10.51
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": -0.27,
+     "mae_f": 3.04,
+     "within_3f": 0.5182,
+     "worst_day": "2026-05-05",
+     "worst_error_f": -7.97
+    },
+    "n": 110,
+    "rain": {
+     "agreed": 0.64,
+     "false_alarms": 22,
+     "hits": 20,
+     "misses": 14,
+     "n": 100,
+     "quiet": 44
+    },
+    "scored": 110
+   },
+   {
+    "enough": true,
+    "excluded": 12,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-24",
+    "high": {
+     "bias_f": -1.58,
+     "mae_f": 4.53,
+     "within_3f": 0.3333,
+     "worst_day": "2026-05-27",
+     "worst_error_f": -9.88
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": -0.35,
+     "mae_f": 3.27,
+     "within_3f": 0.5225,
+     "worst_day": "2026-08-01",
+     "worst_error_f": -8.47
+    },
+    "n": 111,
+    "rain": {
+     "agreed": 0.51,
+     "false_alarms": 27,
+     "hits": 13,
+     "misses": 22,
+     "n": 100,
+     "quiet": 38
+    },
+    "scored": 111
+   },
+   {
+    "enough": true,
+    "excluded": 12,
+    "excluded_reasons": [
+     {
+      "n": 5,
+      "reason": "partial_day"
+     },
+     {
+      "n": 4,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-25",
+    "high": {
+     "bias_f": -1.68,
+     "mae_f": 4.5,
+     "within_3f": 0.3182,
+     "worst_day": "2026-05-20",
+     "worst_error_f": 10.22
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": -0.15,
+     "mae_f": 3.29,
+     "within_3f": 0.5,
+     "worst_day": "2026-04-29",
+     "worst_error_f": -8.67
+    },
+    "n": 110,
+    "rain": {
+     "agreed": 0.4848,
+     "false_alarms": 27,
+     "hits": 11,
+     "misses": 24,
+     "n": 99,
+     "quiet": 37
+    },
+    "scored": 110
+   },
+   {
+    "enough": true,
+    "excluded": 10,
+    "excluded_reasons": [
+     {
+      "n": 6,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-04-26",
+    "high": {
+     "bias_f": -1.4,
+     "mae_f": 4.44,
+     "within_3f": 0.3874,
+     "worst_day": "2026-05-27",
+     "worst_error_f": -11.14
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 0.19,
+     "mae_f": 3.25,
+     "within_3f": 0.5135,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 8.1
+    },
+    "n": 111,
+    "rain": {
+     "agreed": 0.5106,
+     "false_alarms": 25,
+     "hits": 12,
+     "misses": 21,
+     "n": 94,
+     "quiet": 36
+    },
+    "scored": 111
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "twc",
+  "rain_pop": 50.0,
+  "window_days": 400
+ },
+ "twc|7": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -6.79,
+     "mae_f": 6.79,
+     "within_3f": 0.0,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -9.27
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": 1.79,
+     "mae_f": 2.84,
+     "within_3f": 0.6667,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 7.55
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.6,
+     "false_alarms": 2,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 3
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -5.39,
+     "mae_f": 5.39,
+     "within_3f": 0.1667,
+     "worst_day": "2026-08-27",
+     "worst_error_f": -8.21
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": 1.63,
+     "mae_f": 1.63,
+     "within_3f": 0.8333,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 3.08
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.2,
+     "false_alarms": 4,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 1
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -6.41,
+     "mae_f": 6.41,
+     "within_3f": 0.1667,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -9.76
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": 3.32,
+     "mae_f": 3.55,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-27",
+     "worst_error_f": 7.71
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.6,
+     "false_alarms": 2,
+     "hits": 0,
+     "misses": 0,
+     "n": 5,
+     "quiet": 3
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "first_day": "2026-08-23",
+    "high": {
+     "bias_f": -6.27,
+     "mae_f": 6.27,
+     "within_3f": 0.1667,
+     "worst_day": "2026-08-27",
+     "worst_error_f": -8.41
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": 2.97,
+     "mae_f": 2.97,
+     "within_3f": 0.5,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 8.1
+    },
+    "n": 6,
+    "rain": {
+     "agreed": 0.25,
+     "false_alarms": 3,
+     "hits": 0,
+     "misses": 0,
+     "n": 4,
+     "quiet": 1
+    },
+    "scored": 6
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "twc",
+  "rain_pop": 50.0,
+  "window_days": 7
+ },
+ "twc|90": {
+  "available": true,
+  "close_f": 3.0,
+  "coords_station": "Yard",
+  "leads": [
+   {
+    "enough": true,
+    "excluded": 9,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 3,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": -1.81,
+     "mae_f": 4.46,
+     "within_3f": 0.3247,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -9.27
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 1,
+    "low": {
+     "bias_f": -0.3,
+     "mae_f": 2.91,
+     "within_3f": 0.5584,
+     "worst_day": "2026-06-04",
+     "worst_error_f": 7.61
+    },
+    "n": 77,
+    "rain": {
+     "agreed": 0.6522,
+     "false_alarms": 16,
+     "hits": 16,
+     "misses": 8,
+     "n": 69,
+     "quiet": 29
+    },
+    "scored": 77
+   },
+   {
+    "enough": true,
+    "excluded": 7,
+    "excluded_reasons": [
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-03",
+    "high": {
+     "bias_f": -1.42,
+     "mae_f": 4.4,
+     "within_3f": 0.3418,
+     "worst_day": "2026-07-11",
+     "worst_error_f": -8.7
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 2,
+    "low": {
+     "bias_f": -0.46,
+     "mae_f": 3.11,
+     "within_3f": 0.5443,
+     "worst_day": "2026-08-01",
+     "worst_error_f": -8.47
+    },
+    "n": 79,
+    "rain": {
+     "agreed": 0.4493,
+     "false_alarms": 20,
+     "hits": 7,
+     "misses": 18,
+     "n": 69,
+     "quiet": 24
+    },
+    "scored": 79
+   },
+   {
+    "enough": true,
+    "excluded": 8,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 2,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": -1.51,
+     "mae_f": 4.36,
+     "within_3f": 0.3333,
+     "worst_day": "2026-08-29",
+     "worst_error_f": -9.76
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 3,
+    "low": {
+     "bias_f": -0.39,
+     "mae_f": 3.08,
+     "within_3f": 0.5385,
+     "worst_day": "2026-07-24",
+     "worst_error_f": -8.46
+    },
+    "n": 78,
+    "rain": {
+     "agreed": 0.5,
+     "false_alarms": 19,
+     "hits": 10,
+     "misses": 15,
+     "n": 68,
+     "quiet": 24
+    },
+    "scored": 78
+   },
+   {
+    "enough": true,
+    "excluded": 7,
+    "excluded_reasons": [
+     {
+      "n": 3,
+      "reason": "partial_day"
+     },
+     {
+      "n": 2,
+      "reason": "no_measurement"
+     },
+     {
+      "n": 1,
+      "reason": "no_forecast"
+     },
+     {
+      "n": 1,
+      "reason": "coverage_unknown"
+     }
+    ],
+    "first_day": "2026-06-01",
+    "high": {
+     "bias_f": -1.54,
+     "mae_f": 4.52,
+     "within_3f": 0.3291,
+     "worst_day": "2026-08-13",
+     "worst_error_f": -9.87
+    },
+    "last_day": "2026-08-29",
+    "lead_days": 4,
+    "low": {
+     "bias_f": -0.03,
+     "mae_f": 3.17,
+     "within_3f": 0.519,
+     "worst_day": "2026-08-23",
+     "worst_error_f": 8.1
+    },
+    "n": 79,
+    "rain": {
+     "agreed": 0.4688,
+     "false_alarms": 17,
+     "hits": 8,
+     "misses": 17,
+     "n": 64,
+     "quiet": 22
+    },
+    "scored": 79
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 5,
+    "n": 0,
+    "scored": 0
+   },
+   {
+    "enough": false,
+    "excluded": 0,
+    "excluded_reasons": [],
+    "lead_days": 6,
+    "n": 0,
+    "scored": 0
+   }
+  ],
+  "min_cover_hours": 20.0,
+  "min_days": 10,
+  "provider": "twc",
+  "rain_pop": 50.0,
+  "window_days": 90
+ }
+}

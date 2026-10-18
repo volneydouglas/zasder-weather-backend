@@ -443,7 +443,8 @@ assert _WRITE_CASES, "route scan found no write routes — scanner broke"
 def test_a_guest_token_cannot_reach_any_write_route(guest_client, method, path):
     """Share codes go to family by message. One must never be able to delete a
     device, rewrite alert rules, or restore a config backup."""
-    url = path.replace("{mac}", "AA:BB:CC:DD:EE:FF").replace("{rule_id}", "1")
+    url = path.replace("{mac}", "AA:BB:CC:DD:EE:FF").replace("{rule_id}", "1") \
+              .replace("{entry_id}", "1")
     r = guest_client.request(method, url, headers=H_GUEST, json={})
     assert r.status_code in (401, 403), (
         f"{method} {path} accepted a read-only guest token ({r.status_code})")
@@ -499,6 +500,12 @@ SHARED_WRITE_BY_DESIGN = {
     ("POST", "/api/push/unregister"),
     ("POST", "/api/push/live-activity-token"),
     ("POST", "/api/storm/watch/start"),
+    # 2.7: the station logbook (notes beside the location and name editors
+    # in station settings). Annotating a station is station ops; the notes
+    # are audited like every write-share write.
+    ("POST", "/api/devices/{mac}/logbook"),
+    ("PATCH", "/api/devices/{mac}/logbook/{entry_id}"),
+    ("DELETE", "/api/devices/{mac}/logbook/{entry_id}"),
 }
 
 
@@ -578,7 +585,8 @@ def test_a_write_share_token_reaches_every_station_ops_route(
     status except 401/403 (validation 422s and unknown-mac 404s are the
     handler speaking, which means auth admitted us)."""
     client, token = write_share_client
-    url = path.replace("{mac}", "AA:BB:CC:DD:EE:FF").replace("{rule_id}", "1")
+    url = path.replace("{mac}", "AA:BB:CC:DD:EE:FF").replace("{rule_id}", "1") \
+              .replace("{entry_id}", "1")
     r = client.request(method, url,
                        headers={"Authorization": f"Bearer {token}"}, json={})
     # Membership in an expected set, not `not in (401, 403)` (R12): a 500

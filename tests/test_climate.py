@@ -122,6 +122,34 @@ def test_daily_series_year_span(client, monkeypatch):
     ]
 
 
+def test_daily_series_rain_is_rounded_like_the_other_rain_figures(client, monkeypatch):
+    """A counter-only day's rain is a sum of rises, so it carries float
+    dust (0.11999999999999744 on the 2.7 RC smoke test). Served at the
+    three places /current's rain buckets use; the stored value is not
+    touched. A dry day stays 0.0 and a gauge-less day stays None."""
+    from app import db
+    from app.config import settings
+    monkeypatch.setattr(settings, "insights", True)
+    dusty = 10.37 - 10.25
+
+    async def run():
+        async with db.connect() as conn:
+            for day, rise in (("2025-03-01", dusty), ("2025-03-02", 0.0),
+                              ("2025-03-03", None)):
+                await conn.execute(
+                    "INSERT INTO daily_rollups (mac, day, tempf_min, tempf_max, "
+                    "yearly_rise) VALUES (?, ?, 50, 70, ?)", (MAC, day, rise))
+            await conn.commit()
+            return (await (await conn.execute(
+                "SELECT yearly_rise FROM daily_rollups WHERE day = '2025-03-01'"
+            )).fetchone())[0]
+    stored = asyncio.run(run())
+    assert stored == dusty and stored != round(dusty, 3)
+    r = client.get(f"/api/devices/{MAC}/daily-series?days=7&end_day=2025-03-03",
+                   headers=H)
+    assert [row[4] for row in r.json()["series"]] == [0.12, 0.0, None]
+
+
 def test_climate_routes_404_without_insights(client):
     for path in (f"/api/devices/{MAC}/climate?year=2025",
                  f"/api/devices/{MAC}/reports/noaa?year=2025",

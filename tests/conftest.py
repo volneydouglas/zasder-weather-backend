@@ -107,6 +107,8 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         _m._PUBLIC_DASH_LOCK = None     # rebound to each test's event loop
         _m._PUBLIC_DASH_REFRESHING = False   # a test's leaked flag would
         _m._PUBLIC_DASH_REFRESH_TASK = None  # silently disable SWR forever
+        _m._PUBLIC_DASH_KEEPWARM_TASK = None
+        _m._PUBLIC_DASH_LAST_BUILD_S = 0.0   # paces the keep-warm task
         _m._OBS_COUNT_CACHE.clear()
         _m._OBS_COUNT_TASKS.clear()
         # The health probe's answer and its single-flight lock (round-three
@@ -133,6 +135,17 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _nb = sys.modules.get("app.neighbors")
     if _nb is not None:
         _nb._LOCKS.clear()
+    # 2.7 daily ET: the retry memory of days that had no ET, and the
+    # per-station background fills (tasks bound to a previous test's loop).
+    _det = sys.modules.get("app.daily_et")
+    if _det is not None:
+        _det._ATTEMPTED.clear()
+        _det._FILL_TASKS.clear()
+        # R27-03's invalidation generations: an invalidation a test left
+        # open would refuse every later test's stores for that station.
+        _det._OPEN.clear()
+        _det._CLOSED.clear()
+        _det._SEQ = 0
     # 1.8 modules keep small process-global throttles; same isolation rule.
     _wp = sys.modules.get("app.widget_push")
     if _wp is not None:
@@ -161,6 +174,7 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         return None
     _fs._fetch_daily = _no_fetch
     _fs._fetch_twc = _no_fetch      # 2.6: TWC is archived on the same beat
+    _fs._fetch_models = _no_fetch   # 2.7: the Open-Meteo models, one call
     # Disk watch (1.9) reads the HOST machine's real volume — a developer
     # laptop past 85% used makes every tick fire disk_low and skews any
     # test that counts _deliver calls. Pin a healthy fake; disk tests

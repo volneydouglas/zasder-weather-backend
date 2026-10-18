@@ -16,6 +16,7 @@ String backendUrl;
 String ingestToken;
 String setupKey;
 bool forwardAll = false;
+bool atlasUvLuxBroken = false;
 
 static WebServer server(80);
 static Preferences prefs;
@@ -87,6 +88,7 @@ void loadFromNvs() {
   ingestToken = prefs.getString("ingest_token", "");
   provisioned = prefs.getBool("provisioned", false);
   forwardAll  = prefs.getBool("forward_all", false);
+  atlasUvLuxBroken = prefs.getBool("atlas_uvlux_off", false);
   // Per-device setup key: mint + persist on first boot (or after an NVS
   // erase). Kept separate from the token so a 401 wipe never removes it.
   bool minted = false;
@@ -212,6 +214,7 @@ static void handleStatus() {
   body += "  \"token_len\": "    + String((unsigned) ingestToken.length()) + ",\n";
   body += "  \"provisioned\": "  + String(provisioned ? "true" : "false") + ",\n";
   body += "  \"forward_all\": "  + String(forwardAll ? "true" : "false") + ",\n";
+  body += "  \"atlas_uv_lux_broken\": " + String(atlasUvLuxBroken ? "true" : "false") + ",\n";
   body += "  \"pkts_decoded\": " + String(pktsDecoded) + ",\n";
   body += "  \"pkts_posted_ok\": "+ String(pktsPostedOk) + ",\n";
   body += "  \"pkts_401\": "     + String(pkts401) + ",\n";
@@ -367,10 +370,20 @@ static void handleProvision() {
     Serial.printf("forward_all=%s\n", forwardAll ? "true" : "false");
     changed = true;
   }
+  // Optional: Atlas UV/light mask (see config_server.h). NVS keys cap at
+  // 15 characters, hence the shorter stored name.
+  if (server.hasArg("atlas_uv_lux_broken")) {
+    String v = server.arg("atlas_uv_lux_broken");
+    v.trim(); v.toLowerCase();
+    atlasUvLuxBroken = (v == "1" || v == "true" || v == "on");
+    prefs.putBool("atlas_uvlux_off", atlasUvLuxBroken);
+    Serial.printf("atlas_uv_lux_broken=%s\n", atlasUvLuxBroken ? "true" : "false");
+    changed = true;
+  }
   if (!changed) {
     server.send(400, "text/plain",
                 "expected at least one of backend_url, ingest_token, "
-                "forward_all as form/query args");
+                "forward_all, atlas_uv_lux_broken as form/query args");
     return;
   }
   // First successful provision flips the lock; from now on changes

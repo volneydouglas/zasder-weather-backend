@@ -1021,13 +1021,30 @@ def _adds_field(new: dict[str, Any], prev: dict[str, Any]) -> bool:
     """True if `new` provides a non-null value for a sensor field that `prev`
     lacks (null or absent). Such a reading is a multi-source composite
     contribution and must be stored even inside the throttle window; a reading
-    that only changes existing values can be safely coalesced."""
+    that only changes existing values can be safely coalesced.
+
+    One exception: a MOVED rain counter (`yearlyrainin`, the lifetime counter
+    an SDR source posts and the year-to-date the cloud ones do) is stored
+    too. The rain rollups difference the stored counter, so coalescing a
+    rise left the dashboard's and the WU upload's hour and day short until
+    the next stored row (CodeRabbit, PR #103). It only moves when rain
+    falls (or the gauge resets, which the rollups need to see as well), so
+    a dry station coalesces exactly as before."""
     for k, v in new.items():
         if k in _THROTTLE_IGNORE or v is None:
             continue
         if prev.get(k) is None:
             return True
+        if k == "yearlyrainin" and _counter_moved(v, prev[k]):
+            return True
     return False
+
+
+def _counter_moved(new: Any, old: Any) -> bool:
+    try:
+        return abs(float(new) - float(old)) > 1e-6
+    except (TypeError, ValueError):
+        return new != old
 
 
 # ── Write-behind during the chart-index rebuild (2.0) ────────────────────

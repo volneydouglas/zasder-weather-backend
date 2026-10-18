@@ -440,6 +440,10 @@ def test_the_morning_report_it_sent_is_the_report_you_can_open(client,
     # The push says where to land, and it lands on the row that was stored.
     assert pushes and pushes[0]["route"] == f"report/{row['id']}"
     assert la_sends[0][1]["aps"]["content-state"]["reportId"] == row["id"]
+    # And the alert log row names it (F27-07), so the app opens this
+    # report from the log rather than the nearest one by time.
+    logged = client.get("/api/alerts/recent", headers=AUTH).json()["alerts"]
+    assert [a["report_id"] for a in logged if a["kind"] == "digest"] == [row["id"]]
 
     detail = client.get(f"/api/reports/{row['id']}", headers=AUTH).json()
     payload = detail["report"]["payload"]
@@ -581,3 +585,77 @@ def test_a_storm_summary_becomes_a_report(client, monkeypatch):
     detail = client.get(f"/api/reports/{rid}", headers=AUTH).json()["report"]
     assert detail["payload"]["temp_drop_f"] == 20.9
     assert detail["mac"] == "5D:5D:05:00:00:01"
+
+
+# ── the alert log names the report it announced (2.7, F27-07) ──────────
+#
+# The push has always carried `report/<id>`; the alert_log row did not, so
+# the apps matched a logged report alert to a report by timestamp and
+# could open yesterday's when today's was never stored. The row now keeps
+# the id from the same route, and /api/alerts/recent returns it.
+
+def test_a_report_alert_row_names_its_report_and_nothing_else_does(client):
+    from app import alerts
+
+    async def go():
+        cfg = await alerts.effective_config()
+        for kind, route in (("outlook", "report/12"), ("storm", "report/13"),
+                            ("sky", "report/14"), ("digest", None),
+                            ("rule", "rule/4"), ("device_down", None)):
+            await alerts._deliver(cfg, "s", "b", f"{kind} title", "b",
+                                  kind=kind, mac="AA:BB:CC:00:00:01", route=route)
+    asyncio.run(go())
+    rows = client.get("/api/alerts/recent", headers=AUTH).json()["alerts"]
+    got = {r["kind"]: r["report_id"] for r in rows}
+    # A report the server could not store has no route and no id: the
+    # app then opens that kind's list, never a guess.
+    assert got == {"outlook": 12, "storm": 13, "sky": 14, "digest": None,
+                   "rule": None, "device_down": None}
+    assert all("report_id" in r for r in rows)
+
+
+def test_an_alert_log_from_before_report_id_migrates_and_reads_null(temp_env):
+    """The 2.6 alert_log (severity and rule_id, no report_id) with a row
+    in it: init_db adds the column in place, the old row reads null, and
+    a new report alert stores its id beside it."""
+    import importlib
+    import sqlite3
+    import app.config
+    import app.db
+    importlib.reload(app.config)
+    importlib.reload(app.db)
+    from app import db as fresh_db
+    path = app.config.settings.database_path
+
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE alert_log (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_ms     INTEGER NOT NULL,
+            kind      TEXT NOT NULL,
+            mac       TEXT,
+            title     TEXT NOT NULL,
+            body      TEXT,
+            delivered INTEGER NOT NULL DEFAULT 1,
+            severity  TEXT,
+            rule_id   INTEGER
+        );
+        INSERT INTO alert_log (ts_ms, kind, mac, title, body, delivered, severity)
+        VALUES (1792000000000, 'digest', NULL, 'Morning report', 'b', 1, 'info');
+    """)
+    con.commit()
+    con.close()
+
+    asyncio.run(fresh_db.init_db())
+    asyncio.run(fresh_db.init_db())          # a second boot is a no-op
+    con = sqlite3.connect(path)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(alert_log)")]
+    con.close()
+    assert cols.count("report_id") == 1
+
+    async def use():
+        await fresh_db.log_alert(1792000060000, "outlook", None, "Outlook", "b",
+                                 True, severity="info", report_id=21)
+        return await fresh_db.recent_alerts()
+    rows = asyncio.run(use())
+    assert [(r["kind"], r["report_id"]) for r in rows] == [("outlook", 21), ("digest", None)]

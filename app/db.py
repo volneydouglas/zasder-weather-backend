@@ -416,6 +416,10 @@ CREATE TABLE IF NOT EXISTS forecast_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_fsnap_valid
     ON forecast_snapshots (provider, valid_date);
+-- 2.7: "collecting since" per forecast source reads each provider's runs
+-- in issue order (forecast_snapshots.archive_span).
+CREATE INDEX IF NOT EXISTS idx_fsnap_issued
+    ON forecast_snapshots (provider, issued_ms);
 
 -- 1.8 Storm Watch Live Activity bookkeeping, one row per open episode:
 -- which episode the Activity was started for (so a restart never
@@ -784,6 +788,43 @@ CREATE TABLE IF NOT EXISTS alert_log (
     body      TEXT,
     delivered INTEGER NOT NULL DEFAULT 1
 );
+
+-- Daily reference evapotranspiration (2.7, the water balance). One row per
+-- station per COMPLETE local day (settings tz), written by app/daily_et.py
+-- shortly after midnight or lazily on read. INCHES, API-native. A day with
+-- no ET has NO row (absent is not zero; a missing row is retried), so
+-- et_in and method are never NULL here. Rows for a day are deleted when
+-- that day's readings change (an import, a late delivery, a restore, a
+-- rollup rebuild) and recomputed on the next read.
+CREATE TABLE IF NOT EXISTS daily_et (
+    mac         TEXT NOT NULL,
+    day         TEXT NOT NULL,        -- local YYYY-MM-DD
+    et_in       REAL NOT NULL,
+    method      TEXT NOT NULL,        -- 'penman-monteith' | 'hargreaves'
+    computed_ms INTEGER NOT NULL,
+    PRIMARY KEY (mac, day)
+) WITHOUT ROWID;
+
+-- The station logbook (2.7, app/logbook.py, docs/2.7/LOGBOOK.md): why a
+-- chart jumps. source 'user' is typed by a person (backdatable, editable);
+-- 'auto' is written by the server beside a calibration or location change,
+-- in the same transaction, with `kind` and a JSON `detail` of the change.
+-- Values in notes and detail are API-native (°F, inHg, %). Created here
+-- on an older database (CREATE IF NOT EXISTS; nothing to backfill),
+-- deleted with the device, brought along by a database restore.
+CREATE TABLE IF NOT EXISTS logbook (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac         TEXT NOT NULL,
+    ts_ms       INTEGER NOT NULL,
+    note        TEXT NOT NULL,
+    field       TEXT,                 -- an API field name, or NULL
+    source      TEXT NOT NULL,        -- 'user' | 'auto'
+    kind        TEXT,                 -- auto: 'calibration' | 'location'
+    detail_json TEXT,
+    created_ms  INTEGER NOT NULL,
+    updated_ms  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_logbook_mac_ts ON logbook (mac, ts_ms);
 """
 
 
@@ -1362,6 +1403,14 @@ async def init_db(path: str | None = None) -> None:
         if "rule_id" not in existing:
             await db.execute(
                 "ALTER TABLE alert_log ADD COLUMN rule_id INTEGER")
+        # 2.7 (follow-up review F27-07): the stored report a report alert
+        # announced (a morning report, outlook, storm summary, sky note),
+        # so a tap opens that report instead of guessing by timestamp.
+        # NULL for every other kind, for a report that could not be
+        # stored, and for older rows.
+        if "report_id" not in existing:
+            await db.execute(
+                "ALTER TABLE alert_log ADD COLUMN report_id INTEGER")
         # Same migration for device_alert_prefs: storm_summary (1.7 per-
         # station mute) came after the table shipped in 1.4. NULL = on.
         cur = await db.execute("PRAGMA table_info(device_alert_prefs)")
@@ -2122,15 +2171,32 @@ async def set_calibration(mac: str, table: dict[str, float]) -> bool:
     """Replace a station's corrections. An empty table clears the column
     rather than storing an empty object. False when the MAC is unknown,
     for the same reason set_device_display_name returns it: there is
-    nothing to attach a correction to until the station has posted."""
-    from . import calibration
+    nothing to attach a correction to until the station has posted.
+
+    2.7: every field whose correction actually changed gets an automatic
+    logbook entry, written in the same transaction (app/logbook.py). A
+    save that changes nothing writes nothing. This is the one door both
+    the PUT route and the config restore use, so either one is recorded."""
+    from . import calibration, logbook
     cleaned = calibration.clean(table)
     async with connect() as db:
-        cur = await db.execute(
+        row = await (await db.execute(
+            "SELECT calibration_json FROM devices WHERE mac = ?",
+            (mac,))).fetchone()
+        if row is None:
+            return False
+        try:
+            old = calibration.clean(json.loads(row[0])) if row[0] else {}
+        except ValueError:
+            old = {}
+        await db.execute(
             "UPDATE devices SET calibration_json = ? WHERE mac = ?",
             (json.dumps(cleaned) if cleaned else None, mac))
+        await logbook.insert_auto(db, mac,
+                                  logbook.calibration_entries(old, cleaned),
+                                  int(time.time() * 1000))
         await db.commit()
-        return cur.rowcount > 0
+        return True
 
 
 async def all_calibrations() -> dict[str, dict[str, float]]:
@@ -2646,7 +2712,36 @@ async def upsert_device(mac: str, info: dict[str, Any]) -> None:
     # `name` sits behind the same guard: an out-of-order post carrying an
     # explicit device.name used to rename the device even while its older
     # location/info were correctly rejected.
-    async with connect() as db:
+    #
+    # 2.7 follow-up F27-04: this is the other writer of a station's
+    # coordinates (ingest and the cloud pollers), and stored Hargreaves ET
+    # was computed from the latitude. When an ACCEPTED update moves the
+    # effective latitude (read the way the ET store reads it, so an
+    # operator-set location and the out-of-order guard above both decide),
+    # the Hargreaves days drop exactly as set_device_location drops them,
+    # inside an invalidation. Unchanged coordinates (every ordinary post)
+    # drop nothing, and a post that carries no coordinates is not a move:
+    # sources that omit them on some posts must not churn the ET.
+    #
+    # A missing coordinate is not a move, and not a removal either
+    # (CodeRabbit, PR #111): an update with no valid lat/lon pair keeps the
+    # station's last valid `info.coords`. Before this, such a post blanked
+    # the place for every reader of info.coords (the apps' location, the
+    # forecast and sun times, the station map) until the next post that
+    # had one, and a move after it was measured from "no place" and kept
+    # the old latitude's ET. A post that does carry coordinates replaces
+    # them as before. The `location` column is the incoming one, unchanged.
+    from . import daily_et
+    async with connect() as db, daily_et.Invalidation(mac) as et_guard:
+        await db.execute("BEGIN IMMEDIATE")
+        lat_before = await daily_et._station_lat_now(db, mac)
+        if daily_et.station_lat({"info": inner}) is None:
+            prev = await (await db.execute(
+                "SELECT info_json FROM devices WHERE mac = ?", (mac,))).fetchone()
+            prev_coords = ((_parse_json_col(prev["info_json"]).get("info") or {})
+                           .get("coords") if prev else None)
+            if daily_et.station_lat({"info": {"coords": prev_coords}}) is not None:
+                info = {**info, "info": {**inner, "coords": prev_coords}}
         await db.execute(
             """
             INSERT INTO devices (mac, name, location, info_json, last_seen_ms)
@@ -2675,6 +2770,13 @@ async def upsert_device(mac: str, info: dict[str, Any]) -> None:
             (mac, insert_name, location, json.dumps(info), last_seen_ms,
              explicit_name),
         )
+        if lat_before is not None:
+            lat_after = await daily_et._station_lat_now(db, mac)
+            if lat_after is not None and lat_after != lat_before:
+                et_guard.open()
+                await db.execute(
+                    "DELETE FROM daily_et WHERE mac = ? AND method = 'hargreaves'",
+                    (mac,))
         await db.commit()
 
 
@@ -2727,7 +2829,10 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]],
         scrubbed_by_ts[ts] = r
         values = [r.get(_FIELD_MAP[c]) for c in _COLUMNS]
         payload.append((mac, ts, json.dumps(r), *values))
-    async with connect() as db:
+    from . import daily_et as _det
+    # et_guard: R27-03, opened just before the stored-ET delete below and
+    # closed after the commit, so a fill in flight cannot store over it.
+    async with connect() as db, _det.Invalidation(mac) as et_guard:
         # Which timestamps are actually NEW? INSERT OR IGNORE silently skips
         # duplicates, and the insights rollups must not double-count a
         # re-delivered row's values — so diff against what exists first.
@@ -2775,6 +2880,16 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]],
                      if ts in scrubbed_by_ts]
             await update_rollups(db, mac, fresh)
         added = cur.rowcount or 0
+        # 2.7: a stored daily ET is only as good as the readings it was
+        # computed from. Rows landing on a COMPLETE past day (an import, a
+        # relay's backlog after midnight) drop that day's stored value so
+        # the next read recomputes it from what the day now holds.
+        stored_ts = (sorted(new_ts) if new_ts is not None
+                     else [p[1] for p in payload] if added else [])
+        et_days = _complete_past_days(stored_ts)
+        if et_days:
+            et_guard.open()
+            await _drop_daily_et_days(db, mac, et_days)
         if received and added:
             slot = (int(time.time() * 1000) // ARRIVAL_RX_SLOT_MS) * ARRIVAL_RX_SLOT_MS
             stamped = await db.execute(
@@ -2783,7 +2898,38 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]],
                 await db.execute("DELETE FROM arrival_rx WHERE mac = ? AND slot_ms < ?",
                                  (mac, slot - ARRIVAL_RX_KEEP_MS))
         await db.commit()
-        return added
+    if et_days:
+        _det.forget(mac, et_days)
+    return added
+
+
+def _complete_past_days(ts_list: list) -> list[str]:
+    """The complete local days (ISO) that `ts_list` (ms) touches. Today's
+    readings touch nothing: today is never stored. The common live post
+    is one timestamp after local midnight and costs one comparison."""
+    if not ts_list:
+        return []
+    from datetime import datetime as _dt, timezone as _tzu
+    from zoneinfo import ZoneInfo
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = _tzu.utc
+    midnight = _dt.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    cut = int(midnight.timestamp() * 1000)
+    return sorted({_dt.fromtimestamp(int(t) / 1000, tz).date().isoformat()
+                   for t in ts_list
+                   if isinstance(t, (int, float)) and t < cut})
+
+
+async def _drop_daily_et_days(db, mac: str, days: list[str]) -> None:
+    """Delete the stored daily ET of `days` inside the caller's
+    transaction. The caller has opened the invalidation (R27-03)."""
+    for i in range(0, len(days), 500):
+        part = days[i:i + 500]
+        await db.execute(
+            "DELETE FROM daily_et WHERE mac = ? AND day IN (%s)"
+            % ",".join("?" * len(part)), [mac, *part])
 
 
 async def last_stored_observation(mac: str) -> tuple[int, dict[str, Any]] | None:
@@ -2810,8 +2956,34 @@ async def last_stored_observation(mac: str) -> tuple[int, dict[str, Any]] | None
 async def set_device_location(mac: str, lat: float, lon: float,
                               label: str | None, now_ms: int) -> None:
     """Persist an operator-set location for a device (iOS per-device Location
-    setting). Overrides the ingest-time default in list_devices."""
-    async with connect() as db:
+    setting). Overrides the ingest-time default in list_devices.
+
+    2.7: a save that moves the station's point (against the override, or
+    the ingest-time coordinates when there was none) writes an automatic
+    logbook entry in the same transaction; a re-save of the same point or
+    a new place name alone does not. Only for a station that has posted:
+    the logbook belongs to a device row."""
+    from . import daily_et, logbook
+    # R27-03: the Hargreaves delete below is an invalidation; a fill in
+    # flight with the old latitude must not store after it.
+    async with connect() as db, daily_et.Invalidation(mac, opened=True):
+        dev = await (await db.execute(
+            "SELECT info_json FROM devices WHERE mac = ?", (mac,))).fetchone()
+        entry = None
+        if dev is not None:
+            prev = await (await db.execute(
+                "SELECT lat, lon FROM device_location WHERE mac = ?",
+                (mac,))).fetchone()
+            old: tuple[float, float] | None = None
+            if prev is not None:
+                old = (float(prev["lat"]), float(prev["lon"]))
+            else:
+                c = (((_parse_json_col(dev["info_json"]).get("info") or {})
+                      .get("coords") or {}).get("coords") or {})
+                o_lat, o_lon = _tolerant_float(c.get("lat")), _tolerant_float(c.get("lon"))
+                if o_lat is not None and o_lon is not None:
+                    old = (o_lat, o_lon)
+            entry = logbook.location_entry(old, (float(lat), float(lon)))
         await db.execute(
             """
             INSERT INTO device_location (mac, lat, lon, label, updated_ms)
@@ -2822,6 +2994,13 @@ async def set_device_location(mac: str, lat: float, lon: float,
             """,
             (mac, lat, lon, label, now_ms),
         )
+        # 2.7: Hargreaves reads the latitude; a station that moved (or had
+        # its place corrected) gets its estimates recomputed on next read.
+        await db.execute(
+            "DELETE FROM daily_et WHERE mac = ? AND method = 'hargreaves'",
+            (mac,))
+        if entry is not None:
+            await logbook.insert_auto(db, mac, [entry], int(now_ms))
         await db.commit()
 
 
@@ -3052,7 +3231,9 @@ async def delete_device(mac: str) -> dict[str, int]:
 
 
 async def _delete_device_locked(mac: str) -> dict[str, int]:
-    async with connect() as db:
+    from . import daily_et
+    # R27-03: a fill in flight must not bring the deleted station's ET back.
+    async with connect() as db, daily_et.Invalidation(mac, opened=True):
         async def _del(sql: str) -> int:
             cur = await db.execute(sql, (mac,))
             return cur.rowcount or 0
@@ -3090,6 +3271,11 @@ async def _delete_device_locked(mac: str) -> dict[str, int]:
         # 2.5 (R25-10): the sensor checks' refusal counts, stored and still
         # pending, so a re-added MAC does not inherit the old sensor's.
         n_qc    = await _del("DELETE FROM sensor_qc_daily     WHERE mac = ?")
+        # 2.7: the stored daily ET, the same inheritance class.
+        await _del("DELETE FROM daily_et            WHERE mac = ?")
+        # 2.7: the station's logbook. A re-added MAC must not inherit the
+        # old station's notes as markers on its charts.
+        n_log   = await _del("DELETE FROM logbook             WHERE mac = ?")
         await db.commit()
     for key in [k for k in _QC_PENDING if k[0] == mac]:
         _QC_PENDING.pop(key, None)
@@ -3099,7 +3285,7 @@ async def _delete_device_locked(mac: str) -> dict[str, int]:
             "smart_alert_state": n_smart, "storm_state": n_storm,
             "pending_devices": n_pend, "ingest_token_assignments": n_asgn, "wu_station": n_wu,
             "daily_rollups": n_daily, "hour_rollups": n_hour,
-            "sensor_qc": n_qc}
+            "sensor_qc": n_qc, "logbook": n_log}
 
 
 async def get_alert_states() -> dict[str, dict[str, Any]]:
@@ -3146,12 +3332,14 @@ _ALERT_LOG_KEEP = 200
 async def log_alert(ts_ms: int, kind: str, mac: str | None, title: str,
                     body: str | None, delivered: bool,
                     severity: str | None = None,
-                    rule_id: int | None = None) -> None:
+                    rule_id: int | None = None,
+                    report_id: int | None = None) -> None:
     async with connect() as db:
         await db.execute(
             "INSERT INTO alert_log (ts_ms, kind, mac, title, body, delivered, "
-            "severity, rule_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ts_ms, kind, mac, title, body, 1 if delivered else 0, severity, rule_id),
+            "severity, rule_id, report_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts_ms, kind, mac, title, body, 1 if delivered else 0, severity, rule_id,
+             report_id),
         )
         await db.execute(
             "DELETE FROM alert_log WHERE id NOT IN "
@@ -3165,8 +3353,8 @@ async def recent_alerts(limit: int = 50) -> list[dict[str, Any]]:
     """Newest-first alert history for GET /api/alerts/recent."""
     async with connect() as db:
         rows = await (await db.execute(
-            "SELECT id, ts_ms, kind, mac, title, body, delivered, severity, rule_id "
-            "FROM alert_log ORDER BY id DESC LIMIT ?",
+            "SELECT id, ts_ms, kind, mac, title, body, delivered, severity, rule_id, "
+            "report_id FROM alert_log ORDER BY id DESC LIMIT ?",
             (limit,),
         )).fetchall()
     return [dict(r) for r in rows]
@@ -3485,6 +3673,18 @@ async def get_smart_alert_states() -> dict[tuple[str, str], int]:
         rows = await (await db.execute(
             "SELECT mac, kind, triggered FROM smart_alert_state")).fetchall()
     return {(r["mac"], r["kind"]): r["triggered"] for r in rows}
+
+
+async def get_smart_alert_states_full() -> dict[tuple[str, str],
+                                               tuple[int, int | None]]:
+    """(triggered, changed_ms) per (mac, kind). The 2.7 place grouping
+    needs WHEN a station's edge fired, not only that it did."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT mac, kind, triggered, changed_ms FROM smart_alert_state"
+        )).fetchall()
+    return {(r["mac"], r["kind"]): (r["triggered"], r["changed_ms"])
+            for r in rows}
 
 
 async def upsert_smart_alert_state(mac: str, kind: str, triggered: int,
@@ -4084,6 +4284,21 @@ async def observation_rows(mac: str, start_ms: int, end_ms: int,
     return [dict(r) for r in rows]
 
 
+async def et_input_rows(mac: str, start_ms: int,
+                        end_ms: int) -> list[dict[str, Any]]:
+    """The Penman-Monteith inputs of every raw row in [start_ms, end_ms),
+    ascending (2.7, the stored daily ET). Only the six columns the
+    integration reads, never data_json, so a day of two-second posts is
+    a narrow index range scan rather than the export's every column."""
+    async with connect() as db:
+        rows = await (await db.execute(
+            "SELECT dateutc_ms, tempf, humidity, windspeedmph, "
+            "solarradiation, baromabsin, baromrelin FROM observations "
+            "WHERE mac = ? AND dateutc_ms >= ? AND dateutc_ms < ? "
+            "ORDER BY dateutc_ms", (mac, start_ms, end_ms))).fetchall()
+    return [dict(r) for r in rows]
+
+
 async def observation_window(mac: str, start_ms: int, end_ms: int, *,
                              max_rows: int = 250_000) -> list[dict[str, Any]]:
     """Every raw row in a window, ascending, paged to the END.
@@ -4390,7 +4605,17 @@ async def recent_strikes(mac: str, since_ms: int, limit: int = 5000) -> list[dic
         return [{"ms": int(r[0]), "distance_mi": float(r[1])} async for r in cur]
 
 
-async def latest_observation(mac: str) -> dict[str, Any] | None:
+# Accumulators that restart at a local midnight (the day; the week and
+# month on their first day). A composite must not carry one across that
+# midnight: 0.8 in at 23:59:30 is yesterday's total, not today's (2.7
+# follow-up F27-03).
+DAY_SCOPED_RAIN = ("dailyrainin", "weeklyrainin", "monthlyrainin")
+
+
+async def latest_observation(mac: str,
+                             reference_ms: int | None = None,
+                             day_start_ms: int | None = None
+                             ) -> dict[str, Any] | None:
     """Composite "latest" — for each AWN field, return the most recent
     NON-NULL value across the last ~5 minutes of observations. Fixes
     the partial-poster problem where a device has multiple producers
@@ -4401,25 +4626,44 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
     coalesced posts; this composite preserves them.
 
     Returns the dateutc of the freshest contributing row so the iOS
-    app's "last update" indicator still moves forward in real time."""
+    app's "last update" indicator still moves forward in real time.
+
+    `reference_ms` (the WU forward, PR #103) anchors the window to one
+    reading's own time instead of the newest stored row: only rows at or
+    before it and within LOOKBACK_MS of it count, the shared barometer
+    included, and None comes back when no row is that recent. Every other
+    caller passes nothing and gets the dashboard composite unchanged.
+
+    `day_start_ms` (the same caller, F27-03): the local midnight that
+    opened the reading's day. The DAY_SCOPED_RAIN accumulators come only
+    from rows at or after it; an older row still lends its temperature,
+    never its day's rain. Absent, not yesterday's."""
     LOOKBACK_MS = 5 * 60 * 1000
+    upper_ms = reference_ms if reference_ms is not None else 2 ** 62
     async with connect() as db:
         # Fetch the freshest row first to seed dateutc + any always-
         # present keys (helps with rows that have an unusual shape).
         freshest_row = await (await db.execute(
             "SELECT data_json, dateutc_ms FROM observations "
-            "WHERE mac = ? ORDER BY dateutc_ms DESC LIMIT 1",
-            (mac,),
+            "WHERE mac = ? AND dateutc_ms <= ? ORDER BY dateutc_ms DESC LIMIT 1",
+            (mac, upper_ms),
         )).fetchone()
         if not freshest_row:
             return None
-        cutoff_ms = freshest_row["dateutc_ms"] - LOOKBACK_MS
+        cutoff_ms = (reference_ms if reference_ms is not None
+                     else freshest_row["dateutc_ms"]) - LOOKBACK_MS
+        if freshest_row["dateutc_ms"] < cutoff_ms:
+            return None
         recent_rows = await (await db.execute(
-            "SELECT data_json FROM observations "
-            "WHERE mac = ? AND dateutc_ms >= ? "
+            "SELECT data_json, dateutc_ms FROM observations "
+            "WHERE mac = ? AND dateutc_ms >= ? AND dateutc_ms <= ? "
             "ORDER BY dateutc_ms DESC",
-            (mac, cutoff_ms),
+            (mac, cutoff_ms, upper_ms),
         )).fetchall()
+
+    def before_day(row_ms: int) -> bool:
+        return day_start_ms is not None and row_ms < day_start_ms
+
     # Start from freshest row (preserves dateutc + any fields it has),
     # then fill in nulls from older rows in the lookback window.
     out: dict[str, Any] = _parse_json_col(freshest_row["data_json"])
@@ -4427,10 +4671,15 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
         # Corrupt freshest row — still expose its timestamp so the composite
         # fill below has an anchor and the caller sees SOMETHING, not a 500.
         out = {"dateutc": freshest_row["dateutc_ms"]}
+    if before_day(freshest_row["dateutc_ms"]):
+        for k in DAY_SCOPED_RAIN:
+            out.pop(k, None)
     for r in recent_rows[1:]:
         older = _parse_json_col(r["data_json"])
+        stale_day = before_day(r["dateutc_ms"])
         for k, v in older.items():
-            if v is not None and out.get(k) is None:
+            if v is not None and out.get(k) is None \
+                    and not (stale_day and k in DAY_SCOPED_RAIN):
                 out[k] = v
 
     # Cross-device pressure/indoor fallback: if this device still has
@@ -4448,11 +4697,17 @@ async def latest_observation(mac: str) -> dict[str, Any] | None:
             # the JSON of older rows, and reading it here silently killed
             # the fallback once the source's newest barometer row aged past
             # the trim window — while the columns still held the values.
+            # Unbounded for the dashboard (its long-standing behaviour);
+            # bounded to the reading's window when a reference is given,
+            # so a quiet source can't feed WU its last pressure forever.
+            lo_ms = cutoff_ms if reference_ms is not None else -(2 ** 62)
             src_row = await (await db.execute(
                 "SELECT baromrelin, baromabsin, tempinf, humidityin "
                 "FROM observations WHERE mac = ? "
-                "AND baromrelin IS NOT NULL ORDER BY dateutc_ms DESC LIMIT 1",
-                (src_mac,),
+                "AND baromrelin IS NOT NULL "
+                "AND dateutc_ms >= ? AND dateutc_ms <= ? "
+                "ORDER BY dateutc_ms DESC LIMIT 1",
+                (src_mac, lo_ms, upper_ms),
             )).fetchone()
         if src_row:
             for k in ("baromrelin", "baromabsin", "tempinf", "humidityin"):
@@ -4845,18 +5100,21 @@ async def yearly_rain_at_or_before(mac: str, cutoff_ms: int) -> float | None:
 RAIN_RESET_DROP_IN = 0.5
 
 
-async def _min_rain_col_after(mac: str, col: str, since_ms: int) -> float | None:
-    """Lowest value of a cumulative rain column strictly after `since_ms`.
-    On a monotonic counter that is the first reading after a reset.
-    Same internal-whitelist rule as _rain_col_at_or_before: a raise, not
-    an assert."""
+async def _min_rain_col_after(mac: str, col: str, since_ms: int,
+                              until_ms: int | None = None) -> float | None:
+    """Lowest value of a cumulative rain column strictly after `since_ms`
+    (and at or before `until_ms` when given: a reading's own time, so a
+    later reset cannot lower it). On a monotonic counter that is the
+    first reading after a reset. Same internal-whitelist rule as
+    _rain_col_at_or_before: a raise, not an assert."""
     if col not in _COLUMNS:
         raise ValueError(f"refusing to interpolate unknown column {col!r}")
+    upper = until_ms if until_ms is not None else 2 ** 62
     async with connect() as db:
         row = await (await db.execute(
             f"SELECT MIN({col}) AS v FROM observations "
-            f"WHERE mac = ? AND dateutc_ms > ? AND {col} IS NOT NULL",
-            (mac, since_ms),
+            f"WHERE mac = ? AND dateutc_ms > ? AND dateutc_ms <= ? AND {col} IS NOT NULL",
+            (mac, since_ms, upper),
         )).fetchone()
     return row["v"] if row and row["v"] is not None else None
 
@@ -4954,6 +5212,84 @@ async def _yearly_rise_since(mac: str, cur_year: float, boundary_ms: int,
         if floor is not None and floor <= cur_year + 1e-9:
             prior = floor
     return round(max(0.0, cur_year - prior), 3)
+
+
+# How old the counter reading behind a post-anchored rain figure may be:
+# the composite's own window (latest_observation's LOOKBACK_MS).
+COUNTER_MAX_AGE_MS = 5 * 60 * 1000
+
+
+async def counter_rain_through(mac: str, at_ms: int,
+                               tz_name: str = "UTC") -> dict[str, float | None]:
+    """The day's and the hour's rain from the yearly counter AS THEY STOOD
+    at `at_ms`: for one reading uploaded with its own time (the WU
+    forward, 2.7 follow-up F27-03). `rain_rollups` answers for the local
+    hour and day of NOW and its ledger row is folded through the newest
+    reading, so a delayed 12:20 post processed at 12:40 borrowed rain
+    measured at 12:30.
+
+    Read from stored counter rows only, nothing after `at_ms`: the
+    counter's newest reading at or before it (no older than
+    COUNTER_MAX_AGE_MS), differenced against its reading at the start of
+    that reading's local day and hour, with rain_rollups' boundary rule
+    (fallback to the earliest reading for a sensor newer than the
+    boundary) and its reset rule bounded to the same window. A period
+    whose counter reading predates its start (a reading from 23:59 for a
+    post at 00:00:30) is None: absent, never the previous period's."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    out: dict[str, float | None] = {"daily_in": None, "hourly_in": None}
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT yearlyrainin, dateutc_ms FROM observations WHERE mac = ? "
+            "AND yearlyrainin IS NOT NULL AND dateutc_ms <= ? AND dateutc_ms >= ? "
+            "ORDER BY dateutc_ms DESC LIMIT 1",
+            (mac, at_ms, at_ms - COUNTER_MAX_AGE_MS))).fetchone()
+    cur = _tolerant_float(row["yearlyrainin"]) if row else None
+    if cur is None:
+        return out
+    cur_ms = int(row["dateutc_ms"])
+    post_local = datetime.fromtimestamp(at_ms / 1000, tz=tz)
+    for name, boundary in (
+            ("daily_in", post_local.replace(hour=0, minute=0, second=0, microsecond=0)),
+            ("hourly_in", post_local.replace(minute=0, second=0, microsecond=0))):
+        boundary_ms = int(boundary.timestamp() * 1000)
+        if cur_ms < boundary_ms:
+            continue
+        # The day's boundary is a fixed past instant, memoised with
+        # rain_rollups' own (same key, same rule); the hour's is not.
+        prior = await _yearly_prior(mac, boundary_ms, cached=(name == "daily_in"))
+        if prior is None:
+            continue
+        if cur - prior < -RAIN_RESET_DROP_IN:
+            floor = _tolerant_float(await _min_rain_col_after(
+                mac, "yearlyrainin", boundary_ms, until_ms=cur_ms))
+            if floor is not None and floor <= cur + 1e-9:
+                prior = floor
+        out[name] = round(max(0.0, cur - prior), 3)
+    return out
+
+
+async def has_rain_ledger(mac: str) -> bool:
+    """Whether the daily ledger holds any rain day for this station: the
+    inputs every arm of `day_rain.day_rain_in` reads (the day total, the
+    counter's rises, its first/last and the pre-2.2 min/max). A
+    counter-only gauge (SDR, LilyGO) has no `dailyrainin` anywhere, but
+    its days are here, and they outlive the raw readings (2.7 follow-up
+    F27-02: the public pages hid that rain as "never reported"). A
+    0.0 day counts: dry is measured. One indexed probe on (mac, day)."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT 1 FROM daily_rollups WHERE mac = ? AND ("
+            "rain_total IS NOT NULL OR yearly_rise IS NOT NULL "
+            "OR (yearly_first IS NOT NULL AND yearly_last IS NOT NULL) "
+            "OR (yearly_min IS NOT NULL AND yearly_max IS NOT NULL)) LIMIT 1",
+            (mac,))).fetchone()
+    return row is not None
 
 
 async def rain_last_hour_in(mac: str, now_ms: int | None = None) -> float | None:

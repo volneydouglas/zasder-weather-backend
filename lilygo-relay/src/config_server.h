@@ -75,6 +75,11 @@ extern String setupKey;
 // flows through with no firmware change. Set via POST /provision field
 // `forward_all` (1/0).
 extern bool forwardAll;
+// Atlas UV/light mask (`atlas_uv_lux_broken`, 1/0 via POST /provision):
+// the Atlas photodiode can die and repeat a stuck UV + lux (Volney's #711
+// reports UV 4 / ~80,000 lux at night). On, the relay drops uv and light
+// from Atlas packets so a dead sensor never posts daylight at midnight.
+extern bool atlasUvLuxBroken;
 
 void loadFromNvs();  // populates backendUrl + ingestToken from NVS
 void wipeIngestToken();  // for the 401-auto-recovery path

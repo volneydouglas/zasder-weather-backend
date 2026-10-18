@@ -5,6 +5,8 @@ import asyncio
 import os
 from datetime import date, datetime, timedelta, timezone
 
+import pytest
+
 os.environ.setdefault("API_TOKEN", "test-api-token-0123456789abcdef0123")
 
 from app import db, watering  # noqa: E402
@@ -23,6 +25,23 @@ def test_a_phoenix_summer_day_loses_about_a_third_of_an_inch():
     et = watering.hargreaves_et0_in(80.0, 108.0, 33.3, 190)
     assert 0.25 < et < 0.40
     assert watering.hargreaves_et0_in(90, 80, 33.3, 190) is None
+
+
+def test_hargreaves_matches_fao56_example_20():
+    """FAO-56 Example 20: Lyon, 45°43'N, 15 July, Tmax 26.6 °C, Tmin
+    14.8 °C. Ra = 40.6 MJ m-2 day-1 (16.6 mm/day), Tmean 20.7 °C, and
+    ET0 = 0.0023 (20.7 + 17.8) (26.6 - 14.8)^0.5 (16.6) = 5.0 mm/day.
+    The function takes °F and returns inches, so the example goes in
+    converted and comes out converted back."""
+    lat, doy = 45 + 43 / 60, 196            # 15 July, not a leap year
+    ra_mm = watering.extraterrestrial_mm(lat, doy)
+    assert round(ra_mm / 0.408, 1) == 40.6
+    tmax_f, tmin_f = 26.6 * 9 / 5 + 32, 14.8 * 9 / 5 + 32
+    mm = watering.hargreaves_et0_in(tmin_f, tmax_f, lat, doy) * 25.4
+    # Eq. 52 with the example's Celsius figures and this Ra, exactly.
+    assert mm == pytest.approx(0.0023 * (20.7 + 17.8) * (26.6 - 14.8) ** 0.5 * ra_mm,
+                               rel=1e-9)
+    assert mm == pytest.approx(5.0, abs=0.05)
 
 
 def _days(rain, et):

@@ -348,10 +348,13 @@ def test_the_two_relays_agree_on_the_lux_divisor():
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     sdr_path = root / "sdr-relay" / "sdr_relay.py"
-    cpp_path = root / "lilygo-relay" / "src" / "zasder_post.cpp"
+    # The LilyGO mapping lives in field_map.h since the Atlas UV/lux fix
+    # (2026-10-15): the divisor is LUX_PER_WM2 and the lux line uses it.
+    cpp_path = root / "lilygo-relay" / "src" / "field_map.h"
     if not (sdr_path.exists() and cpp_path.exists()):
         pytest.skip("relay sources are not beside this checkout (public mirror)")
     sdr = sdr_path.read_text()
     cpp = cpp_path.read_text()
-    assert "lux / 126.7" in sdr and "lux / 126.7f" in cpp
+    assert "lux / 126.7" in sdr
+    assert "LUX_PER_WM2 = 126.7f" in cpp and "lux / LUX_PER_WM2" in cpp
     assert "126.0" not in sdr

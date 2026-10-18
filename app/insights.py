@@ -651,6 +651,14 @@ async def rebuild(mac: str | None = None) -> dict[str, int]:
         pre = await dbmod.get_kv("rollups_dirty")
         we_set_guard = pre == nonce
         out = await _rebuild_locked(mac)
+        # 2.7: the stored daily ET's Hargreaves days read these rollups,
+        # and a rebuild follows a repair or a restore that changed the
+        # readings; drop it so it is recomputed from what is there now.
+        try:
+            from . import daily_et
+            await daily_et.clear(mac)
+        except Exception:
+            log.exception("daily ET clear after the rollup rebuild failed")
         if pre is not None and (mac is None or we_set_guard):
             # A successful FULL rebuild is the one thing that makes dirty
             # rollups trustworthy again (records() falls back to raw scans

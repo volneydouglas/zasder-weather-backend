@@ -2,12 +2,14 @@
 
 A lawn or a bed needs roughly what the air took out of it minus what the
 sky put back. The sky's half is the station's own gauge; the air's half is
-reference evapotranspiration (ET0), estimated per day with FAO-56's
-Hargreaves equation from the day's high and low and the station's
-latitude. Hargreaves needs no solar sensor or anemometer, which most
-backyard stations lack or site badly, and it reads the daily rollups
-rather than a week of raw readings. It is an ESTIMATE and the verdict
-says so; a Davis console's own ET is better where one exists.
+reference evapotranspiration (ET0), one stored value per day (2.7,
+app/daily_et.py): FAO-56 Penman-Monteith over the day's readings when the
+station has the sensors and covered the day, else FAO-56's Hargreaves
+equation from the day's high and low and the station's latitude, which
+needs no solar sensor or anemometer (most backyard stations lack or site
+them badly). The Water balance page reads the same stored values, so the
+card and the history agree. It is an ESTIMATE and the verdict says so; a
+Davis console's own ET is better where one exists.
 
 The verdict looks at the last seven complete local days:
 
@@ -73,7 +75,7 @@ def verdict(days: list[dict[str, Any]]) -> dict[str, Any]:
     usable = [d for d in days if d.get("rain_in") is not None
               and d.get("et_in") is not None]
     out: dict[str, Any] = {"days": days, "days_used": len(usable),
-                           "method": "hargreaves"}
+                           "method": "hargreaves"}   # for_station refines it
     if len(usable) < MIN_DAYS:
         out.update(verdict=None, rain_in=None, et_in=None, balance_in=None)
         return out
@@ -95,35 +97,47 @@ def verdict(days: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 async def for_station(mac: str, today: date, lat: float | None) -> dict[str, Any]:
+    from . import daily_et
     from .climate import _rollup_rows
-    from .day_rain import day_rain_in
-    from .forecast_skill import covered
     first = today - timedelta(days=DAYS)
     last = today - timedelta(days=1)
     rows = {r["day"]: r for r in await _rollup_rows(mac, first.isoformat(),
                                                    last.isoformat())}
+    # ET is the STORED daily value (2.7, app/daily_et.py), the one the
+    # Water balance page shows, computed here for any of the seven days
+    # that has none yet. Seven days is small, so no budget.
+    et_by_day, _ = await daily_et.ensure(mac, first, last, lat,
+                                         bounded=False)
     days = []
     for k in range(DAYS):
         d = first + timedelta(days=k)
-        r = rows.get(d.isoformat())
         # A day the station did not cover is not a measured day (R25-A03,
         # the 2.5 additional review): one reading makes tmin == tmax, so ET
         # read 0 and a morning of data became a confident "skip" that also
-        # went to the webhooks. Rows without a span (folded before 2.3)
-        # cannot be judged and are taken as they are.
-        if r is not None and covered(dict(r)) is False:
-            r = None
-        et = None
-        if r is not None and lat is not None:
-            et = hargreaves_et0_in(r["tempf_min"], r["tempf_max"], lat,
-                                   d.timetuple().tm_yday)
+        # went to the webhooks. daily_et applies the same rule to rain
+        # (rain_for) and to its Hargreaves fallback; Penman-Monteith needs
+        # PM_MIN_HOURS of readings, which no barely-covered day has.
+        v = et_by_day.get(d.isoformat())
         days.append({"day": d.isoformat(),
-                     "rain_in": day_rain_in(r) if r is not None else None,
-                     "et_in": None if et is None else round(et, 3)})
+                     "rain_in": daily_et.rain_for(rows.get(d.isoformat())),
+                     "et_in": None if v is None else round(v[0], 3),
+                     "method": None if v is None else v[1]})
     out = verdict(days)
+    out["method"] = _method_of(days)
     if lat is None:
         out["note"] = "ET needs the station's location."
     return out
+
+
+def _method_of(days: list[dict[str, Any]]) -> str:
+    """The one word for where the week's ET came from: the method when
+    every day with ET shares it, "mixed" when both appear. With no ET at
+    all the field keeps its 2.5 value ("hargreaves"): the apps decode it
+    as a plain string and a webhook consumer may switch on it."""
+    seen = {d["method"] for d in days if d.get("method")}
+    if len(seen) == 1:
+        return seen.pop()
+    return "mixed" if seen else "hargreaves"
 
 
 async def send_if_due(devices: list[dict[str, Any]], now_ms: int) -> bool:

@@ -8,6 +8,119 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.7.0] — 2026-10-17
+
+### Added
+- **Water balance: every day's evapotranspiration, kept.** The server
+  now stores each station's reference evapotranspiration (ETo) for every
+  complete day, in inches. A day whose readings cover at least 20 hours
+  uses Penman-Monteith from the station's own sensors; otherwise it uses
+  Hargreaves from the day's high, low and the station's latitude; a day
+  with neither has no value, never a zero.
+  `GET /api/devices/{mac}/water-balance` answers a window of up to 400 days
+  with each day's ET, rain and running balance, weekly and monthly
+  totals and which method produced them, and `water-balance.csv`
+  exports the same. Yesterday is stored shortly after midnight; older
+  days are worked out the first time they are asked for, a month inline
+  and the rest in the background. The Watering call reads the same
+  stored values, so the two always agree. A stored day is worked out
+  again when readings land on it later (an import, a relay's backlog),
+  when the station moves, or when its source corrects its coordinates.
+  ET needs the station's location.
+- **A station logbook.** Each station keeps notes with a time (which
+  can be in the past), up to 280 characters and an optional field
+  ("gauge cleaned", "moved the sensor"), so a jump in a chart has its
+  explanation beside it. `GET`/`POST /api/devices/{mac}/logbook`,
+  `PATCH`/`DELETE .../logbook/{id}` and `logbook.csv`; reading takes any
+  token, writing takes the owner token or a write link. Saving a
+  calibration writes an automatic entry for each field that changed, and
+  moving the station writes "Station location changed". The public
+  History page can show the markers and the list when the owner turns
+  that on (off by default).
+- **Every forecast source, scored against your yard.** Every six hours
+  the archive now files Open-Meteo's GFS, ECMWF and ICON models beside
+  its best match and The Weather Company, and
+  `GET /api/devices/{mac}/forecast-accuracy` gains a `sources` block:
+  each source's scores by lead day, how long it has been collecting, the
+  source you use, and the best one for this station by a stated rule
+  (the smallest typical miss on highs and lows one and two days out,
+  compared on the days the sources share). Rain counts rainy days
+  caught and false alarms. It needs about ten days of archive before it
+  ranks. Every earlier field is unchanged. A Weather Company key the
+  upstream refuses is left alone for a day or until it changes.
+- **A stable API for your own clients.** `API.md` names the endpoints
+  and fields a third-party client can rely on (version, devices,
+  current, history, forecast, recent alerts), their units and null
+  rules, and the promise: within a major version a stable field is never
+  removed, renamed or retyped. A test holds the server to it.
+  `GET /api/version` gains a `capabilities` list, starting with
+  `"stable-api"`, so a client can check before it relies on it.
+- **Alert history names the report it announced.** `/api/alerts/recent`
+  rows carry `report_id` for a morning report, outlook, storm summary or
+  sky note, so the apps' new Reports tab opens that exact report instead
+  of matching by time. It is null for other alerts and for older rows.
+- **The public page keeps itself warm.** With `PUBLIC_DASHBOARD` on, the
+  server rebuilds the page before its cache runs out and refills it
+  within seconds of a sharing change or a restore, so a visitor never
+  waits on a cold build or sees an old copy. It never spends more than a
+  quarter of its time on this, however slow the box. A page build of
+  3 seconds or more is logged with its duration and why it ran.
+
+### Changed
+- **One smart alert per place.** Stations within 1 km of each other
+  (by the location you set, else the source's coordinates, else the
+  server's home) are one place, and a weather alert they would each send goes out once,
+  from the first station, with "Also seen at ..." for the others. A
+  sibling that crosses the same line within 30 minutes stays quiet. This
+  covers frost, heat, pressure and temperature drops, wind ramps, pipe
+  freeze, outflow, fronts, first frost and lightning. Lightning
+  detectors at one place share one episode: one opening alert, and one
+  all clear, which waits until no station of the place has heard a
+  strike, near or far, for 30 minutes. Battery, sensor, leak, device and
+  source alerts and your own threshold rules stay per station, and a
+  lone station behaves exactly as before.
+- **Android notifications are data-only.** The FCM message now carries
+  title, body, route, server and alert tier as data at high priority, so
+  the Android app draws it on the right channel in every state and a tap
+  opens the right screen.
+- **Weather Underground gets the whole reading.** The upload sends the
+  station's full current reading (the same one the dashboard shows,
+  nothing older than a few minutes) instead of only the partial post
+  that happened to open the minute. An AcuRite Atlas heard over the air
+  sends temperature and humidity, wind and rain, and UV and light in
+  separate messages, so WU graphed it in patches and its current card
+  could show wind alone. A gauge that posts only its lifetime rain
+  counter now sends WU its hourly and daily rain, measured up to the
+  post's own time and within its own day. Thanks to matt151617 for the
+  report (issue #8).
+- **Fields a station has never reported are hidden on every public
+  page.** The front page, History, Records & climate and Storms leave
+  out cards, columns and tiles for fields the station has never sent (a
+  thermometer-only station no longer shows empty wind, pressure and rain
+  charts), and Storms is offered only to a station that reports rain. A
+  field that is quiet now but reported before stays, and a shared
+  barometer keeps the pressure card.
+
+### Fixed
+- **The LilyGO relay forwards the Atlas's UV and light again.** The
+  relay dropped both from the Atlas's UV and light message, so an Atlas
+  heard by a LilyGO board had no UV or solar. A new board setting,
+  `atlas_uv_lux_broken`, leaves them out for an Atlas whose light sensor
+  has failed and repeats a stuck reading; every other reading still
+  posts. A reading that overflows to infinity is now dropped instead of
+  sent as null. Thanks to matt151617 for the report (issue #8).
+- **With the history throttle on, rain still counts.** Under
+  `INGEST_MIN_INTERVAL_SECONDS`, a post whose only change was a rising
+  rain counter was coalesced away, so the dashboard and WU missed the
+  rain. A moved counter is now always stored; a dry station coalesces as
+  before.
+- **A post without coordinates keeps the station's last ones** instead
+  of blanking its position.
+- **The daily series rounds rain to three places,** so a counter-only
+  station's day no longer reads 0.11999999999999744.
+- **Records & climate's difference from normal matches the numbers
+  shown** ("72° vs 88°" now reads -16, not -17).
+
 ## [2.6.1] — 2026-10-12
 
 ### Fixed

@@ -1,0 +1,52 @@
+{
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "start": "2026-09-15",
+  "end": "2026-10-14",
+  "timezone": "America/Phoenix",
+  "days": [
+    {
+      "day": "2026-09-15",
+      "et_in": 0.241,
+      "method": "penman-monteith",
+      "rain_in": 0.0,
+      "balance_in": -0.241
+    },
+    {
+      "day": "2026-09-16",
+      "et_in": null,
+      "method": null,
+      "rain_in": null,
+      "balance_in": -0.241
+    }
+  ],
+  "weeks": [
+    {
+      "start": "2026-09-14",
+      "et_in": 1.52,
+      "rain_in": 0.1,
+      "balance_in": -1.42,
+      "days_used": 6
+    }
+  ],
+  "months": [
+    {
+      "month": "2026-09",
+      "et_in": 3.9,
+      "rain_in": 0.3,
+      "balance_in": -3.6,
+      "days_used": 16
+    }
+  ],
+  "totals": {
+    "et_in": 6.1,
+    "rain_in": 0.3,
+    "balance_in": -5.8,
+    "days_used": 28,
+    "days": 30
+  },
+  "methods": {
+    "penman-monteith": 20,
+    "hargreaves": 8
+  },
+  "note": "ET needs the station's location."
+}

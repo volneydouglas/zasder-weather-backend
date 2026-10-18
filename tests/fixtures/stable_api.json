@@ -1,0 +1,215 @@
+{
+  "_about": [
+    "The stable public API: every field here is promised to third-party clients (see API.md).",
+    "Within a major version a field listed here is never removed, renamed or given a different JSON type.",
+    "Adding a field to this file is fine. Removing one, renaming one or changing its type is a breaking change.",
+    "tests/test_stable_api.py calls each endpoint on a seeded database and checks the real responses against this file.",
+    "Spec keys: type (string|number|integer|boolean|object|array), nullable (null is a valid value),",
+    "optional (the key may be absent, e.g. a sensor the station does not have), unit (documentation only),",
+    "fields (object members), items (array element spec), ref (a name under definitions)."
+  ],
+  "definitions": {
+    "observation": {
+      "type": "object",
+      "fields": {
+        "dateutc":               {"type": "integer", "unit": "epoch ms (UTC)"},
+        "tempf":                 {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "feelsLike":             {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "dewPoint":              {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "humidity":              {"type": "number", "nullable": true, "optional": true, "unit": "%"},
+        "tempinf":               {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "humidityin":            {"type": "number", "nullable": true, "optional": true, "unit": "%"},
+        "baromrelin":            {"type": "number", "nullable": true, "optional": true, "unit": "inHg"},
+        "baromabsin":            {"type": "number", "nullable": true, "optional": true, "unit": "inHg"},
+        "windspeedmph":          {"type": "number", "nullable": true, "optional": true, "unit": "mph"},
+        "windgustmph":           {"type": "number", "nullable": true, "optional": true, "unit": "mph"},
+        "maxdailygust":          {"type": "number", "nullable": true, "optional": true, "unit": "mph"},
+        "winddir":               {"type": "number", "nullable": true, "optional": true, "unit": "degrees from north"},
+        "hourlyrainin":          {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "eventrainin":           {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "dailyrainin":           {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "weeklyrainin":          {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "monthlyrainin":         {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "yearlyrainin":          {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "uv":                    {"type": "number", "nullable": true, "optional": true, "unit": "UV index"},
+        "solarradiation":        {"type": "number", "nullable": true, "optional": true, "unit": "W/m²"},
+        "lightning_last_1hr":    {"type": "number", "nullable": true, "optional": true, "unit": "strikes"},
+        "lightning_distance_mi": {"type": "number", "nullable": true, "optional": true, "unit": "mi"},
+        "pm25":                  {"type": "number", "nullable": true, "optional": true, "unit": "µg/m³"},
+        "pm10":                  {"type": "number", "nullable": true, "optional": true, "unit": "µg/m³"},
+        "co2":                   {"type": "number", "nullable": true, "optional": true, "unit": "ppm"}
+      }
+    },
+    "current": {
+      "type": "object",
+      "extends": "observation",
+      "fields": {
+        "totalrainin":           {"type": "number", "nullable": true, "optional": true, "unit": "in"}
+      }
+    },
+    "history_row": {
+      "type": "object",
+      "fields": {
+        "dateutc":               {"type": "integer", "unit": "epoch ms (UTC)"},
+        "tempf":                 {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "feelsLike":             {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "dewPoint":              {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "humidity":              {"type": "number", "nullable": true, "optional": true, "unit": "%"},
+        "tempinf":               {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "humidityin":            {"type": "number", "nullable": true, "optional": true, "unit": "%"},
+        "baromrelin":            {"type": "number", "nullable": true, "optional": true, "unit": "inHg"},
+        "windspeedmph":          {"type": "number", "nullable": true, "optional": true, "unit": "mph"},
+        "windgustmph":           {"type": "number", "nullable": true, "optional": true, "unit": "mph"},
+        "winddir":               {"type": "number", "nullable": true, "optional": true, "unit": "degrees from north"},
+        "hourlyrainin":          {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "dailyrainin":           {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "yearlyrainin":          {"type": "number", "nullable": true, "optional": true, "unit": "in"},
+        "uv":                    {"type": "number", "nullable": true, "optional": true, "unit": "UV index"},
+        "solarradiation":        {"type": "number", "nullable": true, "optional": true, "unit": "W/m²"},
+        "lightning_last_1hr":    {"type": "number", "nullable": true, "optional": true, "unit": "strikes"},
+        "lightning_distance_mi": {"type": "number", "nullable": true, "optional": true, "unit": "mi"},
+        "pm25":                  {"type": "number", "nullable": true, "optional": true, "unit": "µg/m³"},
+        "pm10":                  {"type": "number", "nullable": true, "optional": true, "unit": "µg/m³"},
+        "co2":                   {"type": "number", "nullable": true, "optional": true, "unit": "ppm"},
+        "tempf_min":             {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "tempf_max":             {"type": "number", "nullable": true, "optional": true, "unit": "°F"},
+        "humidity_min":          {"type": "number", "nullable": true, "optional": true, "unit": "%"},
+        "humidity_max":          {"type": "number", "nullable": true, "optional": true, "unit": "%"},
+        "baromrelin_min":        {"type": "number", "nullable": true, "optional": true, "unit": "inHg"},
+        "baromrelin_max":        {"type": "number", "nullable": true, "optional": true, "unit": "inHg"},
+        "windspeedmph_max":      {"type": "number", "nullable": true, "optional": true, "unit": "mph"},
+        "windgustmph_max":       {"type": "number", "nullable": true, "optional": true, "unit": "mph"},
+        "uv_max":                {"type": "number", "nullable": true, "optional": true, "unit": "UV index"},
+        "solarradiation_max":    {"type": "number", "nullable": true, "optional": true, "unit": "W/m²"}
+      }
+    },
+    "device": {
+      "type": "object",
+      "fields": {
+        "mac":          {"type": "string"},
+        "name":         {"type": "string"},
+        "display_name": {"type": "string", "nullable": true},
+        "source_name":  {"type": "string", "nullable": true},
+        "location":     {"type": "string", "nullable": true},
+        "lastSeen":     {"type": "integer", "nullable": true, "unit": "epoch ms (UTC)"},
+        "lastData":     {"ref": "observation", "nullable": true},
+        "info": {
+          "type": "object",
+          "fields": {
+            "coords": {
+              "type": "object", "optional": true,
+              "fields": {
+                "coords": {
+                  "type": "object",
+                  "fields": {
+                    "lat": {"type": "number", "unit": "degrees"},
+                    "lon": {"type": "number", "unit": "degrees"}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "forecast_series_number": {
+      "type": "array",
+      "items": {"type": "number", "nullable": true}
+    }
+  },
+  "endpoints": {
+    "GET /api/version": {
+      "auth": "none",
+      "response": {
+        "type": "object",
+        "fields": {
+          "version":          {"type": "string"},
+          "latest":           {"type": "string", "nullable": true},
+          "update_available": {"type": "boolean"},
+          "checked_ms":       {"type": "integer", "nullable": true, "unit": "epoch ms (UTC)"},
+          "capabilities":     {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "GET /api/devices": {
+      "auth": "read",
+      "response": {"type": "array", "items": {"ref": "device"}}
+    },
+    "GET /api/devices/{mac}/current": {
+      "auth": "read",
+      "response": {"ref": "current"}
+    },
+    "GET /api/devices/{mac}/history": {
+      "auth": "read",
+      "response": {
+        "type": "object",
+        "fields": {
+          "start": {"type": "integer", "unit": "epoch ms (UTC)"},
+          "end":   {"type": "integer", "unit": "epoch ms (UTC)"},
+          "count": {"type": "integer"},
+          "rows":  {"type": "array", "items": {"ref": "history_row"}}
+        }
+      }
+    },
+    "GET /api/forecast": {
+      "auth": "read",
+      "response": {
+        "type": "object",
+        "fields": {
+          "source":        {"type": "string"},
+          "fallback_from": {"type": "string", "optional": true},
+          "daily": {
+            "type": "object",
+            "fields": {
+              "time":                          {"type": "array", "items": {"type": "string"}},
+              "weather_code":                  {"type": "array", "items": {"type": "integer", "nullable": true}, "unit": "WMO weather code"},
+              "temperature_2m_max":            {"ref": "forecast_series_number", "unit": "°F"},
+              "temperature_2m_min":            {"ref": "forecast_series_number", "unit": "°F"},
+              "precipitation_probability_max": {"ref": "forecast_series_number", "unit": "%"},
+              "wind_speed_10m_max":            {"ref": "forecast_series_number", "unit": "mph"},
+              "wind_direction_10m_dominant":   {"ref": "forecast_series_number", "unit": "degrees from north"}
+            }
+          },
+          "narrative": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "fields": {
+                "name":  {"type": "string"},
+                "text":  {"type": "string"},
+                "night": {"type": "boolean"},
+                "date":  {"type": "string", "optional": true, "unit": "YYYY-MM-DD"}
+              }
+            }
+          }
+        }
+      }
+    },
+    "GET /api/alerts/recent": {
+      "auth": "read",
+      "response": {
+        "type": "object",
+        "fields": {
+          "alerts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "fields": {
+                "id":        {"type": "integer"},
+                "ts_ms":     {"type": "integer", "unit": "epoch ms (UTC)"},
+                "kind":      {"type": "string"},
+                "mac":       {"type": "string", "nullable": true},
+                "title":     {"type": "string"},
+                "body":      {"type": "string", "nullable": true},
+                "delivered": {"type": "integer", "unit": "1 = delivered, 0 = held back"},
+                "severity":  {"type": "string", "nullable": true},
+                "rule_id":   {"type": "integer", "nullable": true},
+                "report_id": {"type": "integer", "nullable": true}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -461,6 +461,50 @@ def evapotranspiration_in(temp_f, humidity, wind_mph, solar_wm2,
     return max(0.0, et_mm) / 25.4
 
 
+# A step longer than this between two readings is a gap, not a step: it
+# integrates nothing (the station was not there to see it).
+ET_MAX_STEP_H = 1.0
+
+
+def evapotranspiration_over(rows) -> tuple[float, float] | None:
+    """Penman-Monteith integrated over raw readings, ascending by
+    `dateutc_ms`: (inches, hours the integral covers), or None when no
+    step had every input.
+
+    Each reading stands for the time since the reading before it (any
+    reading, whatever it carried), up to ET_MAX_STEP_H; a longer gap adds
+    nothing. Pressure is the station's absolute barometer, else the
+    sea-level one. The one integration both the Science page's "today"
+    row and the stored daily ET (app/daily_et.py) run, so the two never
+    disagree about the same readings (2.7)."""
+    total = 0.0
+    hours = 0.0
+    saw = False
+    previous_ms = None
+    for row in rows:
+        ts = row.get("dateutc_ms")
+        if not isinstance(ts, (int, float)):
+            continue
+        ts = int(ts)
+        gap_h = 0.0 if previous_ms is None else (ts - previous_ms) / 3_600_000
+        previous_ms = ts
+        if gap_h <= 0 or gap_h > ET_MAX_STEP_H:
+            continue
+        solar = _f(row.get("solarradiation"))
+        if solar is None:
+            continue
+        et = evapotranspiration_in(
+            _f(row.get("tempf")), _f(row.get("humidity")),
+            _f(row.get("windspeedmph")), solar,
+            _f(row.get("baromabsin")) or _f(row.get("baromrelin")),
+            hours=gap_h)
+        if et is not None:
+            total += et
+            hours += gap_h
+            saw = True
+    return (total, hours) if saw else None
+
+
 def solar_elevation_deg(ts_ms: int, lat: float, lon: float) -> float | None:
     """How high the sun is, in degrees above the horizon.
 

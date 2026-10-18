@@ -33,10 +33,12 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from . import db
+from .config import settings
 
 log = logging.getLogger("zasder.wu_upload")
 
@@ -44,9 +46,14 @@ WU_UPLOAD_URL = ("https://weatherstation.wunderground.com/weatherstation/"
                  "updateweatherstation.php")
 UPLOAD_TIMEOUT_S = 8
 # Attempt throttle per mac. WU's classic endpoint is designed for ~1/min;
-# uploading a subset of readings is fine (each carries the full current
-# state), so dropping the ones in between loses nothing.
+# uploading a subset of readings is fine because each upload carries the
+# station's full current state (`_current_state`), so dropping the ones in
+# between loses nothing.
 UPLOAD_MIN_INTERVAL_S = 60.0
+# How far apart the incoming post and the station's composite may be for
+# the composite to fill the post's gaps: db.latest_observation's own
+# lookback, so WU sees what the dashboard shows and nothing older.
+COMPOSITE_MAX_SKEW_MS = 5 * 60 * 1000
 
 # Flat ingest row key → WU upload query parameter. The flat row's units are
 # already WU's native upload units, so this is a pure rename. rainin is WU's
@@ -131,6 +138,66 @@ def build_params(station_id: str, upload_key: str,
     return params
 
 
+async def _current_state(mac: str, flat: dict[str, Any]) -> dict[str, Any]:
+    """The reading to upload: this post's own values, with the fields it
+    lacks filled from the station's current composite.
+
+    A partial poster sends one subset per post: the AcuRite Atlas rotates
+    temperature + humidity, wind direction + rain, and UV + light messages
+    about 10 s apart, and the LilyGO relay or an rtl_433 bridge posts each
+    as it is heard. Uploading the post alone gave WU whichever subset held
+    the 60 s slot, so its graphs were patchy while the dashboard (which
+    composites) looked whole (mirror #8, 2026-10-15). The composite is the
+    dashboard's: non-null values from the last few minutes, never older,
+    never zero for a field the station lacks. Counter-only rain (SDR
+    sources post a lifetime counter WU has no parameter for) gets the
+    day's total and the hour's from that counter.
+
+    Both are anchored to the post (CodeRabbit, PR #103): the composite
+    window is measured back from the post's own time (never the newest
+    stored row, which the history throttle can leave minutes behind, and
+    never a reading taken after it). Rain is anchored harder (2.7
+    follow-up F27-03): a day total is never carried across the post's
+    local midnight (0.8 in at 23:59:30 is not the new day's), and the
+    derived day and hour are the counter's rise up to the post's own time
+    in the post's own local day and hour, not the rollups of NOW, which
+    lent a delayed 12:20 post the rain measured at 12:30. What cannot be
+    reconstructed is left out: absent, never wrong."""
+    out = dict(flat)
+    post_ms = int(flat["dateutc"])
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    day_start_ms = int(datetime.fromtimestamp(post_ms / 1000, tz=tz).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    try:
+        latest = await db.latest_observation(mac, post_ms, day_start_ms=day_start_ms)
+    except Exception as e:
+        log.warning("WU upload composite read failed for %s (%s)", mac,
+                    type(e).__name__)
+        latest = None
+    if latest and isinstance(latest.get("dateutc"), (int, float)) and \
+            abs(latest["dateutc"] - post_ms) <= COMPOSITE_MAX_SKEW_MS:
+        for k in _FIELD_MAP:
+            if out.get(k) is None and latest.get(k) is not None:
+                out[k] = latest[k]
+        if out.get("yearlyrainin") is None:
+            out["yearlyrainin"] = latest.get("yearlyrainin")
+    if out.get("yearlyrainin") is not None and (
+            out.get("dailyrainin") is None or out.get("hourlyrainin") is None):
+        try:
+            derived = await db.counter_rain_through(mac, post_ms, settings.timezone)
+        except Exception as e:
+            log.warning("WU upload rain derivation failed for %s (%s)", mac,
+                        type(e).__name__)
+            derived = {}
+        for k, src in (("dailyrainin", "daily_in"), ("hourlyrainin", "hourly_in")):
+            if out.get(k) is None and derived.get(src) is not None:
+                out[k] = derived[src]
+    return out
+
+
 async def _send(params: dict[str, Any]) -> tuple[int, str]:
     """(status_code, body) for one upload GET. Split out so tests monkeypatch
     the transport without an httpx mock (the wu_import._fetch_day pattern)."""
@@ -165,7 +232,8 @@ async def maybe_upload(mac: str, flat: dict[str, Any]) -> bool:
             # forwarding a moment later doesn't wait out a phantom attempt.
             _last_attempt.pop(mac, None)
             return False
-        params = build_params(row["station_id"], row["upload_key"], flat)
+        params = build_params(row["station_id"], row["upload_key"],
+                              await _current_state(mac, flat))
         try:
             status_code, body = await _send(params)
         except Exception as e:

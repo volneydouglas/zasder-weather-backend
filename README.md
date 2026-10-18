@@ -1054,11 +1054,19 @@ bin/setup-local.sh      Guided local Docker setup (tokens, .env, docker compose 
 bin/doctor.sh           Health checklist (auth, /healthz, tokens, volume, pollers, data)
 docker-compose.yml      Local-deployment compose file
 README.md               (this file — human-oriented)
+API.md                  The stable API for third-party clients
 AGENTS.md               LLM-friendly deployment guide
 .env.example            Annotated environment template
 ```
 
 ## API (selected endpoints)
+
+**Building your own client?** Start with **[API.md](API.md)**: the stable
+endpoints (current conditions, history, forecast, recent alerts, version),
+their fields, units and null rules, and the promise that goes with them.
+Within a major version a stable field is never removed, renamed or
+retyped; new fields are only ever added. Everything else below works but
+can change between releases.
 
 Every `/api/*` route except `/api/version` requires
 `Authorization: Bearer <API_TOKEN>`. The apps call these. Public-readable status page at `/`. This table names the
@@ -1073,7 +1081,7 @@ already approved, the API token) is typed on the consent page.
 |---|---|---|
 | GET | `/` | HTML status page (no auth) |
 | GET | `/healthz` | Liveness + running version, no auth |
-| GET | `/api/version` | Running version, latest release, and whether an update is available (no auth) |
+| GET | `/api/version` | Running version, latest release, whether an update is available, and the `capabilities` a client can check for (no auth). Stable, see [API.md](API.md) |
 | GET | `/api/devices` | All devices + latest reading |
 | DELETE | `/api/devices/{mac}` | Remove a retired device + all its observations + alert state (token-gated) |
 | PUT | `/api/devices/{mac}/name` | Rename a station: `{"name": "Back yard"}` (1-64 characters) overrides the name the source posts everywhere it appears (app, widgets, alerts, digest, public page); `""` or `null` goes back to the station's own name. `/api/devices` reports the effective `name`, the override as `display_name`, and the posted name as `source_name` |
@@ -1103,6 +1111,8 @@ already approved, the API token) is typed on the consent page.
 | POST | `/api/alerts/test` | Send a test alert email to the configured recipients |
 | POST | `/api/push/register` | Register a push token (iOS APNs or Android FCM — `platform` field) |
 | GET/PUT | `/api/devices/{mac}/calibration` | Per-sensor offsets and scales, applied at ingest (temperature, humidity, pressure, wind, solar, UV, rain, soil) |
+| GET/POST | `/api/devices/{mac}/logbook?start_ms=&end_ms=` | The station logbook: notes with a time and an optional field ("gauge cleaned"), drawn as chart markers. A calibration or location change adds an automatic entry. Writes take the owner token or a write link; `logbook.csv` exports it |
+| PATCH/DELETE | `/api/devices/{mac}/logbook/{id}` | Edit (your own entries) or delete a logbook entry |
 | POST | `/api/import/weewx?mac=` | Import a `weewx.sdb` uploaded as the raw body. Converts each row from its own `usUnits`; paced, cancellable |
 | POST | `/api/import/csv` | Import a CSV with a caller-supplied column mapping (`mapping`, `time_column`, `time_format`, `units`); up to 16 MiB in the body, a column mapped to `intervalRainIn` is summed into the day counter. Bigger histories go through the WeeWX door |
 | GET | `/api/import/archive/status` | Progress of the running WeeWX or CSV import |

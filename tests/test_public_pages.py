@@ -480,3 +480,394 @@ def test_counts_carry_their_reading_time(public):
     body = public.get(f"/api/devices/{LMAC}/lightning/strikes", headers=LH).json()
     assert body["count_1h"] == 15 and body["strikes"] == []
     assert abs(body["counts_ms"] - (now - 1_000)) < 2_000
+
+
+# ── fields a station has never reported (2.7, mirror #8 on every page) ──
+#
+# The dashboard hides a field the station has never sent
+# (public_dashboard.shown_fields). The deeper pages drew every card anyway:
+# a thermometer-only station's History had empty Humidity, Wind and
+# Pressure charts, a rain bar of nothing and a gust line of nothing, which
+# reads as broken. Same rule, same helper, through the real routes.
+
+BARE = "AA:BB:CC:00:00:8A"
+
+
+def _post_raw(c, at_ms, body, mac=BARE, name="Shed"):
+    stamp = datetime.fromtimestamp(at_ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = c.post("/ingest/custom", headers=IH, json={
+        "device": {"id": mac, "name": name}, "timestamp_utc": stamp, **body})
+    assert r.status_code == 200, r.text
+
+
+def _rollup(day, tmin, tmax, rain=None, gust=None, mac=BARE):
+    from app import db
+
+    async def run():
+        async with db.connect() as conn:
+            await conn.execute(
+                "INSERT OR REPLACE INTO daily_rollups (mac, day, tempf_min, tempf_max, "
+                "rain_total, windgustmph_max) VALUES (?, ?, ?, ?, ?, ?)",
+                (mac, day, tmin, tmax, rain, gust))
+            await conn.commit()
+    asyncio.run(run())
+
+
+def _storm(total, gust, mac=BARE):
+    from app import db
+    now = int(time.time() * 1000)
+
+    async def run():
+        async with db.connect() as conn:
+            await conn.execute(
+                "INSERT INTO storm_history (mac, started_ms, ended_ms, total_in, "
+                "peak_rate_in_hr, max_gust_mph, min_tempf, max_tempf) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (mac, now - 5 * 3_600_000, now - 3 * 3_600_000, total, 0.5, gust, 70.0, 80.0))
+            await conn.commit()
+    asyncio.run(run())
+
+
+@pytest.fixture
+def bare(client, monkeypatch):
+    """The public pages on, insights on, and no station seeded yet."""
+    from app.config import settings
+    monkeypatch.setattr(settings, "public_dashboard", True)
+    monkeypatch.setattr(settings, "insights", True)
+    return client
+
+
+def _cards(html):
+    return re.findall(r'<div class="chart-title">([^<]+?) <span', html)
+
+
+def _warm(c):
+    """The open pages read the all-time records without waiting for them
+    (CodeRabbit, PR #113), so a cold cache hides nothing. The records page
+    computes them (it needs them to draw), which is what a test asserting
+    a hidden field visits first."""
+    assert c.get("/weather/records").status_code == 200
+
+
+def _seed_thermometer(c, extra=None):
+    now = int(time.time() * 1000)
+    for h in range(0, 48, 3):
+        _post_raw(c, now - h * 3_600_000, {"outdoor": {"tempf": 70.0 + h % 7}, **(extra or {})})
+    _rollup(date.today().isoformat(), 68.0, 76.0,
+            rain=(extra or {}).get("rain", {}).get("daily_in"))
+
+
+def test_history_of_a_thermometer_only_station_has_only_temperature(bare):
+    _seed_thermometer(bare)
+    _warm(bare)
+    for rng in ("7d", "30d", "1y"):
+        body = bare.get(f"/weather/history?range={rng}").text
+        cards = _cards(body)
+        assert "Daily high and low" in cards, (rng, cards)
+        for never in ("Humidity", "Wind", "Pressure", "Daily rain", "Peak gust each day"):
+            assert never not in cards, (rng, never, cards)
+    assert "Temperature" in _cards(bare.get("/weather/history").text)
+
+
+def test_history_keeps_rain_judged_by_the_day_total(bare):
+    """A station that sends only a day total (its hourly figure is derived
+    from it): the dashboard keeps Rain by `dailyrainin`, and so does
+    History's daily rain card."""
+    _seed_thermometer(bare, {"rain": {"daily_in": 0.12}})
+    _warm(bare)
+    for rng in ("7d", "1y"):
+        cards = _cards(bare.get(f"/weather/history?range={rng}").text)
+        assert "Daily rain" in cards, (rng, cards)
+        assert "Pressure" not in cards and "Peak gust each day" not in cards, (rng, cards)
+
+
+def test_a_field_that_reported_once_is_not_never(bare):
+    """Quiet now is not never: a barometer that reported weeks ago keeps
+    its card on the 7-day page even with nothing in the window (the
+    all-time records remember it, exactly the dashboard's rule)."""
+    old = int(time.time() * 1000) - 40 * 86_400_000
+    _post_raw(bare, old, {"outdoor": {"tempf": 60.0}, "pressure": {"relative_inhg": 29.9},
+                          "wind": {"speed_mph": 3, "gust_mph": 8}})
+    _seed_thermometer(bare)
+    _warm(bare)
+    cards = _cards(bare.get("/weather/history").text)
+    assert "Pressure" in cards and "Wind" in cards, cards
+    assert "Humidity" not in cards, cards
+
+
+def test_records_climate_has_no_rain_column_without_a_gauge(bare):
+    _seed_thermometer(bare)
+    body = bare.get("/weather/records").text
+    assert "Temperature high" in body and f"Climate, {date.today().year}" in body
+    assert "Rain in</th>" not in body
+    assert "Pressure high" not in body and "Humidity high" not in body
+
+
+def test_records_climate_keeps_rain_judged_by_the_day_total(bare):
+    _seed_thermometer(bare, {"rain": {"daily_in": 0.12}})
+    assert "Rain in</th>" in bare.get("/weather/records").text
+
+
+def test_storms_of_a_gauge_with_no_anemometer_show_no_gust(bare):
+    _seed_thermometer(bare, {"rain": {"daily_in": 0.12}})
+    _storm(0.62, None)
+    _warm(bare)
+    for path in ("/weather/storms", "/weather/storms/latest"):
+        body = bare.get(path).text
+        assert "0.62" in body, path
+        assert "Peak gust" not in body, path
+
+
+def test_the_pages_stay_off_while_the_public_dashboard_is_off(client):
+    _seed_thermometer(client)
+    for path in ("/weather/history", "/weather/history?range=1y", "/weather/records",
+                 "/weather/storms", "/weather/storms/latest"):
+        assert client.get(path).status_code == 404, path
+
+
+# ── rain a station measures only through a counter (2.7 follow-up F27-02) ──
+#
+# The gate above judged rain by `dailyrainin` in the all-time records and
+# by the raw hourly key. A gauge that posts only its lifetime counter
+# (SDR, LilyGO: `yearlyrainin` and nothing else) has neither, yet its
+# daily ledger holds real derived rain: History lost the Daily rain card,
+# the climate table its Rain column and the dashboard its Rain chart.
+# Rain is now judged by every rain input the station sends and by the
+# derived daily ledger. Dry is rain (a 0.00 day is a working gauge);
+# a station with no gauge still loses the card.
+
+COUNTER = "AA:BB:CC:00:00:8B"
+
+
+def _seed_counter(c, steps, key="yearly_in", mac=COUNTER):
+    """Readings `hours_ago` → counter value, oldest first, each with a
+    temperature so the station is an ordinary weather station."""
+    now = int(time.time() * 1000)
+    for hours_ago, value in steps:
+        _post_raw(c, now - hours_ago * 3_600_000,
+                  {"outdoor": {"tempf": 70.0}, "rain": {key: value}}, mac=mac)
+
+
+def _derived_rain(mac=COUNTER):
+    from app import climate, db
+    from app.day_rain import day_rain_in
+
+    async def run():
+        async with db.connect() as conn:
+            rows = await (await conn.execute(
+                "SELECT * FROM daily_rollups WHERE mac = ?", (mac,))).fetchall()
+        return [day_rain_in(r) for r in rows], [climate._day_stats(r)["rain"] for r in rows]
+    return asyncio.run(run())
+
+
+def _rain_shown(c):
+    # Records first: it computes the all-time records History's gate reads
+    # (a cold cache would hide nothing and prove nothing).
+    records = c.get("/weather/records")
+    history = c.get("/weather/history?range=7d")
+    assert history.status_code == records.status_code == 200
+    return {"history": "Daily rain" in _cards(history.text),
+            "records": "Rain in</th>" in records.text}
+
+
+def test_a_counter_only_gauge_keeps_its_derived_rain(bare):
+    _seed_counter(bare, [(30, 10.0), (18, 10.25), (6, 10.25), (1, 10.25)])
+    ledger, _ = _derived_rain()
+    assert ledger and abs(sum(v for v in ledger if v is not None) - 0.25) < 1e-9, ledger
+    assert _rain_shown(bare) == {"history": True, "records": True}
+    # The dashboard shares the rule (records warm from the page above).
+    assert 'Rain <span class="chart-unit">· last 24h' in bare.get("/").text
+
+
+def test_a_dry_counter_is_a_gauge_not_an_absence(bare):
+    """Zero is a real answer: a counter that never moved is a working
+    gauge on dry days, never "never measured"."""
+    _seed_counter(bare, [(30, 4.0), (18, 4.0), (6, 4.0), (1, 4.0)])
+    ledger, _ = _derived_rain()
+    assert ledger and all(v == 0.0 for v in ledger), ledger
+    assert _rain_shown(bare) == {"history": True, "records": True}
+
+
+def test_the_ledger_keeps_rain_after_the_raw_readings_are_gone(bare):
+    """The daily ledger outlives the raw rows: with every observation
+    gone, the derived days still prove a gauge."""
+    from app import db
+    _seed_counter(bare, [(30, 10.0), (18, 10.25), (6, 10.25), (1, 10.25)])
+    # A thermometer elsewhere keeps the records non-empty, so the gate is
+    # live (no records at all hides nothing).
+    _seed_thermometer(bare)
+
+    async def age_out():
+        async with db.connect() as conn:
+            await conn.execute("DELETE FROM observations WHERE mac = ?", (COUNTER,))
+            await conn.commit()
+    asyncio.run(age_out())
+    from app import main
+    asyncio.run(main._warm_records(COUNTER))     # a live gate, not a cold cache
+    assert main._records_cached_or_warm(COUNTER) is not None
+    assert asyncio.run(main._public_shown(COUNTER, ["hourlyrainin"])) == {"hourlyrainin"}
+
+
+_LEDGER_ARMS = {
+    "rain_total": {"rain_total": 0.0},
+    "yearly_rise": {"yearly_rise": 0.0},
+    "yearly_first_and_last": {"yearly_first": 4.0, "yearly_last": 4.0},
+    "yearly_min_and_max": {"yearly_min": 4.0, "yearly_max": 4.0},
+}
+
+
+def _ledger_row(cols):
+    """One daily_rollups row with a temperature and only `cols` of the
+    rain inputs set; db.has_rain_ledger's answer for its station."""
+    from app import db
+    mac = "AA:BB:CC:00:00:8A"
+    names = "".join(f", {c}" for c in cols)
+    marks = "".join(", ?" for _ in cols)
+
+    async def run():
+        async with db.connect() as conn:
+            await conn.execute(
+                f"INSERT INTO daily_rollups (mac, day, tempf_max{names}) "
+                f"VALUES (?, ?, ?{marks})",
+                (mac, "2026-07-04", 90.0, *cols.values()))
+            await conn.commit()
+        return await db.has_rain_ledger(mac)
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("arm", sorted(_LEDGER_ARMS))
+def test_each_ledger_arm_alone_is_a_rain_ledger(bare, arm):
+    """Every input day_rain_in reads proves a gauge on its own, each with
+    a dry 0.0 or an unmoved counter: one row with only that arm set."""
+    assert _ledger_row(_LEDGER_ARMS[arm]) is True
+
+
+def test_a_rollup_row_with_no_rain_input_is_no_ledger(bare):
+    """A thermometer's day: every rain column NULL."""
+    assert _ledger_row({}) is False
+
+
+def test_half_of_each_counter_pair_is_no_ledger(bare):
+    assert _ledger_row({"yearly_first": 4.0, "yearly_min": 4.0}) is False
+
+
+def test_a_monthly_counter_only_gauge_keeps_rain(bare):
+    _seed_counter(bare, [(30, 1.0), (18, 1.25), (6, 1.25), (1, 1.25)], key="monthly_in")
+    assert _rain_shown(bare) == {"history": True, "records": True}
+
+
+def test_rain_gate_evidence_is_the_whole_rain_family_not_a_zero_shortcut():
+    """The pure rule: any rain input in the current reading, the derived
+    ledger, or a wettest-day record keeps Rain; a thermometer keeps
+    nothing; a 0.0 counts."""
+    from app import public_dashboard as pd
+    recs = {"periods": {"all": {"fields": {"tempf": {"max": 90}}}}}
+    fields = ["tempf", "hourlyrainin"]
+    assert pd.shown_fields(fields, {"tempf": 70}, {}, recs) == ["tempf"]
+    for key in ("yearlyrainin", "monthlyrainin", "dailyrainin", "eventrainin",
+                "weeklyrainin", "totalrainin"):
+        assert pd.shown_fields(fields, {"tempf": 70, key: 0.0}, {}, recs) == fields, key
+    assert pd.shown_fields(fields, {"tempf": 70}, {}, recs,
+                           measured={"hourlyrainin"}) == fields
+
+
+def test_today_against_normal_differences_the_numbers_it_shows():
+    """2.7 RC smoke test: "High 72° vs 88° -17°". 71.6 and 88.4 print as
+    72 and 88, so the difference beside them is -16, not round(-16.8)."""
+    from app import public_pages as pp
+    html = pp.render_normals({"normal_high": 88.4, "normal_low": 60.0}, None,
+                             {"fields": {"tempf": {"max": 71.6, "min": 59.6}}})
+    assert 'High 72° vs 88° <span class="pp-diff">-16°</span>' in html, html
+    assert 'Low 60° vs 60° <span class="pp-diff">+0°</span>' in html, html
+
+
+# ── Storms is offered only to a station with rain (2.7 RC smoke test) ──
+#
+# A thermometer-only station was offered the Storms tab and the front
+# page's Storms link, whose page then explained when rain starts a storm.
+# Same never-reported rule as the Rain cards, counter-derived rain
+# included.
+
+def _offers_storms(c):
+    link = re.compile(r'href="/weather/storms(\?[^"]*)?">Storms</a>')
+    return {path: bool(link.search(c.get(path).text))
+            for path in ("/weather/history", "/weather/records", "/weather/reports", "/")}
+
+
+def test_a_thermometer_is_not_offered_storms(bare):
+    _seed_thermometer(bare)
+    bare.get("/weather/records")                 # warms the records cache
+    assert not any(_offers_storms(bare).values()), _offers_storms(bare)
+    # A bookmarked link still answers, and says why there is nothing.
+    for path in ("/weather/storms", "/weather/storms/latest"):
+        r = bare.get(path)
+        assert r.status_code == 200 and "does not report rain" in r.text, path
+        assert "rain starts" not in r.text, path
+
+
+def test_a_counter_only_gauge_is_offered_storms(bare):
+    _seed_counter(bare, [(30, 10.0), (18, 10.25), (6, 10.25), (1, 10.25)])
+    bare.get("/weather/records")
+    assert all(_offers_storms(bare).values()), _offers_storms(bare)
+    assert "rain starts" in bare.get("/weather/storms").text
+
+
+def test_a_day_total_gauge_is_offered_storms(bare):
+    _seed_thermometer(bare, {"rain": {"daily_in": 0.12}})
+    bare.get("/weather/records")
+    assert all(_offers_storms(bare).values()), _offers_storms(bare)
+
+
+# ── the open pages never wait on a cold records compute (CodeRabbit, PR #113) ──
+#
+# _public_shown awaited the all-time records on a cache miss. Every open
+# page reaches it (History, Storms, Reports through the Storms nav), and a
+# cold compute on a big archive with the rollups unable to answer takes
+# minutes, with the visitor waiting and a _PUBLIC_PAGE_SEM slot held. It
+# now reads them the dashboard's way: cached, else hide nothing and warm in
+# the background.
+
+def test_a_cold_records_cache_does_not_hold_up_the_page(bare, monkeypatch):
+    from app import db, main
+    _seed_thermometer(bare)
+    calls = []
+
+    async def run():
+        release = asyncio.Event()
+
+        async def slow_records(mac, tz):
+            calls.append(mac)
+            await release.wait()             # a compute that has not finished
+            return {"periods": {"all": {"fields": {"tempf": {"max": 76.0}}}}}
+        monkeypatch.setattr(db, "records", slow_records)
+        fields = ["tempf", "humidity", "baromrelin", "hourlyrainin"]
+        # The page answers at once with every field (unknown is not never)...
+        shown = await asyncio.wait_for(main._public_shown(BARE, fields), 2.0)
+        assert shown == set(fields)
+        # ...and the compute it needs is under way in the background.
+        await asyncio.sleep(0)
+        assert calls == [BARE]
+        assert main._records_cached_or_warm(BARE) is None   # one warm, not two
+        await asyncio.sleep(0)
+        assert calls == [BARE]
+        release.set()
+        await asyncio.gather(*list(main._WARM_TASKS))
+        # Warm now: the next build filters.
+        assert await main._public_shown(BARE, fields) == {"tempf"}
+    asyncio.run(run())
+
+
+def test_a_cold_records_cache_answers_the_history_page(bare, monkeypatch):
+    """Through the real route: a records compute that never finishes in
+    time does not keep the visitor waiting."""
+    from app import db
+    _seed_thermometer(bare)
+
+    async def stuck(mac, tz):
+        await asyncio.sleep(30)
+        return {}
+    monkeypatch.setattr(db, "records", stuck)
+    t0 = time.monotonic()
+    r = bare.get("/weather/history")
+    assert r.status_code == 200
+    assert time.monotonic() - t0 < 10, "the page waited on the records compute"

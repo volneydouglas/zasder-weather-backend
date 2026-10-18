@@ -587,8 +587,9 @@ async def send_to_all(title: str, body: str,
     `interruption_level` (1.9): "time-sensitive" for the urgent tier —
     iOS-only, FCM ignores it (Android priority is a separate scheme).
 
-    `route` (2.1): where a tap should land, e.g. "report/12". iOS-only for
-    now on both transports; a relay too old to know the field is detected
+    `route` (2.1): where a tap should land, e.g. "report/12". Both
+    platforms since 2.7 (FCM data keys, with `server_id` and `tier`); on
+    the iOS relay transport a relay too old to know the field is detected
     and retried without it, so a route can never cost a delivery."""
     from . import fcm
     own = settings.apns_configured
@@ -659,7 +660,11 @@ async def send_to_all(title: str, body: str,
 
     # Android
     if android and fcm_on:
-        res = await fcm.push_tokens_fcm([t["token"] for t in android], title, body)
+        # F10: the same route, sender stamp and tier the iOS payload
+        # carries, as FCM data keys the Android app reads.
+        res = await fcm.push_tokens_fcm([t["token"] for t in android], title,
+                                        body, route=route, server_id=server_id,
+                                        tier=tier)
         sent += res.get("sent", 0); failed += res.get("failed", 0)
         dead += res.get("dead", [])
 

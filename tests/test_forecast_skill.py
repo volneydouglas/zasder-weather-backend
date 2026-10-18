@@ -336,6 +336,18 @@ def test_a_fifty_percent_call_with_rain_is_a_hit():
     assert dry["misses"] == 1 and dry["hits"] == 0
 
 
+def test_a_day_with_exactly_the_minimum_rain_rained():
+    """RAIN_DAY_MIN_IN is inclusive: one tip of the bucket is a rain day,
+    so a dry call on it is a miss and a wet call a hit."""
+    from app import insights
+    from app.forecast_skill import _rain, RAIN_POP
+    day = {"2026-09-01": {"rain_total": insights.RAIN_DAY_MIN_IN}}
+    dry_call = _rain(["2026-09-01"], {"2026-09-01": {"pop": 0.0}}, day)
+    assert dry_call["misses"] == 1 and dry_call["quiet"] == 0
+    wet_call = _rain(["2026-09-01"], {"2026-09-01": {"pop": RAIN_POP}}, day)
+    assert wet_call["hits"] == 1 and wet_call["false_alarms"] == 0
+
+
 def test_exactly_min_days_of_covered_days_reach_the_threshold(box):
     """Ten fully covered, matched days are enough; nine are not."""
     from app import forecast_skill as fs

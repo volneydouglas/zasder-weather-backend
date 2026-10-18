@@ -200,7 +200,12 @@ def test_the_on_demand_check_answers_in_the_same_shape(client, req, monkeypatch)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["one_tap"] == "request_file" and "update_request" in body
-    assert set(body) == set(client.get("/api/version").json())
+    version = client.get("/api/version").json()
+    assert set(body) == set(version)
+    # 2.7: the keys alone let `capabilities: []` through, and the apps would
+    # stop seeing the stable API after "Check for updates now".
+    assert body["capabilities"] == version["capabilities"]
+    assert "stable-api" in body["capabilities"]
 
 
 def _dotenv_only(monkeypatch, tmp_path, lines: str) -> None:

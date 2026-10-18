@@ -1,0 +1,21 @@
+{
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "entries": [
+    {"id": 7, "mac": "AA:BB:CC:DD:EE:FF", "ts_ms": 1759996800000,
+     "note": "Cleaned the rain gauge funnel", "field": "dailyrainin",
+     "source": "user", "kind": null, "detail": null,
+     "created_ms": 1760001000000, "updated_ms": 1760001000000},
+    {"id": 8, "mac": "AA:BB:CC:DD:EE:FF", "ts_ms": 1760003000000,
+     "note": "Temperature offset changed from 0 to -1.2 °F", "field": "tempf",
+     "source": "auto", "kind": "calibration",
+     "detail": {"field": "tempf", "correction": "offset", "from": 0.0,
+                "to": -1.2, "unit": "°F"},
+     "created_ms": 1760003000000, "updated_ms": 1760003000000},
+    {"id": 9, "mac": "AA:BB:CC:DD:EE:FF", "ts_ms": 1760090000000,
+     "note": "Station location changed", "field": null,
+     "source": "auto", "kind": "location", "detail": null,
+     "created_ms": 1760090000000, "updated_ms": 1760090000000}
+  ],
+  "note_max": 280,
+  "entries_max": 2000
+}

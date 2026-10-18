@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "config_server.h"
+#include "field_map.h"
 #include "ingest_id.h"
 #include "post_fsm.h"
 #include "root_ca.h"
@@ -130,36 +131,8 @@ static String nowIsoUtc() {
   return String(buf);
 }
 
-// Copy a numeric field from the rtl_433 doc into the appropriate
-// sub-block of the outgoing observation, if present.
-static void copyIf(const JsonDocument &in, const char *inKey,
-                   JsonObject &out, const char *outKey) {
-  if (in[inKey].is<float>() || in[inKey].is<int>() || in[inKey].is<double>()) {
-    out[outKey] = in[inKey].as<float>();
-  }
-}
-
-// Unit converters used inline where the source field's unit differs
-// from what /ingest/custom expects (which mirrors AmbientWeather's
-// imperial field names).
-static inline float c_to_f(float c)     { return c * 9.0f / 5.0f + 32.0f; }
-static inline float ms_to_mph(float ms) { return ms * 2.23694f; }
-static inline float mm_to_in(float mm)  { return mm / 25.4f; }
-static inline float hpa_to_inhg(float h){ return h * 0.0295299830714f; }
-
-// Magnus-Tetens dew point in °F from tempf + humidity %. Matches the
-// formula sdr-relay uses so two sources posting to the same device
-// row don't disagree on dew point by a fraction. Returns NaN if
-// humidity is non-positive (rare sensor glitch) — caller must check
-// isnan() before using.
-static float dew_point_f(float temp_f, float humidity_pct) {
-  if (humidity_pct <= 0.0f) return NAN;
-  float t_c = (temp_f - 32.0f) * 5.0f / 9.0f;
-  const float a = 17.625f, b = 243.04f;
-  float gamma = logf(humidity_pct / 100.0f) + (a * t_c) / (b + t_c);
-  float dp_c = (b * gamma) / (a - gamma);
-  return dp_c * 9.0f / 5.0f + 32.0f;
-}
+using FieldMap::c_to_f;
+using FieldMap::hpa_to_inhg;
 
 void zasder_post(const char *rtl433Json,
                  const String &backendUrl,
@@ -278,101 +251,10 @@ void zasder_post(const char *rtl433Json,
   out["timestamp_utc"] = nowIsoUtc();
   out["source"]        = ZASDER_SOURCE_TAG;
 
-  // ── outdoor block ──
-  if (in["temperature_C"].is<float>() || in["temperature_F"].is<float>() ||
-      in["humidity"].is<float>()) {
-    auto outdoor = out["outdoor"].to<JsonObject>();
-    if (in["temperature_C"].is<float>())
-      outdoor["tempf"] = c_to_f(in["temperature_C"].as<float>());
-    else if (in["temperature_F"].is<float>())
-      outdoor["tempf"] = in["temperature_F"].as<float>();
-    // Field names MUST match backend/app/ingest._flatten() schema:
-    //   outdoor: tempf, feels_like, dew_point_f, humidity, uv, solar_wm2
-    //   wind:    speed_mph, gust_mph, direction
-    //   indoor:  tempf, humidity, pressure_inhg
-    //   pressure: relative_inhg
-    // Mis-naming silently drops the field; the iOS card then renders
-    // without that tile.
-    copyIf(in, "humidity",         outdoor, "humidity");
-    copyIf(in, "uv",               outdoor, "uv");
-    copyIf(in, "uvi",              outdoor, "uv");
-    // Solar irradiance: backend schema only takes outdoor.solar_wm2. If
-    // the decoder emits W/m² directly (rare; some Ecowitt variants),
-    // use it; otherwise derive from lux via the standard 126.7 lux/(W·m⁻²)
-    // (the same divisor sdr-relay/sdr_relay.py uses: the two relays share
-    // a device row, so they must share the number)
-    // sunlight approximation. rtl_433 names differ by decoder:
-    //   Atlas emits "lux"; Fineoffset-WH65B/WH24 emits "light_lux".
-    if (in["solar_radiation"].is<float>()) {
-      outdoor["solar_wm2"] = in["solar_radiation"].as<float>();
-    } else {
-      float lux = NAN;
-      if (in["light_lux"].is<float>()) lux = in["light_lux"].as<float>();
-      else if (in["lux"].is<float>())  lux = in["lux"].as<float>();
-      if (!isnan(lux)) {
-        outdoor["solar_wm2"] = lux / 126.7f;
-      }
-    }
-    // Computed dew point when we have both temp + humidity. Backend
-    // accepts dew_point_f directly (no further derivation needed).
-    if (outdoor["tempf"].is<float>() && outdoor["humidity"].is<float>()) {
-      float dp = dew_point_f(outdoor["tempf"].as<float>(),
-                             outdoor["humidity"].as<float>());
-      if (!isnan(dp)) outdoor["dew_point_f"] = dp;
-    }
-  }
-
-  // ── wind block ── rtl_433 decoders emit m/s, mi/h, or km/h depending
-  // on the protocol's native unit; accept all three.
-  if (in["wind_avg_m_s"].is<float>() || in["wind_max_m_s"].is<float>() ||
-      in["wind_avg_mi_h"].is<float>() || in["wind_avg_km_h"].is<float>() ||
-      in["wind_dir_deg"].is<int>()) {
-    auto wind = out["wind"].to<JsonObject>();
-    if (in["wind_avg_m_s"].is<float>())
-      wind["speed_mph"] = ms_to_mph(in["wind_avg_m_s"].as<float>());
-    else if (in["wind_avg_mi_h"].is<float>())
-      wind["speed_mph"] = in["wind_avg_mi_h"].as<float>();
-    else if (in["wind_avg_km_h"].is<float>())
-      wind["speed_mph"] = in["wind_avg_km_h"].as<float>() * 0.621371f;
-    if (in["wind_max_m_s"].is<float>())
-      wind["gust_mph"] = ms_to_mph(in["wind_max_m_s"].as<float>());
-    else if (in["wind_max_mi_h"].is<float>())
-      wind["gust_mph"] = in["wind_max_mi_h"].as<float>();
-    else if (in["wind_max_km_h"].is<float>())
-      wind["gust_mph"] = in["wind_max_km_h"].as<float>() * 0.621371f;
-    copyIf(in, "wind_dir_deg", wind, "direction");
-  }
-
-  // ── rain block ── Send the raw cumulative counter as yearly_in.
-  // The backend's rain_rollups() differences yearlyrainin against
-  // historical values at local-time period boundaries, so daily /
-  // hourly / weekly / monthly come out correct after the first ~24h
-  // of history (the very first reading produces None for daily, which
-  // iOS handles by hiding the cell — subsequent readings populate
-  // properly). Atlas emits rain_in (inches); Fineoffset emits
-  // rain_mm (millimeters).
-  //
-  // CAVEAT: yearlyrainin will look big on first deploy because it's
-  // the sensor's lifetime cumulative, not 0-since-Jan-1. The rollups
-  // are still correct since they're differences.
-  float rain_in_total = NAN;
-  if (in["rain_in"].is<float>()) {
-    rain_in_total = in["rain_in"].as<float>();
-  } else if (in["rain_mm"].is<float>()) {
-    rain_in_total = in["rain_mm"].as<float>() * 0.0393701f;
-  }
-  if (!isnan(rain_in_total)) {
-    auto rain = out["rain"].to<JsonObject>();
-    rain["yearly_in"] = rain_in_total;
-  }
-
-  // ── pressure block ── (only relevant if a paired indoor sensor
-  // forwards barometer; outdoor stations don't have one). Convert
-  // hPa → inHg.
-  if (in["pressure_hPa"].is<float>()) {
-    auto p = out["pressure"].to<JsonObject>();
-    p["relative_inhg"] = hpa_to_inhg(in["pressure_hPa"].as<float>());
-  }
+  // ── reading blocks ── outdoor, wind, rain, pressure (field_map.h: the
+  // native tests run this same mapping).
+  FieldMap::mapReadings(in, out,
+      typeTag == 0x01 && ZasderConfigServer::atlasUvLuxBroken);
 
   // ── WH32B merge ── Fineoffset outdoor stations don't carry indoor
   // temp/humidity or pressure on their own, but a paired WH32B does.

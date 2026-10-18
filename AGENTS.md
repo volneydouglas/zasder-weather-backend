@@ -30,6 +30,10 @@ If you are an agent, before doing anything else:
 - **Composite latest** — `/api/devices/{mac}/current` returns the
   freshest non-null value per field across the last 5 min of obs, so
   multi-source devices show full tile grids in the iOS app.
+- **Stable API**: the endpoints and fields in `API.md` that third-party
+  clients can rely on (additive only within a major version), pinned by
+  `tests/fixtures/stable_api.json` and `tests/test_stable_api.py`. If a
+  change trips that test, keep the old field and add the new one.
 
 ## Repo layout
 
@@ -335,7 +339,8 @@ The board also exposes mDNS as `zasder-lilygo-XXXX.local` (XXXX = last
 | Davis cloud poller silent | Missing one of the three required secrets | Backend logs `WeatherLink not configured` when any of `_KEY/_SECRET/_STATION_ID` is unset. All three needed. |
 | `WeatherLink poll failed: HTTPError` | Wrong key/secret OR rate-limited | Free tier = 1000 req/hr. Default poll = 60s = 60 req/hr — comfortable. Verify keys with `curl -H "X-Api-Secret: ..." "https://api.weatherlink.com/v2/stations?api-key=..."` |
 | iOS app shows "No data" but backend is healthy | Wrong `API_TOKEN` OR wrong backend URL in app settings | Both must match exactly. Try `curl -H "Authorization: Bearer $API_TOKEN" https://<backend>/api/devices` from your terminal to isolate. |
-| Atlas card missing UV/lux | Atlas hardware quirk — UV/lux photodiode commonly dies and reports a stuck value | Set `ATLAS_UV_LUX_BROKEN=1` env on the LilyGO 433 to mask both fields. Hardware-level — not a software bug. |
+| Atlas card missing UV/lux | The Atlas sends UV and lux in their own message (type 0x27, no temperature); LilyGO firmware before the 2.7 relay fix dropped that message's fields | Reflash the 433 board with the current `lilygo-relay`; `pio test -e native` (test_field_map) pins it. |
+| Atlas UV/lux stuck on one value (e.g. UV 4 and daylight at night) | Atlas hardware quirk: the UV/lux photodiode can die and repeat a stuck value | Mask both on the 433 board: `curl -X POST http://<board>.local/provision -H "Authorization: Bearer <current ingest token>" -d atlas_uv_lux_broken=1` (`/status` shows `atlas_uv_lux_broken`); set it back to 0 after the sensor is replaced. |
 | Davis "RAIN TODAY" shows large number | `WEATHERLINK_YEARLY_RAIN_BASELINE_IN` set but rain rollup is computing daily from yearly delta | Davis cloud reports daily-rain directly; we set it explicitly to bypass the rollup. Confirm latest backend code; if you have stale Davis observations with `yearlyrainin=0` and current has the baseline, the rollup math breaks. Fix: delete pre-baseline rows OR re-baseline. |
 
 ## Tests

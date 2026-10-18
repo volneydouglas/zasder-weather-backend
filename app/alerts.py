@@ -594,6 +594,26 @@ def in_quiet_hours(now_ms: int, tz_name: str,
 SMART_KINDS = ("frost", "heat", "pressure_drop", "temp_drop", "wind_ramp",
                "pipe_freeze", "outflow")
 
+# The rate family groups: several of these newly firing on one tick at one
+# place is one weather event, a front (see _deliver_smart_place).
+_FRONT_FAMILY = ("pressure_drop", "temp_drop", "wind_ramp", "outflow")
+_FRONT_LABEL = {"pressure_drop": "pressure falling fast",
+                "temp_drop": "temperature dropping",
+                "wind_ramp": "wind ramping up",
+                "outflow": "a pressure-jump outflow"}
+
+
+@dataclass
+class _SmartEval:
+    """One station's smart-alert tick: what it reads and which edges it
+    newly crossed. Built in _check_smart_alerts, spoken per place."""
+    mac: str
+    name: str
+    fresh_data: bool
+    msg: dict[str, Any]
+    conds: dict[str, bool] = field(default_factory=dict)
+    fresh: list[str] = field(default_factory=list)
+
 
 def smart_condition(kind: str, *, tempf: float | None = None,
                     feels: float | None = None,
@@ -1165,9 +1185,20 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
                     rule_id = int(route.split("/", 1)[1])
                 except ValueError:
                     rule_id = None
+            # 2.7 (F27-07): the report the push opens rides its row, from
+            # the same route the push carries, so the app opens that
+            # report rather than the nearest one by time. None when the
+            # report could not be stored (the route is None then too).
+            report_id = None
+            if route and route.startswith("report/"):
+                try:
+                    report_id = int(route.split("/", 1)[1])
+                except ValueError:
+                    report_id = None
             await db.log_alert(ts_ms, kind, mac,
                                push_title, push_body, delivered,
-                               severity=eff_severity, rule_id=rule_id)
+                               severity=eff_severity, rule_id=rule_id,
+                               report_id=report_id)
         except Exception as e:
             log.exception("alert history write failed: %s", e)
         # 1.8 webhooks (Pillar B): every HANDLED alert fans out to the
@@ -2197,16 +2228,25 @@ class AlertMonitor:
         reading after August 1 fires exactly once per station per season —
         trivially cheap, and the gardeners' favorite. Season key rolls on
         Aug 1 so a January frost belongs to the season that began the
-        previous fall."""
+        previous fall.
+
+        Per place since 2.7: stations at one place share one first frost.
+        The first of them to freeze speaks (naming any that froze on the
+        same tick); a station whose place has already had its first frost
+        this season files its own key silently when it freezes."""
+        from . import places
         try:
             tz = ZoneInfo(settings.timezone)
         except Exception:
             tz = None
         local = datetime.fromtimestamp(now_ms / 1000, tz)
         season = local.year if local.month >= 8 else local.year - 1
-        for d in devices:
-            if db.is_air_monitor_device(d):
-                continue
+        devices = [d for d in devices if not db.is_air_monitor_device(d)]
+
+        def _key(mac: str) -> str:
+            return f"seasonal.first_frost.{mac}.{season}"
+
+        def _freezing(d) -> float | None:
             last = d.get("lastData") or {}
             # Freshness gate (the health-watcher rule): a station that died
             # on a cold night keeps a freezing lastData forever, and firing
@@ -2220,31 +2260,56 @@ class AlertMonitor:
             # "fresh" — it would fire and burn the seasonal key early.
             if (not isinstance(obs_ms, (int, float))
                     or abs(now_ms - obs_ms) > 30 * 60_000):
-                continue
+                return None
             try:
                 tempf = float(last.get("tempf"))
             except (TypeError, ValueError):
-                continue
-            if tempf > 32.5:
-                continue
-            mac = d["mac"]
-            key = f"seasonal.first_frost.{mac}.{season}"
-            if await db.get_kv(key):
-                continue
-            dname = _clean_name(d.get("name") or mac)
-            title = f"{dname}: First frost of the season"
-            body = (f"{tempf:g}°F — the season's first freezing reading. "
-                    f"Tender plants and hoses, this is your notice.")
-            if await _deliver(cfg, f"[Zasder Weather] {title}", body,
-                              title, body,
-                              email_ok=cfg.email_scope == "all",
-                              kind="first_frost", mac=mac):
-                await db.set_kv(key, str(now_ms))
-                log.info("first frost of season %s on %s", season, dname)
+                return None
+            return tempf if tempf <= 32.5 else None
+
+        for members in places.group(devices):
+            units = ([members] if "first_frost" in places.GROUPED_KINDS
+                     else [[m] for m in members])
+            for unit in units:
+                burned = {d["mac"] for d in unit
+                          if await db.get_kv(_key(d["mac"]))}
+                freezing = [(d, t) for d in unit
+                            if d["mac"] not in burned
+                            and (t := _freezing(d)) is not None]
+                if not freezing:
+                    continue
+                if burned:
+                    # The place's first frost already went out (from a
+                    # sibling, this tick or earlier): file this station's
+                    # key without a second notice.
+                    for d, _t in freezing:
+                        await db.set_kv(_key(d["mac"]), str(now_ms))
+                    continue
+                lead, tempf = freezing[0]
+                mac = lead["mac"]
+                dname = _clean_name(lead.get("name") or mac)
+                title = f"{dname}: First frost of the season"
+                body = (f"{tempf:g}°F — the season's first freezing reading. "
+                        f"Tender plants and hoses, this is your notice.")
+                body += places.also_line(
+                    "seen", [_clean_name(d.get("name") or d["mac"])
+                             for d, _t in freezing[1:]])
+                if await _deliver(cfg, f"[Zasder Weather] {title}", body,
+                                  title, body,
+                                  email_ok=cfg.email_scope == "all",
+                                  kind="first_frost", mac=mac):
+                    for d, _t in freezing:
+                        await db.set_kv(_key(d["mac"]), str(now_ms))
+                    log.info("first frost of season %s on %s", season,
+                             "+".join(_clean_name(d.get("name") or d["mac"])
+                                      for d, _t in freezing))
 
     async def _check_smart_alerts(self, cfg, devices, now_ms: int) -> None:
-        """Frost / heat / rapid-pressure-drop alerts, edge-triggered per device."""
-        states = await db.get_smart_alert_states()
+        """Frost / heat / rapid-pressure-drop alerts, edge-triggered per
+        device, delivered per PLACE (2.7): stations at one place that agree
+        send one alert (see app/places.py)."""
+        from . import places
+        full = await db.get_smart_alert_states_full()
         # Weather smart alerts skip air monitors: the outdoor AirGradient
         # reports a real tempf, and without this every frost/heat/front
         # would fire twice for the same yard.
@@ -2257,14 +2322,10 @@ class AlertMonitor:
             except (TypeError, ValueError):
                 return None
 
-        # The rate family groups: when several of these newly fire on the
-        # SAME tick for the SAME station, that is one weather event (a
-        # front) — deliver one notification, not a pile (Pillar A).
-        _FRONT_FAMILY = ("pressure_drop", "temp_drop", "wind_ramp", "outflow")
-        _FRONT_LABEL = {"pressure_drop": "pressure falling fast",
-                        "temp_drop": "temperature dropping",
-                        "wind_ramp": "wind ramping up",
-                        "outflow": "a pressure-jump outflow"}
+        # Phase 1, per station: compute every condition, re-arm what has
+        # cleared, and collect the fresh edges. Nothing is delivered here,
+        # so phase 2 can see the whole place before anyone speaks.
+        evaluated: dict[str, _SmartEval] = {}
         for d in devices:
             mac = d["mac"]
             last = d.get("lastData") or {}
@@ -2325,58 +2386,139 @@ class AlertMonitor:
                 wind_ramp_mph=settings.smart_alert_wind_ramp_mph,
                 pipe_freeze_f=settings.smart_alert_pipe_freeze_f)
 
-            # Evaluate everything first so grouping can see the whole tick.
-            fresh: list[str] = []
+            ev = _SmartEval(
+                mac=mac, name=_clean_name(d.get("name") or mac),
+                fresh_data=places.is_fresh(d, now_ms),
+                msg=dict(tempf=tempf, feels=feels, pressure_delta_3h=delta,
+                         temp_delta_1h=temp_delta_1h, wind=wind, gust=gust,
+                         pipe_freeze_f=settings.smart_alert_pipe_freeze_f))
             for kind in SMART_KINDS:
                 cond = smart_condition(kind, **kw)
-                prev = states.get((mac, kind), 0)
+                ev.conds[kind] = cond
+                prev = full.get((mac, kind), (0, None))[0]
                 if cond and not prev:
-                    fresh.append(kind)
+                    ev.fresh.append(kind)
                 elif not cond and prev and smart_cleared(kind, **kw):
                     # Re-arm only once the condition clears by a deadband, so
                     # a value wobbling on the boundary can't re-fire per tick.
                     await db.upsert_smart_alert_state(mac, kind, 0, now_ms)
+                    full[(mac, kind)] = (0, now_ms)
+            evaluated[mac] = ev
 
-            dname = d.get("name") or mac
-            front = [k for k in fresh if k in _FRONT_FAMILY]
-            if len(front) >= 2:
-                title, body = build_smart_message(
-                    "front", dname,
-                    front_parts=[_FRONT_LABEL[k] for k in front])
-                # The group inherits its LOUDEST member's tier: outflow is
-                # warning ("strong winds in minutes") and grouping it with
-                # a watch-tier sibling must not demote it below the
-                # quiet-hours line (R7 R5).
-                tier = ("warning" if any(severity_of(k) == "warning"
-                                         for k in front) else None)
-                if await _deliver(cfg, f"[Zasder Weather] {title}", body,
-                                  title, body,
-                                  email_ok=cfg.email_scope == "all",
-                                  kind="front", mac=mac,
-                                  severity=tier):
-                    for k in front:
-                        await db.upsert_smart_alert_state(mac, k, 1, now_ms)
-                    log.info("front passage (%s) on %s",
-                             "+".join(front), dname)
-                fresh = [k for k in fresh if k not in front]
+        # Phase 2, per place.
+        for members in places.group(devices):
+            ents = [evaluated[m["mac"]] for m in members]
+            await self._deliver_smart_place(cfg, ents, full, now_ms)
 
-            for kind in fresh:
-                title, body = build_smart_message(
-                    kind, dname, tempf=tempf, feels=feels,
-                    pressure_delta_3h=delta, temp_delta_1h=temp_delta_1h,
-                    wind=wind, gust=gust,
-                    pipe_freeze_f=settings.smart_alert_pipe_freeze_f)
+    async def _deliver_smart_place(self, cfg, ents: list["_SmartEval"],
+                                   full: dict, now_ms: int) -> None:
+        """One place's fresh smart-alert edges, delivered once per kind.
+
+        A station alone is its own place and gets exactly the pre-2.7
+        behaviour. With company: an edge a sibling already announced (its
+        edge fired inside PLACE_WINDOW_MS, or it is still over the line on
+        fresh data) joins that alert silently; edges several stations cross
+        on the same tick go out as one alert from the first of them, naming
+        the others. Every station that took part is marked triggered, so
+        none of them fires the same alert on its next evaluation, and each
+        re-arms on its own reading as before."""
+        from . import places
+        grouped = places.GROUPED_KINDS
+
+        def covered(ev: _SmartEval, kind: str) -> bool:
+            if kind not in grouped:
+                return False
+            for sib in ents:
+                if sib is ev:
+                    continue
+                trig, changed = full.get((sib.mac, kind), (0, None))
+                if not trig:
+                    continue
+                if (changed is not None
+                        and now_ms - changed <= places.PLACE_WINDOW_MS):
+                    return True
+                if sib.fresh_data and sib.conds.get(kind):
+                    return True
+            return False
+
+        for ev in ents:
+            keep: list[str] = []
+            for kind in ev.fresh:
+                if covered(ev, kind):
+                    # Persisted, not just skipped: left at 0 this station
+                    # would read the next tick as a fresh edge again.
+                    await db.upsert_smart_alert_state(ev.mac, kind, 1, now_ms)
+                    full[(ev.mac, kind)] = (1, now_ms)
+                    log.info("smart alert %s on %s joins its place's alert",
+                             kind, ev.name)
+                else:
+                    keep.append(kind)
+            ev.fresh = keep
+
+        # The rate family groups: when several of these newly fire on the
+        # SAME tick at the SAME place, that is one weather event (a front)
+        # and one notification, not a pile (Pillar A; per place since 2.7,
+        # so a Davis's pressure fall and a Tempest's temperature break in
+        # one yard are the same front).
+        front_units = [ents] if "front" in grouped else [[e] for e in ents]
+        for unit in front_units:
+            kinds = {k for e in unit for k in e.fresh if k in _FRONT_FAMILY}
+            if len(kinds) < 2:
+                continue
+            front = [k for k in SMART_KINDS if k in kinds]
+            who = [e for e in unit if any(k in kinds for k in e.fresh)]
+            lead = who[0]
+            title, body = build_smart_message(
+                "front", lead.name,
+                front_parts=[_FRONT_LABEL[k] for k in front])
+            body += places.also_line("seen", [e.name for e in who[1:]])
+            # The group inherits its LOUDEST member's tier: outflow is
+            # warning ("strong winds in minutes") and grouping it with
+            # a watch-tier sibling must not demote it below the
+            # quiet-hours line (R7 R5).
+            tier = ("warning" if any(severity_of(k) == "warning"
+                                     for k in front) else None)
+            if await _deliver(cfg, f"[Zasder Weather] {title}", body,
+                              title, body,
+                              email_ok=cfg.email_scope == "all",
+                              kind="front", mac=lead.mac,
+                              severity=tier):
+                for e in who:
+                    for k in e.fresh:
+                        if k in kinds:
+                            await db.upsert_smart_alert_state(
+                                e.mac, k, 1, now_ms)
+                            full[(e.mac, k)] = (1, now_ms)
+                log.info("front passage (%s) on %s", "+".join(front),
+                         "+".join(e.name for e in who))
+            for e in unit:
+                e.fresh = [k for k in e.fresh if k not in kinds]
+
+        for kind in SMART_KINDS:
+            speakers = [e for e in ents if kind in e.fresh]
+            if not speakers:
+                continue
+            units = [speakers] if kind in grouped else [[e] for e in speakers]
+            for unit in units:
+                lead = unit[0]
+                title, body = build_smart_message(kind, lead.name, **lead.msg)
+                body += places.also_line("seen", [e.name for e in unit[1:]])
                 # Persist triggered=1 only after delivery (same as threshold
                 # rules) so a transport failure retries next tick.
                 if await _deliver(cfg, f"[Zasder Weather] {title}", body,
                                   title, body,
                                   email_ok=cfg.email_scope == "all",
-                                  kind=kind, mac=mac):
-                    await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
-                    log.info("smart alert fired: %s on %s", kind, dname)
+                                  kind=kind, mac=lead.mac):
+                    for e in unit:
+                        await db.upsert_smart_alert_state(
+                            e.mac, kind, 1, now_ms)
+                        full[(e.mac, kind)] = (1, now_ms)
+                    log.info("smart alert fired: %s on %s", kind,
+                             "+".join(e.name for e in unit))
                 else:
                     log.warning("smart alert %s delivery failed for %s; "
-                                "will retry next tick", kind, mac)
+                                "will retry next tick", kind,
+                                "+".join(e.mac for e in unit))
 
 
 def _device_threshold(mac: str, dev_prefs: dict, default_min: float) -> float | None:

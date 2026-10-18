@@ -29,7 +29,7 @@ import csv
 import html as _html
 import io
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Collection
 from zoneinfo import ZoneInfo
 
 from . import public_dashboard as pd
@@ -47,6 +47,13 @@ AXES = {"7d": ("7 days ago", "3.5 days", "now"),
         "30d": ("30 days ago", "15 days", "now"),
         "1y": ("1 year ago", "6 months", "today")}
 HISTORY_FIELDS = ("tempf", "humidity", "windspeedmph", "baromrelin")
+# The field each daily card stands for when the page asks which fields a
+# station has ever reported (2.7, `public_dashboard.shown_fields`). Rain is
+# `hourlyrainin`, the dashboard's own rain key, so a station that sends
+# only a day total keeps the card exactly as it keeps the dashboard's.
+RAIN_CARD_FIELD = "hourlyrainin"
+GUST_CARD_FIELD = "windgustmph"
+HISTORY_CARD_FIELDS = HISTORY_FIELDS + (RAIN_CARD_FIELD, GUST_CARD_FIELD)
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
@@ -86,14 +93,15 @@ MORE_LINK_CLASS = 'class="pp-more-a"'
 NEW_TAB = ' target="_blank" rel="noopener"'
 
 
-def more_links(sid: str | None = None) -> str:
+def more_links(sid: str | None = None, hide: Collection[str] = ()) -> str:
     """The row the front page carries under the stations: where the rest of
     the data is. The front page and the embed share one cached fragment;
     the embed (an iframe on someone else's site) adds NEW_TAB to each link
     at serve time (`for_embed`) so they open a tab instead of navigating
-    inside the frame."""
+    inside the frame. `hide`: NAV keys this server has nothing for (Storms
+    with no rain gauge, `storms_hidden`)."""
     links = "".join(f'<a {MORE_LINK_CLASS} href="{path}{_q(sid)}">{_esc(label)}</a>'
-                    for key, path, label in NAV if key != "now")
+                    for key, path, label in NAV if key != "now" and key not in hide)
     return f'<nav class="pp-more" aria-label="More weather">{links}</nav>'
 
 
@@ -101,9 +109,23 @@ def for_embed(fragment: str) -> str:
     return fragment.replace(MORE_LINK_CLASS, MORE_LINK_CLASS + NEW_TAB)
 
 
-def nav(active: str, sid: str | None) -> str:
+def storms_hidden(rain: bool, has_storm: bool) -> set[str]:
+    """The NAV keys to leave out for a station: Storms, when it has never
+    reported rain (`public_dashboard.shown_fields`, counter-derived rain
+    included) and has no storm on file. A thermometer has no storms to
+    offer (2.7 RC smoke test)."""
+    return set() if rain or has_storm else {"storms"}
+
+
+NO_RAIN_STORMS_NOTE = ("This station does not report rain, so it records no "
+                       "storms.")
+
+
+def nav(active: str, sid: str | None, hide: Collection[str] = ()) -> str:
     items = []
     for key, path, label in NAV:
+        if key in hide and key != active:
+            continue
         cur = ' aria-current="page" class="on"' if key == active else ""
         href = path + (_q(sid) if key != "now" else "")
         items.append(f'<a href="{href}"{cur}>{_esc(label)}</a>')
@@ -122,7 +144,7 @@ def station_picker(stations: list[tuple[str, str]], sid: str, path: str,
 
 
 def page(title: str, active: str, sid: str | None, body: str,
-         station_name: str = "") -> str:
+         station_name: str = "", hide: Collection[str] = ()) -> str:
     head = _esc(station_name or "Zasder Weather")
     return f"""<!doctype html>
 <html lang="en">
@@ -140,7 +162,7 @@ def page(title: str, active: str, sid: str | None, body: str,
   </style>
 </head>
 <body><div class="wrap">
-<header class="pp-head"><div class="pp-station">{head}</div>{nav(active, sid)}</header>
+<header class="pp-head"><div class="pp-station">{head}</div>{nav(active, sid, hide)}</header>
 <main>
 <h1 class="pp-title">{_esc(title)}</h1>
 {body}
@@ -160,7 +182,8 @@ def unavailable(text: str) -> str:
 def svg_bars(points: list[tuple[int, float]], color: str, unit: str,
              time_labels: tuple[str, str, str], width: int = 640,
              height: int = 110, domain: tuple[int, int] | None = None,
-             slots: int | None = None) -> str:
+             slots: int | None = None,
+             marks: list[tuple[int, str]] | None = None) -> str:
     """Daily bars (rain) on a fixed calendar `domain` of `slots` days, so a
     station with a few days of data shows them where they fell. Zero days
     draw nothing; an all-dry window says so; days with no rain data are
@@ -186,9 +209,12 @@ def svg_bars(points: list[tuple[int, float]], color: str, unit: str,
                     f'height="{h:.1f}" fill="{color}" rx="1"/>')
     a, b, c = time_labels
     total = sum(v for _, v in pts)
+    lines = pd.mark_lines(marks, lambda t: round((width - bw) * (t - t0) / span
+                                                 + bw / 2, 1),
+                          t0, t1, height)
     return (f'<div class="chart-plot"><svg viewBox="0 0 {width} {height}" '
             f'preserveAspectRatio="none" class="chart-svg" role="img" '
-            f'aria-label="Daily rain">{"".join(bars)}</svg>'
+            f'aria-label="Daily rain">{lines}{"".join(bars)}</svg>'
             f'<span class="chart-yl" style="top:4%">{hi:.2f}{_esc(unit)}</span></div>'
             f'<div class="chart-legend"><span class="lg">Total {total:.2f} {_esc(unit)} · '
             f'wettest day {hi:.2f} {_esc(unit)}</span></div>'
@@ -211,11 +237,29 @@ def render_history(range_key: str, series: dict[str, list[tuple[int, float]]],
                    days: list[dict[str, Any]] | None, insights: bool,
                    sid: str | None = None,
                    domain: tuple[int, int] | None = None,
-                   day_domain: tuple[int, int] | None = None) -> str:
+                   day_domain: tuple[int, int] | None = None,
+                   log: list[dict[str, Any]] | None = None,
+                   tz_name: str = "UTC",
+                   shown: Collection[str] | None = None) -> str:
     """`series`: field -> (ms, value) points for the 7 d / 30 d views (the
     server's bucketed history), drawn on `domain`, the window the labels
     name. `days`: the rollup day rows (ms at local noon, tmin, tmax, rain,
-    gust) for the daily cards and the 1 y view, drawn on `day_domain`."""
+    gust) for the daily cards and the 1 y view, drawn on `day_domain`.
+    `log`: the station logbook entries in the window, given only when the
+    owner turned the public logbook on (2.7); None draws no markers.
+    `shown`: the fields this station has ever reported, from
+    `public_dashboard.shown_fields` over `HISTORY_CARD_FIELDS` (2.7); a
+    card for any other field is not drawn. None draws every card."""
+    def has(key: str) -> bool:
+        return shown is None or key in shown
+
+    def marks(*fields: str) -> list[tuple[int, str]] | None:
+        # An entry about no field marks every chart; one about a field
+        # marks that field's charts.
+        if not log:
+            return None
+        return [(e["ts_ms"], e["note"]) for e in log
+                if e.get("field") is None or e.get("field") in fields]
     days_n, label = RANGES[range_key]
     axis = AXES[range_key]
     tabs = "".join(
@@ -230,30 +274,55 @@ def render_history(range_key: str, series: dict[str, list[tuple[int, float]]],
                                   "so there is no year view yet."))
     else:
         for key in HISTORY_FIELDS:
+            if not has(key):
+                continue
             meta = pd.FIELD_META[key]
             body = pd.svg_chart(series.get(key, []), meta["color"], unit=meta["unit"],
                                 time_labels=axis, domain=domain,
                                 gap_ms=GAP_MS.get(range_key),
-                                empty=f"no data in the last {label}")
+                                empty=f"no data in the last {label}",
+                                marks=marks(key))
             cards.append(_card(meta["label"], meta["unit"], body, f"last {label}"))
     if days:
         hi = [(d["ms"], d["tmax"]) for d in days]
         lo = [(d["ms"], d["tmin"]) for d in days]
         temp = pd.svg_multi_chart([("High", "#ff9e33", hi), ("Low", "#4cb2ff", lo)],
                                   unit="°F", time_labels=axis, domain=day_domain,
-                                  gap_ms=DAY_GAP_MS)
+                                  gap_ms=DAY_GAP_MS, marks=marks("tempf"))
         if temp:
             cards.insert(0, _card("Daily high and low", "°F", temp, f"last {label}"))
-        rain = svg_bars([(d["ms"], d["rain"]) for d in days], "#5aa0ff", "in", axis,
-                        domain=day_domain, slots=days_n)
-        cards.append(_card("Daily rain", "in", rain, f"last {label}"))
-        gust = pd.svg_chart([(d["ms"], d["gust"]) for d in days], "#39c9d6",
-                            unit="mph", time_labels=axis, domain=day_domain,
-                            gap_ms=DAY_GAP_MS,
-                            empty=f"no gust data in the last {label}")
-        cards.append(_card("Peak gust each day", "mph", gust, f"last {label}"))
+        if has(RAIN_CARD_FIELD):
+            rain = svg_bars([(d["ms"], d["rain"]) for d in days], "#5aa0ff", "in", axis,
+                            domain=day_domain, slots=days_n,
+                            marks=marks(*RAIN_FIELDS))
+            cards.append(_card("Daily rain", "in", rain, f"last {label}"))
+        if has(GUST_CARD_FIELD):
+            gust = pd.svg_chart([(d["ms"], d["gust"]) for d in days], "#39c9d6",
+                                unit="mph", time_labels=axis, domain=day_domain,
+                                gap_ms=DAY_GAP_MS,
+                                empty=f"no gust data in the last {label}",
+                                marks=marks("windgustmph", "windspeedmph"))
+            cards.append(_card("Peak gust each day", "mph", gust, f"last {label}"))
     return (f'<div class="pp-chips pp-ranges">{tabs}</div>'
-            f'<div class="charts pp-charts">{"".join(cards)}</div>')
+            f'<div class="charts pp-charts">{"".join(cards)}</div>'
+            + render_log(log, tz_name))
+
+
+RAIN_FIELDS = ("dailyrainin", "hourlyrainin", "rainratein", "eventrainin",
+               "weeklyrainin", "monthlyrainin", "yearlyrainin")
+
+
+def render_log(log: list[dict[str, Any]] | None, tz_name: str) -> str:
+    """The window's logbook entries under the charts, newest first, so a
+    marker's note can be read without hovering. Nothing when the owner has
+    not published the logbook or the window holds no entry."""
+    if not log:
+        return ""
+    items = "".join(
+        f'<li><span class="pp-log-when">{_esc(_date(e["ts_ms"], tz_name, True))}'
+        f'</span> {_esc(e["note"])}</li>'
+        for e in sorted(log, key=lambda e: (e["ts_ms"], e["id"]), reverse=True))
+    return f'<h2 class="pp-h2">Station log</h2><ul class="pp-log">{items}</ul>'
 
 
 # ── records and climate ──────────────────────────────────────────────────
@@ -319,11 +388,15 @@ def _month_days(year: int, month: int) -> int:
 
 
 def render_climate(summary: dict[str, Any] | None, year: int,
-                   years: list[int], sid: str | None, today=None) -> str:
+                   years: list[int], sid: str | None, today=None,
+                   rain: bool = True) -> str:
     """The year's month-by-month table (the climate summary the apps show),
     with each month's coverage: how many days it has summaries for, and
     whether it is still in progress (A26-06). A month of one day must not
-    read like a month of thirty-one."""
+    read like a month of thirty-one. `rain=False` (a station that has never
+    reported rain, 2.7) leaves the rain column out."""
+    def rain_td(v: Any) -> str:
+        return f'<td>{_n(v, 2)}</td>' if rain else ""
     if not summary or not any(m.get("days") for m in summary.get("months") or []):
         return unavailable(f"No daily summaries for {year}.")
     pick = "".join(
@@ -351,7 +424,7 @@ def render_climate(summary: dict[str, Any] | None, year: int,
             f'<tr{cls}><th scope="row">{MONTHS[m["month"] - 1]}'
             + (f'<small>{_esc(note)}</small>' if note else "") + '</th>'
             f'<td>{_n(m.get("mean"))}</td><td>{_n(m.get("max"))}</td>'
-            f'<td>{_n(m.get("min"))}</td><td>{_n(m.get("rain"), 2)}</td>'
+            f'<td>{_n(m.get("min"))}</td>{rain_td(m.get("rain"))}'
             f'<td>{_n(m.get("hdd"), 0)}</td><td>{_n(m.get("cdd"), 0)}</td></tr>')
     t = summary.get("totals") or {}
     highs = [pd._num(m.get("max")) for m in summary["months"]]
@@ -365,11 +438,12 @@ def render_climate(summary: dict[str, Any] | None, year: int,
                 + (f'<small>{_esc(y_note)}</small>' if y_note else "") + '</th>'
                 f'<td>{_n(t.get("mean"))}</td>'
                 f'<td>{_n(y_hi)}</td><td>{_n(y_lo)}</td>'
-                f'<td>{_n(t.get("rain"), 2)}</td><td>{_n(t.get("hdd"), 0)}</td>'
+                f'{rain_td(t.get("rain"))}<td>{_n(t.get("hdd"), 0)}</td>'
                 f'<td>{_n(t.get("cdd"), 0)}</td></tr>')
     return (f'<div class="pp-chips">{pick}</div>'
             '<div class="pp-table-wrap"><table class="pp-table pp-climate"><thead><tr>'
-            '<th></th><th>Mean °F</th><th>High °F</th><th>Low °F</th><th>Rain in</th>'
+            '<th></th><th>Mean °F</th><th>High °F</th><th>Low °F</th>'
+            + ('<th>Rain in</th>' if rain else '') +
             '<th>Heating degree days</th><th>Cooling degree days</th></tr></thead>'
             f'<tbody>{"".join(rows)}</tbody></table></div>'
             '<p class="pp-note">Means are (high + low) / 2, the NOAA convention; '
@@ -389,9 +463,11 @@ def render_normals(normal: dict[str, Any] | None, obs: dict[str, Any] | None,
     hi, lo = pd._num(t.get("max")), pd._num(t.get("min"))
 
     def diff(a, b):
+        # From the whole degrees printed beside it (2.7 RC smoke test:
+        # 71.6 vs 88.4 printed "72° vs 88° -17°").
         if a is None or b is None:
             return ""
-        d = a - b
+        d = float(f"{a:.0f}") - float(f"{b:.0f}")
         return f' <span class="pp-diff">{d:+.0f}°</span>'
     # The NOAA station's name is a location clue the owner never chose to
     # publish (the addendum review's note), so the page names the source,
@@ -414,14 +490,16 @@ def _duration(start: Any, end: Any) -> str:
     return f"{h} h {m} min" if h else f"{m} min"
 
 
-def render_storm_detail(s: dict[str, Any], tz_name: str) -> str:
+def render_storm_detail(s: dict[str, Any], tz_name: str, gust: bool = True) -> str:
+    """One storm's tiles. `gust=False` (a station that has never reported
+    a gust, 2.7) leaves the peak gust tile out."""
     rng = ""
     lo, hi = pd._num(s.get("min_tempf")), pd._num(s.get("max_tempf"))
     if lo is not None and hi is not None:
         rng = f"{lo:.0f}° to {hi:.0f}°"
     tiles = [("Rain", _n(s.get("total_in"), 2, " in")),
              ("Peak rate", _n(s.get("peak_rate_in_hr"), 2, " in/hr")),
-             ("Peak gust", _n(s.get("max_gust_mph"), 0, " mph")),
+             *([("Peak gust", _n(s.get("max_gust_mph"), 0, " mph"))] if gust else []),
              ("Temperature", rng or "—"),
              ("Lasted", _duration(s.get("started_ms"), s.get("ended_ms")))]
     t = "".join(f'<div class="rec"><div class="rec-k">{_esc(k)}</div>'
@@ -432,22 +510,26 @@ def render_storm_detail(s: dict[str, Any], tz_name: str) -> str:
             f'<div class="records pp-tiles">{t}</div></div>')
 
 
-def render_storms(storms: list[dict[str, Any]], tz_name: str, sid: str | None) -> str:
+def render_storms(storms: list[dict[str, Any]], tz_name: str, sid: str | None,
+                  gust: bool = True, rain: bool = True) -> str:
+    if not storms and not rain:
+        return unavailable(NO_RAIN_STORMS_NOTE)
     if not storms:
         return unavailable("No storms recorded yet. A storm is recorded when "
                            "rain starts and closes after a quiet spell.")
     latest = (f'<h2 class="pp-h2">Latest storm <a class="pp-perma" '
               f'href="/weather/storms/latest{_q(sid)}">fixed link</a></h2>'
-              + render_storm_detail(storms[0], tz_name))
+              + render_storm_detail(storms[0], tz_name, gust))
     rows = "".join(
         f'<tr><th scope="row">{_esc(_date(s.get("started_ms"), tz_name))}</th>'
         f'<td>{_n(s.get("total_in"), 2)}</td><td>{_n(s.get("peak_rate_in_hr"), 2)}</td>'
-        f'<td>{_n(s.get("max_gust_mph"), 0)}</td>'
-        f'<td>{_esc(_duration(s.get("started_ms"), s.get("ended_ms")))}</td></tr>'
+        + (f'<td>{_n(s.get("max_gust_mph"), 0)}</td>' if gust else '')
+        + f'<td>{_esc(_duration(s.get("started_ms"), s.get("ended_ms")))}</td></tr>'
         for s in storms)
     return (latest + '<h2 class="pp-h2">Recent storms</h2>'
             '<div class="pp-table-wrap"><table class="pp-table"><thead><tr><th>Began</th>'
-            '<th>Rain in</th><th>Peak in/hr</th><th>Peak gust mph</th><th>Lasted</th>'
+            '<th>Rain in</th><th>Peak in/hr</th>'
+            + ('<th>Peak gust mph</th>' if gust else '') + '<th>Lasted</th>'
             f'</tr></thead><tbody>{rows}</tbody></table></div>')
 
 
@@ -521,6 +603,9 @@ def daily_csv(days: list[dict[str, Any]]) -> str:
 
 
 CSS = """
+    .pp-log { list-style:none; padding:0; margin:0 0 16px; font-size:14px; }
+    .pp-log li { padding:6px 0; border-bottom:1px solid var(--grid); }
+    .pp-log-when { color:var(--ink-50); font-size:12px; margin-right:8px; }
     .pp-head { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between;
         gap:8px 16px; margin-bottom:12px; }
     .pp-station { font-size:11px; font-weight:800; letter-spacing:1.2px;

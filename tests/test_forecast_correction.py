@@ -134,7 +134,8 @@ def test_the_snapshot_beat_archives_twc_beside_open_meteo_when_a_key_is_set(clie
     devices = [{"mac": "AA", "info": {"coords": {"coords": {"lat": 33.3, "lon": -111.9}}}}]
     asyncio.run(fs.check(devices, int(time.time() * 1000)))
     rows = asyncio.run(_providers(db))
-    assert {r[0] for r in rows} == {"open-meteo", "twc"} == set(fs.ARCHIVED_PROVIDERS)
+    # 2.7 archives the Open-Meteo models too (stubbed out here by conftest).
+    assert {r[0] for r in rows} == {"open-meteo", "twc"} < set(fs.ARCHIVED_PROVIDERS)
     twc_rows = [r for r in rows if r[0] == "twc"]
     assert twc_rows == [("twc", "2026-08-25", 110.0, None), ("twc", "2026-08-26", 107.0, 0.25)]
 

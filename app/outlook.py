@@ -52,6 +52,17 @@ class OutlookReport:
     sunset: str | None
     source: str
     fallback_from: str | None = None
+    # 2.7.1: "Frost possible tonight, low 33F." for the coming night, or
+    # None. Already at the head of `narrative`; kept apart for the morning
+    # push, which does not carry the narrative. Not a wire key.
+    frost_line: str | None = None
+
+
+# 2.7.1 (Doren, 10-19): the coming night's low, banded the way the freeze
+# card bands it (freeze_live._band_title). Frost forms on plants with the
+# screen-level air a few degrees above freezing on a clear calm night.
+FREEZE_LOW_F = 32
+FROST_LOW_F = 34
 
 
 def _num(v: Any) -> float | None:
@@ -111,6 +122,50 @@ def _narrative_for(narrative: list[Any] | None, when: str,
     return None
 
 
+def _deg(low_f: Any) -> int | None:
+    """The whole degree a sentence prints for `low_f` (the `:.0f` every
+    report line uses), or None."""
+    v = _num(low_f)
+    return int(f"{v:.0f}") if v is not None else None
+
+
+def frost_band(low_f: Any) -> str | None:
+    """"freeze" (32 °F and under), "frost" (33-34 °F) or None, for a
+    forecast low in stored °F. Judged on the whole degree the text prints,
+    so the words and the number never disagree: a 32.4 °F low reads
+    "low 32F", which is a freeze."""
+    deg = _deg(low_f)
+    if deg is None:
+        return None
+    if deg <= FREEZE_LOW_F:
+        return "freeze"
+    if deg <= FROST_LOW_F:
+        return "frost"
+    return None
+
+
+def frost_line(low_f: Any) -> str | None:
+    """One plain sentence for the coming night, or None: "Freeze tonight,
+    low 30F." / "Frost possible tonight, low 33F.". °F as stored, like the
+    provider prose it sits beside and the outlook's own "low around 33F"."""
+    band = frost_band(low_f)
+    if band is None:
+        return None
+    lead = "Freeze tonight" if band == "freeze" else "Frost possible tonight"
+    return f"{lead}, low {_deg(low_f)}F."
+
+
+def _row(daily: dict[str, Any], day: Any, undated_index: int) -> int:
+    """The index of the row dated `day`; past the end when the provider
+    sent dates but not this one; `undated_index` when it sent none."""
+    times = daily.get("time") if isinstance(daily.get("time"), list) else []
+    if any(isinstance(t, str) and len(t) >= 10 for t in times):
+        iso = day.isoformat()
+        return next((k for k, t in enumerate(times)
+                     if isinstance(t, str) and t[:10] == iso), len(times))
+    return undated_index
+
+
 def slot_for(local_hour: int) -> str:
     """Before noon the report is about today; from noon on, tomorrow."""
     return "today" if local_hour < 12 else "tomorrow"
@@ -127,14 +182,13 @@ def build(daily: dict[str, Any], *, narrative: list[Any] | None, when: str,
     # one gives an unavailable report, not another day's forecast; one
     # that sent no dates at all keeps day order.
     target = (now_local + timedelta(days=0 if when == "today" else 1)).date()
-    times = daily.get("time") if isinstance(daily.get("time"), list) else []
-    dated = [str(t)[:10] for t in times if isinstance(t, str) and len(t) >= 10]
-    if dated:
-        iso = target.isoformat()
-        i = next((k for k, t in enumerate(times)
-                  if isinstance(t, str) and t[:10] == iso), len(times))
-    else:
-        i = 0 if when == "today" else 1
+    i = _row(daily, target, 0 if when == "today" else 1)
+    # 2.7.1: the coming night's low is TOMORROW's calendar low (its small
+    # hours) whichever day the report describes. An evening report about
+    # tomorrow reads its own row; a morning one about today reads the
+    # next, never today's, whose low was this morning.
+    night = (now_local + timedelta(days=1)).date()
+    frost = frost_line(_at(daily, "temperature_2m_min", _row(daily, night, 1)))
     code = _at(daily, "weather_code", i)
     sky = SKY_WORDS.get(int(code)) if isinstance(code, (int, float)) else None
     pp = _num(_at(daily, "precipitation_probability_max", i))
@@ -142,6 +196,10 @@ def build(daily: dict[str, Any], *, narrative: list[Any] | None, when: str,
     # and the HTML card key off truthiness.
     text = _narrative_for(narrative, when, target.isoformat())
     text = " ".join(text.split()) or None if text else None
+    if frost:
+        # At the head of the prose every app, email and push already shows
+        # (no app change, no new wire key).
+        text = f"{frost} {text}" if text else frost
     return OutlookReport(
         date_label=target.strftime("%A, %B %-d"),
         for_date=target.isoformat(),
@@ -156,6 +214,7 @@ def build(daily: dict[str, Any], *, narrative: list[Any] | None, when: str,
         sunset=_clock(_at(daily, "sunset", i)),
         source=source,
         fallback_from=fallback_from,
+        frost_line=frost,
     )
 
 

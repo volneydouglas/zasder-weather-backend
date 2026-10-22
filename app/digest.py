@@ -50,6 +50,11 @@ class Outlook:
     sky: str | None = None
     narrative: str | None = None
     source: str | None = None
+    # 2.7.1: "Frost possible tonight, low 33F." (outlook.frost_line), or
+    # None. It already leads `narrative` (the email, the text and the
+    # stored report show it there); kept apart for the push, which does
+    # not carry the narrative. Not a wire key.
+    frost_line: str | None = None
 
     @property
     def is_empty(self) -> bool:
@@ -466,6 +471,8 @@ def push_text(r: Report) -> tuple[str, str]:
             bits.append(f"{r.outlook.precip_pct}% rain chance")
         if bits:
             lines.append("Today: " + " · ".join(bits))
+        if r.outlook.frost_line:
+            lines.append(r.outlook.frost_line)
     n = len(r.alerts)
     if n:
         lines.append(f"{n} alert{'s' if n != 1 else ''} in the log.")

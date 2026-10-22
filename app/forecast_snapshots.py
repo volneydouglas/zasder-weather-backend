@@ -466,19 +466,25 @@ def _same_sky(lat: Any, lon: Any, near: tuple[float, float]) -> bool:
         return True
 
 
-async def latest_low_f(provider: str, valid_date: str) -> float | None:
+async def latest_low_f(provider: str, valid_date: str, *,
+                       issued_since_ms: int | None = None) -> float | None:
     """The newest issued low for one local date (YYYY-MM-DD), or None when
     the archive holds no call for it. The freeze-night card's read of the
     archive: one indexed lookup on (provider, valid_date), newest issue
     first, and rows without a low are skipped at the SQL — a call that
-    lost its low in transit is not a forecast of 0°F."""
+    lost its low in transit is not a forecast of 0°F. `issued_since_ms`
+    (2.7.1) leaves out calls issued before it: a source whose key stopped
+    working keeps its last calls in the archive, and those are not a
+    forecast for tonight."""
     from . import db as dbmod
+    since = int(issued_since_ms) if issued_since_ms is not None else 0
     async with dbmod.connect() as conn:
         row = await (await conn.execute(
             "SELECT tmin_f FROM forecast_snapshots "
             "WHERE provider = ? AND valid_date = ? AND tmin_f IS NOT NULL "
+            "AND issued_ms >= ? "
             "ORDER BY issued_ms DESC LIMIT 1",
-            (provider, valid_date))).fetchone()
+            (provider, valid_date, since))).fetchone()
     if row is None:
         return None
     try:

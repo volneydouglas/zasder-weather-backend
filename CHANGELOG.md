@@ -8,6 +8,42 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.7.1] — 2026-10-21
+
+### Fixed
+- **The freeze card arrives in the evening, from your forecast.** The
+  Freeze night card on the lock screen read Open-Meteo's low whatever
+  forecast you chose, so on a night The Weather Company called 31°F and
+  Open-Meteo 36°F it never opened, and the first word of frost came from
+  the station in the small hours. It now reads tonight's low from the
+  forecast your outlook uses ("Forecast from", `outlook_source`), and
+  falls back to Open-Meteo only when that source has filed no forecast
+  for the night in the last day. The card shows the low it used, and the
+  log names the source. Thanks to Doren for the report.
+- **Frost possible tonight.** Frost forms on plants with the air a few
+  degrees above freezing on a clear, calm night, so a forecast low of
+  34°F or under now opens the card, with "Frost possible tonight" on its
+  opening alert; 32°F or under is still "Freeze tonight". The bands are
+  judged on the whole degree the alert prints.
+- **One freeze card per place.** Stations in the same yard (within a
+  kilometre, the rule the weather alerts follow since 2.7.0) share one
+  card instead of one each. The place's first station leads it, any of
+  its stations reading 36°F and falling can open it, and if the lead
+  stops reporting another station there carries the card on. Two cards
+  for one yard both showed whichever station had updated last. A card
+  open during the upgrade carries on as the place's card, with no second
+  start.
+- **A card opened on the forecast stays open.** A card opened at 6 PM
+  while the air was still in the 40s ended an hour later as "warmed up"
+  and opened again on the next check. The warm-up end now counts only
+  once the night has read 36°F or under.
+- **A frost line in the morning report and the outlook.** When your
+  forecast's low for the coming night is 34°F or under, the report says
+  so in one line at the head of its forecast text ("Frost possible
+  tonight, low 33F." or "Freeze tonight, low 30F."), in the email, the
+  notification and the stored report. The morning report reads tonight,
+  not this morning.
+
 ## [2.7.0] — 2026-10-17
 
 ### Added

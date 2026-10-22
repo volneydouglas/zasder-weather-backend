@@ -6,7 +6,7 @@ The self-check in app/updates.py compares this against the latest GitHub
 release so operators see an "update available" banner. See CHANGELOG.md.
 """
 
-__version__ = "2.7.0"
+__version__ = "2.7.1"
 
 # What a client may rely on, served on GET /api/version (2.7). A feature a
 # third-party client might want to detect adds a string here in the

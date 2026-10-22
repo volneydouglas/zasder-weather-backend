@@ -386,7 +386,8 @@ async def _morning_outlook(coords, local):
     r = ol.build(daily, narrative=narrative, when="today", now_local=local,
                  source=used, fallback_from=fallback)
     out = dg.Outlook(hi_f=r.hi_f, lo_f=r.lo_f, precip_pct=r.precip_pct,
-                     sky=r.sky, narrative=r.narrative, source=r.source)
+                     sky=r.sky, narrative=r.narrative, source=r.source,
+                     frost_line=r.frost_line)
     return None if out.is_empty else out
 
 

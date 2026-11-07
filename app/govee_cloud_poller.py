@@ -50,6 +50,10 @@ SUFFIX_MIN_HEX = 4
 # Govee device types / capability instances that mark an air monitor.
 AIR_TYPE = "devices.types.air_quality_monitor"
 AIR_INSTANCES = ("carbonDioxideConcentration", "pm25")
+# 2.8: a thermo-hygrometer (H5179 Wi-Fi and kin, Doren's crawlspace).
+THERMO_TYPE = "devices.types.thermometer"
+SENSOR_TYPE = "devices.types.sensor"
+CLIMATE_INSTANCES = ("sensorTemperature", "sensorHumidity")
 # SKUs known to report Fahrenheit without saying so.
 FAHRENHEIT_SKUS = frozenset({"H5140"})
 # Keys Govee nests a scalar behind, by capability.
@@ -57,12 +61,13 @@ _NESTED_VALUE_KEYS = ("value", "currentTemperature", "currentHumidity",
                       "currentValue", "carbonDioxide")
 
 
-def synth_mac(device_id: str) -> str:
-    """`5D:5D:08:HH:HH:HH` from the Govee device id. Govee ids are eight
-    colon-separated bytes, not a MAC; the low three bytes of a hash of
-    the whole id keep the same monitor on the same address."""
+def synth_mac(device_id: str, family: str = "08") -> str:
+    """`5D:5D:08:HH:HH:HH` (air) or `5D:5D:09:...` (2.8, thermometer) from
+    the Govee device id. Govee ids are eight colon-separated bytes, not a
+    MAC; the low three bytes of a hash of the whole id keep the same
+    device on the same address."""
     digest = hashlib.sha1(device_id.strip().upper().encode()).digest()
-    return f"5D5D08{digest[0]:02X}{digest[1]:02X}{digest[2]:02X}"
+    return f"5D5D{family}{digest[0]:02X}{digest[1]:02X}{digest[2]:02X}"
 
 
 def parse_device_ids(raw: str | None) -> list[str]:
@@ -152,12 +157,35 @@ def capability_values(state: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _instances(dev: dict[str, Any]) -> set[Any]:
+    return {c.get("instance") for c in (dev.get("capabilities") or [])
+            if isinstance(c, dict)}
+
+
 def is_air_monitor_listing(dev: dict[str, Any]) -> bool:
     if dev.get("type") == AIR_TYPE:
         return True
-    insts = {c.get("instance") for c in (dev.get("capabilities") or [])
-             if isinstance(c, dict)}
-    return any(i in insts for i in AIR_INSTANCES)
+    return any(i in _instances(dev) for i in AIR_INSTANCES)
+
+
+def is_thermometer_listing(dev: dict[str, Any]) -> bool:
+    """A thermo-hygrometer (2.8): the thermometer type, or an untyped or
+    generic-sensor listing with temperature or humidity sensing and no air
+    instance. An air monitor that also senses its room's temperature stays
+    an air monitor, and an appliance that reports its own temperature (a
+    heater, a humidifier) is not a thermometer."""
+    if is_air_monitor_listing(dev):
+        return False
+    kind = dev.get("type")
+    if kind == THERMO_TYPE:
+        return True
+    if kind not in (None, "", SENSOR_TYPE):
+        return False
+    return any(i in _instances(dev) for i in CLIMATE_INSTANCES)
+
+
+def is_supported_listing(dev: dict[str, Any]) -> bool:
+    return is_air_monitor_listing(dev) or is_thermometer_listing(dev)
 
 
 def temperature_is_celsius(dev: dict[str, Any]) -> bool:
@@ -199,7 +227,8 @@ def build_payload(device_id: str, listing: dict[str, Any],
         climate["humidity"] = round(min(max(h, 0.0), 100.0))
     if not air and not climate:
         return None
-    device: dict[str, Any] = {"id": synth_mac(device_id)}
+    family = "09" if is_thermometer_listing(listing) else "08"
+    device: dict[str, Any] = {"id": synth_mac(device_id, family)}
     label = name or listing.get("deviceName")
     if isinstance(label, str) and label.strip():
         device["name"] = label.strip()
@@ -213,7 +242,10 @@ def build_payload(device_id: str, listing: dict[str, Any],
         "source": SOURCE,
     }
     # A CO₂ monitor lives indoors: its temperature is the room's, never
-    # the sky's, so it must not impersonate an outdoor station.
+    # the sky's, so it must not impersonate an outdoor station. The same
+    # holds for a thermometer (2.8): a crawlspace, garage or attic sensor
+    # reports the space it sits in, so its reading lands as the device's
+    # indoor temperature and never feeds the outdoor frost or heat watches.
     if climate:
         payload["indoor"] = climate
     if air:
@@ -262,7 +294,7 @@ class GoveeCloudPoller:
             log.warning("govee device list failed: %s", e)
             listed = []
         found = {str(d.get("device", "")).upper(): d for d in listed
-                 if d.get("device") and is_air_monitor_listing(d)}
+                 if d.get("device") and is_supported_listing(d)}
         if self._wanted:
             # A typed suffix polls the full id it resolves to; an id the
             # account does not list is kept as typed so the failure shows.

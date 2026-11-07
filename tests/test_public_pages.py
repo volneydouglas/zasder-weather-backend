@@ -871,3 +871,65 @@ def test_a_cold_records_cache_answers_the_history_page(bare, monkeypatch):
     r = bare.get("/weather/history")
     assert r.status_code == 200
     assert time.monotonic() - t0 < 10, "the page waited on the records compute"
+
+
+# ── UV and solar on the main page (2.8, mirror #8) ───────────────────────
+#
+# An Atlas owner's UV and light reached Records & climate and Weather
+# Underground but never the public main page, which charted only the
+# original five fields. They are page fields now, and the never-reported
+# rule keeps them off a station without the sensors.
+
+def test_the_main_page_shows_uv_and_solar_for_a_station_that_measures_them(bare):
+    now = int(time.time() * 1000)
+    for h in range(0, 24, 2):
+        _post_raw(bare, now - h * 3_600_000,
+                  {"outdoor": {"tempf": 70.0, "uv": 4.1 if h < 6 else 0.0,
+                               "solar_wm2": 628.0 if h < 6 else 0.0}},
+                  name="Atlas")
+    _warm(bare)
+    page = bare.get("/").text
+    cards = _cards(page)
+    assert "UV" in cards and "Solar" in cards, cards
+    assert cards.index("UV") < cards.index("Solar")
+    # The chips read like the app's tiles: one decimal for the index,
+    # whole watts for the light, never "4.10 index" or "628.00 W/m²".
+    # Matched on the labelled chip itself, not anywhere on the page, where
+    # a chart's extreme marker could carry the same text (CodeRabbit, #128).
+    assert re.search(r'<span class="cc-k">UV</span><span class="cc-v"[^>]*>4\.1</span>', page)
+    assert re.search(r'<span class="cc-k">Solar</span><span class="cc-v"[^>]*>628 W/m²</span>', page)
+    assert "628.00" not in page
+    # The UV chart's title names no unit: "UV · last 24h", never "· index".
+    assert re.search(r'UV <span class="chart-unit">· last 24h</span>', page)
+    assert "· index" not in page
+    assert re.search(r'Solar <span class="chart-unit">· last 24h · W/m²</span>', page)
+
+
+def test_the_main_page_leaves_uv_and_solar_off_a_station_without_them(bare):
+    _seed_thermometer(bare)
+    _warm(bare)
+    cards = _cards(bare.get("/").text)
+    assert "UV" not in cards and "Solar" not in cards, cards
+
+
+def test_a_cold_records_cache_still_leaves_uv_and_solar_off_a_thermometer(bare):
+    """Before the all-time records are computed, the original fields all
+    show (unknown is not never), but UV and solar need a reading first."""
+    _seed_thermometer(bare)
+    cards = _cards(bare.get("/").text)          # no _warm(): a cold cache
+    assert "Temperature" in cards
+    assert "UV" not in cards and "Solar" not in cards, cards
+    from app import public_dashboard as pd
+    assert pd.shown_fields(pd.CORE_FIELDS, {"tempf": 70}, {}, None) == [
+        f for f in pd.CORE_FIELDS if f not in ("uv", "solarradiation")]
+    assert "uv" in pd.shown_fields(pd.CORE_FIELDS, {"tempf": 70, "uv": 0.0}, {}, None)
+
+
+def test_uv_and_solar_axis_labels_are_not_two_decimals_and_a_glued_unit():
+    from app import public_dashboard as pd
+    assert pd._axis_label(4.123, "index") == "4.1"
+    assert pd._axis_label(418.5, "W/m²") == "418W/m²"
+    assert pd._axis_label(30.04, "inHg") == "30.04inHg"     # the old five unchanged
+    assert pd._fmt(4.14, "index") == "4.1"
+    assert pd._fmt(627.6, "W/m²") == "628 W/m²"
+    assert pd._fmt(None, "index") == "—"

@@ -59,7 +59,9 @@ def _fake_apns(monkeypatch):
 
     async def fake_update(activity, payload, title, body, **kw):
         calls["update"].append({"activity": activity, "aps": payload["aps"],
-                                "title": title, "body": body})
+                                "title": title, "body": body,
+                                "mac": kw.get("mac"),
+                                "exact": kw.get("exact", False)})
         return {"sent": 1, "dead": [], "failed": 0}
 
     monkeypatch.setattr(apns, "send_live_activity_start", fake_start)
@@ -339,7 +341,9 @@ def test_upgrade_with_both_stations_carrying_a_card_keeps_one_stream(
     """2.7.0 opened a card per station. After the upgrade the place keeps
     the first station's episode (its opening time, its low so far), the
     sibling's state is folded in and cleared, and no start goes out: the
-    phone already has its cards, and every card takes every update."""
+    phone already has its cards. 2.8: the sibling's card is ended on its
+    own, for the tokens registered for exactly that station; a 2.7.0
+    phone's cards are unscoped and follow the place's stream."""
     calls = _fake_apns(monkeypatch)
     _pin_sunrise(monkeypatch)
     from app import freeze_live as fl
@@ -361,7 +365,11 @@ def test_upgrade_with_both_stations_carrying_a_card_keeps_one_stream(
     assert [u["aps"]["content-state"]["tempf"] for u in routine] == [33.2, 32.4]
     assert all(u["aps"]["content-state"]["openedMs"] == T0 - 60 * MIN
                for u in routine)
-    assert len(_ends(calls)) == 1
+    assert all(u["mac"] == DAVIS and not u["exact"] for u in routine)
+    ends = _ends(calls)
+    assert [(u["mac"], u["exact"]) for u in ends] == [(TEMPEST, True),
+                                                      (DAVIS, False)]
+    assert ends[0]["aps"]["content-state"]["openedMs"] == T0 - 58 * MIN
     assert _load(TEMPEST) == {}
 
 
@@ -604,3 +612,110 @@ def test_a_place_back_from_a_network_drop_gets_its_card_back(client, monkeypatch
 
     asyncio.run(run())
     assert [c["title"] for c in calls["start"]] == ["Freeze tonight", "Freeze tonight"]
+
+
+def test_a_folded_cards_failed_end_beat_keeps_its_state_and_retries(
+        client, monkeypatch):
+    """2.8 (CodeRabbit, PR #131): the folded card's end beat is the only
+    thing that closes it on a 2.8 phone. A failed send keeps its state so
+    the next tick sends it again; the state goes once the beat is out."""
+    from app import apns
+    from app import freeze_live as fl
+    _pin_sunrise(monkeypatch)
+    _low("open-meteo", 28.0)
+    _save(DAVIS, _old_episode(T0 - 60 * MIN, 33.0))
+    _save(TEMPEST, _old_episode(T0 - 58 * MIN, 32.5))
+    fail = {"on": True}
+    exact_ends = []
+
+    async def fake_start(payload, title, body, **kw):
+        return {"sent": 1, "dead": [], "failed": 0}
+
+    async def fake_update(activity, payload, title, body, **kw):
+        if kw.get("exact"):
+            exact_ends.append(kw.get("mac"))
+            if fail["on"]:
+                return {"sent": 0, "dead": [], "failed": 1}
+        return {"sent": 1, "dead": [], "failed": 0}
+    monkeypatch.setattr(apns, "send_live_activity_start", fake_start)
+    monkeypatch.setattr(apns, "send_live_activity_update", fake_update)
+    cfg = _cfg()
+
+    asyncio.run(fl.check(cfg, _yard(T0, davis=33.2, tempest=32.9), T0))
+    assert exact_ends == [TEMPEST]
+    assert _load(TEMPEST).get("openedMs") == T0 - 58 * MIN, "kept for a retry"
+
+    fail["on"] = False
+    asyncio.run(fl.check(cfg, _yard(T0 + MIN, davis=33.1, tempest=32.8),
+                         T0 + MIN))
+    assert exact_ends == [TEMPEST, TEMPEST]
+    assert _load(TEMPEST) == {}
+
+
+def test_a_folded_end_beat_that_never_lands_is_given_up_after_a_night(
+        client, monkeypatch):
+    from app import apns
+    from app import freeze_live as fl
+    _pin_sunrise(monkeypatch)
+    _low("open-meteo", 28.0)
+    opened = T0 - fl._FOLD_END_GIVE_UP_MS - MIN
+    _save(DAVIS, _old_episode(T0 - 60 * MIN, 33.0))
+    _save(TEMPEST, _old_episode(opened, 32.5))
+
+    async def fake_start(payload, title, body, **kw):
+        return {"sent": 1, "dead": [], "failed": 0}
+
+    async def failing(activity, payload, title, body, **kw):
+        return {"sent": 0, "dead": [], "failed": 1 if kw.get("exact") else 0}
+    monkeypatch.setattr(apns, "send_live_activity_start", fake_start)
+    monkeypatch.setattr(apns, "send_live_activity_update", failing)
+    asyncio.run(fl.check(_cfg(), _yard(T0, davis=33.2, tempest=32.9), T0))
+    assert _load(TEMPEST) == {}
+
+
+def test_a_pre_28_card_keeps_its_station_through_a_handover(client, monkeypatch):
+    """An episode opened before 2.8 carries only `leadMac` (CodeRabbit, PR
+    #131). When the lead goes quiet and a sibling takes over, the card on
+    the phone is still the Davis's: updates go to the Davis's tokens, not
+    the new lead's."""
+    calls = _fake_apns(monkeypatch)
+    _pin_sunrise(monkeypatch)
+    from app import freeze_live as fl
+    from app import live_state as ls
+    _low("open-meteo", 28.0)
+    _save(DAVIS, {"openedMs": T0, "lastPushMs": T0, "lowF": 28.0,
+                  "lowSource": "open-meteo", "sunriseMs": SUNRISE,
+                  "froze": False, "minF": 34.0, "lastTempf": 34.0,
+                  "aboveSinceMs": None, "leadMac": DAVIS, "hists": {}})
+    t1 = T0 + 6 * HOUR
+    asyncio.run(fl.check(_cfg(), _yard(t1, davis=31.0, tempest=30.2,
+                                       davis_age=ls.STALE_MS + MIN), t1))
+    routine = [u for u in calls["update"] if u["aps"]["event"] == "update"]
+    assert routine and routine[0]["mac"] == DAVIS
+    st = _load(DAVIS)
+    assert st["leadMac"] == TEMPEST and st["cardMac"] == DAVIS
+
+
+def test_the_low_correction_is_the_opening_stations(client, monkeypatch):
+    """The first station has no fresh reading, so its sibling opens the
+    card (CodeRabbit, PR #131). The forecast low is corrected for the
+    station that opens it: the Tempest's -2 °F bias puts a 35 °F forecast
+    in the frost band; the Davis's correction would not."""
+    calls = _fake_apns(monkeypatch)
+    _pin_sunrise(monkeypatch)
+    from app import forecast_skill
+    from app import freeze_live as fl
+    _low("open-meteo", 35.0)
+
+    async def offset(mac, provider):
+        return -2.0 if mac == TEMPEST else 0.0
+    monkeypatch.setattr(forecast_skill, "low_offset_f", offset)
+    # No Davis temperature at all, and the Tempest is not falling: only the
+    # forecast band can open this card.
+    asyncio.run(fl.check(_cfg(), _yard(T0, davis=None, tempest=40.0), T0))
+    assert len(calls["start"]) == 1
+    start = calls["start"][0]
+    assert start["title"] == "Frost possible tonight"
+    assert start["aps"]["attributes"]["mac"] == TEMPEST
+    assert start["aps"]["content-state"]["lowF"] == 33.0
+    assert start["aps"]["content-state"]["lowAdjusted"] is True

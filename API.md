@@ -387,7 +387,7 @@ A daily forecast, in the same units as the readings.
 
 If `twc` is asked for and fails (no key, an expired key, an outage),
 the server answers with the Open-Meteo forecast instead and sets
-`fallback_from` to `"twc"`.
+`fallback_from` to `"twc"`, and since 2.8 `fallback_reason` to say why.
 
 ```json
 {
@@ -409,6 +409,7 @@ the server answers with the Open-Meteo forecast instead and sets
 |---|---|---|
 | `source` | string | Who made the forecast: `open-meteo` or `twc`. |
 | `fallback_from` | string, optional | Present when the source you asked for failed; names it. |
+| `fallback_reason` | string, optional | With `fallback_from` (2.8): `no_key` when the server has no Weather Underground key (lasts until one is added), `failed` for an expired key or an outage. |
 | `daily` | object | Parallel arrays, one entry per day, all the same length. |
 | `daily.time` | array of strings | The local date of each day, `YYYY-MM-DD`. |
 | `daily.weather_code` | array of integers (nullable) | WMO weather code for each day. |

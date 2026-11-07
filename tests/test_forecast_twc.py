@@ -100,6 +100,7 @@ def test_default_source_is_open_meteo_marked(client, om_stub):
     body = client.get("/api/forecast?lat=33.3&lon=-111.9", headers=_H).json()
     assert body["source"] == "open-meteo"
     assert "fallback_from" not in body
+    assert "fallback_reason" not in body
 
 
 def test_twc_without_key_falls_back_marked(client, om_stub):
@@ -107,6 +108,8 @@ def test_twc_without_key_falls_back_marked(client, om_stub):
                       headers=_H).json()
     assert body["source"] == "open-meteo"
     assert body["fallback_from"] == "twc"
+    # A setup gap, not an outage: the app says to add a key (2.8).
+    assert body["fallback_reason"] == "no_key"
 
 
 def test_twc_with_key_serves_twc(client, om_stub, monkeypatch):
@@ -136,6 +139,7 @@ def test_twc_failure_falls_back_to_open_meteo(client, om_stub, monkeypatch):
     body = r.json()
     assert body["source"] == "open-meteo"
     assert body["fallback_from"] == "twc"
+    assert body["fallback_reason"] == "failed"
 
 
 def test_bad_source_rejected(client):

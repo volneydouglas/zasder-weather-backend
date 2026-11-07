@@ -235,12 +235,20 @@ _APP_KEYS = ("db_bytes", "wal_bytes", "observations", "tables")
 
 def _wait_for(client, state: str) -> dict:
     body = None
+    seen: list[str] = []
     for _ in range(100):
         body = client.get("/api/storage", headers=H).json()
+        seen.append(body["state"])
         if body["state"] == state:
             return body
+        # An error answers once and then goes idle, so the next GET can
+        # serve an older cached report as "ready": waiting past it hid the
+        # job's failure behind a stale report (CI, 2026-10-26). Name it.
+        if body["state"] == "error" and state != "error":
+            raise AssertionError(f"the job failed while waiting for {state!r}: "
+                                 f"{body.get('error')!r}; states {seen}")
         time.sleep(0.05)
-    raise AssertionError(f"never reached {state!r}; last {body}")
+    raise AssertionError(f"never reached {state!r}; last {body}; states {seen}")
 
 
 def _job_counter(monkeypatch, gate=None, boom: Exception | None = None):
@@ -394,6 +402,131 @@ def test_api_storage_refresh_forces_a_new_measurement(client, monkeypatch):
     ready = _wait_for(client, "ready")
     assert ready["measured_ms"] >= now_ms
     assert _wait_calls(calls, 1), calls
+
+
+def test_api_storage_a_job_finishing_during_the_cache_read_is_not_served_stale(
+        client, monkeypatch):
+    """The route read the cache, awaited, and only then looked at the job.
+    A job that finished during that read was no longer "running", so the
+    GET served the report it had just read, the OLD one, as "ready", and a
+    poller that stops at "ready" kept the old numbers after a refresh (CI,
+    2026-10-26: about one run in a hundred). Forced here: the poll's cache
+    read lets the job finish and returns only once the job reads ready."""
+    import threading
+    from app import main as M, maintenance
+    seed = maintenance.storage_breakdown(None, detail_days=0)
+    now_ms = int(time.time() * 1000)
+    maintenance.storage_cache_put(seed, now_ms=now_ms - 5000)
+    gate = threading.Event()
+    _job_counter(monkeypatch, gate=gate)
+    real_get = maintenance.storage_cache_get
+    race = {"armed": False}
+
+    def get_while_the_job_lands(*a, **kw):
+        value = real_get(*a, **kw)
+        if race["armed"]:
+            race["armed"] = False
+            gate.set()                                  # let the job finish...
+            deadline = time.time() + 10
+            while (M._STORAGE_JOB.get("state") != "ready"
+                   and time.time() < deadline):
+                time.sleep(0.01)
+        return value                                    # ...then hand back the old read
+    monkeypatch.setattr(maintenance, "storage_cache_get", get_while_the_job_lands)
+
+    assert client.get("/api/storage?refresh=1", headers=H).json()["state"] == "measuring"
+    race["armed"] = True
+    body = client.get("/api/storage", headers=H).json()
+    assert body["state"] == "ready"
+    assert body["measured_ms"] >= now_ms, "served the report read before the job landed"
+
+
+def test_a_restore_forgets_the_old_databases_storage_report(client):
+    """A finished job's report outranks an older cache read, so after a
+    restore a report measured on the OLD database would have outranked
+    the restored database's own cached one (CodeRabbit, #132). The
+    restore hook drops it; the restored cache is what the next GET reads."""
+    from app import main as M, maintenance, restore
+    seed = maintenance.storage_breakdown(None, detail_days=0)
+    now_ms = int(time.time() * 1000)
+    maintenance.storage_cache_put(seed, now_ms=now_ms - 60_000)   # the "restored" cache
+    old = dict(seed, measured_ms=now_ms, db_bytes=123456789)       # pre-restore job
+    M._STORAGE_JOB = {"state": "ready", "report": old, "finished_ms": now_ms}
+    hook = next(h for h in restore.POST_SWAP_HOOKS
+                if h.__name__ == "_reconcile_after_restore")
+    client.portal.call(hook)
+    body = client.get("/api/storage", headers=H).json()
+    assert body["state"] == "ready"
+    assert body["measured_ms"] == now_ms - 60_000
+    assert body.get("db_bytes") != 123456789
+
+
+def test_a_job_running_through_a_restore_drops_its_report(client, monkeypatch):
+    """A job whose scan began on the old database and finished after the
+    swap wrote that report into the restored database's cache and marked
+    itself ready (CodeRabbit, #132). The restore bumps an epoch; the job
+    sees it and drops its report without writing it anywhere."""
+    import threading
+    from app import main as M, maintenance, restore
+    seed = maintenance.storage_breakdown(None, detail_days=0)
+    now_ms = int(time.time() * 1000)
+    maintenance.storage_cache_put(seed, now_ms=now_ms - 5000)
+    gate = threading.Event()
+    calls = _job_counter(monkeypatch, gate=gate)
+    assert client.get("/api/storage?refresh=1", headers=H).json()["state"] == "measuring"
+    assert _wait_calls(calls, 1), calls            # the scan is under way
+    maintenance.storage_cache_put(dict(seed), now_ms=now_ms - 60_000)   # the restored cache
+    hook = next(h for h in restore.POST_SWAP_HOOKS
+                if h.__name__ == "_reconcile_after_restore")
+    client.portal.call(hook)
+    gate.set()                                     # the old scan finishes after the swap
+    deadline = time.time() + 10
+    while M._STORAGE_JOB.get("state") == "running" and time.time() < deadline:
+        time.sleep(0.02)
+    assert M._STORAGE_JOB.get("state") == "idle"
+    assert "report" not in M._STORAGE_JOB
+    assert maintenance.storage_cache_get()["measured_ms"] == now_ms - 60_000
+    body = client.get("/api/storage", headers=H).json()
+    assert body["measured_ms"] == now_ms - 60_000
+
+
+def test_a_swap_between_the_jobs_check_and_its_write_writes_nothing(client, monkeypatch):
+    """The job checks for a restore before each cache write, but a swap can
+    land while it waits for the worker thread that does the write. The
+    write repeats the check on its open connection, where no swap can
+    overlap it (CodeRabbit, #132). Forced here: the swap counter moves just
+    as the write starts."""
+    from app import main as M, maintenance, restore
+    seed = maintenance.storage_breakdown(None, detail_days=0)
+    now_ms = int(time.time() * 1000)
+    maintenance.storage_cache_put(seed, now_ms=now_ms - 60_000)   # the "restored" cache
+    _job_counter(monkeypatch)
+    real_put = maintenance.storage_cache_put
+
+    def swap_lands_first(*a, **kw):
+        restore.SWAPS += 1          # what the restore does inside its lease
+        return real_put(*a, **kw)
+    monkeypatch.setattr(maintenance, "storage_cache_put", swap_lands_first)
+    monkeypatch.setattr(restore, "SWAPS", restore.SWAPS)   # restored after the test
+
+    assert client.get("/api/storage?refresh=1", headers=H).json()["state"] == "measuring"
+    deadline = time.time() + 10
+    while M._STORAGE_JOB.get("state") == "running" and time.time() < deadline:
+        time.sleep(0.02)
+    assert M._STORAGE_JOB.get("state") == "idle"
+    assert maintenance.storage_cache_get()["measured_ms"] == now_ms - 60_000
+
+
+def test_storage_cache_put_skips_the_write_when_no_longer_current(client):
+    from app import maintenance
+    seed = maintenance.storage_breakdown(None, detail_days=0)
+    maintenance.storage_cache_put(dict(seed), now_ms=1_000)
+    assert maintenance.storage_cache_put(dict(seed), now_ms=2_000,
+                                         still_current=lambda: False) is None
+    assert maintenance.storage_cache_get()["measured_ms"] == 1_000
+    assert maintenance.storage_cache_put(dict(seed), now_ms=3_000,
+                                         still_current=lambda: True)["measured_ms"] == 3_000
+    assert maintenance.storage_cache_get()["measured_ms"] == 3_000
 
 
 def test_api_storage_dead_running_task_reads_as_error_once(client):

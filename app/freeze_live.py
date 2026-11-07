@@ -54,6 +54,10 @@ log = logging.getLogger("freeze-live")
 ATTRS_TYPE = "FreezeActivityAttributes"
 ACTIVITY = "freeze"
 _KV_PREFIX = "freeze_live."
+# A folded card's end beat retries each tick until it is out, or until this
+# long after its episode opened: past a whole night, the card has gone
+# stale on the phone by itself and the retry only adds noise.
+_FOLD_END_GIVE_UP_MS = 18 * 3_600_000
 _MIN_PUSH_GAP_MS = 15 * 60_000
 _FREEZE_F = 32.0
 _WATCH_F = 36.0
@@ -76,15 +80,24 @@ _FORECAST_MAX_AGE_MS = 24 * 3_600_000
 # The episode's own keys: what a 2.7.0 per-station state carries into its
 # place on the upgrade (`_fold`).
 _EPISODE_KEYS = ("openedMs", "lastPushMs", "lowF", "lowSource",
-                 "sunriseMs", "froze", "minF", "lastTempf", "aboveSinceMs")
+                 "sunriseMs", "froze", "minF", "lastTempf", "aboveSinceMs",
+                 # 2.8: whose card it is on the phone, and the two optional
+                 # headline facts the card shows.
+                 "cardMac", "frost", "lowAdjusted")
 
 
 def _content_state(*, tempf: float, low_f: float | None,
                    sunrise_ms: int | None, opened_ms: int, froze: bool,
-                   min_f: float, ended: bool) -> dict[str, Any]:
+                   min_f: float, ended: bool, frost: bool = False,
+                   low_adjusted: bool = False) -> dict[str, Any]:
     # `ended` is the storm_watch/heat_watch end marker: False on every
     # live beat, True on the end beat only, so the card can say the
     # night is over for the linger instead of "Freeze tonight".
+    # 2.8, both optional on the phone (an app older than 2.8 ignores them):
+    # `frost` says tonight's low is in the frost band (33-34 °F), so the
+    # card's headline is "Frost possible tonight" until it freezes, and
+    # `lowAdjusted` says `lowF` was corrected for this station's measured
+    # bias against the forecast (forecast_skill.low_offset_f).
     return {
         "tempf": round(float(tempf), 1),
         "lowF": round(float(low_f), 1) if low_f is not None else None,
@@ -93,7 +106,16 @@ def _content_state(*, tempf: float, low_f: float | None,
         "froze": bool(froze),
         "minF": round(float(min_f), 1),
         "ended": bool(ended),
+        "frost": bool(frost),
+        "lowAdjusted": bool(low_adjusted),
     }
+
+
+def _card_mac(st: dict[str, Any]) -> str | None:
+    """The station the card on the phone was opened for (its attributes'
+    mac), which a handover to a sibling does not change. An episode opened
+    before 2.8 has only its lead."""
+    return st.get("cardMac") or st.get("leadMac")
 
 
 def _local_hour(now_ms: int) -> int:
@@ -164,7 +186,7 @@ def _falling(hist: list, tempf: float, now_ms: int) -> bool:
 
 
 async def _end(st: dict[str, Any], name: str, now_ms: int, *,
-               tempf: float | None, reason: str) -> None:
+               tempf: float | None, reason: str, exact: bool = False) -> bool:
     from . import apns
     min_f = ls.num(st.get("minF"))
     cur = tempf if tempf is not None else ls.num(st.get("lastTempf"))
@@ -175,15 +197,37 @@ async def _end(st: dict[str, Any], name: str, now_ms: int, *,
     state = _content_state(
         tempf=cur, low_f=ls.num(st.get("lowF")),
         sunrise_ms=st.get("sunriseMs"), opened_ms=int(st["openedMs"]),
-        froze=bool(st.get("froze")), min_f=min_f, ended=True)
+        froze=bool(st.get("froze")), min_f=min_f, ended=True,
+        frost=bool(st.get("frost")), low_adjusted=bool(st.get("lowAdjusted")))
     payload = apns.build_live_activity_update(
         state, now_s=now_ms // 1000, event="end",
         dismiss_s=(now_ms + _END_LINGER_MS) // 1000)
     verdict = ("it froze" if st.get("froze")
                else f"the low was {min_f:.0f}°F")
-    await apns.send_live_activity_update(
-        ACTIVITY, payload, "Freeze night over", f"{name}: {verdict}")
+    res = await apns.send_live_activity_update(
+        ACTIVITY, payload, "Freeze night over", f"{name}: {verdict}",
+        mac=_card_mac(st), exact=exact)
     log.info("freeze card closed for %s (%s, min %.1fF)", name, reason, min_f)
+    # Delivered, or nothing to deliver to. Only a send that reached tokens
+    # and failed reads as undelivered: the folded card's caller retries it.
+    return bool((res or {}).get("sent")) or not (res or {}).get("failed")
+
+
+async def _corrected_low(cfg, night_iso: str, now_ms: int,
+                         mac: str | None
+                         ) -> tuple[float | None, str | None, bool]:
+    """(tonight's low °F, its source, whether it was corrected): the
+    forecast low from `_tonight_low`, plus this station's measured lead-1
+    low bias for that source when one is known (2.8). Without one the
+    forecast stands as it is."""
+    from . import forecast_skill
+    low, source = await _tonight_low(cfg, night_iso, now_ms)
+    if low is None:
+        return None, None, False
+    offset = await forecast_skill.low_offset_f(mac, source)
+    if offset is None:
+        return low, source, False
+    return low + offset, source, True
 
 
 async def _tonight_low(cfg, night_iso: str,
@@ -219,8 +263,8 @@ def _band_title(low: float | None) -> str | None:
             "frost": "Frost possible tonight"}.get(ol.frost_band(low))
 
 
-async def _fold(st: dict[str, Any], members: list[dict[str, Any]]
-                ) -> tuple[dict[str, Any], list[str]]:
+async def _fold(st: dict[str, Any], members: list[dict[str, Any]],
+                now_ms: int) -> tuple[dict[str, Any], list[str]]:
     """The 2.7.1 upgrade, run every tick so a regrouping is handled the
     same way: 2.7.0 kept one state per station (`freeze_live.<mac>`, with
     its history under "hist"); a place keeps one under its first
@@ -230,10 +274,17 @@ async def _fold(st: dict[str, Any], members: list[dict[str, Any]]
     member's state is folded in: its history, and its open episode when
     the place has none yet (the first such member in place order, the
     lead rule; it keeps leading, since the card on the phone names it).
-    A second open episode is dropped without an end beat: the phone's
-    cards all take every freeze update (the note in `_check_place`), so it
-    follows the place's episode and ends with it. Returns the state and
-    the member keys to clear once it is saved."""
+    A second open episode is ended on its own card, then dropped (2.8).
+    A card a pre-2.8 app holds takes every freeze update, so it follows
+    the place's episode and ends with it, as before. A 2.8 app registers
+    each card for its station, so the dropped card would hear nothing
+    more; its end beat goes to the tokens registered for exactly that
+    station, never the unscoped ones, which include the place's own card
+    on an older phone. Its state is cleared only once that end beat is
+    out, so a failed send retries next tick (CodeRabbit, PR #131), until
+    `_FOLD_END_GIVE_UP_MS` after the episode opened. A crash before the
+    save sends it again, to a card that has already ended. Returns the
+    state and the member keys to clear once it is saved."""
     anchor = members[0]["mac"]
     hists = st.get("hists") if isinstance(st.get("hists"), dict) else {}
     old = st.pop("hist", None)
@@ -247,7 +298,6 @@ async def _fold(st: dict[str, Any], members: list[dict[str, Any]]
         other = await ls.load(key)
         if not other:
             continue
-        folded.append(key)
         if isinstance(other.get("hist"), list):
             hists.setdefault(m["mac"], other["hist"])
         if isinstance(other.get("hists"), dict):
@@ -259,8 +309,10 @@ async def _fold(st: dict[str, Any], members: list[dict[str, Any]]
         if isinstance(ended, str) and ended > str(st.get("endedNight") or ""):
             st["endedNight"] = ended
         if other.get("openedMs") is None:
+            folded.append(key)
             continue
         if st.get("openedMs") is None:
+            folded.append(key)
             for k in _EPISODE_KEYS:
                 st[k] = other.get(k)
             st["leadMac"] = other.get("leadMac") or m["mac"]
@@ -269,6 +321,18 @@ async def _fold(st: dict[str, Any], members: list[dict[str, Any]]
         else:
             log.info("freeze card of %s folds into its place's card",
                      m.get("name") or m["mac"])
+            if not other.get("cardMac") and not other.get("leadMac"):
+                other["leadMac"] = m["mac"]
+            try:
+                done = await _end(other, _name(m), now_ms, tempf=None,
+                                  reason="folded into its place's card",
+                                  exact=True)
+            except Exception:
+                done = False
+                log.exception("freeze end beat for the folded card of %s "
+                              "failed", m.get("name") or m["mac"])
+            if done or now_ms - int(other["openedMs"]) > _FOLD_END_GIVE_UP_MS:
+                folded.append(key)
     st["hists"] = hists
     return st, folded
 
@@ -298,7 +362,13 @@ async def _check_place(cfg, members: list[dict[str, Any]],
     key = _KV_PREFIX + members[0]["mac"]
     st = await ls.load(key)
     before = json.dumps(st, sort_keys=True)
-    st, folded = await _fold(st, members)
+    st, folded = await _fold(st, members, now_ms)
+    # An episode from before 2.8 names only its lead. Pin the card's own
+    # station before anything can hand the lead over, so a 2.8 phone that
+    # registered that card by its station keeps hearing it (CodeRabbit,
+    # PR #131). The fold's adopted episodes are covered: it sets leadMac.
+    if st.get("openedMs") is not None and not st.get("cardMac") and st.get("leadMac"):
+        st["cardMac"] = st["leadMac"]
 
     async def save(state: dict[str, Any]) -> None:
         # The place first, then the folded keys: a crash between the two
@@ -335,7 +405,11 @@ async def _check_place(cfg, members: list[dict[str, Any]],
             await save(st)
             return
         night = _night_date(now_ms).isoformat()
-        low, source = await _tonight_low(cfg, night, now_ms)
+        # Corrected for the station that would open the card: the first
+        # FRESH member, not the place's first member, which may have no
+        # reading (CodeRabbit, PR #131).
+        low, source, adjusted = await _corrected_low(
+            cfg, night, now_ms, fresh[0][0]["mac"])
         # A night whose card already ended as "warmed" is not reopened by
         # the same forecast (CodeRabbit, PR #117): the next tick did, with a
         # new alert. The station trigger can still open it if the air cools
@@ -351,15 +425,24 @@ async def _check_place(cfg, members: list[dict[str, Any]],
                 return
             lead, tempf = falling[0]
             title = "Freeze watch"
+            if lead is not fresh[0][0]:
+                # The station trigger opens it for a falling sibling: its
+                # own correction is the low the card shows.
+                low, source, adjusted = await _corrected_low(
+                    cfg, night, now_ms, lead["mac"])
         name = _name(lead)
         sunrise_ms = _next_sunrise_ms(_coords(lead, devices), now_ms)
         froze = tempf <= _FREEZE_F
+        from . import outlook as ol
+        frost = ol.frost_band(low) == "frost"
         state = _content_state(
             tempf=tempf, low_f=low, sunrise_ms=sunrise_ms,
-            opened_ms=now_ms, froze=froze, min_f=tempf, ended=False)
+            opened_ms=now_ms, froze=froze, min_f=tempf, ended=False,
+            frost=frost, low_adjusted=adjusted)
         body = (f"{name}: {tempf:.0f}°F now"
-                + (f", low of {low:.0f}°F forecast" if low is not None
-                   else ", falling"))
+                + ((f", low of {low:.0f}°F forecast"
+                    + (" (adjusted for your station)" if adjusted else ""))
+                   if low is not None else ", falling"))
         payload = apns.build_live_activity_start(
             ATTRS_TYPE, {"station": name, "mac": lead["mac"]}, state,
             title, body, now_s=now_ms // 1000,
@@ -372,7 +455,9 @@ async def _check_place(cfg, members: list[dict[str, Any]],
                        "lowF": low, "lowSource": source,
                        "sunriseMs": sunrise_ms, "froze": froze,
                        "minF": tempf, "lastTempf": tempf,
-                       "aboveSinceMs": None, "leadMac": lead["mac"]})
+                       "aboveSinceMs": None, "leadMac": lead["mac"],
+                       "cardMac": lead["mac"], "frost": frost,
+                       "lowAdjusted": adjusted})
             log.info("freeze card opened for %s at %.1fF (%s; forecast low %s)",
                      name, tempf, title,
                      f"{low:.1f}F from {source}" if low is not None
@@ -447,17 +532,17 @@ async def _check_place(cfg, members: list[dict[str, Any]],
         state = _content_state(
             tempf=tempf, low_f=ls.num(st.get("lowF")),
             sunrise_ms=sunrise_ms, opened_ms=opened,
-            froze=froze, min_f=min_f, ended=False)
+            froze=froze, min_f=min_f, ended=False,
+            frost=bool(st.get("frost")),
+            low_adjusted=bool(st.get("lowAdjusted")))
         payload = apns.build_live_activity_update(
             state, now_s=now_ms // 1000,
             stale_s=(now_ms + 45 * 60_000) // 1000)
-        # Every freeze card on a phone takes this update: the token table
-        # (db.py, live_activity_tokens) has no station column, so a card
-        # per station showed whichever station pushed last (Doren's Davis
-        # and Tempest, 10-18). One card per place keeps that honest.
-        # Scoping update tokens to a station is 2.8 work: the app has to
-        # register its card's mac with the token.
+        # 2.8: only this card's station's tokens (and pre-2.8 apps', which
+        # cannot say which card they hold). Before, every freeze card on a
+        # phone took every place's update (Doren's Davis and Tempest,
+        # 10-18); one card per place (2.7.1) kept that honest until now.
         await apns.send_live_activity_update(
-            ACTIVITY, payload, "Freeze watch", name)
+            ACTIVITY, payload, "Freeze watch", name, mac=_card_mac(st))
         st["lastPushMs"] = now_ms
     await save(st)

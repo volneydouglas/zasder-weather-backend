@@ -382,3 +382,91 @@ def test_rediscovery_of_an_unresolved_id_is_rate_limited(temp_env, monkeypatch):
     asyncio.run(poller._tick())
     assert fake.calls.count("list") == 2
     del db
+
+
+# ───────────────────────── thermometers (2.8) ─────────────────────────
+#
+# Doren's crawlspace sensor is a GoveeLife H5179 Wi-Fi thermo-hygrometer.
+# The poller used to keep air monitors only, so it never reached the
+# server. A thermometer is its own device in the 5D:5D:09 family, its
+# reading lands as the space's (indoor) temperature, and the backend's
+# weather pickers treat it as a monitor, never as the station. The
+# listing below follows the shape of Govee's thermometer listings.
+
+THERMO_ID = "AB:CD:EF:01:23:45:67:89"
+THERMO = {"sku": "H5179", "device": THERMO_ID, "deviceName": "Crawlspace",
+          "type": "devices.types.thermometer",
+          "capabilities": [
+              {"type": "devices.capabilities.online", "instance": "online"},
+              {"type": "devices.capabilities.property", "instance": "sensorTemperature"},
+              {"type": "devices.capabilities.property", "instance": "sensorHumidity"}]}
+
+
+def thermo_state(temp=41.2, hum=63.0, online=1):
+    return {"sku": "H5179", "device": THERMO_ID, "capabilities": [
+        {"type": "devices.capabilities.online", "instance": "online", "state": {"value": online}},
+        {"type": "devices.capabilities.property", "instance": "sensorTemperature", "state": {"value": temp}},
+        {"type": "devices.capabilities.property", "instance": "sensorHumidity", "state": {"value": hum}}]}
+
+
+def test_a_thermometer_listing_is_its_own_kind():
+    from app.govee_cloud_poller import is_supported_listing, is_thermometer_listing
+    assert is_thermometer_listing(THERMO)
+    assert not is_air_monitor_listing(THERMO)
+    # Typed only by its capabilities, still a thermometer.
+    assert is_thermometer_listing({"capabilities": [{"instance": "sensorTemperature"}]})
+    assert is_thermometer_listing({"type": "devices.types.sensor",
+                                   "capabilities": [{"instance": "sensorHumidity"}]})
+    # An appliance that reports its own temperature is not a thermometer.
+    for appliance in ("devices.types.heater", "devices.types.humidifier"):
+        assert not is_thermometer_listing({"type": appliance,
+                                           "capabilities": [{"instance": "sensorTemperature"}]})
+    # An air monitor that senses its room's temperature stays an air monitor.
+    assert not is_thermometer_listing(LISTING)
+    assert is_supported_listing(LISTING) and is_supported_listing(THERMO)
+    assert not is_supported_listing({"type": "devices.types.light", "capabilities": []})
+
+
+def test_a_thermometer_reading_lands_as_a_space_sensor():
+    p = build_payload(THERMO_ID, THERMO, thermo_state())
+    assert p["device"]["id"] == synth_mac(THERMO_ID, "09")
+    assert p["device"]["id"].startswith("5D5D09")
+    assert p["device"]["model"] == "H5179" and p["device"]["name"] == "Crawlspace"
+    assert p["indoor"] == {"tempf": 41.2, "humidity": 63}
+    assert "air" not in p and "outdoor" not in p
+    # Offline: the cloud's cache is not a reading.
+    assert build_payload(THERMO_ID, THERMO, thermo_state(online=0)) is None
+    # A listing that declares Celsius is converted, as for air monitors.
+    metric = dict(THERMO, capabilities=[
+        {"instance": "sensorTemperature", "parameters": {"unit": "unit.temperature.celsius"}},
+        {"instance": "sensorHumidity"}])
+    assert build_payload(THERMO_ID, metric, thermo_state(temp=5.0))["indoor"]["tempf"] == 41.0
+
+
+def test_the_thermometer_family_is_a_monitor_to_the_weather_pickers():
+    from app import db
+    assert db.is_air_monitor(synth_mac(THERMO_ID, "09"))
+    assert db.is_air_monitor_device({"mac": "5D:5D:09:00:00:01", "lastData": {"tempinf": 40.0}})
+    assert not db.is_air_monitor("5D:5D:0A:00:00:01")
+
+
+def test_discovery_keeps_thermometers_and_air_monitors(temp_env, monkeypatch):
+    db = _fresh_db(temp_env)
+    from app import govee_cloud_poller as gcp
+    posted: list[dict] = []
+
+    async def fake_ingest(payload):
+        posted.append(payload)
+        return {"ok": True, "inserted": 1}
+    monkeypatch.setattr(gcp.ingest, "_do_ingest", fake_ingest)
+    fake = FakeClient([LISTING, THERMO, {"sku": "H6001", "device": "LIGHT", "type": "devices.types.light"}],
+                      {DEV_ID: state(), THERMO_ID: thermo_state()})
+    poller = gcp.GoveeCloudPoller(fake, 60)
+
+    async def run():
+        await poller._discover()
+        assert sorted(poller._devices) == sorted([DEV_ID, THERMO_ID])
+        await poller._tick()
+    asyncio.run(run())
+    assert sorted(p["device"]["id"][:6] for p in posted) == ["5D5D08", "5D5D09"]
+    del db

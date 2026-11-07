@@ -75,6 +75,8 @@ class Report:
     stations: list[StationDay] = field(default_factory=list)
     alerts: list[AlertLine] = field(default_factory=list)
     outlook: Outlook | None = None
+    # 2.8: today's sunset outlook (sunset.outlook_for), or None.
+    sunset_outlook: dict | None = None
 
 
 # ── the disagreement (2.1) ──────────────────────────────────────────────
@@ -314,6 +316,16 @@ def _outlook_block(o: Outlook) -> str:
             f'Arial,sans-serif;color:{_TEXT};">' + body + "</div>")
 
 
+def _sunset_block(s: dict | None) -> str:
+    """2.8: one line under the outlook, "Sunset 5:37 PM, looks good: 72%,
+    broken high cloud and a clear horizon"."""
+    if not s or not s.get("line"):
+        return ""
+    return (f'<div style="{_TILE}margin-top:6px;font:400 14px -apple-system,'
+            f"'Segoe UI',Arial,sans-serif;color:{_TEXT};\">"
+            + html.escape(s["line"]) + ".</div>")
+
+
 def _alerts_block(alerts: list[AlertLine]) -> str:
     if not alerts:
         return (f'<div style="{_LABEL}padding:18px 0 6px;">ALERT LOG</div>'
@@ -379,6 +391,7 @@ def build_html(r: Report, theme: str = "dark") -> str:
               color:{_TEXT};padding:10px 0 2px;">{html.escape(headline(r))}</div>
   {stations}
   {outlook}
+  {_sunset_block(r.sunset_outlook)}
   {_alerts_block(r.alerts)}
   <div style="border-top:1px solid {_EDGE};margin-top:20px;padding-top:10px;
               font:400 11px -apple-system,Arial,sans-serif;color:{_DIM};">
@@ -433,6 +446,8 @@ def build_text(r: Report) -> str:
             # The HTML card names the provider; a text-only reader is owed
             # the same (CodeRabbit, PR #82).
             out.append("  Forecast from The Weather Company.")
+    if r.sunset_outlook and r.sunset_outlook.get("line"):
+        out += ["", r.sunset_outlook["line"] + "."]
     out.append("")
     if r.alerts:
         out.append("Alert log:")
@@ -473,6 +488,11 @@ def push_text(r: Report) -> tuple[str, str]:
             lines.append("Today: " + " · ".join(bits))
         if r.outlook.frost_line:
             lines.append(r.outlook.frost_line)
+    so = r.sunset_outlook
+    if so and isinstance(so.get("pct"), int) and so["pct"] >= 70:
+        # Only a good evening earns a line on the lock screen; the report
+        # itself always carries it.
+        lines.append(f"Sunset {so.get('verdict', 'looks good')}: {so['pct']}%")
     n = len(r.alerts)
     if n:
         lines.append(f"{n} alert{'s' if n != 1 else ''} in the log.")

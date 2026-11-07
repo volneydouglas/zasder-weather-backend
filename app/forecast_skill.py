@@ -579,3 +579,71 @@ def corrections_from(card: dict[str, Any]) -> list[dict[str, Any]]:
         if row["high_offset_f"] is not None or row["low_offset_f"] is not None:
             out.append(row)
     return out
+
+
+# ── Tonight's low, corrected for the yard (2.8) ─────────────────────────
+# Doren (10-17): his station reads about 3 °F under the forecast low on
+# clear nights, so a 35 °F forecast that turns into 32 °F at the station
+# opened no frost card and printed no frost line. The 2.5 correction above
+# already knows this per lead; the night's low is a lead-1 call (filed the
+# evening before, for the next calendar day's small hours), so the frost
+# decisions use the lead-1 low offset when there is one. No offset (too
+# few scored days, an unarchived source, a station too far from the
+# forecast's sky, Insights off) is no correction: absent is not zero.
+
+LOW_LEAD_DAYS = 1
+_LOW_OFFSET_CACHE: dict[tuple[str, str, str], float | None] = {}
+
+
+def _reset_for_tests() -> None:
+    _LOW_OFFSET_CACHE.clear()
+
+
+async def low_offset_f(mac: str | None, provider: str | None) -> float | None:
+    """The °F to ADD to `provider`'s forecast low for the coming night at
+    station `mac`, or None. Cached per station, source and local day (the
+    server's timezone, the day the scorecard grades), holding today's only:
+    the scorecard reads 45 days of ledger and the freeze card asks every
+    tick of the evening. Optional: any failure is no correction, logged and
+    not cached, so the next call retries."""
+    from .config import settings
+    from . import forecast_snapshots as fs
+    from . import neighbors
+    if not mac or not provider or not settings.insights:
+        return None
+    if provider not in fs.ARCHIVED_PROVIDERS:
+        return None
+    import time
+    day = _local_date(int(time.time() * 1000)).isoformat()
+    key = (mac, provider, day)
+    if key in _LOW_OFFSET_CACHE:
+        return _LOW_OFFSET_CACHE[key]
+    offset: float | None = None
+    try:
+        if provider == "twc" and not await fs.twc_key():
+            raise LookupError("no TWC archive without a key")
+        devices = await db.list_devices()
+        sky = fs.coords_device(devices)
+        if sky is not None and sky["mac"] != mac:
+            here = fs.coords([d for d in devices if d["mac"] == mac])
+            there = fs.coords([sky])
+            if (here is None or there is None or neighbors.distance_km(
+                    here[0], here[1], there[0], there[1]) > neighbors.MAX_DISTANCE_KM):
+                raise LookupError("too far from the forecast's sky")
+        card = await scorecard(mac, provider=provider, days=CORRECTION_DAYS)
+        if card.get("available"):
+            for row in corrections_from(card):
+                if row["lead_days"] == LOW_LEAD_DAYS:
+                    offset = row["low_offset_f"]
+    except LookupError:
+        offset = None
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "tonight's-low correction failed for %s (%s); none applied",
+            mac, provider)
+        return None
+    for stale in [k for k in _LOW_OFFSET_CACHE if k[2] != day]:
+        del _LOW_OFFSET_CACHE[stale]
+    _LOW_OFFSET_CACHE[key] = offset
+    return offset

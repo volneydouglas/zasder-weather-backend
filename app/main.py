@@ -353,7 +353,7 @@ async def lifespan(app: FastAPI):
         is dropped, the deferred jobs a fresh boot would schedule are
         scheduled, and the report backfill runs. Only after this does the
         restore report done."""
-        global _PUBLIC_DASH_CACHE
+        global _PUBLIC_DASH_CACHE, _STORAGE_JOB, _STORAGE_EPOCH
         from . import wu_upload as _wu, share_targets as _st, alerts as _al
         # First the epoch, then the clears: a producer mid-await against
         # the OLD database fails its token check instead of refilling a
@@ -370,6 +370,14 @@ async def lifespan(app: FastAPI):
         _SENSOR_HEALTH_CACHE.clear()
         db._QC_PENDING.clear()
         _PUBLIC_DASH_CACHE = None
+        # 2.8: a finished storage job's report outranks an older cache read
+        # (/api/storage), so one measured on the OLD database would outrank
+        # the restored database's own cached report too. Forget a finished
+        # one; a running one sees the bumped epoch and drops its report
+        # instead of writing it into the restored cache (CodeRabbit, #132).
+        _STORAGE_EPOCH += 1
+        if _STORAGE_JOB.get("state") != "running":
+            _STORAGE_JOB = {"state": "idle"}
         # 2.7: the stored daily ET describes whatever database computed it;
         # drop it so every day is recomputed from the restored readings
         # (the lazy fill on read, the nightly job for yesterday).
@@ -1823,6 +1831,82 @@ async def public_daily_csv(name: str, station: str | None = Query(None)) -> Resp
                     headers={"Content-Disposition": f'inline; filename="weather-{y}.csv"'})
 
 
+# ── Station display (2.8) ──────────────────────────────────────────────
+# A room display for a 10" screen, a TV or a spare tablet. The page is a
+# static shell with no data in it; its script (static/display/) asks one of
+# two routes for the readings: the anonymous one while the public dashboard
+# is on, or the token one with a READ token carried in the URL fragment
+# (never the query string, so it stays out of access logs).
+
+_DISPLAY_HTML: str | None = None
+
+
+def _display_html() -> str:
+    global _DISPLAY_HTML
+    if _DISPLAY_HTML is None:
+        _DISPLAY_HTML = (Path(__file__).parent / "static" / "display" / "index.html").read_text()
+    return _DISPLAY_HTML
+
+
+@app.get("/display", response_class=HTMLResponse)
+async def station_display_page() -> HTMLResponse:
+    """The display's shell. Open on every server because it carries no
+    readings, settings or names: what it shows comes from /display/data
+    (public stations, opt-in) or /api/display (a read token)."""
+    return HTMLResponse(_display_html(), headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/display/data")
+async def station_display_public_data() -> JSONResponse:
+    """The display's readings for anonymous viewers. 404 unless the public
+    dashboard is on; only the stations the public pages show, by public id;
+    no coordinates and no indoor readings (station_display.build)."""
+    from . import map_beacon as _mb, station_display as _sd
+    eff = await _pd_effective()
+    if not eff["enabled"]:
+        raise HTTPException(status_code=404, detail="public pages are off")
+    devices = await db.list_devices()
+    by_mac = {d["mac"]: d for d in devices}
+    macs = [m for m in _public_macs(devices, eff) if m in by_mac]
+    server_id = await ensure_server_id()
+    weather = [(_mb.station_id(server_id, m), by_mac[m]) for m in macs
+               if not db.is_air_monitor_device(by_mac[m])]
+    if not weather:
+        raise HTTPException(status_code=404, detail="no public station")
+    air = next((by_mac[m] for m in macs if db.is_air_monitor_device(by_mac[m])), None)
+    place = (eff.get("location") or (await effective_server_name())["name"]
+             or "Weather")
+    coords = _sd.place_coords([d for _, d in weather])
+    # Keyed by what is public RIGHT NOW (stations, air monitor, label), so
+    # a station the owner just made private never rides a cached payload
+    # for the rest of its 20 s (CodeRabbit, PR #129).
+    key = "public:" + ",".join(m for m in macs) + "|" + place
+    payload = await _sd.cached(key, lambda: _sd.build(
+        weather, air, public=True, place=place, coords=coords))
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/display", dependencies=[Depends(require_token)])
+async def station_display_data(
+    authorization: Annotated[str | None, Header()] = None,
+) -> JSONResponse:
+    """The display's readings for a read token: every weather station on
+    the server, by MAC. `can_write` lets the page refuse to run on an owner
+    token: a wall display should hold a view-only link."""
+    from . import station_display as _sd
+    devices = await db.list_devices()
+    weather = [(d["mac"], d) for d in devices if not db.is_air_monitor_device(d)]
+    air = next((d for d in devices if db.is_air_monitor_device(d)), None)
+    place = (await effective_server_name())["name"] or "Weather"
+    coords = _sd.place_coords([d for _, d in weather])
+    payload = await _sd.cached("private", lambda: _sd.build(
+        weather, air, public=False, place=place, coords=coords))
+    out = dict(payload)
+    out["can_write"] = tokens_match(_extract_bearer(authorization),
+                                    settings.write_tokens)
+    return JSONResponse(out, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/status", response_class=HTMLResponse)
 async def status_page() -> HTMLResponse:
@@ -2343,6 +2427,7 @@ async def _build_public_dashboard(devices: list[dict], now_ms: int) -> str:
             if weather else "")
     return pd.render_dashboard(stations, fields, tz_name=settings.timezone,
                                app_url=settings.public_dashboard_app_url,
+                               android_url=settings.public_dashboard_android_url,
                                location=eff["location"], more_html=more)
 
 
@@ -2560,6 +2645,10 @@ _DB_BACKUP_FRESH_MS = 10 * 60_000     # a ready snapshot is reusable this long
 # request-time scan cannot be bounded on a 2 GB database.
 _STORAGE_JOB: dict[str, Any] = {"state": "idle"}
 _STORAGE_TASK: asyncio.Task | None = None
+# Bumped by every database restore (2.8). A storage job started before a
+# restore measured the OLD file: it must neither write its report into the
+# restored database's cache nor publish it (CodeRabbit, #132).
+_STORAGE_EPOCH = 0
 _STORAGE_FRESH_MS = 6 * 3_600_000     # a cached report is served this long
 
 
@@ -3255,12 +3344,34 @@ async def _run_storage_job(job: dict[str, Any], detail_days: int) -> None:
     """Full measurement on a worker thread, then into the kv cache. The
     job dict carries the outcome — like _run_db_backup, this task's
     exception must never vanish into a fire-and-forget void."""
-    from . import maintenance
+    from . import maintenance, restore
+    # Two counters: restore.SWAPS moves inside the maintenance lease before
+    # the file does, _STORAGE_EPOCH in the post-swap hook. Either moving
+    # means the report describes a database that is gone.
+    epoch, swaps = _STORAGE_EPOCH, restore.SWAPS
+
+    def same_database() -> bool:
+        return epoch == _STORAGE_EPOCH and swaps == restore.SWAPS
+
+    def restored_since() -> bool:
+        """A restore swapped the database after this job started: the
+        report describes a file that is gone. Forget it without writing it
+        anywhere; the next GET measures the restored database."""
+        if same_database():
+            return False
+        job.clear()
+        job["state"] = "idle"
+        return True
+
     try:
         report = await asyncio.to_thread(
             maintenance.storage_breakdown, None, detail_days)
     except Exception as e:
+        if restored_since():
+            return
         job.update(state="error", error=str(e))
+        return
+    if restored_since():
         return
     # The scan is minutes of work on a big archive; do not let a ten-second
     # lock wait on the one-row cache write throw it away (2026-09-02: nine
@@ -3272,15 +3383,23 @@ async def _run_storage_job(job: dict[str, Any], detail_days: int) -> None:
     for attempt, delay in enumerate((0, 3, 6, 12, 24, 48)):
         if delay:
             await asyncio.sleep(delay)
+        if restored_since():          # checked after every wait, before every write
+            return
         try:
+            # The check repeats inside the write, on the open connection,
+            # where no swap can overlap it (CodeRabbit, #132): the loop's
+            # check above cannot see a restore that lands while this task
+            # waits for its worker thread.
             await asyncio.to_thread(maintenance.storage_cache_put, report,
-                                    None, report["measured_ms"])
+                                    None, report["measured_ms"], same_database)
             break
         except Exception as e:
             if attempt == 5 or not db.is_lock_error(e):
                 log.warning("storage report not cached (%s); serving from "
                             "memory until the next scan", e)
                 break
+    if restored_since():
+        return
     job.update(state="ready", finished_ms=report["measured_ms"])
 
 
@@ -3325,10 +3444,6 @@ async def api_storage(refresh: bool = False) -> JSONResponse:
                              "state": "error", "error": job.get("error")})
 
     cached = await asyncio.to_thread(maintenance.storage_cache_get)
-    # A finished job whose cache write failed still has its report.
-    if (cached is None and job.get("state") == "ready"
-            and isinstance(job.get("report"), dict)):
-        cached = job["report"]
 
     def _measuring(job: dict[str, Any]) -> JSONResponse:
         # The old report (its old measured_ms) when there is one, and the
@@ -3345,6 +3460,16 @@ async def api_storage(refresh: bool = False) -> JSONResponse:
     if (job.get("state") == "running"
             and task is not None and not task.done()):
         return _measuring(job)
+    # A finished job's own report wins over an older cache read. Two ways
+    # to get here with the cache behind the job: its cache write failed,
+    # or (2.8, CI 2026-10-26) the job landed while the read above was in
+    # flight, and the read returned the report from before the refresh.
+    # Serving that as "ready" told a poller the old numbers were the new.
+    report = job.get("report") if job.get("state") == "ready" else None
+    if isinstance(report, dict) and (
+            cached is None
+            or report.get("measured_ms", 0) > cached.get("measured_ms", 0)):
+        cached = report
     if (cached is not None and not refresh
             and now_ms - cached["measured_ms"] < _STORAGE_FRESH_MS):
         return JSONResponse({**cached, "state": "ready"})
@@ -3719,6 +3844,9 @@ class AlertPrefsIn(BaseModel):
     # 2.2 sky notes.
     sky_notes: bool | None = None
     sky_good_only: bool | None = None
+    # 2.8 the good-sunset heads-up and its threshold (percent).
+    sunset_alert: bool | None = None
+    sunset_threshold: int | None = Field(default=None, ge=1, le=100)
     # 2.3 NWS relay: the push switch and the warnings-only filter.
     nws_push: bool | None = None
     nws_warnings_only: bool | None = None
@@ -3747,6 +3875,14 @@ class AlertPrefsIn(BaseModel):
     # (API-native). 0 = any distance, which stores NULL.
     lightning_alert: bool | None = None
     lightning_alert_mi: float | None = Field(default=None, ge=0, le=40)
+    # 2.8: each scheduled report's channels, 'push' | 'email' | 'both';
+    # "" clears back to the delivery it always had (the storm_channels rule).
+    digest_channels: str | None = None
+    outlook_channels: str | None = None
+    sky_channels: str | None = None
+    # 2.8: the smart kinds muted one at a time. The MUTED set (the
+    # nws_families rule); an unknown key is dropped rather than stored.
+    smart_muted: list[str] | None = Field(default=None, max_length=32)
 
 
 class DeviceAlertIn(BaseModel):
@@ -3762,6 +3898,7 @@ class DeviceAlertIn(BaseModel):
 async def _alerts_state() -> dict[str, Any]:
     """Full alert config + per-device status — the shape the iOS app renders."""
     from .alerts import effective_config, _device_threshold
+    from .alerts import SMART_KINDS as _SMART_KINDS, SMART_LABELS as _SMART_LABELS
     cfg = await effective_config()
     prefs = await db.get_alert_prefs()
     dev_prefs = await db.get_device_alert_prefs()
@@ -3833,6 +3970,10 @@ async def _alerts_state() -> dict[str, Any]:
         "outlook_source": cfg.outlook_source or "open-meteo",
         "sky_notes": cfg.sky_notes,
         "sky_good_only": cfg.sky_good_only,
+        # 2.8: effective, never null, so the app shows the controls when a
+        # server answers the fields at all.
+        "sunset_alert": cfg.sunset_alert,
+        "sunset_threshold": cfg.sunset_threshold,
         # 2.3: effective, never null, so the app shows the switch when a
         # server answers the field at all.
         "nws_push": cfg.nws_push,
@@ -3866,10 +4007,24 @@ async def _alerts_state() -> dict[str, Any]:
         # 2.4: the EFFECTIVE value (row over env), because it is a
         # setting now rather than a read-only fact about the server.
         "smart_alerts_enabled": cfg.smart_alerts,
+        # A muted kind's crossing is recorded silently (2.8), so it is left
+        # out here too: the Mac edge-detects this list into banners.
         "smart_alerts": [
             {"mac": mac, "kind": kind, "triggered": bool(trig)}
             for (mac, kind), trig in sorted((await db.get_smart_alert_states()).items())
+            if kind not in cfg.smart_muted
         ],
+        # 2.8: the muted kinds and the catalogue the switches are drawn
+        # from (the nws_family_catalogue rule).
+        "smart_muted": cfg.smart_muted,
+        "smart_kind_catalogue": [
+            {"key": k, "label": _SMART_LABELS[k]} for k in _SMART_KINDS],
+        # 2.8: each scheduled report's channels; null = the delivery it
+        # always had. A pre-2.8 server omits the keys, which is how the
+        # apps know to hide the pickers.
+        "digest_channels": prefs.get("digest_channels"),
+        "outlook_channels": prefs.get("outlook_channels"),
+        "sky_channels": prefs.get("sky_channels"),
         "devices": dev_list,
     }
 
@@ -4082,6 +4237,55 @@ def _has_ctl(s: str) -> bool:
     return any(ord(c) < 32 or ord(c) == 127 for c in s)
 
 
+# ── 2.8: the crawlspace freeze watch (Doren). Owner-only both ways like the
+# other alert settings; the config lives in server_kv (crawlspace_watch).
+
+class CrawlspaceWatchIn(BaseModel):
+    enabled: bool | None = None
+    threshold_f: float | None = Field(default=None, ge=-40, le=50)
+    hours: int | None = Field(default=None, ge=1, le=24)
+    # "" clears the sensor.
+    sensor_mac: str | None = Field(default=None, max_length=32)
+    sensor_watch_f: float | None = Field(default=None, ge=-40, le=60)
+    sensor_urgent_f: float | None = Field(default=None, ge=-40, le=60)
+
+
+@app.get("/api/alerts/crawlspace", dependencies=[Depends(require_write_token)])
+async def get_crawlspace_watch() -> JSONResponse:
+    from dataclasses import asdict
+    from . import crawlspace_watch as cw
+    return JSONResponse(asdict(await cw.load_config()))
+
+
+@app.put("/api/alerts/crawlspace", dependencies=[Depends(require_write_token)])
+async def put_crawlspace_watch(body: CrawlspaceWatchIn) -> JSONResponse:
+    """Partial update; omitted fields keep their value."""
+    from dataclasses import asdict
+    from . import crawlspace_watch as cw
+    from .ingest import _format_mac
+    c = await cw.load_config()
+    if body.enabled is not None:
+        c.enabled = body.enabled
+    if body.threshold_f is not None:
+        c.threshold_f = float(body.threshold_f)
+    if body.hours is not None:
+        c.hours = int(body.hours)
+    if body.sensor_watch_f is not None:
+        c.sensor_watch_f = float(body.sensor_watch_f)
+    if body.sensor_urgent_f is not None:
+        c.sensor_urgent_f = float(body.sensor_urgent_f)
+    if body.sensor_mac is not None:
+        mac = body.sensor_mac.strip()
+        if mac and not any(d["mac"] == _format_mac(mac) for d in await db.list_devices()):
+            raise HTTPException(status_code=404, detail=f"unknown device {mac}")
+        c.sensor_mac = _format_mac(mac) if mac else None
+    if c.sensor_urgent_f > c.sensor_watch_f:
+        raise HTTPException(status_code=400,
+                            detail="the urgent level must be at or below the watch level")
+    await cw.save_config(c)
+    return JSONResponse(asdict(c))
+
+
 @app.put("/api/alerts", dependencies=[Depends(require_write_token)])
 async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     fields: dict[str, Any] = {}
@@ -4095,6 +4299,8 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
         fields["heat_day"] = 1 if body.heat_day else 0
     if body.heat_day_threshold_f is not None:
         fields["heat_day_threshold_f"] = body.heat_day_threshold_f
+    if body.sunset_threshold is not None:
+        fields["sunset_threshold"] = body.sunset_threshold
     # Quiet hours are a PAIR: in_quiet_hours engages only when both ends
     # are set, so a one-sided write got a 200 and a feature that never
     # fires (R7 finding 5). Require both in one request (either real
@@ -4129,7 +4335,7 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
     for f in ("sky_notes", "sky_good_only", "nws_push", "nws_warnings_only",
               "storm_live_activity", "lightning_live_activity",
               "wind_live_activity", "freeze_live_activity",
-              "smart_alerts", "lightning_alert"):
+              "smart_alerts", "lightning_alert", "sunset_alert"):
         v = getattr(body, f)
         if v is not None:
             fields[f] = 1 if v else 0
@@ -4155,6 +4361,20 @@ async def put_alerts(body: AlertPrefsIn) -> JSONResponse:
             raise HTTPException(status_code=400,
                                 detail="email_scope must be 'all' or 'device_down'")
         fields["email_scope"] = body.email_scope
+    for f in ("digest_channels", "outlook_channels", "sky_channels"):
+        v = getattr(body, f)
+        if v is None:
+            continue
+        if v == "":
+            fields[f] = None
+        elif v not in ("push", "email", "both"):
+            raise HTTPException(status_code=400,
+                                detail=f"{f} must be 'push', 'email' or 'both'")
+        else:
+            fields[f] = v
+    if body.smart_muted is not None:
+        from .alerts import normalise_smart_muted
+        fields["smart_muted"] = json.dumps(normalise_smart_muted(body.smart_muted))
     if body.storm_channels is not None:
         # "" clears back to legacy delivery (push always, email by scope).
         if body.storm_channels == "":
@@ -5967,6 +6187,15 @@ class LiveActivityTokenIn(BaseModel):
     kind: str = "start"
     # 1.8: which Activity an 'update' token belongs to.
     activity: str | None = None
+    # 2.8: the station an 'update' token's card belongs to (its attributes'
+    # mac), so a station's updates reach only its own cards.
+    # Any station id custom ingest stores (a hub's MAC, or an id like
+    # "ST-00012345" passed through as-is): printable, bounded, and never
+    # '|', which ingest refuses too. A MAC-only pattern answered 422 for
+    # those stations and their cards missed every update (CodeRabbit,
+    # PR #146).
+    mac: str | None = Field(default=None, min_length=1, max_length=64,
+                            pattern=r"^[\x21-\x7b\x7d\x7e]+$")
 
 
 @app.post("/api/push/live-activity-token",
@@ -6002,8 +6231,12 @@ async def live_activity_token_register(body: LiveActivityTokenIn) -> JSONRespons
             raise HTTPException(status_code=400, detail="unknown activity")
         activity = body.activity or "rain"
     env = body.env if body.env in ("sandbox", "production") else None
+    mac = None
+    if body.kind == "update" and body.mac:
+        from .ingest import _format_mac
+        mac = _format_mac(body.mac)
     await db.register_live_activity_token(body.token, body.kind, env,
-                                          activity=activity)
+                                          activity=activity, mac=mac)
     return JSONResponse({"ok": True})
 
 
@@ -7517,6 +7750,42 @@ async def get_forecast_hourly(
         raise HTTPException(status_code=502, detail="forecast upstream unavailable")
 
 
+@app.get("/api/sunset-outlook", dependencies=[Depends(require_token)])
+async def get_sunset_outlook(
+    lat: float | None = Query(None, ge=-90, le=90),
+    lon: float | None = Query(None, ge=-180, le=180),
+) -> JSONResponse:
+    """2.8 (Doren 10-17): how good the next sunset looks, 0-100%. At `lat`/`lon` when both are given (the
+    app's dashboard passes the station it is showing), else at the server's
+    forecast station. `outlook` is null when there is no cloud forecast to
+    judge by (absent, never a zero)."""
+    from zoneinfo import ZoneInfo
+    from . import forecast_snapshots as fs
+    from . import sunset as ss
+    if lat is not None and lon is not None:
+        coords = (lat, lon)
+    else:
+        coords = fs.coords(await db.list_devices())
+    if coords is None and settings.forecast_lat is not None \
+            and settings.forecast_lon is not None:
+        coords = (settings.forecast_lat, settings.forecast_lon)
+    if coords is None:
+        return JSONResponse({"outlook": None})
+    try:
+        tz = ZoneInfo(settings.timezone)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    sets = ss.next_sunset(coords[0], coords[1], datetime.now(tz), tz)
+    if sets is None:
+        return JSONResponse({"outlook": None})
+    try:
+        out = await asyncio.wait_for(
+            ss.outlook_at(coords[0], coords[1], sets, tz, settings.timezone), timeout=20)
+    except Exception:
+        out = None
+    return JSONResponse({"outlook": out})
+
+
 @app.get("/api/forecast", dependencies=[Depends(require_token)])
 async def get_forecast(
     lat: float | None = None, lon: float | None = None,
@@ -7565,6 +7834,11 @@ async def get_forecast(
         "forecast_days": 7,
     }
     fallback_from: str | None = None
+    # Why TWC did not answer (2.8): "no_key" is a setup gap that lasts until
+    # an owner adds a WU key, "failed" a dead key or a WU outage. The app's
+    # strip said "didn't answer" for both, forever on a keyless server
+    # (Mesa, 2026-10-15).
+    fallback_reason: str | None = None
     if source == "twc":
         from . import forecast_twc
         wu_key = await effective_wu_key()
@@ -7579,8 +7853,10 @@ async def get_forecast(
                 log.warning("TWC forecast failed (%s); falling back to "
                             "Open-Meteo", type(e).__name__)
                 fallback_from = "twc"
+                fallback_reason = "failed"
         else:
             fallback_from = "twc"          # asked for TWC, no key configured
+            fallback_reason = "no_key"
     # A third-party API that times out, 500s or returns an HTML error page is
     # routine, not a bug in this server — report it as an upstream failure so
     # the app can say "forecast unavailable" instead of "server error".
@@ -7606,6 +7882,7 @@ async def get_forecast(
         body["narrative"] = []
         if fallback_from:
             body["fallback_from"] = fallback_from
+            body["fallback_reason"] = fallback_reason
         return JSONResponse(body)
     except httpx.HTTPError as e:
         log.warning("forecast upstream failed: %s", e)

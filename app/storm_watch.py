@@ -84,8 +84,11 @@ async def on_open_tick(cfg, device: dict, started_ms: int,
             # New episode (or a restart lost nothing: the row persists) —
             # start the Activity exactly once per episode.
             state = await _content_state(mac, started_ms, now_ms, field, False)
+            # `mac` (2.8): the card says whose storm it is, so the app can
+            # register its update token for that station alone. Older apps
+            # ignore the extra attribute.
             payload = apns.build_live_activity_start(
-                ATTRS_TYPE, {"stationName": name}, state,
+                ATTRS_TYPE, {"stationName": name, "mac": mac}, state,
                 "Storm watch", f"{name} — storm in progress",
                 now_s=now_ms // 1000,
                 stale_s=(now_ms + 30 * 60_000) // 1000,
@@ -107,7 +110,7 @@ async def on_open_tick(cfg, device: dict, started_ms: int,
             state, now_s=now_ms // 1000,
             stale_s=(now_ms + 30 * 60_000) // 1000)
         await apns.send_live_activity_update(
-            "storm", payload, "Storm watch", f"{name} — updated")
+            "storm", payload, "Storm watch", f"{name} — updated", mac=mac)
         await db.set_storm_watch_la(mac, started_ms, now_ms)
     except Exception:
         log.exception("storm watch push failed for %s", mac)
@@ -135,7 +138,7 @@ async def on_closed(cfg, device: dict, started_ms: int | None,
             state, now_s=now_ms // 1000, event="end",
             dismiss_s=(now_ms + _END_LINGER_MS) // 1000, alert=alert)
         await apns.send_live_activity_update(
-            "storm", payload, "Storm watch ended", name)
+            "storm", payload, "Storm watch ended", name, mac=mac)
     except Exception:
         log.exception("storm watch end push failed for %s", mac)
     finally:

@@ -266,7 +266,11 @@ async def _security_headers(request: Request, call_next):
     h.setdefault("X-Content-Type-Options", "nosniff")
     h.setdefault("X-Frame-Options", "DENY")
     h.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    h.setdefault("Permissions-Policy", "geolocation=(), camera=(), microphone=()")
+    # geolocation=(self): the map's "Near me" button (2.8) asks the
+    # browser for the visitor's position on a tap. This origin only, never
+    # a frame (frame-ancestors 'none' above), and the page never sends the
+    # position anywhere: see nearMe() in static/map.js.
+    h.setdefault("Permissions-Policy", "geolocation=(self), camera=(), microphone=()")
     h.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     h.setdefault("Cross-Origin-Opener-Policy", "same-origin")
     return resp

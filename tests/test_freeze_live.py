@@ -105,21 +105,21 @@ def test_freeze_forecast_lifecycle_pins_the_wire_contract(client, monkeypatch):
     assert aps["attributes"] == {"station": "Yard", "mac": MAC}
     assert aps["content-state"] == {
         "tempf": 40.0, "lowF": 28.0, "sunriseMs": SUNRISE, "openedMs": T0,
-        "froze": False, "minF": 40.0, "ended": False}
+        "froze": False, "minF": 40.0, "ended": False, "frost": False, "lowAdjusted": False}
 
     ups = [p["aps"] for a, p in calls["update"] if a == "freeze"]
     assert [u["event"] for u in ups] == ["update", "update", "end"]
     assert ups[0]["content-state"] == {
         "tempf": 34.0, "lowF": 28.0, "sunriseMs": SUNRISE, "openedMs": T0,
-        "froze": False, "minF": 34.0, "ended": False}
+        "froze": False, "minF": 34.0, "ended": False, "frost": False, "lowAdjusted": False}
     assert ups[1]["content-state"] == {
         "tempf": 31.0, "lowF": 28.0, "sunriseMs": SUNRISE, "openedMs": T0,
-        "froze": True, "minF": 31.0, "ended": False}
+        "froze": True, "minF": 31.0, "ended": False, "frost": False, "lowAdjusted": False}
     # The end beat is the only one that says so: the card reads "night
     # over" for the linger, not "Freeze tonight".
     assert ups[2]["content-state"] == {
         "tempf": 33.0, "lowF": 28.0, "sunriseMs": SUNRISE, "openedMs": T0,
-        "froze": True, "minF": 30.0, "ended": True}
+        "froze": True, "minF": 30.0, "ended": True, "frost": False, "lowAdjusted": False}
     assert ups[2]["dismissal-date"] == (T0 + (11 * 60 + 90) * MIN) // 1000
     assert "openedMs" not in _state()
 
@@ -156,12 +156,12 @@ def test_freeze_station_path_opens_on_a_fall_and_ends_when_warm(client, monkeypa
     asyncio.run(run())
     assert calls["start"][0][1]["aps"]["content-state"] == {
         "tempf": 36.0, "lowF": None, "sunriseMs": SUNRISE, "openedMs": T0 + 50 * MIN,
-        "froze": False, "minF": 36.0, "ended": False}
+        "froze": False, "minF": 36.0, "ended": False, "frost": False, "lowAdjusted": False}
     ups = [p["aps"] for a, p in calls["update"]]
     assert ups[-1]["event"] == "end"
     assert ups[-1]["content-state"] == {
         "tempf": 38.5, "lowF": None, "sunriseMs": SUNRISE,
-        "openedMs": T0 + 50 * MIN, "froze": False, "minF": 36.0, "ended": True}
+        "openedMs": T0 + 50 * MIN, "froze": False, "minF": 36.0, "ended": True, "frost": False, "lowAdjusted": False}
     assert "openedMs" not in _state()
 
 
@@ -298,7 +298,7 @@ def test_freeze_without_a_sunrise_ends_in_the_morning(client, monkeypatch):
         assert len(ends) == 1
         assert ends[0]["content-state"] == {
             "tempf": 31.0, "lowF": 28.0, "sunriseMs": None, "openedMs": T0,
-            "froze": True, "minF": 30.0, "ended": True}
+            "froze": True, "minF": 30.0, "ended": True, "frost": False, "lowAdjusted": False}
 
     asyncio.run(run())
     assert calls["start"][0][1]["aps"]["content-state"]["sunriseMs"] is None

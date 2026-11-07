@@ -132,6 +132,28 @@ of the rtl_433 model name folded into the sensor id) and are named
 transmissions (garage doors, TPMS, …) are filtered by field shape. The
 flag persists in NVS across reboots.
 
+### A second AcuRite sensor on the Atlas (`tower_id`)
+
+An AcuRite temperature/humidity sensor (the 592TXR "tower", the 609TXC,
+or the temperature-only 606TX) can ride along on the Atlas's station
+instead of being dropped. Find its id under `heard` on `/status` (for
+example `"Acurite-Tower #2310"`), then pair it:
+
+```sh
+curl -X POST http://<board>/provision \
+  -H "Authorization: Bearer $CURRENT_INGEST_TOKEN" \
+  --data-urlencode "tower_id=2310" \
+  --data-urlencode "tower_indoor=1"     # 1 = indoor reading, 0 = sensor 1
+```
+
+With `tower_indoor=1` its readings are the station's indoor temperature
+and humidity; with `0` (the default) they are channel sensor 1
+(`temp1f` / `humidity1`), the way AmbientWeather shows an extra sensor.
+`tower_id=0` unpairs it (its reading stops at once). A paired tower never becomes a station of its own,
+even in discovery mode, and its reading stops being posted 10 minutes
+after the sensor goes quiet. Towers have no barometer: the pressure on an
+AcuRite display is measured by the display and never transmitted.
+
 ### Security of the config plane
 
 Worth stating plainly, because the code can't fix it:

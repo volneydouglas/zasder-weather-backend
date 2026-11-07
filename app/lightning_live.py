@@ -87,7 +87,7 @@ def _strikes_1h(st: dict[str, Any], last: dict[str, Any], now_ms: int) -> int:
 
 async def _end(st: dict[str, Any], name: str, now_ms: int,
                *, distance_mi: float | None, strikes_1h: int,
-               reason: str) -> None:
+               reason: str, mac: str | None = None) -> None:
     from . import apns
     last_strike = int(st.get("lastStrikeMs") or now_ms)
     state = _content_state(
@@ -99,7 +99,7 @@ async def _end(st: dict[str, Any], name: str, now_ms: int,
         state, now_s=now_ms // 1000, event="end",
         dismiss_s=(now_ms + _END_LINGER_MS) // 1000)
     await apns.send_live_activity_update(
-        ACTIVITY, payload, "Lightning all clear", name)
+        ACTIVITY, payload, "Lightning all clear", name, mac=mac)
     log.info("lightning card closed for %s (%s)", name, reason)
 
 
@@ -183,7 +183,7 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int) -> None:
                 last_strike = now_ms
                 st["lastStrikeMs"] = now_ms
             if stale or now_ms - last_strike >= _ALL_CLEAR_MS:
-                await _end(st, name, now_ms,
+                await _end(st, name, now_ms, mac=mac,
                            distance_mi=dist if dist is not None else prev_dist,
                            strikes_1h=strikes_1h,
                            reason="stale" if stale else "all clear")
@@ -211,7 +211,7 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int) -> None:
                     state, now_s=now_ms // 1000,
                     stale_s=(now_ms + 20 * 60_000) // 1000)
                 await apns.send_live_activity_update(
-                    ACTIVITY, payload, "Lightning nearby", name)
+                    ACTIVITY, payload, "Lightning nearby", name, mac=mac)
                 st["lastPushMs"] = now_ms
                 if cur_dist is not None:
                     st["pushedDist"] = cur_dist

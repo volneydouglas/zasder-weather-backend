@@ -68,7 +68,11 @@ reviews:
         /weather/records, /weather/storms, /weather/storms/latest,
         /weather/reports, /weather/reports/noaa/{name},
         /weather/data/{name}: 404 unless the public dashboard is on, public
-        stations only, no MAC, coordinates or settings);
+        stations only, no MAC, coordinates or settings); since 2.8 the
+        station display (GET /display: a static shell with no data, open on
+        every server; GET /display/data: 404 unless the public dashboard is
+        on, public stations only; a private display calls the token-gated
+        /api/display with a read token from the URL fragment);
         POST /mcp takes the bearer or an OAuth access token; every other
         /api/* route is token-gated, and /ingest/custom is gated by a
         separate INGEST_TOKEN.

@@ -379,12 +379,15 @@ class Settings(BaseSettings):
     # A comma-separated MAC list pins specific stations; "all" shows every one.
     public_dashboard_macs: str | None = None
     # Which 24h charts. Empty/unset = the core set (temp/humidity/wind/
-    # pressure/rain). Comma-separated API field names to override, e.g.
+    # pressure/rain/UV/solar; a field the station never reported is left
+    # out). Comma-separated API field names to override, e.g.
     # "tempf,humidity,baromrelin".
     public_dashboard_fields: str | None = None
     # "Get the app" link shown in place of the screenshots. Defaults to the
     # published iOS app; point it at your own listing if you ship your own.
     public_dashboard_app_url: str = "https://apps.apple.com/us/app/zasder-weather/id6774523656"
+    # The Android twin (2.8): the Google Play listing. Empty hides the link.
+    public_dashboard_android_url: str = "https://play.google.com/store/apps/details?id=com.zasder.weather"
     # A rough, OPERATOR-TYPED place label shown beside the station name on
     # the public page ("Chandler, AZ"). Typed on purpose — the page refuses
     # to derive location from stored coordinates, so what appears is exactly

@@ -93,7 +93,7 @@ def test_storm_watch_lifecycle(client, monkeypatch):
     aps = calls["start"][0]["aps"]
     assert aps["event"] == "start"
     assert aps["attributes-type"] == "StormWatchActivityAttributes"
-    assert aps["attributes"] == {"stationName": "Test Station"}
+    assert aps["attributes"] == {"stationName": "Test Station", "mac": "AA:BB:CC:00:00:01"}
     assert aps["content-state"]["startMs"] == started
     assert aps["content-state"]["ended"] is False
 

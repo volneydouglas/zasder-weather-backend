@@ -10,6 +10,22 @@ html, body { margin: 0; height: 100%; background: #0b0d12; color: #e8ecf2;
 .brand b { color: #e8ecf2; letter-spacing: 1px; }
 .count { background: rgba(11,13,18,.85); border: 1px solid #262c38; border-radius: 10px;
          padding: 8px 12px; font-size: 12px; color: #8a93a3; }
+#bar .right { display: flex; gap: 8px; align-items: center; }
+/* "Near me" (2.8): the same quiet surface as the count beside it. */
+.near { background: rgba(11,13,18,.85); border: 1px solid #262c38; border-radius: 10px;
+        padding: 8px 12px; font: inherit; font-size: 12px; font-weight: 600;
+        color: #e8ecf2; cursor: pointer; white-space: nowrap; }
+.near:hover { border-color: #3a4152; }
+.near:focus-visible { outline: 2px solid #4fa6f2; outline-offset: 2px; }
+.near[aria-busy="true"] { color: #8a93a3; cursor: progress; }
+.near-note { position: absolute; top: 56px; right: 12px; z-index: 1000; max-width: 280px;
+             background: rgba(11,13,18,.92); border: 1px solid #262c38; border-radius: 10px;
+             padding: 8px 12px; font-size: 12px; color: #e8ecf2; }
+/* Empty = no box, but the live region stays in the accessibility tree. */
+.near-note:empty { display: block; padding: 0; border: 0; background: none; }
+/* The visitor's own position: drawn here, never sent anywhere. */
+.me { width: 14px; height: 14px; border-radius: 7px; background: #4fa6f2;
+      border: 3px solid #fff; box-shadow: 0 0 0 6px rgba(79,166,242,.25); }
 /* Pins are coloured by class, not an inline style: the CSP allows no inline styles. */
 .pin { width: 34px; height: 34px; border-radius: 17px; border: 2px solid rgba(255,255,255,.85);
        display: flex; align-items: center; justify-content: center; font-weight: 800;

@@ -24,8 +24,16 @@ FIELD_META: dict[str, dict[str, Any]] = {
     "windspeedmph":  {"label": "Wind",        "unit": "mph",  "color": "#39c9d6"},
     "baromrelin":    {"label": "Pressure",    "unit": "inHg", "color": "#b39dff"},
     "hourlyrainin":  {"label": "Rain",        "unit": "in",   "color": "#5aa0ff"},
+    # 2.8 (mirror #8: an Atlas owner's UV and light reached Records and WU
+    # but never the main page). Colours are the app's Quantity.uv and
+    # Quantity.dryness dark values: the app draws solar in the sun's yellow.
+    # A station without the sensor never shows either card, because
+    # shown_fields drops a field the station has never reported.
+    "uv":            {"label": "UV",          "unit": "index", "color": "#ff80cc"},
+    "solarradiation": {"label": "Solar",      "unit": "W/m²", "color": "#ffd64d"},
 }
-CORE_FIELDS = ["tempf", "humidity", "windspeedmph", "baromrelin", "hourlyrainin"]
+CORE_FIELDS = ["tempf", "humidity", "windspeedmph", "baromrelin", "hourlyrainin",
+               "uv", "solarradiation"]
 
 
 def _num(v: Any) -> float | None:
@@ -58,7 +66,29 @@ def _fmt(v: float | None, unit: str) -> str:
         return f"{round(v)}%"
     if unit == "mph":
         return f"{round(v)} mph"
+    if unit == "index":
+        return f"{v:.1f}"          # a UV index is its own unit: "UV 4.1"
+    if unit == "W/m²":
+        return f"{round(v)} W/m²"
     return f"{v:.2f} {unit}"
+
+
+def _title_unit(unit: str) -> str:
+    """The "· unit" tail of a chart title. A UV index is its own unit, so
+    its title stops at "last 24h" rather than reading "· index"
+    (CodeRabbit on #128); every other field keeps its unit."""
+    return "" if unit == "index" else f" · {_esc(unit)}"
+
+
+def _axis_label(v: float, unit: str) -> str:
+    """A chart's y-axis label. Two decimals and the unit run together for
+    the original five fields; UV gets one decimal and no unit word, solar
+    whole watts, so neither reads as "418.50W/m²"."""
+    if unit == "index":
+        return f"{v:.1f}"
+    if unit == "W/m²":
+        return f"{round(v)}W/m²"
+    return f"{_fmt(v, '')}{unit}"
 
 
 DAY_AXIS = ("24h ago", "12h", "now")
@@ -85,7 +115,7 @@ def _axis_html(lo: float, hi: float, unit: str,
                     f'class="chart-grid"/>')
         pct = round(y * 100.0 / height, 1)
         labels.append(f'<span class="chart-yl" style="top:{pct}%">'
-                      f'{_fmt(v, "")}{_esc(unit)}</span>')
+                      f'{_esc(_axis_label(v, unit))}</span>')
     a, b, c = time_labels
     time_row = (f'<div class="chart-axis"><span>{_esc(a)}</span>'
                 f'<span>{_esc(b)}</span><span>{_esc(c)}</span></div>')
@@ -580,6 +610,8 @@ def resolve_fields(raw: str | None) -> list[str]:
 RAIN_EVIDENCE = ("hourlyrainin", "dailyrainin", "rainratein", "eventrainin",
                  "weeklyrainin", "monthlyrainin", "yearlyrainin", "totalrainin")
 FIELD_RAIN = "hourlyrainin"
+# Fields only some stations have a sensor for: shown on evidence alone.
+SENSOR_ONLY_FIELDS = frozenset({"uv", "solarradiation"})
 _EVER_REPORTED_BY: dict[str, tuple[str, ...]] = {FIELD_RAIN: RAIN_EVIDENCE}
 
 
@@ -599,12 +631,20 @@ def shown_fields(fields: list[str], obs: dict[str, Any] | None,
     daily rain ledger, which outlives the raw readings and holds a
     counter-only gauge's rain). A value of 0.0 anywhere is evidence: a dry
     day on a working gauge is not a missing gauge."""
-    if not records:
-        return fields
-    ever = (records.get("periods", {}).get("all", {}) or {}).get("fields")
-    if not isinstance(ever, dict):
-        return fields
     o = obs or {}
+
+    def seen_now(key: str) -> bool:
+        # The producers keep only finite numbers in a series, so any entry
+        # is a reading; a current value counts the same way.
+        return _num(o.get(key)) is not None or bool(series.get(key))
+
+    ever = ((records or {}).get("periods", {}).get("all", {}) or {}).get("fields")
+    if not records or not isinstance(ever, dict):
+        # Cold cache: unknown is not never for the original fields, but the
+        # sensor-only ones (2.8, UV and solar) need evidence before a card
+        # appears, or a thermometer-only station's first render shows two
+        # empty cards until the records warm (CodeRabbit on #128).
+        return [k for k in fields if k not in SENSOR_ONLY_FIELDS or seen_now(k)]
     out = []
     for key in fields:
         evidence = _EVER_REPORTED_BY.get(key, (key,))
@@ -805,9 +845,23 @@ def _air_tile(label: str, value: str, sub: str, color: str) -> str:
             f'{sub_html}</div>')
 
 
+def _app_links(app_url: str, android_url: str) -> list[str]:
+    """The store links beside a card's reading: iOS, then Android (2.8,
+    once the app was on Google Play). Each is dropped when its URL is
+    empty, so an operator who ships only one app can blank the other."""
+    links = []
+    for url, label in ((app_url, "Get the iOS app"),
+                       (android_url, "Get the Android app")):
+        if url:
+            links.append(f'<a class="cc-app" href="{_esc(url)}" '
+                         f'target="_blank" rel="noopener">{label} ↗</a>')
+    return links
+
+
 def render_air_station(name: str, obs: dict[str, Any] | None,
                        series: dict[str, list[tuple[int, float]]],
-                       app_url: str = "", location: str | None = None) -> str:
+                       app_url: str = "", location: str | None = None,
+                       android_url: str = "") -> str:
     """The air card. Fixed tiles (PM10, CO2, TVOC index, NOx index) render
     whether or not the latest reading carries them, so a sensor still
     warming up shows "no reading" rather than a hole; temperature and
@@ -874,11 +928,9 @@ def render_air_station(name: str, obs: dict[str, Any] | None,
     loc_html = (f'<span class="cc-loc"> · {_esc(location)}</span>'
                 if location else "")
     side_html = ""
-    if app_url:
-        side_html = (f'<div class="cc-side">'
-                     f'<a class="cc-app" href="{_esc(app_url)}" '
-                     f'target="_blank" rel="noopener">Get the iOS app ↗</a>'
-                     f'</div>')
+    links = _app_links(app_url, android_url)
+    if links:
+        side_html = f'<div class="cc-side">{"".join(links)}</div>'
     return (
         f'<section class="station station-air">'
         f'  <div class="cc">'
@@ -906,7 +958,8 @@ def render_station(name: str, obs: dict[str, Any] | None,
                    air: bool = False,
                    lightning: dict[str, Any] | None = None,
                    map_url: str = "",
-                   measured: Collection[str] = ()) -> str:
+                   measured: Collection[str] = (),
+                   android_url: str = "") -> str:
     """One station block: current-conditions header + a chart per field.
 
     The temperature chart overlays the feels-like line (from
@@ -919,7 +972,7 @@ def render_station(name: str, obs: dict[str, Any] | None,
     """
     if air:
         return render_air_station(name, obs, series, app_url=app_url,
-                                  location=location)
+                                  location=location, android_url=android_url)
     o = obs or {}
     fields = shown_fields(fields, o, series, records, measured)
     temp = _num(o.get("tempf"))
@@ -961,7 +1014,7 @@ def render_station(name: str, obs: dict[str, Any] | None,
                              unit=meta["unit"])
         charts.append(
             f'<div class="chart"><div class="chart-title">{_esc(meta["label"])} '
-            f'<span class="chart-unit">· last 24h · {_esc(meta["unit"])}</span></div>'
+            f'<span class="chart-unit">· last 24h{_title_unit(meta["unit"])}</span></div>'
             f'{body}</div>'
         )
         # Wind rose rides alongside the wind chart.
@@ -995,11 +1048,7 @@ def render_station(name: str, obs: dict[str, Any] | None,
     loc_html = (f'<span class="cc-loc"> · {_esc(location)}</span>'
                 if location else "")
     side_html = ""
-    links = []
-    if app_url:
-        import html as _h
-        links.append(f'<a class="cc-app" href="{_h.escape(app_url, quote=True)}" '
-                     f'target="_blank" rel="noopener">Get the iOS app ↗</a>')
+    links = _app_links(app_url, android_url)
     if map_url:
         # 2.6: the station's pin on maps.zasder.com, only for a station
         # its owner put on the map (the caller passes "" otherwise).
@@ -1088,7 +1137,7 @@ def render_records(records: dict[str, Any] | None, tz_name: str) -> str:
 def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                      tz_name: str = "UTC",
                      app_url: str = "", location: str | None = None,
-                     more_html: str = "") -> str:
+                     more_html: str = "", android_url: str = "") -> str:
     """Full dashboard section for all selected stations. With 2+ stations a
     side-by-side compare block leads (temp/feels/humidity/pressure, every
     station on one axis per field), then the per-station blocks."""
@@ -1109,6 +1158,7 @@ def render_dashboard(stations: list[dict[str, Any]], fields: list[str],
                        # First station only: one link and one place label per
                        # page, however many stations it shows.
                        app_url=app_url if i == 0 else "",
+                       android_url=android_url if i == 0 else "",
                        location=location if i == 0 else None,
                        air=bool(s.get("air")),
                        lightning=s.get("lightning"),

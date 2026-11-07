@@ -268,19 +268,23 @@ async def _probe(provider: str) -> str | None:
             return _check_macs(eff.get("macs"), devices)
         elif provider == "govee":
             from .govee_cloud_client import GoveeCloudClient
-            from .govee_cloud_poller import (is_air_monitor_listing,
+            from .govee_cloud_poller import (is_supported_listing,
                                              parse_device_ids)
             client = GoveeCloudClient(eff["api_key"])
             listed = await client.list_devices()
+            # The poller's own filter (2.8): air monitors and thermometers
+            # both count, or a thermometer-only account read as empty
+            # (CodeRabbit, PR #146).
             monitors = {str(d.get("device", "")).upper()
-                        for d in listed if is_air_monitor_listing(d)}
+                        for d in listed if is_supported_listing(d)}
             wanted = parse_device_ids(eff.get("devices"))
             if wanted:
                 from .govee_cloud_poller import resolve_device_ids
                 resolved, missing = resolve_device_ids(wanted, sorted(monitors))
                 if missing:
                     return (f"key works but these device ids are not air "
-                            f"monitors on the account: {', '.join(missing)}"
+                            f"monitors or thermometers on the account: "
+                            f"{', '.join(missing)}"
                             + (f" (it has: {', '.join(sorted(monitors))})"
                                if monitors else ""))
                 if resolved != wanted and await db.get_kv(
@@ -294,8 +298,8 @@ async def _probe(provider: str) -> str | None:
                     await db.set_kv(_kv_key(provider, "devices"),
                                     ",".join(resolved))
             elif not monitors:
-                return ("key works but no air monitors are visible — only "
-                        "Wi-Fi Govee devices appear on the API")
+                return ("key works but no air monitors or thermometers are "
+                        "visible — only Wi-Fi Govee devices appear on the API")
         else:
             from .airgradient_client import AirGradientClient
             client = AirGradientClient(eff["token"])

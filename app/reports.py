@@ -109,6 +109,8 @@ def morning_payload(report: Any) -> dict[str, Any]:
             "source": report.outlook.source},
         # 2.1: how far the stations disagreed (None with one station).
         "spread": _spread_wire(report),
+        # 2.8: today's sunset outlook.
+        "sunset_outlook": sunset_wire(getattr(report, "sunset_outlook", None)),
     }
 
 
@@ -337,6 +339,23 @@ def outlook_payload(report: Any) -> dict[str, Any]:
         "sunset": report.sunset,
         "source": report.source,
         "fallback_from": report.fallback_from,
+        # 2.8: the sunset of the day described.
+        "sunset_outlook": sunset_wire(getattr(report, "sunset_outlook", None)),
+    }
+
+
+def sunset_wire(s: Any) -> dict[str, Any] | None:
+    """2.8: the sunset outlook as stored in a report (sunset.outlook_for's
+    dict, minus the instant the page does not need)."""
+    if not isinstance(s, dict) or _int(s.get("pct")) is None:
+        return None
+    return {
+        "date": s.get("date"),
+        "sunset": s.get("sunset"),
+        "pct": _int(s.get("pct")),
+        "verdict": s.get("verdict"),
+        "reasons": [str(x) for x in (s.get("reasons") or [])],
+        "line": s.get("line"),
     }
 
 

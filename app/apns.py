@@ -485,18 +485,35 @@ def _remember_update(activity: str, payload: dict, tokens: list[str],
     _LA_LAST_SENT[activity] = (state, _token_set(tokens), fresh_until)
 
 
+def _forget_others(activity: str, memo: str) -> None:
+    """Drop every unchanged-skip memo for `activity` except `memo`."""
+    for key in [k for k in _LA_LAST_SENT
+                if k != memo and (k == activity or k.startswith(activity + ":"))]:
+        del _LA_LAST_SENT[key]
+
+
 async def send_live_activity_update(activity: str, payload: dict,
-                                    title: str, body: str) -> dict:
+                                    title: str, body: str,
+                                    mac: str | None = None,
+                                    exact: bool = False) -> dict:
     """Fan an ActivityKit update payload out to every update token
     registered for `activity` ('rain' | 'storm' | 'heat'). Same transport
     split and dead-token pruning as send_live_activity_start. A routine
     update that repeats the last one while it is still fresh is skipped
-    (`unchanged: True`), see _LA_LAST_SENT."""
-    rows = await db.list_live_activity_tokens("update", activity=activity)
+    (`unchanged: True`), see _LA_LAST_SENT.
+
+    `mac` (2.8): the station whose card this updates. Only that station's
+    cards (and pre-2.8 apps' cards, which cannot say) receive it, and the
+    unchanged-skip is kept per station, so one station's quiet card never
+    hides another's change."""
+    rows = await db.list_live_activity_tokens("update", activity=activity,
+                                              mac=mac, exact=exact)
     if not rows:
         return {"sent": 0, "dead": [], "failed": 0}
     tokens = [r["token"] for r in rows]
-    if unchanged_update(activity, payload, tokens):
+    memo = (activity if mac is None
+            else f"{activity}:{mac}" + (":exact" if exact else ""))
+    if unchanged_update(memo, payload, tokens):
         return {"sent": 0, "dead": [], "failed": 0, "unchanged": True}
     if settings.apns_configured:
         res = await _push_tokens(rows, title, body,
@@ -518,7 +535,14 @@ async def send_live_activity_update(activity: str, payload: dict,
     # already accepted the deliveries, and an exception here would read
     # as sent_any=False upstream — next tick re-sends and STACKS cards,
     # the exact hole the per-half retry stamps exist to close.
-    _remember_update(activity, payload, tokens, res)
+    _remember_update(memo, payload, tokens, res)
+    if mac is None or any(r.get("mac") is None for r in rows):
+        # This send wrote to cards that other stations' sends also write
+        # to: every card when unscoped, or a pre-2.8 app's unscoped card.
+        # Their memos no longer describe what those cards show, so the
+        # next update from any other station must go out (CodeRabbit,
+        # PR #131: A, then B on a shared card, then A's repeat skipped).
+        _forget_others(activity, memo)
     try:
         for tok in res.get("dead", []):
             await db.remove_live_activity_token(tok)

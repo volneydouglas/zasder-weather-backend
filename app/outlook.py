@@ -52,6 +52,8 @@ class OutlookReport:
     sunset: str | None
     source: str
     fallback_from: str | None = None
+    # 2.8: the sunset outlook for the day described (sunset.outlook_for).
+    sunset_outlook: dict | None = None
     # 2.7.1: "Frost possible tonight, low 33F." for the coming night, or
     # None. Already at the head of `narrative`; kept apart for the morning
     # push, which does not carry the narrative. Not a wire key.
@@ -144,15 +146,19 @@ def frost_band(low_f: Any) -> str | None:
     return None
 
 
-def frost_line(low_f: Any) -> str | None:
+def frost_line(low_f: Any, adjusted: bool = False) -> str | None:
     """One plain sentence for the coming night, or None: "Freeze tonight,
     low 30F." / "Frost possible tonight, low 33F.". °F as stored, like the
-    provider prose it sits beside and the outlook's own "low around 33F"."""
+    provider prose it sits beside and the outlook's own "low around 33F".
+    `adjusted` (2.8): the low was corrected for this station's measured
+    bias, and the sentence says so, because it may differ from the
+    forecast's own number printed beside it."""
     band = frost_band(low_f)
     if band is None:
         return None
     lead = "Freeze tonight" if band == "freeze" else "Frost possible tonight"
-    return f"{lead}, low {_deg(low_f)}F."
+    tail = " (adjusted for your station)" if adjusted else ""
+    return f"{lead}, low {_deg(low_f)}F{tail}."
 
 
 def _row(daily: dict[str, Any], day: Any, undated_index: int) -> int:
@@ -173,7 +179,8 @@ def slot_for(local_hour: int) -> str:
 
 def build(daily: dict[str, Any], *, narrative: list[Any] | None, when: str,
           now_local: datetime, source: str,
-          fallback_from: str | None = None) -> OutlookReport:
+          fallback_from: str | None = None,
+          low_offset_f: float | None = None) -> OutlookReport:
     # The row is the one DATED the day the report describes, never simply
     # row 0 or 1 (R26-02, the 2.6 detailed review): before TWC's first
     # morning issue its row 0 is yesterday, and the report read yesterday's
@@ -188,7 +195,14 @@ def build(daily: dict[str, Any], *, narrative: list[Any] | None, when: str,
     # tomorrow reads its own row; a morning one about today reads the
     # next, never today's, whose low was this morning.
     night = (now_local + timedelta(days=1)).date()
-    frost = frost_line(_at(daily, "temperature_2m_min", _row(daily, night, 1)))
+    # 2.8: the frost decision reads the night's low corrected for this
+    # station's measured bias (forecast_skill.low_offset_f) when one is
+    # known. The forecast's own high and low below stay as issued.
+    night_low = _num(_at(daily, "temperature_2m_min", _row(daily, night, 1)))
+    if night_low is not None and low_offset_f is not None:
+        frost = frost_line(night_low + low_offset_f, adjusted=True)
+    else:
+        frost = frost_line(night_low)
     code = _at(daily, "weather_code", i)
     sky = SKY_WORDS.get(int(code)) if isinstance(code, (int, float)) else None
     pp = _num(_at(daily, "precipitation_probability_max", i))
@@ -246,6 +260,8 @@ def text(r: OutlookReport) -> str:
         if r.sunset:
             sun.append(f"sunset {r.sunset}")
         lines.append(", ".join(sun).capitalize() + ".")
+    if r.sunset_outlook and r.sunset_outlook.get("line"):
+        lines.append(r.sunset_outlook["line"] + ".")
     if r.narrative:
         lines.append("")
         lines.append(r.narrative)
@@ -267,6 +283,9 @@ def push_text(r: OutlookReport) -> tuple[str, str]:
         bits.append(f"high {r.hi_f:.0f}")
     if r.precip_pct is not None:
         bits.append(f"{r.precip_pct}% precipitation")
+    so = r.sunset_outlook
+    if so and isinstance(so.get("pct"), int) and so["pct"] >= 70:
+        bits.append(f"sunset {so.get('verdict', 'looks good')} ({so['pct']}%)")
     body = ", ".join(bits) if bits else "Open for the forecast."
     # 2.3 (Doren, 09-11): the push carries the forecast the email carries.
     # APNs caps the payload at 4 KB; a TWC narrative is a sentence or two,
@@ -319,6 +338,8 @@ def build_html(r: OutlookReport, theme: str = "dark") -> str:
     if r.sunset:
         sun.append(ec.tile("SUNSET", _h.escape(r.sunset), width="50%"))
     inner += ec.tile_row(sun, margin_top=6)
+    if r.sunset_outlook and r.sunset_outlook.get("line"):
+        inner += ec.prose(r.sunset_outlook["line"] + ".")
     if r.narrative:
         inner += ec.section_label("THE FORECAST")
         inner += ec.prose(r.narrative)

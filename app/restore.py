@@ -108,6 +108,13 @@ _TASK: "asyncio.Task | None" = None
 # file free of names the public mirror's residue sweep forbids.
 POST_SWAP_HOOKS: list[Callable[[], Any]] = []
 
+# How many swaps have been started in this process (2.8). Bumped inside the
+# maintenance lease, before the file moves, so a worker that opens a counted
+# connection and then sees an unchanged count knows the database under it is
+# the one it measured: no swap can begin while its connection is open, and
+# one that already happened has moved the count (CodeRabbit, #132).
+SWAPS = 0
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -604,6 +611,7 @@ async def receive_upload(chunks: AsyncIterator[bytes], dest: Path,
 async def _validate_and_swap(upload: Path, live: Path) -> None:
     """The background half. Every failure lands in JOB; nothing here is
     allowed to vanish into a fire-and-forget void."""
+    global SWAPS
     from . import db, ingest
     try:
         JOB["state"] = "validating"
@@ -619,6 +627,7 @@ async def _validate_and_swap(upload: Path, live: Path) -> None:
         db._CHART_INDEX_BUILDING = True
         try:
             async with db.maintenance_lease():
+                SWAPS += 1    # before anything moves; see SWAPS
                 try:
                     pre = await _swap_holding_the_lease(upload, live)
                     try:

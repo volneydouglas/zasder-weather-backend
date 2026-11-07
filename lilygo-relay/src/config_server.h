@@ -80,6 +80,13 @@ extern bool forwardAll;
 // reports UV 4 / ~80,000 lux at night). On, the relay drops uv and light
 // from Atlas packets so a dead sensor never posts daylight at midnight.
 extern bool atlasUvLuxBroken;
+// Paired AcuRite tower (`tower_id`, the sensor's rtl_433 id, 0 = none, via
+// POST /provision): its temperature and humidity ride the Atlas's post
+// instead of being dropped (tower_pair.h). `tower_indoor` (1/0) files them
+// as the station's indoor reading; off, they are channel sensor 1
+// (temp1f/humidity1). The id is on /status under `heard`.
+extern uint32_t towerId;
+extern bool towerIndoor;
 
 void loadFromNvs();  // populates backendUrl + ingestToken from NVS
 void wipeIngestToken();  // for the 401-auto-recovery path

@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<title>Station Display</title>
+<style>
+@font-face{font-family:"Barlow";font-weight:400;font-display:swap;src:url(/static/display/fonts/barlow-400.woff2) format("woff2")}
+@font-face{font-family:"Barlow";font-weight:500;font-display:swap;src:url(/static/display/fonts/barlow-500.woff2) format("woff2")}
+@font-face{font-family:"Barlow";font-weight:600;font-display:swap;src:url(/static/display/fonts/barlow-600.woff2) format("woff2")}
+@font-face{font-family:"Barlow Semi Condensed";font-weight:300;font-display:swap;src:url(/static/display/fonts/barlow-semi-condensed-300.woff2) format("woff2")}
+@font-face{font-family:"Barlow Semi Condensed";font-weight:400;font-display:swap;src:url(/static/display/fonts/barlow-semi-condensed-400.woff2) format("woff2")}
+@font-face{font-family:"Barlow Semi Condensed";font-weight:500;font-display:swap;src:url(/static/display/fonts/barlow-semi-condensed-500.woff2) format("woff2")}
+@font-face{font-family:"JetBrains Mono";font-weight:100 800;font-display:swap;src:url(/static/display/fonts/jetbrains-mono.woff2) format("woff2")}
+:root{
+  color-scheme:dark;
+  --ground:#0B1218; --panel:#111B23; --panel2:#15222C; --line:#22313E; --line2:#2C3E4D;
+  --text:#E6EDF2; --muted:#8094A4; --faint:#566A7A;
+  --temp:#FF9E33; --feels:#FF6B5F; --hum:#4CB2FF; --wind:#39C9D6; --press:#B39DFF;
+  --rain:#5AA0FF; --uv:#FF80CC; --solar:#FFD64D; --good:#4ED48A; --warn:#FFB547; --bad:#FF5A5F; --bolt:#9FA8FF;
+  --num:"Barlow Semi Condensed","Arial Narrow",system-ui,sans-serif;
+  --ui:"Barlow",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{height:100%;margin:0}
+/* A kiosk has a mouse it never uses: hide the pointer once it sits still
+   (display.js sets .idle after 3 s; any move or touch brings it back). */
+html.idle,html.idle *{cursor:none!important}
+body{background:var(--ground);color:var(--text);font-family:var(--ui);overflow:hidden;cursor:default;-webkit-font-smoothing:antialiased}
+.viewport{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+.stage{width:1280px;height:800px;flex:none;transform-origin:center center;background:var(--ground);overflow:hidden;position:relative;display:grid;grid-template-rows:54px auto 1fr 236px 122px;transition:filter .8s}
+.stage.framed{border:1px solid var(--line);border-radius:14px}
+/* fixed grid rows: a hidden banner must not shift the others */
+.top{grid-row:1}.banner{grid-row:2}.main{grid-row:3}.charts{grid-row:4}.fc{grid-row:5}
+.stage.night{filter:brightness(.62) sepia(.28) saturate(.9)}
+/* top bar */
+.top{display:flex;align-items:center;gap:18px;padding:0 20px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0F1820,#0C141B);min-width:0}
+.place{display:flex;flex-direction:column;line-height:1.05;min-width:0}
+.place .n{font:600 19px var(--ui);letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+.place .s{font:500 11px var(--ui);color:var(--muted);letter-spacing:1.2px;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+.chips{display:flex;gap:6px;margin-left:6px;min-width:0;overflow:hidden}
+.chip{font:500 12px var(--ui);color:var(--muted);background:transparent;border:1px solid var(--line2);border-radius:999px;padding:4px 10px;cursor:pointer;white-space:nowrap}
+.chip[aria-pressed="true"]{color:var(--text);background:var(--panel2);border-color:#46637A}
+.chip:focus-visible{outline:2px solid var(--hum);outline-offset:2px}
+.spacer{flex:1}
+.sun{display:flex;gap:14px;font:500 13px var(--mono);color:var(--muted);white-space:nowrap}
+.sun span b{color:var(--text);font-weight:500}
+/* 2.8 sunset outlook: how good the next sunset looks, beside its time */
+.sunchip{font:600 11px var(--ui);letter-spacing:.6px;text-transform:uppercase;padding:2px 8px;border-radius:999px;border:1px solid var(--line2);background:var(--panel2);color:var(--muted);align-self:center}
+.sunchip.good{color:var(--solar);border-color:var(--solar)}
+.clock{font:500 26px var(--num);letter-spacing:.5px;min-width:96px;text-align:right;font-variant-numeric:tabular-nums}
+.date{font:500 12px var(--ui);color:var(--muted);text-transform:uppercase;letter-spacing:1px;text-align:right}
+.live{display:flex;align-items:center;gap:7px;font:500 12px var(--mono);color:var(--muted);white-space:nowrap}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--good);animation:pulse 2.4s infinite}
+.dot.stale{background:var(--warn);animation:none}.dot.dead{background:var(--bad);animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(78,212,138,.55)}70%{box-shadow:0 0 0 9px rgba(78,212,138,0)}100%{box-shadow:0 0 0 0 rgba(78,212,138,0)}}
+.banner{display:flex;align-items:center;gap:12px;padding:8px 20px;border-bottom:1px solid #7A2B2B;background:linear-gradient(90deg,#5A1F1F,#3A1717);font:600 15px var(--ui);min-width:0}
+.banner.watch{border-bottom-color:#7A5A2B;background:linear-gradient(90deg,#4F3A16,#33260F)}
+.banner .tag{font:600 11px var(--ui);letter-spacing:1.4px;text-transform:uppercase;background:var(--bad);color:#1A0B0B;padding:3px 8px;border-radius:4px}
+.banner.watch .tag{background:var(--warn)}
+.banner .txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.banner .more{margin-left:auto;font:500 12px var(--mono);color:#E0B0A0;white-space:nowrap}
+/* main row */
+.main{display:grid;grid-template-columns:330px 300px 1fr;gap:14px;padding:14px 20px 10px;min-height:0}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.lbl{font:600 11px var(--ui);color:var(--muted);letter-spacing:1.3px;text-transform:uppercase;white-space:nowrap}
+.hero{padding:16px 18px;display:flex;flex-direction:column;gap:6px;position:relative;overflow:hidden}
+.temp{display:flex;align-items:flex-start;gap:4px;font:300 128px/0.9 var(--num);color:var(--text);letter-spacing:-3px;font-variant-numeric:tabular-nums}
+.temp sup{font:400 40px var(--num);color:var(--temp);margin-top:12px;letter-spacing:0}
+.cond{font:500 20px var(--ui)}
+.feel{font:500 15px var(--ui);color:var(--muted)}
+.feel b{color:var(--feels);font-weight:600}
+.hilo{display:flex;gap:18px;margin-top:auto;padding-top:10px;border-top:1px solid var(--line)}
+.hilo div{display:flex;flex-direction:column}
+.hilo .v{font:500 30px var(--num);font-variant-numeric:tabular-nums}
+.hilo .t{font:500 11px var(--mono);color:var(--faint)}
+.hi .v{color:var(--temp)} .lo .v{color:var(--hum)}
+.storm{display:none;position:absolute;inset:0;padding:16px 18px;background:radial-gradient(120% 90% at 100% 0%,#173253 0%,#0F1C29 55%,#0E1822 100%);flex-direction:column;gap:6px}
+.stage.storming .storm{display:flex}
+.storm .big{font:300 92px/0.95 var(--num);color:var(--rain);letter-spacing:-2px}
+.storm .big small{font:400 30px var(--num);color:var(--text);letter-spacing:0}
+.storm .row{display:flex;gap:22px;margin-top:6px}
+.storm .row .v{font:500 28px var(--num)} .storm .row .k{font:600 10px var(--ui);color:var(--muted);letter-spacing:1.2px;text-transform:uppercase}
+.storm .rate{margin-top:auto;font:500 14px var(--ui);color:#A9C8EA}
+/* compass */
+.compass{padding:14px 16px 12px;display:flex;flex-direction:column;align-items:center;gap:4px}
+.compass .lbl{align-self:flex-start}
+.compass svg{width:236px;height:236px}
+.wind-read{display:flex;gap:22px;align-items:baseline;font:500 15px var(--ui);color:var(--muted)}
+.wind-read .v{font:500 30px var(--num);color:var(--wind);font-variant-numeric:tabular-nums}
+.wind-read .g{color:var(--text)}
+#needle{transition:transform 1.4s cubic-bezier(.3,1.4,.5,1)}
+/* tiles */
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(2,1fr);gap:10px;min-height:0}
+.tile{padding:12px 14px;display:flex;flex-direction:column;gap:2px;position:relative;min-width:0}
+.tile .v{font:500 40px/1 var(--num);margin-top:6px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.tile .v small{font:400 16px var(--num);color:var(--muted);margin-left:3px}
+.tile .sub{font:500 12px var(--ui);color:var(--muted);margin-top:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pill{display:inline-block;font:600 10px var(--ui);letter-spacing:1px;text-transform:uppercase;padding:2px 6px;border-radius:4px;margin-left:6px;vertical-align:middle;color:#0B1218}
+.flash{animation:flash 1.2s ease-out}
+@keyframes flash{0%{opacity:.35}100%{opacity:1}}
+/* charts */
+.charts{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;padding:0 20px 10px;min-height:0}
+.chart{padding:10px 12px 8px;display:flex;flex-direction:column;min-height:0}
+.chart .head{display:flex;justify-content:space-between;align-items:baseline}
+.chart .now{font:500 20px var(--num);font-variant-numeric:tabular-nums}
+.chart svg{width:100%;flex:1;margin-top:4px;min-height:0}
+.chart .none{flex:1;display:flex;align-items:center;justify-content:center;color:var(--faint);font:500 13px var(--ui)}
+.axis{display:flex;justify-content:space-between;font:400 10px var(--mono);color:var(--faint)}
+/* forecast */
+.fc{display:grid;grid-template-columns:repeat(7,1fr);margin:0 20px 14px;padding:10px 6px}
+.fc .none{grid-column:1/-1;display:flex;align-items:center;justify-content:center;color:var(--faint);font:500 13px var(--ui)}
+.fd{display:flex;flex-direction:column;align-items:center;gap:4px;border-right:1px solid var(--line);padding:0 8px;min-width:0}
+.fd:last-child{border-right:0}
+.fd .d{font:600 12px var(--ui);letter-spacing:1px;text-transform:uppercase;color:var(--muted)}
+.fd.today .d{color:var(--text)}
+.fd svg.ic{width:30px;height:30px}
+.fd .rng{display:flex;align-items:center;gap:6px;font:500 17px var(--num);width:100%;justify-content:center}
+.fd .rng .lo{color:var(--hum)} .fd .rng .hi{color:var(--temp)}
+.fd .track{position:relative;height:5px;width:46px;border-radius:3px;background:var(--line)}
+.fd .track i{position:absolute;top:0;bottom:0;border-radius:3px;background:linear-gradient(90deg,var(--hum),var(--temp))}
+.fd .pop{font:500 11px var(--mono);color:var(--rain)}
+/* messages (no data yet, link problems) */
+.msg{position:absolute;inset:0;z-index:5;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(11,18,24,.94);text-align:center;padding:40px}
+.msg h1{font:500 34px var(--num);margin:0;text-wrap:balance}
+.msg p{font:500 16px var(--ui);color:var(--muted);max-width:620px;margin:0;line-height:1.45}
+@media (prefers-reduced-motion:reduce){.dot,#needle,.flash{animation:none;transition:none}.stage{transition:none}}
+</style>
+</head>
+<body>
+<div class="viewport" id="vp">
+ <div class="stage" id="stage">
+  <header class="top">
+    <div class="place"><span class="n" id="place">Weather</span><span class="s" id="stName"></span></div>
+    <div class="chips" id="chips" role="group" aria-label="Station"></div>
+    <div class="spacer"></div>
+    <div class="sun" id="sunRow" hidden><span>Sunrise <b id="sr"></b></span><span>Sunset <b id="ss"></b></span><span class="sunchip" id="sunChip" hidden></span></div>
+    <div class="live"><span class="dot" id="dot" aria-hidden="true"></span><span id="ago">connecting</span></div>
+    <div><div class="clock" id="clock"></div><div class="date" id="date"></div></div>
+  </header>
+  <div class="banner" id="banner" role="alert" hidden><span class="tag" id="bTag">Warning</span><span class="txt" id="bTxt"></span><span class="more" id="bMore"></span></div>
+  <section class="main">
+    <div class="panel hero" id="hero">
+      <span class="lbl">Outside now</span>
+      <div class="temp"><span id="tNow">—</span><sup>°F</sup></div>
+      <div class="cond" id="cond"></div>
+      <div class="feel" id="feelRow">Feels like <b id="feels"></b> · Dew point <span id="dewHero"></span></div>
+      <div class="hilo">
+        <div class="hi"><span class="lbl">Today high</span><span class="v" id="hi">—</span><span class="t" id="hiT"></span></div>
+        <div class="lo"><span class="lbl">Today low</span><span class="v" id="lo">—</span><span class="t" id="loT"></span></div>
+        <div><span class="lbl">Peak gust 24h</span><span class="v" id="g24" style="color:var(--wind)">—</span><span class="t">mph</span></div>
+      </div>
+      <div class="storm" aria-live="polite">
+        <span class="lbl" style="color:#9DC2EA">Rain falling</span>
+        <div class="big"><span id="sTot"></span><small> in today</small></div>
+        <div class="row">
+          <div><div class="k">Last hour</div><div class="v" id="sRate"></div></div>
+          <div><div class="k">Wettest hour</div><div class="v" id="sPeak"></div></div>
+          <div><div class="k">Temp</div><div class="v" id="sTemp"></div></div>
+        </div>
+        <div class="rate" id="sNote"></div>
+      </div>
+    </div>
+    <div class="panel compass">
+      <span class="lbl">Wind</span>
+      <svg viewBox="0 0 240 240" role="img" aria-label="Wind direction">
+        <defs><radialGradient id="cg" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#16242F"/><stop offset="100%" stop-color="#0E171F"/></radialGradient></defs>
+        <circle cx="120" cy="120" r="108" fill="url(#cg)" stroke="#2C3E4D" stroke-width="1.5"/>
+        <g id="ticks"></g>
+        <g font-family="Barlow, system-ui" font-weight="600" font-size="15" fill="#8094A4" text-anchor="middle">
+          <text x="120" y="36">N</text><text x="207" y="125">E</text><text x="120" y="215">S</text><text x="33" y="125">W</text>
+        </g>
+        <g id="needle" style="transform-origin:120px 120px">
+          <path d="M120 24 L131 120 L120 112 L109 120 Z" fill="#39C9D6"/>
+          <path d="M120 216 L128 120 L120 128 L112 120 Z" fill="#2C3E4D"/>
+        </g>
+        <circle cx="120" cy="120" r="40" fill="#0E171F" stroke="#2C3E4D"/>
+        <text id="wDir" x="120" y="116" text-anchor="middle" font-family="Barlow Semi Condensed, system-ui" font-size="26" font-weight="500" fill="#E6EDF2"></text>
+        <text id="wDeg" x="120" y="136" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" fill="#8094A4"></text>
+      </svg>
+      <div class="wind-read"><span><span class="v" id="wSpd">—</span> mph</span><span>gust <span class="v g" id="wGst">—</span></span></div>
+    </div>
+    <div class="tiles" id="tiles"></div>
+  </section>
+  <section class="charts" id="charts"></section>
+  <section class="panel fc" id="fc"></section>
+  <div class="msg" id="msg"><h1 id="msgH">Connecting</h1><p id="msgP">Fetching the latest readings.</p></div>
+ </div>
+</div>
+<script src="/static/display/display.js"></script>
+</body>
+</html>

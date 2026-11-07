@@ -175,6 +175,20 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _fs._fetch_daily = _no_fetch
     _fs._fetch_twc = _no_fetch      # 2.6: TWC is archived on the same beat
     _fs._fetch_models = _no_fetch   # 2.7: the Open-Meteo models, one call
+    # 2.8 station display: its 20 s payload cache, and the two upstream
+    # calls (forecast, weather-service alerts) stubbed like the snapshots'.
+    import app.station_display as _sdisp
+    _sdisp._reset_for_tests()
+    _sdisp._fetch_forecast = _no_fetch
+    _sdisp._fetch_alerts = _no_fetch
+    # 2.8 sunset outlook: the morning report, the outlook and the display
+    # all ask Open-Meteo for the sunset hour; no test reaches the network.
+    import app.sunset as _sunset
+    _sunset.reset_cache()
+
+    async def _no_json(url, params):  # noqa: ANN001
+        return None
+    _sunset._fetch_json = _no_json
     # Disk watch (1.9) reads the HOST machine's real volume — a developer
     # laptop past 85% used makes every tick fire disk_low and skews any
     # test that counts _deliver calls. Pin a healthy fake; disk tests
@@ -194,6 +208,10 @@ def temp_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     _hw = sys.modules.get("app.health_watch")
     if _hw is not None:
         _hw._reset_for_tests()
+    # 2.8: tonight's-low correction is cached per station and day.
+    _fsk = sys.modules.get("app.forecast_skill")
+    if _fsk is not None:
+        _fsk._reset_for_tests()
     # 2.1 modules with process-global job/cache state (2.1 pre-release
     # review BE-10): a restore left "swapping" by one test must not make
     # the next test's restore refuse, and cached advice must not leak.

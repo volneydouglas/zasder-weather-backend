@@ -12,6 +12,7 @@
 #include "ingest_id.h"
 #include "post_fsm.h"
 #include "root_ca.h"
+#include "tower_pair.h"
 
 // 5 consecutive 401s = the token is wrong. Wipe it from NVS; the board
 // stays on Wi-Fi and LOCKED (provisioned flag kept), serving /provision
@@ -61,6 +62,10 @@ struct WH32BCache {
   unsigned long ms = 0;   // millis() of the last capture — age bound
 };
 static WH32BCache wh32b;
+
+// The paired AcuRite tower's latest reading (tower_pair.h), merged into
+// every Atlas post while it is fresh.
+static TowerPair::Cache tower;
 
 // Age bound on the merge. Without one, a WH32B that dies (battery, RF
 // fault) keeps having its LAST reading merged into every outdoor post
@@ -155,6 +160,15 @@ void zasder_post(const char *rtl433Json,
   const char *model = in["model"].as<const char *>();
   if (!model) return;
   uint32_t id = in["id"].as<uint32_t>();
+
+  // Paired AcuRite tower: cache + return, like the WH32B below. Its
+  // readings ride the Atlas's next post (tower_pair.h); it never becomes a
+  // station of its own, even in discovery mode.
+  if (TowerPair::capture(in, ZasderConfigServer::towerId, tower, millis())) {
+    Serial.printf("[tower-cache] tempf=%.1f hum=%.1f batt=%d\n",
+                  tower.tempf, tower.humidity, tower.batteryOk);
+    return;
+  }
 
   // Fineoffset-WH32B: cache + return. We never POST the WH32B as its
   // own device (operator doesn't want an indoor-only station row);
@@ -279,6 +293,16 @@ void zasder_post(const char *rtl433Json,
       auto p = out["pressure"].to<JsonObject>();
       p["relative_inhg"] = wh32b.pressure_inhg;
     }
+  }
+
+  // ── tower merge ── the paired AcuRite tower onto the Atlas (0x01): as
+  // the indoor reading or as channel sensor 1, per the board's
+  // tower_indoor setting. Nothing once its reading is stale.
+  if (typeTag == 0x01) {
+    TowerPair::merge(tower, ZasderConfigServer::towerId,
+                     ZasderConfigServer::towerIndoor ? TowerPair::Role::Indoor
+                                                     : TowerPair::Role::Channel,
+                     millis(), out);
   }
 
   String body;

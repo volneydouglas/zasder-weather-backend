@@ -198,6 +198,47 @@ def rule_triggered(comparator: str, threshold: float, value: float,
     return abs(value - threshold) < tolerance   # equalTo — noisy sensors
 
 
+def collapse_ladder(fired: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(speak, quiet) for the rules that fired on ONE station's reading.
+
+    2.8 (Doren 10-17: a gust jumping from 6.7 to 20.7 mph fired his 10,
+    15 and 20 mph rules in one go): rules on the same field and the same
+    direction that cross together are one event, told once by the most
+    extreme of them, the highest "above" threshold or the lowest "below"
+    one, with the more severe rule winning a tie. "equalTo" rules each
+    speak for themselves. Pure, so the choice is testable on its own."""
+    groups: dict[tuple[str, str], list[dict]] = {}
+    speak: list[dict] = []
+    for r in fired:
+        if r.get("comparator") in ("above", "below"):
+            groups.setdefault((r["field"], r["comparator"]), []).append(r)
+        else:
+            speak.append(r)
+    quiet: list[dict] = []
+    rank = {s: i for i, s in enumerate(("minor", "standard", "major", "urgent"))}
+    for (_field, comp), rs in groups.items():
+        sign = 1 if comp == "above" else -1
+        best = max(rs, key=lambda r: (sign * float(r["threshold"]),
+                                      rank.get(r.get("severity") or "minor", 0)))
+        speak.append(best)
+        quiet.extend(r for r in rs if r is not best)
+    return speak, quiet
+
+
+def ladder_severity(rule: dict, quiet: list[dict]) -> str:
+    """The loudest severity among `rule` and the rules folded into it
+    (same field and direction). The extreme threshold names the alert;
+    its loudness is the loudest rung's, so an urgent 10 mph rule folded
+    under a minor 20 mph one still gets through quiet hours (CodeRabbit,
+    PR #131)."""
+    rank = {s: i for i, s in enumerate(RULE_SEVERITIES)}
+    group = [rule] + [q for q in quiet
+                      if (q["field"], q["comparator"])
+                      == (rule["field"], rule["comparator"])]
+    return max((r.get("severity") or "minor" for r in group),
+               key=lambda s: rank.get(s, 0))
+
+
 def evaluate_rule(comparator: str, threshold: float, value: float,
                   prev_triggered: int,
                   tolerance: float = _DEFAULT_EQUALITY_TOLERANCE) -> tuple[bool, bool]:
@@ -349,6 +390,9 @@ ALERT_SEVERITY: dict[str, str] = {
     "leak_cleared": "info",
     "outflow": "warning",
     "pipe_freeze": "warning",
+    # 2.8: the crawlspace forecast notice is a heads-up at sunset; the
+    # sensor's 32 °F level passes severity="warning" explicitly.
+    "crawlspace": "watch",
     "nws": "warning",
     "lightning_clear": "info",
     "first_frost": "info",
@@ -361,10 +405,33 @@ ALERT_SEVERITY: dict[str, str] = {
     "source_recovered": "info",
     # 2.2 sky notes: sunset, the moon, and the scope's verdict.
     "sky": "info",
+    # 2.8 good-sunset heads-up: a watch, so quiet hours hold it.
+    "sunset": "watch",
     "device_recovered": "info",
     "battery_recovered": "info",
     "disk_recovered": "info",
 }
+
+
+def _sunset_threshold(v) -> int:
+    """The stored threshold, 1..100, or the default 70 when unset/garbled."""
+    if isinstance(v, bool):
+        return 70
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 70
+    return n if 1 <= n <= 100 else 70
+
+
+async def night_low_offset(provider: str | None) -> float | None:
+    """2.8: the forecast station's measured lead-1 low bias for
+    `provider`, the correction the frost lines read, or None."""
+    from . import forecast_skill
+    from . import forecast_snapshots as fs
+    sky = fs.coords_device(await db.list_devices())
+    return await forecast_skill.low_offset_f(sky["mac"] if sky else None,
+                                             provider)
 
 
 async def _morning_outlook(coords, local):
@@ -384,7 +451,8 @@ async def _morning_outlook(coords, local):
         coords[0], coords[1], source=source, wu_key=wu_key,
         tz_name=settings.timezone)
     r = ol.build(daily, narrative=narrative, when="today", now_local=local,
-                 source=used, fallback_from=fallback)
+                 source=used, fallback_from=fallback,
+                 low_offset_f=await night_low_offset(used))
     out = dg.Outlook(hi_f=r.hi_f, lo_f=r.lo_f, precip_pct=r.precip_pct,
                      sky=r.sky, narrative=r.narrative, source=r.source,
                      frost_line=r.frost_line)
@@ -474,10 +542,30 @@ async def build_morning_report(devices, now_ms: int, window_start: int,
         except Exception:
             outlook = None
 
+    # 2.8 (Doren 10-17): today's sunset outlook, best-effort like the
+    # forecast above. None when there is no cloud forecast to judge by.
+    sunset_outlook = None
+    if primary_coords is not None:
+        sunset_outlook = await _sunset_outlook_for(primary_coords, local.date(), tz)
+
     report = dg.Report(
         date_label=local.strftime("%A, %B %-d"),
-        stations=stations, alerts=alert_lines, outlook=outlook)
+        stations=stations, alerts=alert_lines, outlook=outlook,
+        sunset_outlook=sunset_outlook)
     return report, stations, rows
+
+
+async def _sunset_outlook_for(coords, day, tz) -> dict | None:
+    """The sunset outlook for `day` at `coords`, or None on any failure:
+    it is a line in a report, never a reason the report fails."""
+    from . import sunset as ss
+    try:
+        return await asyncio.wait_for(
+            ss.outlook_for(coords[0], coords[1], day, tz, settings.timezone),
+            timeout=20)
+    except Exception:
+        log.warning("sunset outlook unavailable for %s", day)
+        return None
 
 
 # 2.1 Reports shipped with an empty list on day one: storm summaries
@@ -594,6 +682,19 @@ def in_quiet_hours(now_ms: int, tz_name: str,
 
 SMART_KINDS = ("frost", "heat", "pressure_drop", "temp_drop", "wind_ramp",
                "pipe_freeze", "outflow")
+# The words the apps show beside each kind's switch (2.8). The server owns
+# them so iPhone, Mac and Android cannot spell a kind three ways.
+SMART_LABELS = {
+    "frost": "Frost",
+    "heat": "Heat",
+    "pressure_drop": "Pressure falling fast",
+    "temp_drop": "Temperature dropping fast",
+    "wind_ramp": "Wind picking up fast",
+    "pipe_freeze": "Hard freeze (pipe risk)",
+    "outflow": "Storm outflow",
+}
+# Which channels a scheduled report may use (2.8), the storm summary's set.
+CHANNELS = ("push", "email", "both")
 
 # The rate family groups: several of these newly firing on one tick at one
 # place is one weather event, a front (see _deliver_smart_place).
@@ -814,6 +915,10 @@ class EffectiveAlertConfig:
     # and a stargazing verdict; `sky_good_only` sends it on good nights only.
     sky_notes: bool = False
     sky_good_only: bool = False
+    # 2.8 (Doren 10-17): the "good sunset" heads-up ~45 minutes before
+    # sunset when the sunset outlook scores at or above the threshold.
+    sunset_alert: bool = False
+    sunset_threshold: int = 70
     # 2.3 (Doren, 09-11: "I turned off but I'm still getting
     # notifications"): the NWS relay had no switch; the app's toggle was
     # phone-local. NULL in the row keeps the 1.8 behaviour (on).
@@ -855,6 +960,14 @@ class EffectiveAlertConfig:
     # lightning_alert_mi None = any strike the detector hears (~25 mi).
     lightning_alert: bool = False
     lightning_alert_mi: float | None = None
+    # 2.8 (Doren 10-18): each scheduled report's channels, 'push' |
+    # 'email' | 'both'; None = the delivery it always had.
+    digest_channels: str | None = None
+    outlook_channels: str | None = None
+    sky_channels: str | None = None
+    # 2.8 (Doren 10-29): smart kinds muted one at a time; the master switch
+    # above still turns the whole pillar off.
+    smart_muted: list[str] = field(default_factory=list)
 
 
 def _parse_recipients(raw: str | None) -> list[str]:
@@ -933,6 +1046,8 @@ async def effective_config() -> EffectiveAlertConfig:
         outlook_source=(str(p["outlook_source"]) if p.get("outlook_source") else None),
         sky_notes=bool(p.get("sky_notes")),
         sky_good_only=bool(p.get("sky_good_only")),
+        sunset_alert=bool(p.get("sunset_alert")),
+        sunset_threshold=_sunset_threshold(p.get("sunset_threshold")),
         nws_push=(p.get("nws_push") is None or bool(p.get("nws_push"))),
         storm_live_activity=(p.get("storm_live_activity") is None
                              or bool(p.get("storm_live_activity"))),
@@ -948,6 +1063,10 @@ async def effective_config() -> EffectiveAlertConfig:
         nws_muted_families=_muted_families(p.get("nws_families")),
         report_theme=_report_theme(p.get("report_theme")),
         smart_alerts=smart,
+        digest_channels=_channels(p.get("digest_channels")),
+        outlook_channels=_channels(p.get("outlook_channels")),
+        sky_channels=_channels(p.get("sky_channels")),
+        smart_muted=_smart_muted(p.get("smart_muted")),
         lightning_alert=(bool(p["lightning_alert"])
                          if p.get("lightning_alert") is not None else smart),
         lightning_alert_mi=lt_mi)
@@ -1000,6 +1119,39 @@ async def report_theme_now(cfg, devices: list[dict[str, Any]] | None = None
 def _report_theme(raw: Any) -> str:
     from . import email_card
     return raw if raw in email_card.THEMES else "dark"
+
+
+def _channels(raw: Any) -> str | None:
+    """A stored channel choice, or None (the legacy delivery) for NULL or
+    anything outside the closed set."""
+    return raw if raw in CHANNELS else None
+
+
+def normalise_smart_muted(raw: Any) -> list[str]:
+    """Known smart kinds only, each once, in SMART_KINDS order: a typo or a
+    kind a later release removed is dropped rather than stored."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    wanted = {k for k in raw if isinstance(k, str)}
+    return [k for k in SMART_KINDS if k in wanted]
+
+
+def _smart_muted(raw: Any) -> list[str]:
+    if not raw:
+        return []
+    try:
+        return normalise_smart_muted(json.loads(raw))
+    except (ValueError, TypeError):
+        return []
+
+
+def channel_flags(choice: str | None, *, email_default: bool,
+                  push_default: bool = True) -> tuple[bool, bool]:
+    """(email_ok, push_ok) for a channel choice; None keeps the defaults
+    the caller always used."""
+    if choice is None:
+        return email_default, push_default
+    return choice in ("email", "both"), choice in ("push", "both")
 
 
 def _muted_families(raw: Any) -> list[str]:
@@ -1080,7 +1232,9 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
                    html: str | None = None,
                    route: str | None = None,
                    quiet_hours_exempt: bool = False,
-                   outcome: dict[str, Any] | None = None) -> bool:
+                   outcome: dict[str, Any] | None = None,
+                   delivered_by_caller: bool = False,
+                   hold_unless_delivered: bool = False) -> bool:
     """Send an alert through every configured channel (email + push). Returns
     True when the alert is HANDLED: at least one channel delivered, or no
     channel had anything to attempt. Shared by device-down + threshold.
@@ -1115,8 +1269,10 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
                                getattr(cfg, "quiet_start_min", None),
                                getattr(cfg, "quiet_end_min", None))):
         push_ok = False
-    delivered = False
-    attempted = False
+    # A channel the caller sent itself (the outlook's HTML email) counts
+    # here, so the history row says the alert went out.
+    delivered = delivered_by_caller
+    attempted = delivered_by_caller
     if cfg.enabled and email_ok:
         attempted = True
         try:
@@ -1164,6 +1320,15 @@ async def _deliver(cfg: EffectiveAlertConfig, subject: str, body: str,
         webhook_channel = bool(await db.list_webhooks(enabled_only=True))
     except Exception:
         pass
+    if hold_unless_delivered and not delivered:
+        # The caller retries this next tick (the outlook after a failed
+        # email, CodeRabbit PR #131): without email or push through, no
+        # history row and no webhook yet, and a webhook alone does not
+        # count as delivery, or the email would never be retried.
+        if outcome is not None:
+            outcome["delivered"] = False
+            outcome["attempted"] = True
+        return False
     if webhook_channel:
         delivered = True
     if outcome is not None:
@@ -1353,6 +1518,14 @@ class AlertMonitor:
         # as handled and the dispatch still fans out).
         if not alerts_open:
             return
+        # ── 2.8: the crawlspace freeze watch (opt-in; Doren). First after
+        # the gate, ahead of the unguarded checks below, so an exception in
+        # one of them cannot skip a freeze night (CodeRabbit, PR #130).
+        from . import crawlspace_watch
+        try:
+            await crawlspace_watch.check(cfg, devices, now_ms, _deliver)
+        except Exception:
+            log.exception("crawlspace watch failed")
         repeat_ms = int(cfg.repeat_hours * 3600 * 1000)
         states = await db.get_alert_states()
         dev_prefs = await db.get_device_alert_prefs()
@@ -1478,6 +1651,12 @@ class AlertMonitor:
             await self._maybe_send_sky(cfg, devices, now_ms)
         except Exception:
             log.exception("sky note failed")
+        # Its own try: a sky-note failure recurring every tick must not
+        # starve the heads-up's 45-minute window (CodeRabbit, PR #136).
+        try:
+            await self._maybe_send_sunset(cfg, devices, now_ms)
+        except Exception:
+            log.exception("sunset heads-up failed")
         # ── storm summary: one report per event, after the rain stops. Not
         # gated on smart_alerts — it is a different kind of thing, and the
         # rain counter it watches needs no derived inputs.
@@ -1512,6 +1691,10 @@ class AlertMonitor:
         rstates = await db.get_rule_states_full()
         for d in devices:
             last = d.get("lastData") or {}
+            # Pass 1: every rule's verdict on this reading. Pass 2 delivers,
+            # so a ladder of rules on one field that a single reading
+            # crosses at once can speak once (2.8, see collapse_ladder).
+            verdicts: list[tuple[dict, float, int, Any, bool, bool]] = []
             for rule in rules:
                 if rule["target_mac"] and rule["target_mac"] != d["mac"]:
                     continue
@@ -1526,6 +1709,18 @@ class AlertMonitor:
                 now_trig, fire = evaluate_rule(
                     rule["comparator"], rule["threshold"], val, prev,
                     EQUALITY_TOLERANCE.get(rule["field"], _DEFAULT_EQUALITY_TOLERANCE))
+                verdicts.append((rule, val, prev, clear_since, now_trig, fire))
+            speak, quiet = collapse_ladder(
+                [v[0] for v in verdicts if v[5]])
+            quiet_ids = {r["id"] for r in quiet}
+            for rule, val, prev, clear_since, now_trig, fire in verdicts:
+                if fire and rule["id"] in quiet_ids:
+                    # Crossed on the same reading as a more extreme rule on
+                    # the same field, which carries the alert. Marked
+                    # triggered like a delivered rule once that one is out,
+                    # so it does not speak next tick; it re-arms on its own
+                    # threshold exactly as before.
+                    continue
                 if fire:
                     # Reviewer P2: only persist triggered=1 AFTER delivery succeeds.
                     # If SMTP/APNs/relay fails, leave state at 0 so the next tick
@@ -1542,12 +1737,17 @@ class AlertMonitor:
                         cfg, f"[Zasder Weather] {title}", body, title, body,
                         email_ok=cfg.email_scope == "all",
                         kind="rule", mac=d["mac"],
-                        severity=rule_tier(rule.get("severity")),
+                        severity=rule_tier(ladder_severity(rule, quiet)),
                         route=f"rule/{rule['id']}")
                     if delivered:
                         await db.upsert_rule_state(rule["id"], d["mac"], 1, now_ms)
                         log.info("threshold alert fired: rule %s (%s) on %s value=%.3f",
                                  rule["id"], rule["field"], dname, val)
+                        for q in quiet:
+                            if (q["field"], q["comparator"]) == (rule["field"], rule["comparator"]):
+                                await db.upsert_rule_state(q["id"], d["mac"], 1, now_ms)
+                                log.info("threshold rule %s folded into rule %s on %s",
+                                         q["id"], rule["id"], dname)
                     else:
                         log.warning(
                             "threshold alert delivery failed for rule %s on %s; "
@@ -1780,7 +1980,10 @@ class AlertMonitor:
         # email piece keeps its own transport guard below.
         if cfg.digest_hour is None:
             return
-        email_ready = bool(cfg.enabled and cfg.recipients)
+        # 2.8 channels: a half the owner switched off is a half that is done.
+        email_on, phone_on = channel_flags(
+            getattr(cfg, "digest_channels", None), email_default=True)
+        email_ready = bool(cfg.enabled and cfg.recipients) and email_on
         try:
             tz = ZoneInfo(settings.timezone)
         except Exception:
@@ -1816,7 +2019,11 @@ class AlertMonitor:
         # whole day closed.
         phone_done = (await db.get_kv("alerts.digest.phone_day")
                       == local.date().isoformat())
-        if email_done and phone_done:
+        # Email only (2.8): the phone half is owed nothing, so it never
+        # holds the day open. The grace decision below still reads the real
+        # stamp, so an email-only report switched on after its window waits
+        # for tomorrow as before rather than being given up on.
+        if email_done and (phone_done or not phone_on):
             return                            # both halves delivered today
         # A report switched on or rescheduled after its hour, or a box
         # that was down all morning, must not say "Good morning" at 8 PM
@@ -1845,6 +2052,10 @@ class AlertMonitor:
                         "after its time; giving up for today",
                         "email" if not email_done else "phone", late)
             return
+        if not phone_on and not phone_done:
+            # Done without sending: no card, no banner.
+            await db.set_kv("alerts.digest.phone_day", local.date().isoformat())
+            phone_done = True
 
         from . import digest as dg
 
@@ -1975,7 +2186,18 @@ class AlertMonitor:
         # there would also mark the evening slot's report delivered
         # (CodeRabbit, PR #82).
         report = ol.build(daily, narrative=narrative, when=ol.slot_for(hour),
-                          now_local=local, source=used, fallback_from=fallback)
+                          now_local=local, source=used, fallback_from=fallback,
+                          low_offset_f=await night_low_offset(used))
+        # 2.8: the sunset of the day the outlook describes.
+        try:
+            for_day = datetime.strptime(report.for_date, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            for_day = None
+        if for_day is not None:
+            sunset_outlook = await _sunset_outlook_for(coords, for_day, tz)
+            if sunset_outlook is not None:
+                import dataclasses as _dc
+                report = _dc.replace(report, sunset_outlook=sunset_outlook)
         # Three facts, kept apart (2.2 release review R22-09): the archive
         # row, the delivery, and the day. The day is stamped only when
         # the row exists AND the channels are done; a stored row with a
@@ -1993,29 +2215,20 @@ class AlertMonitor:
             log.exception("outlook report not stored; will retry next tick")
         sent_key = f"alerts.outlook.sent:{report.for_date}:{report.when}"
         already_sent = bool(await db.get_kv(sent_key))
+        # 2.8 (Doren 10-18, "push only for outlooks").
+        email_on, push_on = channel_flags(
+            getattr(cfg, "outlook_channels", None), email_default=True)
         sent_any = False
         had_targets = False
         if not already_sent:
             title, body = ol.push_text(report)
-            # Through _deliver (R23): the outlook lands in the alert
-            # history and reaches webhooks, like the sky note. Email stays
-            # below — it carries the full text and its HTML twin, which
-            # _deliver's plain body would not. Quiet hours do not apply
-            # to an hour the owner chose. `outcome` keeps the sent-marker
-            # rule below exactly what it was.
-            out: dict[str, Any] = {}
-            try:
-                await _deliver(cfg, "[Zasder Weather] " + title, ol.text(report),
-                               title, body, email_ok=False,
-                               kind="outlook", severity="info",
-                               route=(f"report/{report_id}" if report_id else None),
-                               quiet_hours_exempt=True, outcome=out)
-                sent_any = bool(out.get("delivered"))
-                had_targets = bool(out.get("attempted") or out.get("delivered"))
-            except Exception:
-                had_targets = True
-                log.exception("outlook push failed")
-            if cfg.enabled and cfg.recipients:
+            # Email first (CodeRabbit, PR #131): with email the only
+            # channel, a failed send used to leave _deliver's history row
+            # and webhooks behind on every retry. The email carries the
+            # full text and its HTML twin, which _deliver's plain body
+            # would not, so it is sent here and its outcome handed over.
+            email_sent = None
+            if email_on and cfg.enabled and cfg.recipients:
                 had_targets = True
                 try:
                     theme = await report_theme_now(cfg, devices)
@@ -2023,8 +2236,29 @@ class AlertMonitor:
                                             ol.text(report), cfg.recipients, cfg,
                                             ol.build_html(report, theme))
                     sent_any = True
+                    email_sent = True
                 except Exception:
+                    email_sent = False
                     log.exception("outlook email failed; will retry next tick")
+            # Through _deliver (R23): the outlook lands in the alert
+            # history and reaches webhooks, like the sky note. Quiet hours
+            # do not apply to an hour the owner chose. After a failed
+            # email, it records the outlook only if push gets it through;
+            # otherwise the retry does.
+            out: dict[str, Any] = {}
+            try:
+                await _deliver(cfg, "[Zasder Weather] " + title, ol.text(report),
+                               title, body, email_ok=False, push_ok=push_on,
+                               kind="outlook", severity="info",
+                               route=(f"report/{report_id}" if report_id else None),
+                               quiet_hours_exempt=True, outcome=out,
+                               delivered_by_caller=bool(email_sent),
+                               hold_unless_delivered=email_sent is False)
+                sent_any = sent_any or bool(out.get("delivered"))
+                had_targets = had_targets or bool(out.get("attempted") or out.get("delivered"))
+            except Exception:
+                had_targets = True
+                log.exception("outlook push failed")
             if sent_any or not had_targets:
                 await db.set_kv(sent_key, "1")
                 already_sent = True
@@ -2122,13 +2356,78 @@ class AlertMonitor:
                 payload=payload, dedupe=rp.sky_key(day_key))
         except Exception:
             log.exception("sky note report not stored; sending without a page")
+        email_on, push_on = channel_flags(
+            getattr(cfg, "sky_channels", None),
+            email_default=cfg.email_scope == "all")
         delivered = await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
-                                   email_ok=cfg.email_scope == "all",
+                                   email_ok=email_on, push_ok=push_on,
                                    kind="sky", severity="info",
                                    route=(f"report/{report_id}" if report_id else None))
         if delivered:
             await db.set_kv("alerts.sky.day", day_key)
             log.info("sky note sent: %s night", v)
+
+    async def _maybe_send_sunset(self, cfg, devices, now_ms: int) -> None:
+        """2.8 (Doren 10-17): "a good sunset tonight" from 45 minutes
+        before sunset until sunset, once per place per local day, when the
+        sunset outlook scores at or above the owner's threshold. A place
+        (stations within a kilometre, places.group) gets one heads-up, read
+        at its lead station's coordinates; a night below the threshold
+        stamps the day and stays quiet, and a night with no cloud forecast
+        is retried on later ticks inside the window. Watch tier: quiet
+        hours hold it, and a held heads-up is not sent late: the window is
+        read against the NEXT sunset, so once one passes the next is a day
+        away. The stamp is that sunset's own local minute, so each sunset is
+        decided once whatever the server's zone."""
+        if not cfg.sunset_alert:
+            return
+        try:
+            tz = ZoneInfo(settings.timezone)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        local = datetime.fromtimestamp(now_ms / 1000, tz)
+        from . import places, sunset as ss
+        weather = [d for d in devices if not db.is_air_monitor_device(d)]
+        groups = places.group(weather)
+        for members in groups:
+            lead = members[0]
+            coords = places.device_coords(lead)
+            if coords is None:
+                continue
+            sunset = ss.next_sunset(coords[0], coords[1], local, tz)
+            if sunset is None or local < sunset - timedelta(minutes=45):
+                continue
+            key = f"alerts.sunset.day:{lead['mac']}"
+            day = sunset.astimezone(tz).strftime("%Y-%m-%dT%H:%M")
+            if await db.get_kv(key) == day:
+                continue
+            out = await self._fetch_sunset(coords, sunset, tz)
+            if not out or not isinstance(out.get("pct"), int):
+                continue
+            if out["pct"] < cfg.sunset_threshold:
+                await db.set_kv(key, day)
+                log.info("sunset heads-up held: %s%% below %s%%", out["pct"],
+                         cfg.sunset_threshold)
+                continue
+            name = (lead.get("name") or lead["mac"]) if len(groups) > 1 else None
+            title = "Good sunset tonight" + (f" at {name}" if name else "")
+            body = out["line"] + "."
+            delivered = await _deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
+                                       email_ok=cfg.email_scope == "all",
+                                       kind="sunset", mac=lead["mac"], severity="watch")
+            if delivered:
+                await db.set_kv(key, day)
+                log.info("sunset heads-up sent: %s%%", out["pct"])
+
+    async def _fetch_sunset(self, coords, sunset_at, tz):
+        """Seam for tests: the outlook for one sunset, nothing else."""
+        from . import sunset as ss
+        try:
+            return await asyncio.wait_for(
+                ss.outlook_at(coords[0], coords[1], sunset_at, tz, settings.timezone),
+                timeout=20)
+        except Exception:
+            return None
 
     async def _fetch_clouds(self, lat, lon, tz_name, now_local):
         """Seam for tests: tonight's mean cloud cover, nothing else."""
@@ -2327,6 +2626,7 @@ class AlertMonitor:
         # cleared, and collect the fresh edges. Nothing is delivered here,
         # so phase 2 can see the whole place before anyone speaks.
         evaluated: dict[str, _SmartEval] = {}
+        muted = set(getattr(cfg, "smart_muted", None) or ())
         for d in devices:
             mac = d["mac"]
             last = d.get("lastData") or {}
@@ -2397,7 +2697,13 @@ class AlertMonitor:
                 cond = smart_condition(kind, **kw)
                 ev.conds[kind] = cond
                 prev = full.get((mac, kind), (0, None))[0]
-                if cond and not prev:
+                if cond and not prev and kind in muted:
+                    # Muted (2.8): the crossing is recorded without a word,
+                    # so unmuting later does not announce an old one; it
+                    # re-arms on the deadband like any other.
+                    await db.upsert_smart_alert_state(mac, kind, 1, now_ms)
+                    full[(mac, kind)] = (1, now_ms)
+                elif cond and not prev:
                     ev.fresh.append(kind)
                 elif not cond and prev and smart_cleared(kind, **kw):
                     # Re-arm only once the condition clears by a deadband, so

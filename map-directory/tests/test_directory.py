@@ -142,6 +142,52 @@ def test_the_map_page_serves_under_a_csp(client):
     assert "content-security-policy" in client.get("/healthz").headers
 
 
+def test_near_me_asks_on_a_tap_and_keeps_the_position_on_the_page(client):
+    """2.8 "Near me": the policy lets this origin (and only this origin) ask
+    for a position, the button is on the page, the ask is wired to the
+    button's click and nowhere else, and the only request the script makes
+    is the directory listing, so a position has no way off the page."""
+    import re
+    r = client.get("/")
+    policy = r.headers["permissions-policy"]
+    assert "geolocation=(self)" in policy, policy
+    assert "camera=()" in policy and "microphone=()" in policy
+    assert 'id="nearme"' in r.text and 'id="nearme-note"' in r.text
+    # The live region is in the tree from the start (an element that
+    # appears WITH its message may not be announced), CodeRabbit on #123.
+    note = re.search(r'<div[^>]*id="nearme-note"[^>]*>', r.text).group(0)
+    assert 'role="status"' in note and "hidden" not in note, note
+    js = client.get("/static/map.js").text
+    assert js.count("getCurrentPosition(") == 1
+    assert "watchPosition" not in js, "one position per tap, never a track"
+    # The ask lives in nearMe(), which only the button's click calls.
+    assert re.search(r"addEventListener\('click', nearMe\)", js)
+    assert len(re.findall(r"\bnearMe\(\)", js)) == 1, "nearMe() called outside the click"
+    # Every request the page makes: the listing, nothing else.
+    fetches = re.findall(r"fetch\(([^)]*)\)", js)
+    assert fetches and all(f.startswith("'/v1/beacons'") for f in fetches), fetches
+    for leak in ("sendBeacon", "XMLHttpRequest", "localStorage.setItem('zasder.map.near",
+                 "history.pushState", "history.replaceState"):
+        assert leak not in js, leak
+
+
+def test_near_me_only_the_latest_tap_may_answer(client):
+    """Two quick taps: the first position or error can arrive after the
+    second ask starts. Each tap takes a fresh number, and BOTH callbacks
+    drop an answer that is not for the latest tap before touching the dot,
+    the map, the note or the busy state (CodeRabbit, PR #123)."""
+    import re
+    js = client.get("/static/map.js").text
+    body = js[js.index("function nearMe()"):js.index("const nearBtn")]
+    assert re.search(r"const seq = \+\+nearSeq;", body), "a tap does not take a new number"
+    assert body.index("++nearSeq") < body.index("getCurrentPosition("), "numbered after the ask"
+    for cb in (r"getCurrentPosition\(pos => \{", r"\}, err => \{"):
+        m = re.search(cb + r"\s*(.*)", body)
+        assert m, cb
+        assert m.group(1).startswith("if (seq !== nearSeq) return;"), \
+            f"callback acts before checking it is the latest tap: {m.group(1)[:60]}"
+
+
 def _rotation(old_key, server, new_key):
     from app import main as m
     new_pub = _pub(new_key)

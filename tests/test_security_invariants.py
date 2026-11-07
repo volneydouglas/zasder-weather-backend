@@ -107,6 +107,14 @@ PUBLIC_BY_DESIGN = {
     ("GET", "/weather/storms"), ("GET", "/weather/storms/latest"),
     ("GET", "/weather/reports"), ("GET", "/weather/reports/noaa/{name}"),
     ("GET", "/weather/data/{name}"),
+    # The station display (2.8, app/station_display.py). /display is a
+    # static shell with no readings, names or settings in it, so it is
+    # open on every server; a private kiosk carries a READ token in the URL
+    # fragment and calls the token-gated /api/display. /display/data is
+    # anonymous BY OPT-IN like the pages above: 404 unless the public
+    # dashboard is on, only the public stations, by public id, without
+    # coordinates or indoor readings.
+    ("GET", "/display"), ("GET", "/display/data"),
 }
 
 # Routes that are anonymous AND mutating, on purpose: the OAuth 2.1
@@ -230,7 +238,7 @@ def test_every_undeclared_route_authenticates_in_its_handler():
 def test_the_public_route_list_has_not_quietly_grown():
     """PUBLIC_BY_DESIGN is the whole unauthenticated surface. It should change
     only by deliberate edit, never as a side effect."""
-    assert len(PUBLIC_BY_DESIGN) == 17  # +/embed (1.6.1); +4 OAuth (2.1); +7 public pages (2.6)
+    assert len(PUBLIC_BY_DESIGN) == 19  # +/embed (1.6.1); +4 OAuth (2.1); +7 public pages (2.6); +2 station display (2.8)
     assert all(m == "GET" for m, _ in PUBLIC_BY_DESIGN), (
         "a mutating route was added to the public-by-design list")
     assert len(ANONYMOUS_BY_DESIGN) == 4, (

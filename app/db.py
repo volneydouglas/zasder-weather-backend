@@ -366,7 +366,11 @@ CREATE TABLE IF NOT EXISTS live_activity_tokens (
     -- one per device, and start lookups ignore this column.
     activity     TEXT,
     created_ms   INTEGER NOT NULL,
-    last_seen_ms INTEGER NOT NULL
+    last_seen_ms INTEGER NOT NULL,
+    -- 2.8: on 'update' rows, the station the running card belongs to
+    -- (its attributes' mac). NULL = an app older than 2.8, whose cards
+    -- take every station's updates as before.
+    mac          TEXT
 );
 
 -- 1.8 outbound webhooks (Pillar B): alert events POSTed to user URLs,
@@ -1353,6 +1357,20 @@ async def init_db(path: str | None = None) -> None:
             # NULL switch = follow smart_alerts, which is how it ran from
             # 1.8 to 2.5; NULL distance = any strike the detector hears.
             ("lightning_alert", "INTEGER"), ("lightning_alert_mi", "REAL"),
+            # 2.8 (Doren 10-17): the good-sunset heads-up and its threshold
+            # (NULL switch = off, NULL threshold = 70%).
+            ("sunset_alert", "INTEGER"), ("sunset_threshold", "INTEGER"),
+            # 2.8 (Doren 10-18, "push only for outlooks"): which channels
+            # carry each scheduled report, 'push' | 'email' | 'both'. NULL
+            # = the delivery each one always had, so nobody's reports move
+            # until they pick (the storm_channels rule).
+            ("digest_channels", "TEXT"), ("outlook_channels", "TEXT"),
+            ("sky_channels", "TEXT"),
+            # 2.8 (Doren 10-29, "how do I turn off these alerts?"): the
+            # smart kinds muted one at a time, a JSON list of
+            # alerts.SMART_KINDS keys. The MUTED set, never the allowed
+            # one, so a kind added later arrives on (the nws_families rule).
+            ("smart_muted", "TEXT"),
         ):
             if col not in existing:
                 await db.execute(f"ALTER TABLE alert_prefs ADD COLUMN {col} {decl}")
@@ -1382,6 +1400,12 @@ async def init_db(path: str | None = None) -> None:
         if "activity" not in existing:
             await db.execute(
                 "ALTER TABLE live_activity_tokens ADD COLUMN activity TEXT")
+        # 2.8: the station an update token's card belongs to, so one
+        # station's update or end no longer reaches every station's card
+        # (Doren's Davis and Tempest freeze cards both showed the Tempest).
+        if "mac" not in existing:
+            await db.execute(
+                "ALTER TABLE live_activity_tokens ADD COLUMN mac TEXT")
         # 1.8 per-rule urgency + severity riding the alert history.
         cur = await db.execute("PRAGMA table_info(alert_rules)")
         existing = {r[1] for r in await cur.fetchall()}
@@ -2798,6 +2822,34 @@ def _scrub_nonfinite(v: Any) -> Any:
     return v
 
 
+def _column_number(v: Any) -> Any:
+    """What a typed observation column may hold: a finite number or NULL.
+
+    The pollers store upstream JSON verbatim, and every typed column is
+    numeric. A non-numeric string ("--", "") kept SQLite's TEXT type in
+    a REAL column, and the bucketed history's MIN()/MAX() hand TEXT back
+    as TEXT: one such reading put a string in that minute's
+    `humidity_max`, and the apps' decode of the WHOLE 24 hour history
+    failed on it (mirror issue #9: the hero's VS YESTERDAY and VS
+    FORECAST read "—" while every other card filled in). A dict or list
+    did worse and failed the insert. Numeric text becomes the number,
+    which is what SQLite's REAL affinity already did with it; the
+    verbatim payload still lands in data_json."""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, str):
+        try:
+            f = float(v)
+        except ValueError:
+            return None
+        return f if math.isfinite(f) else None
+    return None
+
+
 ARRIVAL_RX_SLOT_MS = 300_000
 ARRIVAL_RX_KEEP_MS = 3 * 86_400_000
 
@@ -2827,7 +2879,7 @@ async def insert_observations(mac: str, rows: list[dict[str, Any]],
         if ts in scrubbed_by_ts:
             continue
         scrubbed_by_ts[ts] = r
-        values = [r.get(_FIELD_MAP[c]) for c in _COLUMNS]
+        values = [_column_number(r.get(_FIELD_MAP[c])) for c in _COLUMNS]
         payload.append((mac, ts, json.dumps(r), *values))
     from . import daily_et as _det
     # et_guard: R27-03, opened just before the stored-ET delete below and
@@ -3153,8 +3205,11 @@ def is_air_monitor(mac: str) -> bool:
     weather smart alerts) must skip them or the monitor fights the real
     station for the job (Volney, 2026-08-26)."""
     compact = str(mac or "").upper().replace(":", "")
-    # 07 AirGradient, 08 Govee (2.0). Keep in step with Device.isAirMonitor.
-    return compact.startswith("5D5D07") or compact.startswith("5D5D08")
+    # 07 AirGradient, 08 Govee air (2.0), 09 Govee thermometers (2.8: a
+    # crawlspace or garage sensor is a monitor, never the station the
+    # forecast, heat-day or frost watch is about). Keep in step with
+    # Device.isAirMonitor.
+    return compact[:6] in ("5D5D07", "5D5D08", "5D5D09")
 
 
 def is_air_monitor_device(device: dict[str, Any]) -> bool:
@@ -3376,7 +3431,10 @@ _ALERT_PREF_COLS = ("enabled", "default_threshold_min", "repeat_hours", "recipie
                     "lightning_live_activity", "wind_live_activity",
                     "freeze_live_activity", "lightning_live_mi",
                     "wind_live_mph", "smart_alerts",
-                    "lightning_alert", "lightning_alert_mi")
+                    "lightning_alert", "lightning_alert_mi",
+                    "sunset_alert", "sunset_threshold",
+                    "digest_channels", "outlook_channels", "sky_channels",
+                    "smart_muted")
 
 
 async def get_alert_prefs() -> dict[str, Any]:
@@ -4186,33 +4244,41 @@ async def remove_push_token(token: str) -> None:
 
 async def register_live_activity_token(token: str, kind: str,
                                        env: str | None,
-                                       activity: str | None = None) -> None:
+                                       activity: str | None = None,
+                                       mac: str | None = None) -> None:
     """Push-to-start / per-activity update registration, same idempotent
     shape as push_tokens — iOS rotates these and the app re-posts whatever
     it currently holds. `activity` names which Activity an UPDATE token
     belongs to; on 'start' rows it records only which observer registered
     last (iOS hands every attributes type the SAME start token — proven
     live 2026-08-27 — so the label is not a routing key and start lookups
-    ignore it). NULL = a 1.7 app's rain-start registration."""
+    ignore it). NULL = a 1.7 app's rain-start registration.
+
+    `mac` (2.8) is the station an UPDATE token's card belongs to, so
+    updates reach only that station's card; None from an older app, whose
+    card keeps taking every station's updates."""
     now = int(time.time() * 1000)
     async with connect() as db:
         await db.execute(
             """
             INSERT INTO live_activity_tokens (token, kind, env, activity,
-                                              created_ms, last_seen_ms)
-            VALUES (?, ?, ?, ?, ?, ?)
+                                              created_ms, last_seen_ms, mac)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(token) DO UPDATE SET
                 kind = excluded.kind, env = excluded.env,
                 activity = excluded.activity,
-                last_seen_ms = excluded.last_seen_ms
+                last_seen_ms = excluded.last_seen_ms,
+                mac = excluded.mac
             """,
-            (token, kind, env, activity, now, now),
+            (token, kind, env, activity, now, now, mac),
         )
         await db.commit()
 
 
 async def list_live_activity_tokens(kind: str = "start",
-                                    activity: str | None = None
+                                    activity: str | None = None,
+                                    mac: str | None = None,
+                                    exact: bool = False
                                     ) -> list[dict[str, Any]]:
     """Tokens for one kind; the activity discriminator applies to UPDATE
     tokens only.
@@ -4231,18 +4297,35 @@ async def list_live_activity_tokens(kind: str = "start",
     activity filter entirely.
 
     UPDATE tokens are genuinely per-RUNNING-activity and keep the scope —
-    a storm update must never write another activity's content-state."""
+    a storm update must never write another activity's content-state.
+
+    `mac` (2.8) narrows an update to the cards of one station: the tokens
+    registered with that station, plus every token registered without one
+    (an app older than 2.8 cannot say, and must keep getting its card's
+    updates). `exact` leaves those out: a beat meant for one card only,
+    which an unscoped card would take for its own (the freeze fold's end)."""
     async with connect() as db:
         if kind == "start" or activity is None:
             rows = await (await db.execute(
-                "SELECT token, env FROM live_activity_tokens WHERE kind = ?",
+                "SELECT token, env, mac FROM live_activity_tokens WHERE kind = ?",
                 (kind,))).fetchall()
+        elif mac is not None and exact:
+            rows = await (await db.execute(
+                "SELECT token, env, mac FROM live_activity_tokens "
+                "WHERE kind = ? AND activity = ? AND mac = ?",
+                (kind, activity, mac))).fetchall()
+        elif mac is not None:
+            rows = await (await db.execute(
+                "SELECT token, env, mac FROM live_activity_tokens "
+                "WHERE kind = ? AND activity = ? AND (mac IS NULL OR mac = ?)",
+                (kind, activity, mac))).fetchall()
         else:
             rows = await (await db.execute(
-                "SELECT token, env FROM live_activity_tokens "
+                "SELECT token, env, mac FROM live_activity_tokens "
                 "WHERE kind = ? AND activity = ?",
                 (kind, activity))).fetchall()
-    return [{"token": r["token"], "env": r["env"]} for r in rows]
+    return [{"token": r["token"], "env": r["env"], "mac": r["mac"]}
+            for r in rows]
 
 
 _OBS_EXPORT_COLS: list[str] | None = None
@@ -4890,6 +4973,11 @@ async def history(
             p: dict[str, Any] = {"dateutc": r["dateutc_ms"]}
             for col in _COLUMNS:
                 v = r[col]
+                # TEXT a 2.7 server stored before insert coerced it (issue
+                # #9): INSERT OR IGNORE never rewrites that row. Floats
+                # too, for an infinity REAL affinity made of "1e999".
+                if isinstance(v, (str, float)):
+                    v = _column_number(v)
                 if v is not None:
                     p[_FIELD_MAP[col]] = v
             parsed.append(_normalize_lightning(p))
@@ -4979,7 +5067,14 @@ async def history(
     async with connect() as db:
         rows = await (await db.execute(sql,
             (mac, start_ms, end_ms, limit))).fetchall()
-    bucketed = [dict(r) for r in rows]
+    # MIN()/MAX() hand back TEXT stored before insert coerced it (issue
+    # #9), and one string in one bucket failed the apps' whole window.
+    # A Python pass rather than a typeof() CASE around each of the ~45
+    # aggregates in the SELECT; it costs nothing on clean rows.
+    # A stored infinity ("1e999" under REAL affinity) failed the response
+    # outright (allow_nan=False), so floats take the same pass.
+    bucketed = [{k: (_column_number(v) if isinstance(v, (str, float)) else v)
+                 for k, v in dict(r).items()} for r in rows]
     _derive_hourly_rain(bucketed)
     return bucketed
 

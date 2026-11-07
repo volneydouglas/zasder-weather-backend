@@ -19,8 +19,16 @@
 <div id="map" role="application" aria-label="Map of shared weather stations"></div>
 <div id="bar">
   <div class="brand"><i>zasder</i><b>WEATHER</b> &nbsp;·&nbsp; stations people chose to share</div>
-  <div class="count" id="count">loading…</div>
+  <div class="right">
+    <!-- 2.8: zoom to the stations around the visitor. Asks the browser
+         for a position only when tapped; see nearMe() in map.js. -->
+    <button type="button" class="near" id="nearme" aria-describedby="nearme-note">Near me</button>
+    <div class="count" id="count">loading…</div>
+  </div>
 </div>
+<!-- Present and empty from the start, so a screen reader is already
+     listening when the first message lands; .near-note:empty hides the box. -->
+<div class="near-note" id="nearme-note" role="status" aria-live="polite"></div>
 <!-- What the pins show. Populated by map.js: the CSP forbids inline
      script, and the list of readings lives with the bands that colour
      them. -->

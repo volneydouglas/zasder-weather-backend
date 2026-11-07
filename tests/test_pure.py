@@ -721,6 +721,31 @@ def test_public_dashboard_air_stations_stay_out_of_now_strip_and_compare():
 
 # ───────────────────── smart (derived) alert logic ─────────────────────
 
+def test_public_page_store_links_ios_then_android_each_optional():
+    """2.8: the Android app's Play link sits beside the iOS one, on the
+    first station only, and either link disappears when its URL is empty
+    (an operator shipping one app blanks the other)."""
+    st = [{"name": "Front", "obs": {"tempf": 70.0, "dateutc": 1}, "series": {}},
+          {"name": "Back", "obs": {"tempf": 71.0, "dateutc": 2}, "series": {}}]
+    both = _pdash.render_dashboard(st, ["tempf"], app_url="https://ios.example/a",
+                                   android_url="https://play.example/b?id=x&y=1")
+    assert both.count("Get the iOS app") == 1 and both.count("Get the Android app") == 1
+    assert both.index("Get the iOS app") < both.index("Get the Android app")
+    assert both.index("Get the Android app") < both.index('<div class="cc-name">Back')
+    assert 'href="https://play.example/b?id=x&amp;y=1"' in both      # escaped
+    ios_only = _pdash.render_dashboard(st, ["tempf"], app_url="https://ios.example/a")
+    assert "Get the Android app" not in ios_only and "Get the iOS app" in ios_only
+    android_only = _pdash.render_dashboard(st, ["tempf"], app_url="",
+                                           android_url="https://play.example/b")
+    assert "Get the iOS app" not in android_only and "Get the Android app" in android_only
+    neither = _pdash.render_dashboard(st, ["tempf"])
+    assert 'class="cc-side"' not in neither
+    air = _pdash.render_air_station("Airbox", {"pm25": 4.0, "dateutc": 1}, {},
+                                    app_url="https://ios.example/a",
+                                    android_url="https://play.example/b")
+    assert air.index("Get the iOS app") < air.index("Get the Android app")
+
+
 def test_smart_condition_frost():
     sc = alerts.smart_condition
     kw = dict(frost_f=35.0, heat_f=105.0, drop_inhg=0.06)

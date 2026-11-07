@@ -26,6 +26,17 @@ class _Lazy:
     def __delattr__(self, name):
         delattr(self._mod(), name)
 
+    # pytest 9.2 (#10644) records monkeypatch's old value from the target's
+    # instance `__dict__` and, finding no entry, undoes by DELETING the name.
+    # Through a proxy with an empty `__dict__` that deleted the real
+    # function from app.machine_advice, and every later test that touched
+    # it failed (FlyMachines, rss_bytes, and /api/server/advice's compute()
+    # in test_oauth). Point `__dict__` at the module's own namespace so the
+    # recorded old value is the module's, and undo restores it.
+    @property
+    def __dict__(self):
+        return self._mod().__dict__
+
 
 MA = _Lazy()
 

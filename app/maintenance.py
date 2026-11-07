@@ -35,6 +35,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .config import settings
@@ -1549,15 +1550,24 @@ def storage_cache_get(db_path: str | None = None) -> dict | None:
 
 
 def storage_cache_put(report: dict, db_path: str | None = None,
-                      now_ms: int | None = None) -> dict:
+                      now_ms: int | None = None,
+                      still_current: Callable[[], bool] | None = None) -> dict | None:
     """Stamp `measured_ms` and store the report under the kv key. Returns
     the stamped dict (the same object) so the job can hand it straight to
-    the next GET."""
+    the next GET.
+
+    `still_current` (2.8) is asked AFTER the counted connection is open and
+    before the write. While that connection is open no restore can swap the
+    file (the maintenance lease drains it first), so a True here means the
+    report lands in the database it was measured on. False skips the write
+    and returns None (CodeRabbit, #132)."""
     path = db_path or settings.database_path
     report["measured_ms"] = (int(time.time() * 1000) if now_ms is None
                              else int(now_ms))
     conn = _connect(path)
     try:
+        if still_current is not None and not still_current():
+            return None
         conn.execute(
             "INSERT INTO server_kv (k, v) VALUES (?, ?) "
             "ON CONFLICT(k) DO UPDATE SET v = excluded.v",

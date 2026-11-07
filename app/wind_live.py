@@ -86,7 +86,8 @@ def _risen(hist: list, gust: float, now_ms: int) -> bool:
 
 async def _end(st: dict[str, Any], name: str, now_ms: int, *,
                gust: float | None, direction: float | None,
-               speed: float | None, reason: str) -> None:
+               speed: float | None, reason: str,
+               mac: str | None = None) -> None:
     from . import apns
     peak = ls.num(st.get("peakMph")) or 0.0
     state = _content_state(
@@ -98,7 +99,8 @@ async def _end(st: dict[str, Any], name: str, now_ms: int, *,
         state, now_s=now_ms // 1000, event="end",
         dismiss_s=(now_ms + _END_LINGER_MS) // 1000)
     await apns.send_live_activity_update(
-        ACTIVITY, payload, "Wind easing", f"{name} peaked at {peak:.0f} mph")
+        ACTIVITY, payload, "Wind easing", f"{name} peaked at {peak:.0f} mph",
+        mac=mac)
     log.info("wind card closed for %s (%s, peak %.1f mph)", name, reason, peak)
 
 
@@ -168,7 +170,7 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int) -> None:
             opened = int(opened)
             if stale:
                 await _end(st, name, now_ms, gust=gust, direction=direction,
-                           speed=speed, reason="stale")
+                           speed=speed, reason="stale", mac=mac)
                 await ls.save(key, {"hist": hist})
                 continue
             if gust is None:
@@ -194,7 +196,7 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int) -> None:
             under_since = st.get("underSinceMs")
             if under_since is not None and now_ms - int(under_since) >= _UNDER_MS:
                 await _end(st, name, now_ms, gust=gust, direction=direction,
-                           speed=speed, reason="under threshold")
+                           speed=speed, reason="under threshold", mac=mac)
                 await ls.save(key, {"hist": hist})
                 continue
             # Easing: under 70% of the peak for 15 minutes, and back off
@@ -225,7 +227,7 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int) -> None:
                     state, now_s=now_ms // 1000,
                     stale_s=(now_ms + 20 * 60_000) // 1000)
                 await apns.send_live_activity_update(
-                    ACTIVITY, payload, "Wind event", name)
+                    ACTIVITY, payload, "Wind event", name, mac=mac)
                 st["lastPushMs"] = now_ms
                 st["pushedPeak"] = peak
             if st != st_before:

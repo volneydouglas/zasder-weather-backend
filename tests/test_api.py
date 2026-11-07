@@ -543,6 +543,77 @@ def test_history_short_window_returns_raw(client):
     assert body["rows"][0]["tempf"] in (70, 71, 72, 73, 74)
 
 
+def test_history_typed_fields_are_numbers_after_a_junk_poller_value(client):
+    """Mirror issue #9. A poller stores upstream JSON verbatim, and a
+    non-numeric string in a typed column came back out of the bucketed
+    history's MIN()/MAX() as a string: one "--" put text in that minute's
+    `humidity_max`, the apps' decode of the whole 24 hour history failed,
+    and the hero's VS YESTERDAY / VS FORECAST read "—". Every typed field
+    on the wire is a number or null, for both window shapes, and a dict
+    in a typed field no longer fails the insert."""
+    import asyncio, time
+    from app import db
+    mac = "AA:BB:CC:DD:EE:09"
+    now = int(time.time() * 1000) // 60_000 * 60_000
+    rows = [{"dateutc": now - i * 60_000, "tempf": 67.1, "humidity": 60,
+             "dailyrainin": 0.0, "uv": 2} for i in range(0, 25 * 60)]
+    rows[5]["humidity"] = "--"
+    rows[9]["dailyrainin"] = ""
+    rows[12]["uv"] = {"value": 2}
+    rows[15]["tempf"] = "68.5"            # numeric text stays the number
+    added = asyncio.run(db.insert_observations(mac, rows))
+    assert added == len(rows)
+    h = {"Authorization": "Bearer test-api-token"}
+    for hours in (2, 24):
+        body = client.get(f"/api/devices/{mac}/history?hours={hours}",
+                          headers=h).json()
+        junk = [(r["dateutc"], k, v) for r in body["rows"]
+                for k, v in r.items() if isinstance(v, str)]
+        assert junk == [], (hours, junk[:3])
+    raw = client.get(f"/api/devices/{mac}/history?hours=2", headers=h).json()
+    by_ts = {r["dateutc"]: r for r in raw["rows"]}
+    assert "humidity" not in by_ts[now - 5 * 60_000]
+    assert by_ts[now - 15 * 60_000]["tempf"] == 68.5
+    assert by_ts[now - 6 * 60_000]["humidity"] == 60
+
+
+def test_history_typed_fields_are_numbers_for_text_stored_before_the_fix(client):
+    """A server upgraded from 2.7 can already hold TEXT in a typed column,
+    and INSERT OR IGNORE never rewrites that row, so the read side turns
+    it into a number or null too (CodeRabbit, PR #140): an older app on
+    an upgraded server must not keep losing the whole window."""
+    import asyncio, sqlite3, time
+    from app import db
+    from app.config import settings
+    mac = "AA:BB:CC:DD:EE:0A"
+    now = int(time.time() * 1000) // 60_000 * 60_000
+    rows = [{"dateutc": now - i * 60_000, "tempf": 67.1, "humidity": 60}
+            for i in range(0, 3 * 60)]
+    asyncio.run(db.insert_observations(mac, rows))
+    con = sqlite3.connect(settings.database_path)
+    con.execute("UPDATE observations SET humidity = '--' "
+                "WHERE mac = ? AND dateutc_ms = ?", (mac, now - 5 * 60_000))
+    con.execute("UPDATE observations SET tempf = '66.5' "
+                "WHERE mac = ? AND dateutc_ms = ?", (mac, now - 7 * 60_000))
+    # REAL affinity turns this text into an infinity, which JSONResponse
+    # (allow_nan=False) refused: the whole window 500'd (CodeRabbit).
+    con.execute("UPDATE observations SET humidity = '1e999' "
+                "WHERE mac = ? AND dateutc_ms = ?", (mac, now - 9 * 60_000))
+    con.commit(); con.close()
+    h = {"Authorization": "Bearer test-api-token"}
+    for hours in (2, 24):
+        r = client.get(f"/api/devices/{mac}/history?hours={hours}", headers=h)
+        assert r.status_code == 200, (hours, r.status_code)
+        junk = [(row["dateutc"], k, v) for row in r.json()["rows"]
+                for k, v in row.items() if isinstance(v, str)]
+        assert junk == [], (hours, junk[:3])
+    raw = {r["dateutc"]: r for r in client.get(
+        f"/api/devices/{mac}/history?hours=2", headers=h).json()["rows"]}
+    assert raw[now - 5 * 60_000].get("humidity") is None
+    assert raw[now - 9 * 60_000].get("humidity") is None
+    assert raw[now - 7 * 60_000]["tempf"] == 66.5
+
+
 def test_history_long_window_buckets_and_avoids_truncation(client):
     """A 7-day window with 1000 dense observations would normally be
     truncated by LIMIT=2000 to the first ~500 observations only. With
@@ -1756,9 +1827,13 @@ def test_public_dashboard_on_renders_charts(client, monkeypatch):
                           "wind": {"speed_mph": 3}, "rain": {}, "pressure": {"relative_inhg": 29.9},
                           "source": "test"})
     page = client.get("/").text
-    # The App Store link rides beside the first station's temperature (the
-    # full-width banner is gone), exactly once however many stations render.
-    assert page.count('class="cc-app"') == 1 and "Get the iOS app" in page
+    # The store links ride beside the first station's temperature (the
+    # full-width banner is gone), once each however many stations render:
+    # iOS first, then Android (2.8), both on by default.
+    assert page.count('class="cc-app"') == 2
+    assert page.count("Get the iOS app") == 1 and page.count("Get the Android app") == 1
+    assert page.index("Get the iOS app") < page.index("Get the Android app")
+    assert "play.google.com/store/apps/details?id=com.zasder.weather" in page
     assert "app-cta" not in page                  # the old banner markup
     assert 'class="hero-shots"' not in page       # screenshots markup replaced
     assert "Davis Vantage Pro 2" in page          # station shown

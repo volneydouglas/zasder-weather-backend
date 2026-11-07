@@ -17,6 +17,10 @@
   // The last listing, kept so switching metric relabels the pins already
   // on the map instead of refetching the directory.
   let features = [];
+  // The longitude the pins are drawn around after a Near me tap (see
+  // frameNear), so a view across the date line shows its pins. Null until
+  // then: the pins keep their own longitudes.
+  let wrapRef = null;
   // The station whose popup is open, so relabelling the pins can put it
   // back: switching metric rebuilds every marker, and without this the
   // card the reader was reading vanished under them.
@@ -204,7 +208,11 @@
       const fit = text.length >= 5 ? ' tiny' : (text.length === 4 ? ' small' : '');
       const icon = L.divIcon({ className: '', iconSize: [34, 34], iconAnchor: [17, 17],
         html: '<div class="pin ' + pinClass(metric, v) + fit + '">' + esc(text) + '</div>' });
-      const m = L.marker([lat, lon], { icon, title: p.name || 'Shared station' });
+      // After a Near me framed the view across the date line, a pin draws
+      // in the same world copy as that view, or it lands 360° away, off
+      // screen (CodeRabbit, PR #123). wrapRef is null otherwise.
+      const drawLon = wrapRef == null ? lon : unwrap(lon, wrapRef);
+      const m = L.marker([lat, drawLon], { icon, title: p.name || 'Shared station' });
       m.bindPopup(card(p), { maxWidth: 280 });
       m.on('popupopen', () => { openStation = p.station_id; });
       m.on('popupclose', () => { if (openStation === p.station_id) openStation = null; });
@@ -234,7 +242,11 @@
         f => f && f.properties && f.geometry && Array.isArray(f.geometry.coordinates)
              && f.geometry.coordinates.length === 2);
       render();
-      if (focusMarker && !load.fitted) {
+      load.listed = true;
+      if (nearHere) {
+        // A Near me tap that beat the first listing: frame it now.
+        frameNear();
+      } else if (focusMarker && !load.fitted) {
         // A share link (?station=<id>): open on that station.
         map.setView(focusMarker.getLatLng(), 11);
         cluster.zoomToShowLayer(focusMarker, () => focusMarker.openPopup());
@@ -244,6 +256,141 @@
       document.getElementById('count').textContent = 'map unavailable';
     }
   }
+  // MARK: near me (2.8)
+
+  // "Near me": zoom to the stations around the visitor. Twin of NearMe in
+  // the app's StationMapView.swift (the same 3 stations, the same 50 mi).
+  // The browser asks for a position ONLY when the button is tapped, never
+  // on page load, and this page NEVER SENDS THE POSITION: it is not
+  // fetched with, not put in the URL, not stored, not logged. It moves the
+  // map and draws one dot, and that is all. Like any map view, the tiles
+  // for the area then on screen load from OpenStreetMap, so the tile server
+  // sees which area is shown, as it does for every pan. The directory's
+  // Permissions-Policy allows geolocation for this origin alone
+  // (app/main.py).
+  const NEAR_STATIONS = 3;        // the nearest few frame the view
+  const NEAR_MAX_KM = 80.47;      // 50 mi: farther than this is not "near"
+  const NEAR_ALONE_ZOOM = 10;     // nothing near: about 40 km across
+  let meMarker = null;
+  // The last fix, kept only in this variable so a tap that lands before
+  // the first listing can be framed when the pins arrive (CodeRabbit,
+  // PR #123). Cleared once framed.
+  let nearHere = null;
+  // Counts Near me taps; a position or error for an older tap is dropped.
+  let nearSeq = 0;
+
+  // Great-circle distance in km. Enough for "which pins are closest".
+  function km(aLat, aLon, bLat, bLon) {
+    const r = Math.PI / 180;
+    const dLat = (bLat - aLat) * r, dLon = (bLon - aLon) * r;
+    const h = Math.sin(dLat / 2) ** 2
+      + Math.cos(aLat * r) * Math.cos(bLat * r) * Math.sin(dLon / 2) ** 2;
+    return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+  }
+
+  // A longitude moved by whole turns to within 180° of `ref`, so a box
+  // across the date line spans the short way round.
+  function unwrap(lon, ref) {
+    while (lon - ref > 180) lon -= 360;
+    while (lon - ref < -180) lon += 360;
+    return lon;
+  }
+
+  // The nearest few stations within NEAR_MAX_KM, as [lat, lon] pairs.
+  function nearestStations(lat, lon) {
+    return features
+      .map(f => { const [fLon, fLat] = f.geometry.coordinates;
+                  return { ll: [fLat, unwrap(fLon, lon)], d: km(lat, lon, fLat, fLon) }; })
+      .filter(x => Number.isFinite(x.d) && x.d <= NEAR_MAX_KM)
+      .sort((a, b) => a.d - b.d)
+      .slice(0, NEAR_STATIONS)
+      .map(x => x.ll);
+  }
+
+  function nearNote(text) {
+    const el = document.getElementById('nearme-note');
+    if (!el) return;
+    // Never `hidden`: a live region that appears with its message may not
+    // announce it (CodeRabbit, PR #123). Empty text hides the box in CSS.
+    el.textContent = text || '';
+  }
+
+  // Frames the last fix with the nearest stations in the current listing.
+  function frameNear() {
+    if (!nearHere) return;
+    const here = nearHere;
+    nearHere = null;
+    const near = nearestStations(here[0], here[1]);
+    // Redraw the pins around the reader's longitude: the fit below is
+    // measured the same way, so a neighbour across the date line is drawn
+    // inside it.
+    wrapRef = here[1];
+    render();
+    if (near.length) {
+      nearNote('');
+      map.fitBounds(L.latLngBounds([here].concat(near)).pad(0.3), { maxZoom: 12 });
+    } else {
+      map.setView(here, NEAR_ALONE_ZOOM);
+      nearNote('No shared stations within 50 mi (80 km) yet.');
+    }
+  }
+
+  function nearMe() {
+    const btn = document.getElementById('nearme');
+    if (!('geolocation' in navigator)) {
+      nearNote('This browser cannot share a location.');
+      return;
+    }
+    nearNote('');
+    // A new ask forgets the last answer: a failed tap must not leave an old
+    // dot up, nor a pending frame a later listing would act on (CodeRabbit,
+    // PR #123).
+    if (meMarker) { map.removeLayer(meMarker); meMarker = null; }
+    nearHere = null;
+    // Each tap is its own request; only the latest may touch the dot, the
+    // map, the note or the busy state. Two quick taps otherwise let the
+    // first answer land after the second ask and put the old fix back
+    // (CodeRabbit, PR #123).
+    const seq = ++nearSeq;
+    if (btn) btn.setAttribute('aria-busy', 'true');
+    navigator.geolocation.getCurrentPosition(pos => {
+      if (seq !== nearSeq) return;
+      if (btn) btn.removeAttribute('aria-busy');
+      const lat = pos.coords.latitude, lon = pos.coords.longitude;
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        nearNote('Your location could not be read.');
+        return;
+      }
+      const here = [lat, lon];
+      if (meMarker) { meMarker.setLatLng(here); }
+      else {
+        meMarker = L.marker(here, { interactive: false, keyboard: false, zIndexOffset: 1000,
+          icon: L.divIcon({ className: '', iconSize: [20, 20], iconAnchor: [10, 10],
+                            html: '<div class="me" aria-hidden="true"></div>' }) }).addTo(map);
+      }
+      // A tap is an explicit ask, so it wins over a ?station= link and
+      // over the first listing's fit (load.fitted).
+      load.fitted = true;
+      nearHere = here;
+      if (load.listed) {
+        frameNear();
+      } else {
+        // The pins are still loading: show the reader now, frame the
+        // neighbours when load() lands. Never "nobody near" before then.
+        map.setView(here, NEAR_ALONE_ZOOM);
+      }
+    }, err => {
+      if (seq !== nearSeq) return;
+      if (btn) btn.removeAttribute('aria-busy');
+      nearNote(err && err.code === 1
+        ? 'Location is off for this page. Allow it in the browser to see stations near you.'
+        : 'Your location could not be found. Try again in a moment.');
+    }, { enableHighAccuracy: false, timeout: 10000, maximumAge: 5 * 60 * 1000 });
+  }
+
+  const nearBtn = document.getElementById('nearme');
+  if (nearBtn) nearBtn.addEventListener('click', nearMe);
+
   buildChips();
   load();
   setInterval(load, 5 * 60 * 1000);

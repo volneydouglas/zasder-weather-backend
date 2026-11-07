@@ -8,6 +8,107 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.8.0] — 2026-11-07
+
+### Added
+- **A station display for a wall screen, a TV or a Raspberry Pi.**
+  `GET /display` is a full-screen page made for a 1280x800 screen (it
+  scales to any window and never scrolls): the temperature with today's
+  high and low, a live wind compass, eight tiles chosen from what your
+  station measures, four 24-hour charts, the 7-day forecast, a banner
+  for active weather-service warnings, and a storm card while rain is
+  falling. It dims after sunset (`?nodim` turns that off), can rotate
+  through your stations (`?rotate=N` seconds), and hides an idle mouse
+  pointer. The page itself carries no readings. It reads
+  `GET /api/display` with a view-only link (the apps make one under
+  Settings, Sharing, Station display, and the link goes in the address
+  after `#`, which the browser never sends to the server), or
+  `GET /display/data` for your public stations when `PUBLIC_DASHBOARD`
+  is on. It refuses to run on an owner or read-and-write token, since a
+  wall display should only be able to look. The fonts are served by
+  your own server.
+- **A sunset outlook.** How good tonight's sunset looks, as a score from
+  0 to 100% with a verdict ("looks good", "could be nice", "fair",
+  "looks dull") and the reason, from the hourly cloud forecast at the
+  sunset minute: low cloud on the horizon blocks the light, broken
+  middle and high cloud gives it something to light up, and rain that
+  has just cleared adds a little. It is a line in the morning report and
+  the evening outlook, a chip beside the sun times on the display,
+  `GET /api/sunset-outlook?lat=&lon=`, and an opt-in heads-up about 45
+  minutes before sunset when the score reaches your threshold
+  (`sunset_alert`, `sunset_threshold`, default 70%). With no cloud
+  forecast there is no score, never a zero.
+- **Govee thermometers.** Govee temperature and humidity sensors such as
+  the H5179 now come in through the Govee connection alongside the air
+  monitors. They are filed as indoor readings, never as a weather
+  station.
+- **A crawlspace freeze watch.** At sunset the server checks the next 36
+  hours of hourly forecast for a run of cold hours (by default 6 hours
+  at or below 27°F, both adjustable) and sends one notice for the night.
+  If a sensor is in the crawlspace, it also warns at 36°F and urgently
+  at 32°F from the live reading. With The Weather Company as your
+  forecast, its colder overnight low can start a warning but its warmer
+  one never cancels one.
+- **Push, email or both for each report.** The morning report, the
+  evening outlook and the sky note each have their own channel
+  (`digest_channels`, `outlook_channels`, `sky_channels`), like the storm
+  summary. They are in the config backup.
+- **Each smart watch on its own switch.** Pressure falling fast, frost,
+  heat and the rest can each be turned off while the others stay on
+  (`smart_muted`; `GET /api/alerts` lists the kinds in
+  `smart_kind_catalogue`). A muted watch is still noted quietly, so
+  turning it back on mid-event never replays it.
+- **UV and solar on the public page.** A station with those sensors gets
+  a UV and a Solar card with a 24-hour chart on the public main page. A
+  station without them shows neither.
+- **The Android app on the public page.** "Get the Android app" now sits
+  beside the iOS link. `PUBLIC_DASHBOARD_ANDROID_URL` points it at
+  another listing, or hides it when set empty.
+- **Why the forecast fell back.** `/api/forecast` sends
+  `fallback_reason` (`no_key` or `failed`) with `fallback_from`, so the
+  apps can say that The Weather Company needs a WU API key on this
+  server instead of saying it did not answer.
+- **LilyGO relay: pair an AcuRite tower sensor with the Atlas.** The 433
+  MHz relay can pair one AcuRite 592TXR, 609TXC or 606TX by its id
+  (`tower_id` on `/provision`). Its temperature and humidity join the
+  Atlas's station as the indoor reading (`tower_indoor=1`) or as extra
+  sensor 1, and a neighbour's sensor of the same model stays ignored.
+  The relay's `/status` lists the last eight sensors it heard, with
+  their ids. These sensors have no barometer, so they bring no pressure.
+  Reflash from the web flasher without erasing to get it.
+
+### Changed
+- **One alert per ladder.** When several rules on the same field and
+  direction cross on one reading, only the highest (for "above") or
+  lowest (for "below") sends, so a gust from 6 to 21 mph sends your 20
+  mph alert, not your 10, 15 and 20 together. If that alert fails to go
+  out, the whole ladder stays armed to try again.
+- **Tonight's low, corrected for your station.** The freeze card, the
+  frost line in the morning report and the outlook use the forecast low
+  adjusted by how that forecast has scored at your station, when there
+  are enough scored nights, and say "adjusted for your station" when
+  they do. The forecast's own high and low in the outlook stay as
+  issued.
+- **"Frost possible tonight" on the freeze card** on a 33 to 34°F night.
+- **Live Activity updates reach their own station's card.** With two
+  stations, each card now shows its own station (an app older than 2.8
+  still receives every update, as before).
+
+### Fixed
+- **One bad reading no longer blanks a day of history.** A weather
+  service that sent text such as `--` where a number belongs had it
+  stored as text, and the 24-hour history then carried that text for a
+  day, which the apps could not read. Number fields now store a number
+  or nothing, and the history cleans up any text already stored, so the
+  apps' "vs yesterday" and "vs forecast" figures fill in again once the
+  server is updated. A stored infinity no longer fails the whole window.
+- **Rain today for a gauge that only counts up.** On the display, an SDR
+  or LilyGO station's day and hour totals come from the rain ledger, as
+  they do everywhere else.
+- **The outlook email retries properly.** With the mail server down, an
+  email-only outlook logged an alert and fired your webhooks on every
+  retry; both now wait until the outlook is actually delivered.
+
 ## [2.7.1] — 2026-10-21
 
 ### Fixed

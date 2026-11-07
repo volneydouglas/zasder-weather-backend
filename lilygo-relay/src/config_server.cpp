@@ -8,6 +8,8 @@
 
 #include "auth_logic.h"
 #include "display.h"
+#include "heard_list.h"
+#include "tower_pair.h"
 #include "url_logic.h"
 
 namespace ZasderConfigServer {
@@ -17,6 +19,8 @@ String ingestToken;
 String setupKey;
 bool forwardAll = false;
 bool atlasUvLuxBroken = false;
+uint32_t towerId = 0;
+bool towerIndoor = false;
 
 static WebServer server(80);
 static Preferences prefs;
@@ -36,6 +40,7 @@ static Preferences prefs;
 // but itself requires auth.
 static bool provisioned = false;
 static String        lastPacket    = "(none)";
+static HeardList::List heard;       // distinct sensors, newest first
 static String        lastPostText  = "(none)";
 static uint32_t      pktsDecoded   = 0;
 static uint32_t      pktsPostedOk  = 0;
@@ -89,6 +94,8 @@ void loadFromNvs() {
   provisioned = prefs.getBool("provisioned", false);
   forwardAll  = prefs.getBool("forward_all", false);
   atlasUvLuxBroken = prefs.getBool("atlas_uvlux_off", false);
+  towerId     = prefs.getUInt("tower_id", 0);
+  towerIndoor = prefs.getBool("tower_indoor", false);
   // Per-device setup key: mint + persist on first boot (or after an NVS
   // erase). Kept separate from the token so a 401 wipe never removes it.
   bool minted = false;
@@ -167,6 +174,19 @@ static String escapeJson(const String &s) {
   return out;
 }
 
+// /status `heard`: [{"packet":"Acurite-Tower #1234","age_s":12}, ...],
+// newest first.
+static String heardJson() {
+  String out = "[";
+  const unsigned long now = millis();
+  for (int i = 0; i < heard.count; i++) {
+    if (i) out += ", ";
+    out += "{\"packet\": \"" + escapeJson(String(heard.label[i])) +
+           "\", \"age_s\": " + String((now - heard.ms[i]) / 1000UL) + "}";
+  }
+  return out + "]";
+}
+
 // Deliberately unauthenticated: this is the read-only diagnostic an
 // operator hits first when a board misbehaves, often from a phone with no
 // way to attach a Bearer header. It never returns the token or the setup
@@ -215,6 +235,9 @@ static void handleStatus() {
   body += "  \"provisioned\": "  + String(provisioned ? "true" : "false") + ",\n";
   body += "  \"forward_all\": "  + String(forwardAll ? "true" : "false") + ",\n";
   body += "  \"atlas_uv_lux_broken\": " + String(atlasUvLuxBroken ? "true" : "false") + ",\n";
+  body += "  \"tower_id\": "    + String((unsigned long) towerId) + ",\n";
+  body += "  \"tower_indoor\": "+ String(towerIndoor ? "true" : "false") + ",\n";
+  body += "  \"heard\": "       + heardJson() + ",\n";
   body += "  \"pkts_decoded\": " + String(pktsDecoded) + ",\n";
   body += "  \"pkts_posted_ok\": "+ String(pktsPostedOk) + ",\n";
   body += "  \"pkts_401\": "     + String(pkts401) + ",\n";
@@ -319,6 +342,22 @@ static void handleProvision() {
   // Accept both form-encoded and ?query=string. backend_url is
   // required; ingest_token can be set independently (handy for token
   // rotation without re-entering the URL).
+  // tower_id is checked BEFORE anything is saved: a refused id must not
+  // leave this request's backend_url or ingest_token applied behind a 400
+  // (CodeRabbit, PR #141). A decimal id; 0 or empty unpairs. Anything else
+  // is refused rather than read as 0, which would silently unpair a typo.
+  const bool towerIdGiven = server.hasArg("tower_id");
+  uint32_t newTowerId = 0;
+  if (towerIdGiven) {
+    String v = server.arg("tower_id");
+    v.trim();
+    if (v.length() > 0 && !TowerPair::parseId(v.c_str(), &newTowerId)) {
+      server.send(400, "text/plain",
+                  "tower_id must be the sensor's decimal rtl_433 id "
+                  "(see \"heard\" on /status), or 0 to unpair\n");
+      return;
+    }
+  }
   bool changed = false;
   if (server.hasArg("backend_url")) {
     String v = server.arg("backend_url");
@@ -380,10 +419,26 @@ static void handleProvision() {
     Serial.printf("atlas_uv_lux_broken=%s\n", atlasUvLuxBroken ? "true" : "false");
     changed = true;
   }
+  // Optional: paired AcuRite tower (see config_server.h), validated above.
+  if (towerIdGiven) {
+    towerId = newTowerId;
+    prefs.putUInt("tower_id", towerId);
+    Serial.printf("tower_id=%lu\n", (unsigned long) towerId);
+    changed = true;
+  }
+  if (server.hasArg("tower_indoor")) {
+    String v = server.arg("tower_indoor");
+    v.trim(); v.toLowerCase();
+    towerIndoor = (v == "1" || v == "true" || v == "on");
+    prefs.putBool("tower_indoor", towerIndoor);
+    Serial.printf("tower_indoor=%s\n", towerIndoor ? "true" : "false");
+    changed = true;
+  }
   if (!changed) {
     server.send(400, "text/plain",
                 "expected at least one of backend_url, ingest_token, "
-                "forward_all, atlas_uv_lux_broken as form/query args");
+                "forward_all, atlas_uv_lux_broken, tower_id, tower_indoor "
+                "as form/query args");
     return;
   }
   // First successful provision flips the lock; from now on changes
@@ -620,6 +675,7 @@ void noteIncomingPacket(const char *model, uint32_t id) {
   char buf[48];
   snprintf(buf, sizeof(buf), "%.32s #%u", model, (unsigned) id);
   lastPacket = buf;
+  heard.note(model, id, millis());
   char dispLine[24];
   snprintf(dispLine, sizeof(dispLine), "rx: %.14s#%u",
            model, (unsigned) id);

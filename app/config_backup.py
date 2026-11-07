@@ -86,6 +86,12 @@ _ALERT_PREF_KEYS = (
     "smart_alerts",
     # 2.6: the lightning alert's own switch and distance.
     "lightning_alert", "lightning_alert_mi",
+    # 2.8: the good-sunset heads-up and its threshold.
+    "sunset_alert", "sunset_threshold",
+    # 2.8: each scheduled report's channels, and the smart kinds muted
+    # one at a time.
+    "digest_channels", "outlook_channels", "sky_channels",
+    "smart_muted",
 )
 # Columns set_alert_prefs stores that the backup deliberately leaves out,
 # each with its reason. test_config_backup checks _ALERT_PREF_KEYS is
@@ -120,9 +126,18 @@ async def export_config() -> dict[str, Any]:
         # replacement box without them stores uncorrected readings from
         # then on (2.4 review). Optional on restore, like the names.
         "device_calibrations": await db.all_calibrations(),
+        # 2.8: the crawlspace freeze watch (thresholds, hours, sensor).
+        # Optional on restore; an older file has no key.
+        "crawlspace_watch": await _crawlspace_export(),
         # Recorded so a restore can say what it couldn't put back.
         "smtp_password_included": False,
     }
+
+
+async def _crawlspace_export() -> dict[str, Any]:
+    from dataclasses import asdict
+    from . import crawlspace_watch as cw
+    return asdict(await cw.load_config())
 
 
 class RestoreError(ValueError):
@@ -144,7 +159,8 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
                "rain_start", "heat_day",
                "nws_push", "nws_warnings_only", "storm_live_activity",
                "lightning_live_activity", "wind_live_activity",
-               "freeze_live_activity", "smart_alerts", "lightning_alert"):
+               "freeze_live_activity", "smart_alerts", "lightning_alert",
+               "sunset_alert"):
         if isinstance(v, bool) or v in (0, 1):
             return 1 if v else 0
         return _INVALID
@@ -213,8 +229,28 @@ def _coerce_alert_pref(key: str, v: Any) -> Any:
             return _INVALID
         n = int(v)
         return n if n == v and 0 <= n <= hi else _INVALID
-    if key == "storm_channels":
+    if key == "sunset_threshold":
+        # 1..100 %, the bounds PUT /api/alerts takes.
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return _INVALID
+        n = int(v)
+        return n if n == v and 1 <= n <= 100 else _INVALID
+    if key in ("storm_channels", "digest_channels", "outlook_channels",
+               "sky_channels"):
         return v if v in ("push", "email", "both") else _INVALID
+    if key == "smart_muted":
+        # Stored as JSON text, cleaned against the kinds the server knows
+        # (the nws_families rule): never a key the apps cannot show.
+        from . import alerts as _al
+        raw = v
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                return _INVALID
+        if not isinstance(raw, list):
+            return _INVALID
+        return json.dumps(_al.normalise_smart_muted(raw))
     if key == "smtp_port":
         try:
             p = int(v)
@@ -258,6 +294,7 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
                                "alert_rules": 0, "device_locations": 0,
                                "device_names": 0,
                                "device_calibrations": 0,
+                               "crawlspace_watch": 0,
                                "smtp_password_restored": False}
 
     prefs = payload.get("alert_prefs")
@@ -427,6 +464,14 @@ async def import_config(payload: Any, *, replace_rules: bool = True) -> dict[str
                 continue
             if await db.set_calibration(mac, clean_table):
                 summary["device_calibrations"] += 1
+
+    crawl = payload.get("crawlspace_watch")
+    if isinstance(crawl, dict):
+        # The same cleaner load_config uses: an out-of-range value from a
+        # hand-edited file falls back to its default, never stored as is.
+        from . import crawlspace_watch as cw
+        await cw.save_config(cw.Config.from_dict(crawl))
+        summary["crawlspace_watch"] = 1
 
     if sum(v for v in summary.values() if isinstance(v, int)) == 0:
         if summary.get("alert_rules_error"):

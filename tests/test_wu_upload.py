@@ -830,7 +830,17 @@ def test_throttled_counter_rise_still_reaches_wu(client, monkeypatch):
     rollups, the dashboard and WU all see the rise."""
     from app.config import settings
     monkeypatch.setattr(settings, "ingest_min_interval_seconds", 600)
-    now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    # Half past the previous hour, not "now" (2.8): the day and hour rain
+    # are the counter's rise inside the post's own local day and clock hour
+    # (F27-03), so a post landing exactly on hh:00:00 opens a new hour, and
+    # on 00:00:00 a new day, with nothing in it yet. With "now" the second
+    # post hit that once in ~3,600 runs; CI runs started on the hour found it.
+    # Half past in the STATION's clock, which is what buckets the rain: in a
+    # half-hour zone, half past in UTC is on the local hour (CodeRabbit).
+    from zoneinfo import ZoneInfo
+    local = (dt.datetime.now(ZoneInfo(settings.timezone)) - dt.timedelta(hours=1)).replace(
+        minute=30, second=0, microsecond=0)
+    now = local.astimezone(dt.timezone.utc)
     _atlas_post(client, now - dt.timedelta(minutes=2), "rain", yearly_in=12.30)
     _configure(client)
     calls: list[dict] = []

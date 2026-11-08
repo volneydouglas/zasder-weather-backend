@@ -1622,6 +1622,16 @@ async def init_db(path: str | None = None) -> None:
                 _CHART_INDEX_REBUILD_NEEDED = True
         await db.commit()
 
+        # 2.8.1: an Android build from mid-October 2026 registered its FCM
+        # token without a platform and the column default filed it as
+        # 'ios'. The hosted relay refused every batch that carried one, so
+        # no iPhone on that server got a push. Re-file them as Android
+        # (FCM delivers them where it is configured; elsewhere they are
+        # skipped, never sent to Apple). Idempotent, and a handful of rows.
+        relabeled = await _relabel_fcm_push_tokens(db)
+        if relabeled:
+            log.info("re-filed %d FCM push token(s) stored as iOS", relabeled)
+
         # Probe for SQLite's math functions once — they drive the circular mean
         # used for bucketed wind direction (see _winddir_expr).
         global _HAS_MATH_FUNCS
@@ -4212,7 +4222,30 @@ async def delete_push_token(token: str) -> bool:
         return cur.rowcount > 0
 
 
+def _push_platform(token: str, platform: str | None) -> str:
+    """The platform a token really belongs to. An FCM-shaped token is
+    Android whatever the caller said (2.8.1: platform-less registrations
+    from an October 2026 Android build defaulted to 'ios')."""
+    from .apns import looks_like_fcm
+    if platform != "android" and looks_like_fcm(token):
+        return "android"
+    return platform or "ios"
+
+
+async def _relabel_fcm_push_tokens(db) -> int:
+    rows = await (await db.execute(
+        "SELECT token FROM push_tokens WHERE platform != 'android'")).fetchall()
+    fix = [r[0] for r in rows if _push_platform(r[0], "ios") == "android"]
+    for tok in fix:
+        await db.execute(
+            "UPDATE push_tokens SET platform = 'android' WHERE token = ?", (tok,))
+    if fix:
+        await db.commit()
+    return len(fix)
+
+
 async def register_push_token(token: str, platform: str, env: str | None) -> None:
+    platform = _push_platform(token, platform)
     now = int(__import__("time").time() * 1000)
     async with connect() as db:
         await db.execute(
@@ -6531,6 +6564,16 @@ async def _backfill_storm_capture(db) -> int:
 # a NULL nobody can explain.
 _STORM_CAPTURE_COLS = ("pre_tempf", "post_tempf", "temp_drop_f",
                        "pressure_change_inhg", "dew_change_f")
+
+
+async def storm_recorded(mac: str, started_ms: int) -> bool:
+    """Whether this storm episode is already in storm_history (2.8.1: the
+    give-up close may be retried after its record was written)."""
+    async with connect() as db:
+        row = await (await db.execute(
+            "SELECT 1 FROM storm_history WHERE mac = ? AND started_ms = ? "
+            "LIMIT 1", (mac, started_ms))).fetchone()
+    return row is not None
 
 
 async def record_storm(mac: str, s: dict) -> None:

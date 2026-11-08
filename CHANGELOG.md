@@ -8,6 +8,28 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.8.1] — 2026-11-07
+
+### Fixed
+- **Push notifications to iPhones stopped on a server holding an Android
+  token filed as iOS.** An Android build from mid-October registered its
+  push token without saying it was Android, and the server filed it as
+  an iPhone token. The hosted relay then refused the whole batch, so no
+  iPhone on that server got a push. Those tokens are now re-filed as
+  Android when the server starts (and delivered through FCM where it is
+  set up), a new registration is filed by the token's shape, and a token
+  that is not an iPhone token never goes into a relay batch again. The
+  relay itself now sends to the iPhone tokens in a mixed batch and
+  reports the rest, so a server that has not updated yet is helped too.
+- **More than 50 iPhones on one server.** Relay pushes now go out in
+  batches of 50, the relay's limit, instead of one request it refused.
+- **A storm summary that cannot be delivered no longer retries forever.**
+  It used to try again every minute. It still retries while the summary
+  is fresh, and six hours after the rain stopped the storm is closed
+  with its record and its report page kept.
+- A relay refusal about the tokens is no longer mistaken for an older
+  relay and sent a second time.
+
 ## [2.8.0] — 2026-11-07
 
 ### Added

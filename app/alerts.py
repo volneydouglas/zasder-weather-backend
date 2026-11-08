@@ -170,6 +170,12 @@ _STORM_BASELINE_MAX_AGE_MS = 6 * 3_600_000
 # before the rain opened the window, and the summary's "17 mph" — true for
 # the rain window — read as a wrong variable (2026-08-23).
 _STORM_GUST_LEAD_MS = 30 * 60_000
+# 2.8.1: a storm summary that cannot be delivered used to retry every
+# minute forever (Mesa Arts, 11-07: a relay that refused the batch kept
+# one storm retrying for days). This long after the storm became
+# reportable (rain stopped + the quiet window) the push is old news: close the storm, keep its record and its report page,
+# and stop.
+_STORM_DELIVERY_GIVE_UP_MS = 6 * 3_600_000
 
 
 # Half-window for an `equalTo` rule per field, API-native units, the
@@ -1902,6 +1908,42 @@ class AlertMonitor:
                     except Exception:
                         log.exception("storm report write failed; "
                                       "sending the summary without a page")
+                    # 2.8.1: past the give-up age the push is old news, so
+                    # it is never attempted again: the storm is recorded
+                    # (once, whatever restarts in between) and only then
+                    # closed, so a failed write retries the close next tick.
+                    # Measured from the moment the storm could first be
+                    # reported (rain stopped + the quiet window), so a long
+                    # quiet window still gets its delivery attempts
+                    # (CodeRabbit, PR #148).
+                    if now_ms - (last_rain or started) > (
+                            int(cfg.storm_quiet_minutes) * 60_000
+                            + _STORM_DELIVERY_GIVE_UP_MS):
+                        try:
+                            if not await db.storm_recorded(mac, summary.started_ms):
+                                await db.record_storm(mac, {
+                                    "started_ms": summary.started_ms,
+                                    "ended_ms": summary.ended_ms,
+                                    "total_in": summary.total_in,
+                                    "peak_rate_in_hr": summary.peak_rate_in_hr,
+                                    "max_gust_mph": summary.max_gust_mph,
+                                    "min_tempf": summary.min_tempf,
+                                    "max_tempf": summary.max_tempf,
+                                    **capture})
+                        except Exception:
+                            log.exception("storm history write failed; the "
+                                          "close retries next tick")
+                            continue
+                        log.warning("storm summary for %s still undelivered "
+                                    "%.1f h after the rain stopped; closing "
+                                    "it without a push", mac,
+                                    (now_ms - (last_rain or started)) / 3_600_000)
+                        await db.upsert_storm_state(mac, None, None, field,
+                                                    value, obs_ms)
+                        await storm_watch.on_closed(
+                            cfg, d, started, last_rain, now_ms, field,
+                            reported=False)
+                        continue
                     # Clear state only after delivery, same as the other
                     # alerts, so a transport failure retries next tick rather
                     # than losing the storm entirely.

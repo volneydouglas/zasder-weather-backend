@@ -30,6 +30,30 @@ _jwt_cache: tuple[str, float] | None = None
 _JWT_TTL = 50 * 60
 
 
+# 2.8.1: what an APNs device token looks like, by the hosted relay's own
+# rule (hex, 32 to 200 characters; Apple's are 64 today). An FCM
+# registration token is ~140+ characters of base64-ish text with a ':'.
+# An Android build from mid-October 2026 registered its FCM token without
+# a platform, the column default filed it as 'ios', and the relay then
+# refused EVERY batch that carried it (422 "device tokens must be hex"),
+# so no iPhone on that server got a push (Mesa Arts and Atlas, found at
+# the 2.8.0 release).
+_HEX = frozenset("0123456789abcdefABCDEF")
+RELAY_BATCH_MAX = 50          # RelayPush.tokens max_length
+
+
+def is_apns_token(token: str | None) -> bool:
+    return (isinstance(token, str) and 32 <= len(token) <= 200
+            and all(c in _HEX for c in token))
+
+
+def looks_like_fcm(token: str | None) -> bool:
+    """An FCM registration token: long, not hex, with the ':' that splits
+    its instance id from the rest. Shape only; FCM is the judge."""
+    return (isinstance(token, str) and len(token) >= 100 and ":" in token
+            and not is_apns_token(token))
+
+
 def make_jwt(team_id: str, key_id: str, key_p8: str, now: float | None = None) -> str:
     """ES256 provider JWT for APNs. Pure — unit-tested with an ephemeral key."""
     # `now is None`, not `now or ...`: now=0 is a legitimate pinned iat (epoch)
@@ -298,6 +322,61 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
     Apple, and returns dead tokens for us to prune. POSTs only {tokens, title,
     body, env} (+ the optional constrained interruption_level, 1.9) — the
     relay enforces that shape."""
+    # 2.8.1: one token the relay cannot take sank the whole batch (its
+    # schema answers 422 for every token), so drop them here, count them
+    # failed, and never prune them: they are another platform's tokens,
+    # not dead ones. send_to_all reroutes FCM-shaped rows before this.
+    bad = [t for t in tokens if not is_apns_token(t)]
+    if bad:
+        log.warning("relay push: skipping %d token(s) that are not APNs "
+                    "device tokens", len(bad))
+        tokens = [t for t in tokens if is_apns_token(t)]
+        if not tokens:
+            return {"sent": 0, "dead": [], "failed": len(bad)}
+    if len(tokens) > RELAY_BATCH_MAX:
+        # The relay takes at most 50 tokens per request (and refused a
+        # bigger batch outright); send in slices and add the answers up.
+        total = {"sent": 0, "dead": [], "failed": len(bad)}
+        for i in range(0, len(tokens), RELAY_BATCH_MAX):
+            part = await _push_via_relay(
+                tokens[i:i + RELAY_BATCH_MAX], title, body, url, token,
+                la_payload=la_payload, push_type=push_type,
+                interruption_level=interruption_level, route=route,
+                server_id=server_id, tier=tier)
+            total["sent"] += part.get("sent", 0)
+            total["dead"] += part.get("dead", [])
+            total["failed"] += part.get("failed", 0)
+        return total
+    res = await _relay_post(tokens, title, body, url, token,
+                            la_payload=la_payload, push_type=push_type,
+                            interruption_level=interruption_level,
+                            route=route, server_id=server_id, tier=tier)
+    if bad:
+        res["failed"] = res.get("failed", 0) + len(bad)
+    return res
+
+
+def _rejects_tokens(r: httpx.Response) -> bool:
+    """A 422 that names the tokens, not an unknown field: retrying without
+    the extras cannot help, so do not spend a second call on it."""
+    try:
+        detail = r.json().get("detail")
+    except Exception:
+        return False
+    if not isinstance(detail, list):
+        return False
+    return any(isinstance(d, dict) and "tokens" in (d.get("loc") or [])
+               for d in detail)
+
+
+async def _relay_post(tokens: list[str], title: str, body: str,
+                      url: str, token: str,
+                      la_payload: dict | None = None,
+                      push_type: str = "liveactivity",
+                      interruption_level: str | None = None,
+                      route: str | None = None,
+                      server_id: str | None = None,
+                      tier: str | None = None) -> dict:
     env = (settings.apns_env or "").strip()
     if env not in _HOSTS:
         # Same refuse-to-guess semantics as _resolve_env on the own-key path:
@@ -351,7 +430,7 @@ async def _push_via_relay(tokens: list[str], title: str, body: str,
             extras = [k for k in ("interruption_level", "route", "server_id",
                                   "sound_tier")
                       if k in payload]
-            if r.status_code == 422 and extras:
+            if r.status_code == 422 and extras and not _rejects_tokens(r):
                 log.warning("relay rejected %s (older relay?) — retrying as "
                             "a standard push", " and ".join(extras))
                 for k in extras:
@@ -627,10 +706,26 @@ async def send_to_all(title: str, body: str,
     # 2.3: stamp the sender so a phone holding several owned sites opens
     # the tap in the one that pushed (Sites). Resolved once per batch.
     server_id = await current_server_id()
-    ios = [t for t in tokens if (t.get("platform") or "ios") != "android"]
-    android = [t for t in tokens if t.get("platform") == "android"]
+    ios: list[dict] = []
+    android: list[dict] = []
+    unknown = 0
+    for t in tokens:
+        if t.get("platform") == "android":
+            android.append(t)
+        elif is_apns_token(t.get("token")):
+            ios.append(t)
+        elif looks_like_fcm(t.get("token")):
+            # 2.8.1: an FCM token filed as iOS (the platform-less Android
+            # registrations of mid-October 2026) goes where it can be
+            # delivered, and never into a relay batch it would sink.
+            android.append(t)
+        else:
+            unknown += 1
+            log.warning("push token %s… is neither an APNs nor an FCM "
+                        "token; skipping it", (t.get("token") or "")[:8])
 
-    sent = failed = pruned = 0
+    sent = pruned = 0
+    failed = unknown
     dead: list[str] = []
 
     # iOS

@@ -312,11 +312,11 @@ def test_relay_client_omits_the_route_when_there_is_none(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
     monkeypatch.setattr(apns.settings, "apns_env", "production")
 
-    asyncio.run(apns._push_via_relay(["t"], "ti", "bo", "http://r", "k"))
+    asyncio.run(apns._push_via_relay(["a" * 64], "ti", "bo", "http://r", "k"))
     assert "route" not in seen["bodies"][0]
 
     seen.clear()
-    asyncio.run(apns._push_via_relay(["t"], "ti", "bo", "http://r", "k",
+    asyncio.run(apns._push_via_relay(["a" * 64], "ti", "bo", "http://r", "k",
                                      route="report/3"))
     assert seen["bodies"][0]["route"] == "report/3"
 
@@ -352,7 +352,7 @@ def test_an_older_relay_that_rejects_the_route_still_delivers(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", _Client)
     monkeypatch.setattr(apns.settings, "apns_env", "production")
-    res = asyncio.run(apns._push_via_relay(["t"], "ti", "bo", "http://r", "k",
+    res = asyncio.run(apns._push_via_relay(["a" * 64], "ti", "bo", "http://r", "k",
                                            route="report/3"))
     assert len(bodies) == 2, "one retry, without the field it rejected"
     assert "route" not in bodies[1]

@@ -116,14 +116,25 @@ def first_wet_bucket(series: list[tuple[int, float]], now_ms: int,
 
 
 def build_message(name: str, start_ms: int, total_mm_2h: float,
-                  tz_name: str) -> tuple[str, str]:
+                  tz_name: str, now_ms: int | None = None) -> tuple[str, str]:
+    """The push. A bucket that has already begun (the API returns the
+    current quarter-hour, and a poll can land six minutes into it) is
+    "starting now", never a clock time that has passed: Doren, 2026-11-12,
+    read "Rain expected around 11:30 AM" at 11:36 and asked whether it was
+    delivered late. It was not; it was worded for a time that was gone."""
+    inches = total_mm_2h / 25.4
+    if now_ms is not None and start_ms <= now_ms:
+        title = "Rain starting now"
+        body = (f"{name}: the forecast shows rain starting about now "
+                f"(~{inches:.2f} in over the next two hours, Open-Meteo "
+                f"15-minute model). Your station will confirm when it arrives.")
+        return title, body
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = timezone.utc
     local = datetime.fromtimestamp(start_ms / 1000, tz)
     when = local.strftime("%-I:%M %p") if hasattr(local, "strftime") else str(local)
-    inches = total_mm_2h / 25.4
     title = f"Rain expected around {when}"
     body = (f"{name}: the forecast shows rain starting around {when} "
             f"(~{inches:.2f} in over the following two hours, Open-Meteo "
@@ -249,6 +260,15 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
         hourly = 0.0
     if hourly > DRY_GATE_IN:
         return
+    # The gauge has already confirmed it (a storm episode is open, which
+    # the storm watch opened on the first tips, under the dry gate's
+    # 0.02 in): the Storm Watch card is the story now and a forecast of
+    # rain that is falling is noise. Doren, 2026-11-12: a "rain expected"
+    # push landed with his storm watch sixteen minutes old and 0.01 in on
+    # the gauge. Checked AFTER the throttle stamp on purpose, so a storm
+    # does not make the nowcast poll Open-Meteo every tick.
+    if await _storm_open(devices):
+        return
 
     series = await fetch_minutely(lat, lon)
     if not series:
@@ -269,7 +289,7 @@ async def check(cfg, devices: list[dict[str, Any]], now_ms: int,
         return
 
     name = d.get("name") or d.get("mac") or "Your station"
-    title, body = build_message(name, start_ms, total_mm, settings.timezone)
+    title, body = build_message(name, start_ms, total_mm, settings.timezone, now_ms=now_ms)
     if await deliver(cfg, f"[Zasder Weather] {title}", body, title, body,
                      email_ok=cfg.email_scope == "all"):
         await db.set_kv(_KV_STATE, json.dumps(

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from .poller_lifecycle import reap
 import asyncio
+import time
 import logging
 from typing import Any
 
@@ -43,6 +44,101 @@ log = logging.getLogger("wl-poller")
 SENSOR_TYPES_ISS    = {43, 46}
 SENSOR_TYPE_INDOOR  = 365      # 6313 built-in indoor temp+hum
 SENSOR_TYPE_BAROM   = 242      # 6313 built-in barometer
+# 2.8.2: the sensor_type set above is the Vantage Pro2 ISS as the 6313
+# console reports it. A Vantage Vue behind a WeatherLink Live has another
+# sensor_type (Davis's catalog has one per ISS model, with and without a
+# fan) and its record came through as "no ISS data": success with zero
+# rows, a green check in the app and no station, silently, for everyone
+# who did not own the maintainer's exact hardware (Thierry, 2026-11-12).
+# The DATA STRUCTURE is the stable name for "this is the ISS record"
+# (weatherlink.github.io/v2-api/data-structure-types):
+#   10 ISS current conditions, WeatherLink Live
+#   23 ISS current conditions, WeatherLink Console
+# and the console's own barometer and inside sensors are 19 and 21.
+# (The cloud's 1 and 2 are the WeatherLinkIP / Vantage Connect combined
+# records with their own field names, not the WLL local API's type 1.)
+# A record that names none of these but carries an outdoor temperature
+# and a wind or rain field is treated as the ISS too, so the next catalog
+# entry Davis adds is not a repeat. The WLL's barometer and inside
+# sensors are structures 3 and 4 locally, but through the cloud Davis's
+# 11 and 12 are GENERIC non-ISS records (CodeRabbit, PR #153), so those
+# two are told apart by the fields they carry, `bar_sea_level` and
+# `temp_in`, never by a structure number. Several records can look like
+# an ISS (an auxiliary transmitter reports as structure 10 as well, and
+# `sensors[]` has no documented order): the one with the most of
+# temperature, humidity, wind, rain, solar and UV wins, a known ISS
+# sensor_type breaks a tie, and the lowest transmitter id breaks the
+# rest, so the slot never goes to whichever record happened to come first.
+ISS_STRUCTURE_TYPES    = {10, 23}
+BAROM_STRUCTURE_TYPES  = {19}
+INDOOR_STRUCTURE_TYPES = {21}
+_ISS_SHAPE_KEYS = ("wind_speed_last", "wind_speed_avg_last_2_min",
+                   "rain_rate_last", "rainfall_daily", "rainfall_day_in")
+_ISS_SCORE_KEYS = (("temp",), ("hum",),
+                   ("wind_speed_last", "wind_speed_avg_last_2_min"),
+                   ("rainfall_daily", "rainfall_day_in", "rainfall_daily_in"),
+                   ("solar_rad",), ("uv_index",))
+# rain_size (WLL records) -> inches per bucket tip, as wll-poller/poller.py.
+_RAIN_SIZE_IN: dict[int, float] = {1: 0.01, 2: 0.2 / 25.4, 3: 0.1 / 25.4, 4: 0.001}
+
+
+def classify_sensor(s: dict[str, Any]) -> str | None:
+    """'iss', 'indoor', 'barom' or None for one `sensors[]` entry of a
+    /v2/current answer: by sensor_type where the type is known, by
+    data_structure_type otherwise, and by the record's own fields last."""
+    stype = s.get("sensor_type")
+    dst = s.get("data_structure_type")
+    rows = s.get("data") or []
+    r = rows[0] if rows and isinstance(rows[0], dict) else {}
+    if stype in SENSOR_TYPES_ISS or dst in ISS_STRUCTURE_TYPES:
+        return "iss"
+    if stype == SENSOR_TYPE_INDOOR or dst in INDOOR_STRUCTURE_TYPES or r.get("temp_in") is not None:
+        return "indoor"
+    if stype == SENSOR_TYPE_BAROM or dst in BAROM_STRUCTURE_TYPES or r.get("bar_sea_level") is not None:
+        return "barom"
+    if r.get("temp") is not None and any(k in r for k in _ISS_SHAPE_KEYS):
+        return "iss"
+    return None
+
+
+def iss_score(s: dict[str, Any]) -> tuple[int, int, int]:
+    """Higher sorts first: how much of an ISS the record is, whether its
+    sensor_type is a known ISS, and the lowest transmitter id last."""
+    rows = s.get("data") or []
+    r = rows[0] if rows and isinstance(rows[0], dict) else {}
+    fields = sum(1 for keys in _ISS_SCORE_KEYS if any(r.get(k) is not None for k in keys))
+    known = 1 if s.get("sensor_type") in SENSOR_TYPES_ISS else 0
+    try:
+        tx = int(r.get("tx_id") or r.get("txid") or 0)
+    except (TypeError, ValueError):
+        tx = 0
+    return (fields, known, -tx)
+
+
+def describe_sensors(current: dict[str, Any]) -> str:
+    """What the station answered with, for the log line that says no ISS
+    record was recognised: `sensor_type/data_structure_type` pairs."""
+    pairs = []
+    for s in current.get("sensors") or []:
+        pairs.append(f"{s.get('sensor_type')}/{s.get('data_structure_type')}")
+    return ", ".join(pairs) if pairs else "no sensors at all"
+
+
+def _rain_in(iss: dict[str, Any], *names_in: str, clicks: str) -> float | None:
+    """A rain total in inches from whichever spelling the record has: the
+    console's `_in` fields first (either spelling Davis has used), else a
+    WLL record's bucket-tip count times its rain_size."""
+    for n in names_in:
+        v = iss.get(n)
+        if v is not None:
+            return float(v)
+    v = iss.get(clicks)
+    if v is None:
+        return None
+    try:
+        return float(v) * _RAIN_SIZE_IN.get(int(iss.get("rain_size") or 1), 0.01)
+    except (TypeError, ValueError):
+        return None
 
 
 def _synth_mac(tx_id: int) -> str:
@@ -65,27 +161,40 @@ def build_payload(station: dict[str, Any],
     barom_data: dict[str, Any] = {}
     tx_id = 1   # default; overwritten if ISS data carries tx_id
 
+    candidates: list[dict[str, Any]] = []
     for s in sensors:
-        stype = s.get("sensor_type")
         rows = s.get("data") or []
         if not rows:
             continue
         r = rows[0]
-        if stype in SENSOR_TYPES_ISS:
-            iss_data = r
-            if r.get("tx_id"):
-                # R6: a truthy non-numeric tx_id raised out of build_payload
-                # and dropped the ENTIRE cycle's reading — fall back to the
-                # default instead, matching this module's own "mis-naming
-                # silently drops data" lesson.
-                try:
-                    tx_id = int(r["tx_id"])
-                except (TypeError, ValueError):
-                    pass
-        elif stype == SENSOR_TYPE_INDOOR:
+        kind = classify_sensor(s)
+        if kind == "iss":
+            candidates.append(s)
+        elif kind == "indoor" and (not indoor_data or r.get("temp_in") is not None):
             indoor_data = r
-        elif stype == SENSOR_TYPE_BAROM:
+        elif kind == "barom" and (not barom_data or r.get("bar_sea_level") is not None):
             barom_data = r
+    if candidates:
+        # Eligibility first, then the score: a record without a temperature
+        # is not the ISS whatever else it carries, so it must not win the
+        # slot and then be rejected with the rest unconsidered (CodeRabbit,
+        # PR #153). With no temperature anywhere, the best of what there
+        # is still goes through, as before.
+        with_temp = [s for s in candidates if s["data"][0].get("temp") is not None]
+        best = max(with_temp or candidates, key=iss_score)
+        r = best["data"][0]
+        iss_data = r
+        # The console spells the transmitter `tx_id`; a WeatherLink Live
+        # record spells it `txid` (read live from one on 2026-11-12).
+        # R6: a truthy non-numeric id raised out of build_payload and
+        # dropped the ENTIRE cycle's reading — fall back to the default
+        # instead, matching this module's own "mis-naming silently
+        # drops data" lesson.
+        if r.get("tx_id") or r.get("txid"):
+            try:
+                tx_id = int(r.get("tx_id") or r.get("txid"))
+            except (TypeError, ValueError):
+                pass
 
     if not iss_data:
         log.debug("no ISS sensor in WeatherLink response")
@@ -93,7 +202,10 @@ def build_payload(station: dict[str, Any],
 
     # Use the freshest sensor timestamp as the observation time so the
     # backend stores it correctly even if our poll cadence drifts.
-    ts_ms = (iss_data.get("ts") or 0) * 1000
+    # The console stamps each record (`ts`); a WLL-shaped record may carry
+    # none, in which case the answer's own stamp (`generated_at`) is the
+    # observation time rather than dropping the whole reading.
+    ts_ms = (iss_data.get("ts") or current.get("generated_at") or 0) * 1000
     if not ts_ms:
         return None
     from datetime import datetime, timezone
@@ -146,22 +258,29 @@ def build_payload(station: dict[str, Any],
         wind["direction"] = round(float(direction))
 
     rain: dict[str, Any] = {}
-    if iss_data.get("rainfall_year_in") is not None:
+    yearly = _rain_in(iss_data, "rainfall_year_in", clicks="rainfall_year")
+    if yearly is not None:
         # Add the operator-supplied baseline so a mid-year-installed
         # ISS reports the actual year-to-date total, not just rain
         # since pairing. (Davis cloud's rainfall_year_in resets to 0
         # at install + only counts new tips from then on.)
-        rain["yearly_in"] = (float(iss_data["rainfall_year_in"])
-                              + settings.weatherlink_yearly_rain_baseline_in)
+        rain["yearly_in"] = yearly + settings.weatherlink_yearly_rain_baseline_in
     # Davis cloud reports daily + hourly directly. Setting them here
     # explicitly stops backend/app/main.py:get_current() from invoking
     # its rain-rollup enrichment (which would otherwise compute
     # daily/weekly/monthly from yearlyrainin DELTAS — broken for a
     # baselined value since the "yesterday" yearlyrainin is fictional).
-    if iss_data.get("rainfall_day_in") is not None:
-        rain["daily_in"] = float(iss_data["rainfall_day_in"])
-    if iss_data.get("rainfall_last_60_min_in") is not None:
-        rain["hourly_in"] = float(iss_data["rainfall_last_60_min_in"])
+    daily = _rain_in(iss_data, "rainfall_day_in", "rainfall_daily_in", clicks="rainfall_daily")
+    if daily is not None:
+        rain["daily_in"] = daily
+    hourly = _rain_in(iss_data, "rainfall_last_60_min_in", clicks="rainfall_last_60_min")
+    if hourly is not None:
+        rain["hourly_in"] = hourly
+    # A WLL record carries the month too; the console's does not, and the
+    # backend's rollup fills it in from the yearly history either way.
+    monthly = _rain_in(iss_data, "rainfall_monthly_in", clicks="rainfall_monthly")
+    if monthly is not None:
+        rain["monthly_in"] = monthly
     # Davis cloud doesn't expose weekly_in / monthly_in inches; the
     # backend's rollup will still compute them from now-baselined
     # yearly history (which is correct as soon as all stored rows
@@ -204,6 +323,7 @@ class WeatherlinkPoller:
                  interval_s: int = 60):
         self._client = client
         self._station_id = station_id
+        self._no_iss_warned_at = -3600.0
         self._interval_s = max(15, interval_s)
         self._station_meta: dict[str, Any] | None = None
         self._task: asyncio.Task[None] | None = None
@@ -260,7 +380,15 @@ class WeatherlinkPoller:
                     # no ISS data. Distinct from a failure, and worth showing
                     # as such rather than silent success.
                     source_status.record_success("davis-cloud", rows=0)
-                    log.debug("no ISS data in poll response — skipping ingest")
+                    # A WARNING that names what the station DID send, once an
+                    # hour: this is the line that would have said "Vantage Vue"
+                    # on day one (2.8.2). DEBUG hid it for every self-hoster.
+                    now = time.monotonic()
+                    if now - self._no_iss_warned_at >= 3600:
+                        self._no_iss_warned_at = now
+                        log.warning("WeatherLink answered but no ISS record was "
+                                    "recognised (sensor_type/data_structure_type: %s); "
+                                    "nothing ingested", describe_sensors(current))
                 else:
                     result = await ingest._do_ingest(payload)  # type: ignore[attr-defined]
                     # rows STORED, not rows posted — the history-write throttle

@@ -76,7 +76,7 @@ def test_a_dated_heading_means_the_apps_carry_the_same_number():
     """Round two (I1): the guard read only app/version.py, and its message
     told you to bump project.yml without ever looking at it. The apps and
     the backend share one release number (project.yml's own comment), so
-    a dated heading pins MARKETING_VERSION too. The build number is only
+    a dated heading bounds MARKETING_VERSION too. The build number is only
     checked for shape: App Store Connect refuses a re-upload at the same
     version+build, and nothing here can know the last upload."""
     if not PROJECT_YML.exists():
@@ -84,12 +84,10 @@ def test_a_dated_heading_means_the_apps_carry_the_same_number():
     newest, date = _newest()
     marketing, build = _app_versions()
     assert build > 0
-    if date.strip().lower() == "unreleased":
-        assert marketing <= newest, (
-            f"ios/project.yml says {marketing} but the changelog's newest "
-            f"section is {newest}")
-        return
-    assert marketing == newest, (
-        f"the changelog dates {newest} as released but ios/project.yml says "
-        f"MARKETING_VERSION {marketing}; bump it (and CURRENT_PROJECT_VERSION) "
-        "before tagging")
+    # `<=`, not `==`, on a dated heading too (2.8.2): a backend-only patch
+    # (2.6.1, 2.7.1, 2.8.1) used to force a MARKETING_VERSION bump with no
+    # app build behind it, so build numbers 57 and 59 were minted and never
+    # uploaded. The app may LAG the backend by a patch; it may never lead.
+    assert marketing <= newest, (
+        f"ios/project.yml says {marketing} but the changelog's newest "
+        f"section is {newest}: the app never runs ahead of the backend")

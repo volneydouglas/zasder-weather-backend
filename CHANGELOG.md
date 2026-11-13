@@ -8,6 +8,12 @@ The running version is shown on the status page and at `GET /api/version`;
 the backend checks GitHub daily and shows an "update available" banner
 (disable with `UPDATE_CHECK=0`). To upgrade, run `bin/upgrade.sh`.
 
+## [2.8.2] — 2026-11-12
+
+A Vantage Vue behind a WeatherLink Live is a station again. The Davis cloud poller recognised the ISS by two sensor type numbers, the Vantage Pro2's as the 6313 console reports it, so a Vue's record came through as "no ISS data" and the server recorded success with zero rows: keys right, station id right, a green check in the app, and no station, silently. The ISS is now recognised by its data structure (WeatherLink Live local, WeatherLink Live cloud, console) or, failing that, by its fields, and a WeatherLink Live record's rain, which arrives as bucket-tip counts with a rain size code, is converted to inches like the LAN poller already did. When nothing is recognised the log says what the station did send, once an hour, instead of a debug line nobody sees. Reported by a Vantage Vue owner on 2026-11-12.
+
+The rain nowcast no longer announces rain that the station has already confirmed. A "rain expected" push went out with a storm watch sixteen minutes old and 0.01 in on the gauge (under the 0.02 in wet gate): an open storm episode on any station now holds the nowcast, since the Storm Watch card is the story from the first tips. And a quarter-hour bucket that has already begun reads "Rain starting now" instead of a clock time that has passed; a 15-minute model poll can land six minutes into the bucket, and "around 11:30 AM" at 11:36 read as a late delivery. It was not late, it was worded for a time that was gone.
+
 ## [2.8.1] — 2026-11-07
 
 ### Fixed

@@ -154,6 +154,48 @@ def test_check_gates(monkeypatch):
         await nowcast.check(_Cfg(), [_device(hourly=0.25)], now, fake_deliver)
         assert sent == [], "a wet trailing hour suppresses the warning"
 
+        # Doren, 2026-11-12: 0.01 in on the gauge is under the dry gate, but
+        # the storm watch had opened on it sixteen minutes earlier. An open
+        # storm episode on any station is the gauge's confirmation.
+        nowcast._reset_for_tests()
+        STORM["AA"] = {"started_ms": now - 16 * 60_000}
+        await nowcast.check(_Cfg(), [_device(hourly=0.01)], now, fake_deliver)
+        assert sent == [], "an open storm episode suppresses the warning"
+        STORM.clear()
+        nowcast._reset_for_tests()
+        await nowcast.check(_Cfg(), [_device(hourly=0.01)], now, fake_deliver)
+        assert len(sent) == 1, "the same gauge reading with no episode open still warns"
+
+    asyncio.run(run())
+
+
+def test_a_bucket_already_begun_is_starting_now_not_a_past_time(monkeypatch):
+    """The API returns the current quarter-hour too, and a poll can land
+    six minutes into it: the push said "around 11:30 AM" at 11:36."""
+    import asyncio
+    now = int(time.time() * 1000)
+    title, body = nowcast.build_message("Yard", now - 6 * 60_000, 2.54, "UTC", now_ms=now)
+    assert title == "Rain starting now" and "starting about now" in body and "0.10 in" in body
+    title, _ = nowcast.build_message("Yard", now + 20 * 60_000, 2.54, "UTC", now_ms=now)
+    assert title.startswith("Rain expected around ")
+    # Without now_ms (the older callers) the wording is unchanged.
+    assert nowcast.build_message("Yard", now - 6 * 60_000, 2.54, "UTC")[0].startswith("Rain expected around ")
+
+    async def run():
+        series = [(now - 6 * 60_000, 1.0), (now + 9 * 60_000, 2.0)]
+        sent = []
+
+        async def fake_fetch(lat, lon):
+            return series
+
+        async def fake_deliver(cfg, subject, body, ptitle, pbody, email_ok=True, **kw):
+            sent.append(ptitle)
+            return True
+
+        monkeypatch.setattr(nowcast, "fetch_minutely", fake_fetch)
+        await nowcast.check(_Cfg(), [_device()], now, fake_deliver)
+        assert sent == ["Rain starting now"]
+
     asyncio.run(run())
 
 

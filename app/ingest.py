@@ -1279,6 +1279,22 @@ async def _do_ingest(payload_obj: Any) -> dict[str, Any]:
         # first computed it (CodeRabbit, PR #40).
         flat["_feels_derived"] = True
 
+  
+    # Automatic UV spike filter:
+    # Reject high UV values when concurrent solar radiation is too low.
+    # Only the UV field is nulled; all other weather measurements survive.
+    # Scoped to the main outdoor station.
+    if mac == "5D:5D:01:00:02:AD":
+        uv_value = flat.get("uv")
+        solar_value = flat.get("solarradiation")
+        if (uv_value is not None and solar_value is not None
+                and uv_value >= 5.0 and solar_value < 100):
+            log.warning(
+                "UV spike dropped for %s: UV %.2f with solar radiation %.1f",
+                mac, uv_value, solar_value)
+            flat["uv"] = None
+
+
     # Physical plausibility bands next (records QC): decode garbage — values
     # beyond world-record extremes — is nulled field-by-field before it can
     # reach records, rollups, alerts or the relative guards below (whose
